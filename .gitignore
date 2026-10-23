@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Secrets – never commit
+.env
+.env.*
+*.pem
+*.key
+
+# Local workfolders and run output used while developing
+workfolder*/
+runs/
+spikes/out/
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
