@@ -31,3 +31,6 @@ spikes/out/
 !src/arr/runs/
 # The workfolder template is part of the repo (overrides workfolder*/ above)
 !templates/workfolder/
+
+# Claude Code agent worktrees (see umsetzung/Arbeitsweise.md §9)
+.claude/worktrees/
