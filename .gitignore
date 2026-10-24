@@ -17,20 +17,16 @@ htmlcov/
 *.pem
 *.key
 
-# Local workfolders and run output used while developing
-workfolder*/
-runs/
-spikes/out/
+# Local workfolders and run output used while developing (anchored at repo root)
+/workfolder*/
+/runs/
+/spikes/out/
+/spikes/*/tmp/
 
 # macOS / editors
 .DS_Store
 .idea/
 .vscode/
-
-# The arr.runs subpackage is code, not run output (overrides runs/ above)
-!src/arr/runs/
-# The workfolder template is part of the repo (overrides workfolder*/ above)
-!templates/workfolder/
 
 # Claude Code agent worktrees (see umsetzung/Arbeitsweise.md §9)
 .claude/worktrees/

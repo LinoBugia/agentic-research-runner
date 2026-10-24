@@ -33,7 +33,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-m 'not live'"
+addopts = "-m 'not live' --strict-markers"
 markers = [
     "live: uses real models and costs tokens (run manually with -m live)",
     "macos: runs only on macOS",
