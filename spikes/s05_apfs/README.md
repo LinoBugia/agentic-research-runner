@@ -17,7 +17,7 @@ Ergebnis: [docs/spikes/S5_apfs.md](../../docs/spikes/S5_apfs.md)
 Voraussetzung: macOS mit APFS, ca. 1,6 GB frei. Kein Login, kein sudo.
 
 ```bash
-uv run python spikes/s05_apfs/main.py                # ca. 500 MB in 4480 Dateien, 3 Wiederholungen, ca. 1 min
+uv run python spikes/s05_apfs/main.py                # ca. 500 MB in 4480 Dateien, 3 Wiederholungen, ca. 2 min
 uv run python spikes/s05_apfs/sizes.py <ordner>      # Größen eines beliebigen Ordners
 ```
 
