@@ -17,3 +17,16 @@ Status: Planung abgeschlossen (Projektauftrag v1.0), Umsetzung beginnt mit Welle
 | [06 Gruppenchats](docs/06-gruppenchats.md) | Kommunikationsmodell der Agenten |
 | [07 Berechtigungen & Freigaben](docs/07-berechtigungen-und-freigaben.md) | Sandbox, Regeln, Freigabe-Inbox, Aufsichts-Agent |
 | [API-Recherche](docs/mathe-agent-harness.md) | Agent-SDKs (Claude, OpenAI, Codex) |
+
+## Entwicklung
+
+Voraussetzungen: [uv](https://docs.astral.sh/uv/) und Python 3.12.
+
+```bash
+uv sync                                   # Umgebung anlegen
+uv run arr info                           # CLI ausprobieren
+uv run pytest                             # Tests
+uv run ruff check && uv run ruff format --check   # Linter und Format
+```
+
+Regeln für die Entwicklung (Sprache, Tests, Secrets, Commits): [CLAUDE.md](CLAUDE.md). Spikes: [spikes/README.md](spikes/README.md).
