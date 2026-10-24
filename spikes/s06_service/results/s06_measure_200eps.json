@@ -1,0 +1,159 @@
+{
+  "config": {
+    "port": 8765,
+    "rate": 200.0,
+    "seconds": 30.0,
+    "idle": 8,
+    "keep": false
+  },
+  "live_page_load_ms": 193,
+  "table_page_load_ms": 155,
+  "table_sort_filter_ms_incl_waits": 863,
+  "writer": {
+    "events": 6000,
+    "seconds": 30.0
+  },
+  "events_written": 6000,
+  "events_shown_in_ui": 6000,
+  "events_via_sse": 6000,
+  "latency_ms": {
+    "ui_event_to_dom": {
+      "n": 6000,
+      "mean": 87.0,
+      "p50": 86.9,
+      "p95": 139.4,
+      "p99": 151.8,
+      "max": 167.9
+    },
+    "sse_event_to_client": {
+      "n": 6000,
+      "mean": 27.2,
+      "p50": 27.1,
+      "p95": 49.9,
+      "p99": 52.1,
+      "max": 70.5
+    },
+    "click_round_trip": {
+      "n": 27,
+      "mean": 65.0,
+      "p50": 65.9,
+      "p95": 71.4,
+      "p99": 82.1,
+      "max": 85.9
+    },
+    "rest_get_runs_500_rows": {
+      "n": 27,
+      "mean": 4.3,
+      "p50": 4.2,
+      "p95": 5.3,
+      "p99": 5.8,
+      "max": 5.9
+    },
+    "mcp_call_tool": {
+      "n": 27,
+      "mean": 3.9,
+      "p50": 2.5,
+      "p95": 3.8,
+      "p99": 31.1,
+      "max": 40.6
+    }
+  },
+  "frames": {
+    "count": 2578,
+    "fps_mean": 60.0,
+    "interval_ms": {
+      "n": 2578,
+      "mean": 16.7,
+      "p50": 16.7,
+      "p95": 16.7,
+      "p99": 16.8,
+      "max": 29.8
+    },
+    "frames_over_50ms": 0
+  },
+  "longtasks": {
+    "count": 0,
+    "total_ms": 0
+  },
+  "resources": {
+    "idle": {
+      "service_cpu": {
+        "mean": 0.5,
+        "max": 0.6
+      },
+      "service_rss_mb": {
+        "mean": 108.1,
+        "max": 108.1
+      },
+      "browser_cpu": {
+        "mean": 0.0,
+        "max": 0.0
+      },
+      "browser_rss_mb": {
+        "mean": 9.0,
+        "max": 63.0
+      },
+      "renderer_cpu": {
+        "mean": 0.0,
+        "max": 0.0
+      },
+      "renderer_rss_mb": {
+        "mean": 0.0,
+        "max": 0.0
+      }
+    },
+    "browser_idle": {
+      "service_cpu": {
+        "mean": 0.7,
+        "max": 0.9
+      },
+      "service_rss_mb": {
+        "mean": 112.5,
+        "max": 112.6
+      },
+      "browser_cpu": {
+        "mean": 6.2,
+        "max": 15.7
+      },
+      "browser_rss_mb": {
+        "mean": 998.7,
+        "max": 1002.1
+      },
+      "renderer_cpu": {
+        "mean": 2.4,
+        "max": 2.9
+      },
+      "renderer_rss_mb": {
+        "mean": 453.9,
+        "max": 454.0
+      }
+    },
+    "stream": {
+      "service_cpu": {
+        "mean": 6.2,
+        "max": 10.2
+      },
+      "service_rss_mb": {
+        "mean": 120.7,
+        "max": 125.8
+      },
+      "browser_cpu": {
+        "mean": 21.8,
+        "max": 65.2
+      },
+      "browser_rss_mb": {
+        "mean": 1132.3,
+        "max": 1337.7
+      },
+      "renderer_cpu": {
+        "mean": 16.2,
+        "max": 36.1
+      },
+      "renderer_rss_mb": {
+        "mean": 574.2,
+        "max": 775.5
+      }
+    }
+  },
+  "app_log_tail": "[10/24/26 21:09:35] INFO     StreamableHTTP       streamable_http_manager.py:162\n                             session manager                                    \n                             started                                            \n"
+}

@@ -1,0 +1,40 @@
+{
+  "window": {
+    "id": 13592,
+    "pid": 89681,
+    "owner": "Python",
+    "title": "",
+    "bounds": {
+      "X": 360.0,
+      "Height": 800.0,
+      "Y": 140.0,
+      "Width": 1200.0
+    }
+  },
+  "seconds_to_window": 1.53,
+  "process_tree": [
+    {
+      "pid": 89678,
+      "name": "Python",
+      "rss_mb": 98.3
+    },
+    {
+      "pid": 89680,
+      "name": "Python",
+      "rss_mb": 16.7
+    },
+    {
+      "pid": 89681,
+      "name": "Python",
+      "rss_mb": 181.2
+    }
+  ],
+  "service_stats_after_6s": {
+    "events": 384,
+    "subscribers": 2
+  },
+  "screencapture_exit": 1,
+  "screencapture_stderr": "could not create image from window",
+  "app_exit": -15,
+  "log_tail": "[10/24/26 21:11:27] INFO     StreamableHTTP       streamable_http_manager.py:162\n                             session manager                                    \n                             started                                            \n"
+}

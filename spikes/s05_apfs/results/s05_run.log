@@ -1,0 +1,269 @@
+testdata {'files': 4480, 'logical': 538066944, 'allocated': 544374784, 'private': 544374784, 'actual': 544374784, 'shared_files': 0, 'seconds': 0.05406483300612308, 'create_seconds': 2.5, 'free_delta_mib': 520.8}
+{'method': 'cp -c -R', 'rep': 1, 'seconds': 0.659, 'free_delta_mib': 1.4, 'du_mib': 519.2, 'logical_mib': 513.1, 'private_mib': 0.0, 'shared_files': 4480}
+{'method': 'cp -c -R', 'rep': 2, 'seconds': 0.683, 'free_delta_mib': 1.4, 'du_mib': 519.2, 'logical_mib': 513.1, 'private_mib': 0.0, 'shared_files': 4480}
+{'method': 'cp -c -R', 'rep': 3, 'seconds': 0.698, 'free_delta_mib': 1.5, 'du_mib': 519.2, 'logical_mib': 513.1, 'private_mib': 0.0, 'shared_files': 4480}
+{'method': 'clonefile (ctypes)', 'rep': 1, 'seconds': 0.041, 'free_delta_mib': 1.3, 'du_mib': 519.2, 'logical_mib': 513.1, 'private_mib': 0.0, 'shared_files': 4480}
+{'method': 'clonefile (ctypes)', 'rep': 2, 'seconds': 0.04, 'free_delta_mib': 3.4, 'du_mib': 519.2, 'logical_mib': 513.1, 'private_mib': 0.0, 'shared_files': 4480}
+{'method': 'clonefile (ctypes)', 'rep': 3, 'seconds': 0.023, 'free_delta_mib': 1.2, 'du_mib': 519.2, 'logical_mib': 513.1, 'private_mib': 0.0, 'shared_files': 4480}
+{'method': 'shutil.copytree', 'rep': 1, 'seconds': 1.975, 'free_delta_mib': 520.9, 'du_mib': 519.2, 'logical_mib': 513.1, 'private_mib': 519.2, 'shared_files': 0}
+{'method': 'shutil.copytree', 'rep': 2, 'seconds': 1.358, 'free_delta_mib': 519.8, 'du_mib': 519.2, 'logical_mib': 513.1, 'private_mib': 519.2, 'shared_files': 0}
+{'method': 'shutil.copytree', 'rep': 3, 'seconds': 1.343, 'free_delta_mib': 512.8, 'du_mib': 519.2, 'logical_mib': 513.1, 'private_mib': 519.2, 'shared_files': 0}
+{'method': 'cp -R (ohne -c)', 'rep': 1, 'seconds': 0.98, 'free_delta_mib': 521.2, 'du_mib': 519.2, 'logical_mib': 513.1, 'private_mib': 519.2, 'shared_files': 0}
+{'method': 'cp -R (ohne -c)', 'rep': 2, 'seconds': 1.001, 'free_delta_mib': 521.2, 'du_mib': 519.2, 'logical_mib': 513.1, 'private_mib': 519.2, 'shared_files': 0}
+{'method': 'cp -R (ohne -c)', 'rep': 3, 'seconds': 0.986, 'free_delta_mib': 520.9, 'du_mib': 519.2, 'logical_mib': 513.1, 'private_mib': 519.2, 'shared_files': 0}
+{'change': '1 Byte in 10 Dateien à 1 MiB überschrieben (in place)', 'free_delta_mib': 0.2, 'private_delta_mib': 0.2, 'du_delta_mib': 0.0}
+{'change': '64 KiB an 10 Dateien angehängt', 'free_delta_mib': 0.6, 'private_delta_mib': 0.6, 'du_delta_mib': 0.6}
+{'change': '10 Dateien à 1 MiB komplett neu geschrieben', 'free_delta_mib': 10.0, 'private_delta_mib': 10.0, 'du_delta_mib': 0.0}
+{'change': '10 Dateien „Editor-Speichern“ (temp + rename, 1 Byte anders)', 'free_delta_mib': 10.0, 'private_delta_mib': 10.0, 'du_delta_mib': 0.0}
+{'change': '20 neue Dateien à 1 MiB', 'free_delta_mib': 20.1, 'private_delta_mib': 20.0, 'du_delta_mib': 20.0}
+{'change': '20 Dateien à 1 MiB gelöscht', 'free_delta_mib': 0.1, 'private_delta_mib': 0.0, 'du_delta_mib': -20.0}
+{'case': 'A: Quelle bleibt', 'files': 17923, 'logical_mib': 2058.6, 'du_mib': 2082.6, 'private_mib': 21.0, 'actual_mib': 21.0, 'freed_on_delete_mib': 25.8, 'measure_seconds': 0.3}
+{'case': 'B: Quelle vorher gelöscht', 'files': 17923, 'logical_mib': 2058.6, 'du_mib': 2082.6, 'private_mib': 26.0, 'actual_mib': 540.2, 'freed_on_delete_mib': 545.7, 'measure_seconds': 0.29}
+{'fs': 'HFS+', 'target_fs': 'hfs', 'can_clone_precheck': False, 'clonefile': 'EXDEV: Cross-device link', 'cp_-c_exit': 0, 'cp_-c_stderr': '', 'cp_-c_copied_files': 100, 'clone_or_copy': 'copytree (clonefile: EXDEV)', 'clonefile_within_target': 'ENOTSUP'}
+{'fs': 'ExFAT', 'target_fs': 'exfat', 'can_clone_precheck': False, 'clonefile': 'EXDEV: Cross-device link', 'cp_-c_exit': 0, 'cp_-c_stderr': '', 'cp_-c_copied_files': 100, 'clone_or_copy': 'copytree (clonefile: EXDEV)', 'clonefile_within_target': 'ENOTSUP'}
+{'fs': 'APFS', 'target_fs': 'apfs', 'can_clone_precheck': False, 'clonefile': 'EXDEV: Cross-device link', 'cp_-c_exit': 0, 'cp_-c_stderr': '', 'cp_-c_copied_files': 100, 'clone_or_copy': 'copytree (clonefile: EXDEV)', 'clonefile_within_target': 'ok'}
+{
+  "machine": {
+    "macos": "26.6.2",
+    "python": "3.12.0"
+  },
+  "volume_fs": "apfs",
+  "df_before": "Filesystem   1024-blocks      Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s5   482797652 437509656  16348416    97% 3146471 163484160    2%   /System/Volumes/Data",
+  "free_before_mib": 15965.3,
+  "noise_idle": {
+    "samples": 6,
+    "min_max_spread_mib": 0.5,
+    "stdev_mib": 0.2
+  },
+  "testdata": {
+    "files": 4480,
+    "logical": 538066944,
+    "allocated": 544374784,
+    "private": 544374784,
+    "actual": 544374784,
+    "shared_files": 0,
+    "seconds": 0.05406483300612308,
+    "create_seconds": 2.5,
+    "free_delta_mib": 520.8
+  },
+  "methods": [
+    {
+      "method": "cp -c -R",
+      "rep": 1,
+      "seconds": 0.659,
+      "free_delta_mib": 1.4,
+      "du_mib": 519.2,
+      "logical_mib": 513.1,
+      "private_mib": 0.0,
+      "shared_files": 4480
+    },
+    {
+      "method": "cp -c -R",
+      "rep": 2,
+      "seconds": 0.683,
+      "free_delta_mib": 1.4,
+      "du_mib": 519.2,
+      "logical_mib": 513.1,
+      "private_mib": 0.0,
+      "shared_files": 4480
+    },
+    {
+      "method": "cp -c -R",
+      "rep": 3,
+      "seconds": 0.698,
+      "free_delta_mib": 1.5,
+      "du_mib": 519.2,
+      "logical_mib": 513.1,
+      "private_mib": 0.0,
+      "shared_files": 4480
+    },
+    {
+      "method": "clonefile (ctypes)",
+      "rep": 1,
+      "seconds": 0.041,
+      "free_delta_mib": 1.3,
+      "du_mib": 519.2,
+      "logical_mib": 513.1,
+      "private_mib": 0.0,
+      "shared_files": 4480
+    },
+    {
+      "method": "clonefile (ctypes)",
+      "rep": 2,
+      "seconds": 0.04,
+      "free_delta_mib": 3.4,
+      "du_mib": 519.2,
+      "logical_mib": 513.1,
+      "private_mib": 0.0,
+      "shared_files": 4480
+    },
+    {
+      "method": "clonefile (ctypes)",
+      "rep": 3,
+      "seconds": 0.023,
+      "free_delta_mib": 1.2,
+      "du_mib": 519.2,
+      "logical_mib": 513.1,
+      "private_mib": 0.0,
+      "shared_files": 4480
+    },
+    {
+      "method": "shutil.copytree",
+      "rep": 1,
+      "seconds": 1.975,
+      "free_delta_mib": 520.9,
+      "du_mib": 519.2,
+      "logical_mib": 513.1,
+      "private_mib": 519.2,
+      "shared_files": 0
+    },
+    {
+      "method": "shutil.copytree",
+      "rep": 2,
+      "seconds": 1.358,
+      "free_delta_mib": 519.8,
+      "du_mib": 519.2,
+      "logical_mib": 513.1,
+      "private_mib": 519.2,
+      "shared_files": 0
+    },
+    {
+      "method": "shutil.copytree",
+      "rep": 3,
+      "seconds": 1.343,
+      "free_delta_mib": 512.8,
+      "du_mib": 519.2,
+      "logical_mib": 513.1,
+      "private_mib": 519.2,
+      "shared_files": 0
+    },
+    {
+      "method": "cp -R (ohne -c)",
+      "rep": 1,
+      "seconds": 0.98,
+      "free_delta_mib": 521.2,
+      "du_mib": 519.2,
+      "logical_mib": 513.1,
+      "private_mib": 519.2,
+      "shared_files": 0
+    },
+    {
+      "method": "cp -R (ohne -c)",
+      "rep": 2,
+      "seconds": 1.001,
+      "free_delta_mib": 521.2,
+      "du_mib": 519.2,
+      "logical_mib": 513.1,
+      "private_mib": 519.2,
+      "shared_files": 0
+    },
+    {
+      "method": "cp -R (ohne -c)",
+      "rep": 3,
+      "seconds": 0.986,
+      "free_delta_mib": 520.9,
+      "du_mib": 519.2,
+      "logical_mib": 513.1,
+      "private_mib": 519.2,
+      "shared_files": 0
+    }
+  ],
+  "modifications": [
+    {
+      "change": "1 Byte in 10 Dateien à 1 MiB überschrieben (in place)",
+      "free_delta_mib": 0.2,
+      "private_delta_mib": 0.2,
+      "du_delta_mib": 0.0
+    },
+    {
+      "change": "64 KiB an 10 Dateien angehängt",
+      "free_delta_mib": 0.6,
+      "private_delta_mib": 0.6,
+      "du_delta_mib": 0.6
+    },
+    {
+      "change": "10 Dateien à 1 MiB komplett neu geschrieben",
+      "free_delta_mib": 10.0,
+      "private_delta_mib": 10.0,
+      "du_delta_mib": 0.0
+    },
+    {
+      "change": "10 Dateien „Editor-Speichern“ (temp + rename, 1 Byte anders)",
+      "free_delta_mib": 10.0,
+      "private_delta_mib": 10.0,
+      "du_delta_mib": 0.0
+    },
+    {
+      "change": "20 neue Dateien à 1 MiB",
+      "free_delta_mib": 20.1,
+      "private_delta_mib": 20.0,
+      "du_delta_mib": 20.0
+    },
+    {
+      "change": "20 Dateien à 1 MiB gelöscht",
+      "free_delta_mib": 0.1,
+      "private_delta_mib": 0.0,
+      "du_delta_mib": -20.0
+    }
+  ],
+  "validation": [
+    {
+      "case": "A: Quelle bleibt",
+      "files": 17923,
+      "logical_mib": 2058.6,
+      "du_mib": 2082.6,
+      "private_mib": 21.0,
+      "actual_mib": 21.0,
+      "freed_on_delete_mib": 25.8,
+      "measure_seconds": 0.3
+    },
+    {
+      "case": "B: Quelle vorher gelöscht",
+      "files": 17923,
+      "logical_mib": 2058.6,
+      "du_mib": 2082.6,
+      "private_mib": 26.0,
+      "actual_mib": 540.2,
+      "freed_on_delete_mib": 545.7,
+      "measure_seconds": 0.29
+    }
+  ],
+  "non_apfs": [
+    {
+      "fs": "HFS+",
+      "target_fs": "hfs",
+      "can_clone_precheck": false,
+      "clonefile": "EXDEV: Cross-device link",
+      "cp_-c_exit": 0,
+      "cp_-c_stderr": "",
+      "cp_-c_copied_files": 100,
+      "clone_or_copy": "copytree (clonefile: EXDEV)",
+      "clonefile_within_target": "ENOTSUP"
+    },
+    {
+      "fs": "ExFAT",
+      "target_fs": "exfat",
+      "can_clone_precheck": false,
+      "clonefile": "EXDEV: Cross-device link",
+      "cp_-c_exit": 0,
+      "cp_-c_stderr": "",
+      "cp_-c_copied_files": 100,
+      "clone_or_copy": "copytree (clonefile: EXDEV)",
+      "clonefile_within_target": "ENOTSUP"
+    },
+    {
+      "fs": "APFS",
+      "target_fs": "apfs",
+      "can_clone_precheck": false,
+      "clonefile": "EXDEV: Cross-device link",
+      "cp_-c_exit": 0,
+      "cp_-c_stderr": "",
+      "cp_-c_copied_files": 100,
+      "clone_or_copy": "copytree (clonefile: EXDEV)",
+      "clonefile_within_target": "ok"
+    }
+  ],
+  "df_after": "Filesystem   1024-blocks      Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s5   482797652 437504388  16353684    97% 3146393 163536840    2%   /System/Volumes/Data",
+  "free_after_mib": 15970.4,
+  "tmp_exists_after": false
+}
