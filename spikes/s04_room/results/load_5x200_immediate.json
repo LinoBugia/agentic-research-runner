@@ -1,0 +1,75 @@
+{
+  "config": {
+    "agents": 5,
+    "messages": 1000,
+    "orchestrator": 200,
+    "txn": "immediate",
+    "keep": false,
+    "per_agent": 200
+  },
+  "wall_s": {
+    "posting_done": 17.0,
+    "total": 18.07
+  },
+  "load_phase_s": 10.54,
+  "throughput_posts_per_s": 94.9,
+  "messages_in_db": 1200,
+  "messages_by_sender": {
+    "agent0": 200,
+    "agent1": 200,
+    "agent2": 200,
+    "agent3": 200,
+    "agent4": 200,
+    "orchestrator": 200
+  },
+  "expected_in_db": 1200,
+  "agent_tool_errors": 0,
+  "agent_tool_error_samples": [],
+  "lock_errors_in_server_logs": 0,
+  "external_writer_errors": 0,
+  "lost_messages": 0,
+  "duplicate_deliveries": 0,
+  "cursor_mismatches": 0,
+  "membership_rejected_all": true,
+  "membership_sample": {
+    "post_rejected": true,
+    "post_text": "Error executing tool post_message: not a member of #secret",
+    "read_rejected": true,
+    "read_text": "Error executing tool read_messages: not a member of #secret"
+  },
+  "rows_written_to_foreign_channels": 0,
+  "startup_s": {
+    "n": 5,
+    "mean": 3840.59,
+    "p50": 3843.89,
+    "p95": 3893.79,
+    "p99": 3897.72,
+    "max": 3898.7
+  },
+  "latency_ms": {
+    "post_message": {
+      "n": 1000,
+      "mean": 34.26,
+      "p50": 26.18,
+      "p95": 82.96,
+      "p99": 164.65,
+      "max": 284.29
+    },
+    "read_messages": {
+      "n": 551,
+      "mean": 31.81,
+      "p50": 25.38,
+      "p95": 69.16,
+      "p99": 121.61,
+      "max": 157.34
+    },
+    "external_write": {
+      "n": 200,
+      "mean": 0.52,
+      "p50": 0.2,
+      "p95": 2.43,
+      "p99": 5.38,
+      "max": 6.44
+    }
+  }
+}
