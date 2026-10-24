@@ -1,0 +1,53 @@
+[project]
+name = "agentic-research-runner"
+version = "0.1.0"
+description = "Lokale Bibliothek für Mathe-Projekte plus Agent-Harness mit Web-GUI"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2",
+    "ruamel-yaml>=0.19.1",
+    "typer>=0.27.3",
+]
+
+[project.scripts]
+arr = "arr.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arr"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# Python files only: code sketches in the Markdown docs are not meant to be formatted.
+include = ["*.py", "*.pyi"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-m 'not live'"
+markers = [
+    "live: uses real models and costs tokens (run manually with -m live)",
+    "macos: runs only on macOS",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.17.2",
+]
+spikes = [
+    "claude-agent-sdk>=0.2.174",
+    "mcp>=2.3.0",
+    "nicegui>=3.18.0",
+    "openai-codex>=0.163.0",
+]
