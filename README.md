@@ -2,7 +2,7 @@
 
 Lokale Bibliothek für Mathe-Projekte plus Agent-Harness mit Web-GUI. Aus einem Claude-Code-Chat heraus startet `arr` **Research-Groups**: mehrere Claude- und ChatGPT-Agenten mit eigenem Arbeitsordner, Rollen und Gruppenchats. Jeder Run wird vollständig protokolliert.
 
-Status: Planung abgeschlossen (Projektauftrag v1.0), Umsetzung beginnt mit Phase 0.
+Status: Planung abgeschlossen (Projektauftrag v1.0), Umsetzung beginnt mit Welle 0. Reihenfolge und Stand: [Codeplan](umsetzung/Codeplan.md), Ablauf: [Arbeitsweise](umsetzung/Arbeitsweise.md).
 
 ## Dokumentation
 
