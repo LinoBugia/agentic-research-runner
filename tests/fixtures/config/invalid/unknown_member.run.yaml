@@ -1,0 +1,46 @@
+# INVALID: unknown agent critic in groupchats[1].members[1]
+version: 1
+name: "Collatz – Ideen-Exploration"         # Anzeigename (optional)
+project: collatz                             # Ordner unter projects/
+skill: exploration                           # optional: Group-Skill als Vorlage
+task_file: task.md                           # oder inline:  task: |  …
+topology:
+  kind: exploration                          # solo | roundtable | exploration | waterfall | review
+  params:
+    ideas:                                   # vorgegebene Ideen (leer → Agenten wählen selbst)
+      - "2-adische Darstellung"
+      - "Stoppzeiten-Statistik"
+    final_ranking: true
+limits: { wall_time: 3h, turns_per_agent: 40, budget_usd: 25 }
+
+defaults:                                    # gelten für alle Agenten, einzeln überschreibbar
+  provider: claude
+  model: claude-sonnet-5-5
+  auth: max-privat
+  effort: high
+  workspace: { mode: copy }                  # copy | shared | empty
+  tools: { shell: true, web: false }
+
+agents:
+  - id: explorer
+    count: 2                                 # → explorer-1, explorer-2
+    role: roles/explorer.md                  # relativ zum Skill-Ordner oder Projekt
+    model: claude-opus-5-5
+    skills: [sympy-check]                    # zusätzlich zu den Rollen-Skills
+  - id: explorer-gpt
+    provider: codex
+    model: gpt-6.1-sol
+    auth: chatgpt-privat
+    role: roles/explorer.md
+  - id: ranker
+    role: roles/ranker.md
+    workspace: { mode: empty }
+    read_dirs: ["run:output"]                # liest abgegebene Ergebnisse
+
+groupchats:                                  # Details: 06 Gruppenchats
+  - name: main
+    purpose: "Zwischenstände teilen, Ansätze gegenseitig prüfen"
+    members: [explorer-*, explorer-gpt]      # Muster erlaubt
+    mode: event                              # rounds | event | moderated
+  - name: ranking
+    members: [ranker, critic]

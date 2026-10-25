@@ -11,6 +11,8 @@ name = "agentic-research-runner"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "mcp" },
+    { name = "nicegui" },
     { name = "pydantic" },
     { name = "ruamel-yaml" },
     { name = "typer" },
@@ -24,13 +26,13 @@ dev = [
 ]
 spikes = [
     { name = "claude-agent-sdk" },
-    { name = "mcp" },
-    { name = "nicegui" },
     { name = "openai-codex" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "mcp", specifier = ">=2.3,<3" },
+    { name = "nicegui", specifier = ">=3.18" },
     { name = "pydantic", specifier = ">=2" },
     { name = "ruamel-yaml", specifier = ">=0.19.1" },
     { name = "typer", specifier = ">=0.27.3" },
@@ -44,8 +46,6 @@ dev = [
 ]
 spikes = [
     { name = "claude-agent-sdk", specifier = ">=0.2.174" },
-    { name = "mcp", specifier = ">=2.3.0" },
-    { name = "nicegui", specifier = ">=3.18.0" },
     { name = "openai-codex", specifier = ">=0.163.0" },
 ]
 

@@ -1,0 +1,49 @@
+# INVALID: default of params.max_revisions above max
+# (<gpt-modell> replaced by gpt-6.1-sol).
+kind: research-group
+version: 1
+description: Beweis-Review mit unabhängigen Judges und Nacharbeit
+topology: review
+
+params:                                   # vom Aufrufer überschreibbar
+  judges:            { default: 3, min: 1, max: 6, doc: "Anzahl unabhängiger Judges" }
+  max_revisions:     { default: 7, min: 0, max: 5 }
+  discussion_rounds: { default: 1, min: 0, max: 3 }
+  verdict:           { default: majority, choices: [majority, unanimous, meta_judge] }
+  judge_memory:      { default: fresh, choices: [fresh, continue] }
+  artifact:          { default: null, doc: "Pfad zum Beweis im Projekt; leer → Autor schreibt zuerst" }
+
+rubric:
+  scale: [1, 10]
+  pass_score: 8
+  criteria: [korrektheit, vollständigkeit, strenge, klarheit]
+
+defaults:
+  provider: claude
+  model: claude-sonnet-5-5
+  effort: high
+  workspace: { mode: copy }
+
+agents:
+  - id: author
+    role: roles/author.md
+    model: claude-opus-5-5
+    skills: [sympy-check]
+  - id: judge
+    count: "{{ params.judges }}"          # → judge-1 … judge-N
+    role: roles/judge.md
+    mix:                                  # Heterogenität: Replikate abwechselnd verteilen
+      - { provider: claude, model: claude-opus-5-5 }
+      - { provider: codex,  model: gpt-6.1-sol }
+  - id: meta-judge
+    when: { param: verdict, equals: meta_judge }
+    role: roles/meta-judge.md
+
+groupchats:
+  - name: author-desk
+    members: [author]
+  - name: judges
+    members: [judge-*, meta-judge]
+    open_from: discussion                 # erst ab dieser Phase lesbar/schreibbar
+    mode: rounds                          # bei verdict=meta_judge: moderated, Moderator meta-judge
+    anonymous: true                       # Judges sehen nicht, welches Modell hinter wem steckt

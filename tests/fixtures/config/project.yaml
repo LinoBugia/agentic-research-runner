@@ -1,0 +1,4 @@
+# project.yaml from docs/02-workfolder-und-runs.md §2.2
+skills: all                  # oder Liste: [arr, proof-review, sympy-check]
+copy_exclude: ["data/big/**", "*.pdf"]   # nicht in Agent-Arbeitsordner kopieren
+read_dirs: []                # Standard-Lese-Ordner für Research-Agenten

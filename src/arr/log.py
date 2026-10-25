@@ -1,6 +1,6 @@
 """Logging setup for arr processes: one stderr handler with time, level and logger name.
 
-See docs/01-architektur.md §7.
+See docs/01-architektur.md §2.
 """
 
 import logging

@@ -10,11 +10,13 @@ ARR_HOME_ENV = "ARR_HOME"
 
 
 def app_dir() -> Path:
-    """Return the app directory: `$ARR_HOME` if set, otherwise `~/.arr`.
+    """Return the absolute app directory: `$ARR_HOME` if set, otherwise `~/.arr`.
 
-    The directory is not created here.
+    A relative `$ARR_HOME` is made absolute against the current directory, so the returned
+    path stays valid after a directory change or in a subprocess. The directory is not
+    created here.
     """
     override = os.environ.get(ARR_HOME_ENV)
     if override:
-        return Path(override).expanduser()
+        return Path(override).expanduser().absolute()
     return Path.home() / ".arr"

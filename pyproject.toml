@@ -5,6 +5,8 @@ description = "Lokale Bibliothek für Mathe-Projekte plus Agent-Harness mit Web-
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "mcp>=2.3,<3",
+    "nicegui>=3.18",
     "pydantic>=2",
     "ruamel-yaml>=0.19.1",
     "typer>=0.27.3",
@@ -47,7 +49,5 @@ dev = [
 ]
 spikes = [
     "claude-agent-sdk>=0.2.174",
-    "mcp>=2.3.0",
-    "nicegui>=3.18.0",
     "openai-codex>=0.163.0",
 ]
