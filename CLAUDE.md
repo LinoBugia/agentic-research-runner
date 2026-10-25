@@ -33,4 +33,4 @@ Vor jedem Commit: `uv run pytest && uv run ruff check && uv run ruff format --ch
 - `templates/` – Vorlagen für Workfolder, Projekte, Vollmachten, Start-Skills
 - `tests/` – pytest, `asyncio_mode = "auto"`
 - `spikes/` – Wegwerf-Code, siehe [spikes/README.md](spikes/README.md); wird nie von `arr` importiert
-- Laufzeit-Abhängigkeiten bewusst klein halten. Agent-SDKs, `mcp` und NiceGUI liegen vorerst nur in der Gruppe `spikes`.
+- Laufzeit-Abhängigkeiten bewusst klein halten. Agent-SDKs liegen vorerst nur in der Gruppe `spikes`; `mcp` und NiceGUI sind Laufzeit-Abhängigkeiten.
