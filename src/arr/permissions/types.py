@@ -199,12 +199,14 @@ _ALLOWED_ACTIONS = {
     ApprovalType.PERMISSION: {DecisionAction.ALLOW, DecisionAction.DENY},
     ApprovalType.ESCALATION: {DecisionAction.OPTION},
 }
+_USER_ONLY_TYPES = {ApprovalType.RUN_START, ApprovalType.ESCALATION}
 
 
 class ApprovalItem(Record):
     """An entry of the approval inbox: run start, permission request or escalation (docs/07 §6).
 
-    Run starts have no deadline (docs/07 §5). The GUI builds its own view model with the same
+    Run starts have no deadline (docs/07 §5). Run starts and escalations are decided only by
+    the user, with scope `once` (E15, docs/07 §6). The GUI builds its own view model with the same
     enums (docs/08 §5.0); the details of a run start come from the resolved run.
     """
 
@@ -236,6 +238,15 @@ class ApprovalItem(Record):
         if self.status is ApprovalStatus.OPEN and self.decision is not None:
             raise ValueError("Ein offener Eintrag hat noch keine „decision“.")
         if self.decision is not None:
+            if self.type in _USER_ONLY_TYPES and (
+                self.decision.decided_by is not DecidedBy.USER
+                or self.decision.scope is not DecisionScope.ONCE
+            ):
+                raise ValueError(
+                    "Run-Starts und Eskalationen entscheidet in v1 nur der User in der GUI, "
+                    "jeweils einmalig (E15, 07 §6). Erlaubt ist nur „decided_by: user“ mit "
+                    "„scope: once“."
+                )
             if self.decision.action not in _ALLOWED_ACTIONS[self.type]:
                 raise ValueError(
                     f"„{self.decision.action}“ passt nicht zu einem Eintrag vom Typ „{self.type}“."

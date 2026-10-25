@@ -130,11 +130,16 @@ class ErrorData(TypedDict):
 
 
 class TurnEndData(TypedDict):
-    """`data` of `turn_end` (docs/02 §6); `usage` without cost, cost separately."""
+    """`data` of `turn_end` (docs/02 §6); `usage` without cost, cost separately.
+
+    `cost_kind` (`billed` | `estimated` | None = unknown) lets the index be rebuilt from the
+    run folder (docs/02 §8).
+    """
 
     status: str
     usage: UsageData
     cost_usd: float | None
+    cost_kind: NotRequired[str | None]
     session: str | None
     num_turns: int | None
 
@@ -207,11 +212,19 @@ class Usage(Record):
     cost_kind: CostKind | None = None
 
     def __add__(self, other: Self) -> Self:
-        """Sum field by field; `None + x = x`. Mixed cost kinds give `estimated`."""
-        if self.cost_kind == other.cost_kind or other.cost_usd is None:
-            kind = self.cost_kind
-        elif self.cost_usd is None:
-            kind = other.cost_kind
+        """Sum field by field; `None + x = x`.
+
+        `cost_kind` of the sum looks at the parts that have a cost: all equal → that kind;
+        one of them unknown (`None`) → `None` (unknown beats estimated); `billed` +
+        `estimated` → `estimated`. Without any cost, equal kinds are kept, else `None`.
+        """
+        kinds = {part.cost_kind for part in (self, other) if part.cost_usd is not None}
+        if not kinds:
+            kind = self.cost_kind if self.cost_kind == other.cost_kind else None
+        elif None in kinds:
+            kind = None
+        elif len(kinds) == 1:
+            kind = kinds.pop()
         else:
             kind = CostKind.ESTIMATED
         return type(self)(

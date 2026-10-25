@@ -8,8 +8,9 @@ message following docs/08-ux-konzept.md §8.4.
 
 Layers for agent fields, lowest first: built-in, `project.yaml read_dirs`, `arr.yaml
 defaults.<provider>`, `group.yaml defaults`, `run.yaml defaults`, the agent, its `mix` entry.
-A `defaults` layer whose `provider` differs from the agent's provider does not contribute
-`model`, `auth` and `effort`. `tools` merges field by field, all other fields replace.
+`model`, `auth` and `effort` come only from layers whose effective provider equals the
+agent's final provider (see `_merge_agent`). `tools` merges field by field, all other
+fields replace. Limits merge field by field over `BUILTIN_LIMITS`.
 """
 
 import contextlib
@@ -17,6 +18,7 @@ import difflib
 import io
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,8 @@ from ruamel.yaml.error import MarkedYAMLError
 
 from arr.errors import ConfigError, ConfigIssue
 from arr.models import (
+    BUILTIN_LIMITS,
+    MAX_COUNT,
     PLACEHOLDER_RE,
     AgentConfig,
     AgentDefaults,
@@ -37,7 +41,6 @@ from arr.models import (
     GroupChatConfig,
     GroupSpec,
     Limits,
-    MixEntry,
     ProjectSettings,
     Provider,
     ResolvedRun,
@@ -68,6 +71,7 @@ _SPEC_ONLY = {"id", "count", "mix", "when"}
 
 RUN_SOURCE = "run.yaml"
 GROUP_SOURCE = "group.yaml"
+OVERRIDES_SOURCE = "Start-Parameter"
 
 # --------------------------------------------------------------------------------------------
 # Loading
@@ -347,16 +351,58 @@ def _param_name(expression: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _substitute(value: Any, params: Mapping[str, Any], loc: Loc, issues: list[ConfigIssue]) -> Any:
+def _as_text(name: str, value: Any, loc: Loc, issues: list[ConfigIssue]) -> str | None:
+    """Text of a parameter value inside a longer string; `None` (+ issue) if it has none."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        issues.append(
+            ConfigIssue(
+                format_loc(loc),
+                f"Parameter „{name}“ hat keinen Wert und kann nicht in den Text eingesetzt "
+                "werden. Gib beim Start einen Wert an oder lege unter „params“ einen "
+                "Standardwert fest.",
+            )
+        )
+        return None
+    if isinstance(value, list | dict):
+        what = "eine Liste" if isinstance(value, list) else "ein Abschnitt"
+        issues.append(
+            ConfigIssue(
+                format_loc(loc),
+                f"Parameter „{name}“ ist {what} und kann nicht in einen Text eingesetzt werden. "
+                "Verwende den Platzhalter als ganzen Wert oder einen anderen Parameter.",
+            )
+        )
+        return None
+    return str(value)
+
+
+def _substitute(
+    value: Any,
+    params: Mapping[str, Any],
+    loc: Loc,
+    issues: list[ConfigIssue],
+    *,
+    check_values: bool = True,
+) -> Any:
     """Replace `{{ params.<name> }}` in all strings of `value`.
 
-    A string that is exactly one placeholder becomes the parameter's value (keeps its type);
-    placeholders inside longer text are replaced by the value's text.
+    A string that is exactly one placeholder becomes the parameter's value (keeps its type).
+    Inside longer text, numbers and texts are inserted as text and booleans as
+    `true`/`false`; `None`, lists and sections are errors. With `check_values=False` only the
+    names are checked (used for `group.yaml` before the final values are known).
     """
     if isinstance(value, dict):
-        return {k: _substitute(v, params, (*loc, k), issues) for k, v in value.items()}
+        return {
+            k: _substitute(v, params, (*loc, k), issues, check_values=check_values)
+            for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [_substitute(v, params, (*loc, i), issues) for i, v in enumerate(value)]
+        return [
+            _substitute(v, params, (*loc, i), issues, check_values=check_values)
+            for i, v in enumerate(value)
+        ]
     if not isinstance(value, str):
         return value
     matches = list(PLACEHOLDER_RE.finditer(value))
@@ -388,7 +434,13 @@ def _substitute(value: Any, params: Mapping[str, Any], loc: Loc, issues: list[Co
         names.append(name)
     if len(matches) == 1 and matches[0].group(0) == value.strip():
         return params[names[0]]
-    return PLACEHOLDER_RE.sub(lambda m: str(params[_param_name(m.group(1)) or ""]), value)
+    if not check_values:
+        return value
+    texts = [_as_text(name, params[name], loc, issues) for name in names]
+    if any(text is None for text in texts):
+        return value
+    parts = iter(texts)
+    return PLACEHOLDER_RE.sub(lambda _: next(parts) or "", value)
 
 
 def _check_when(spec: AgentSpec, params: Mapping[str, Any], loc: Loc) -> ConfigIssue | None:
@@ -423,7 +475,7 @@ def check_group_spec(spec: GroupSpec, *, source: str = GROUP_SOURCE) -> None:
     params = {name: decl.default for name, decl in spec.params.items()}
     issues: list[ConfigIssue] = []
     for loc, data in _template_sections(spec):
-        _substitute(data, params, loc, issues)
+        _substitute(data, params, loc, issues, check_values=False)
     for i, agent in enumerate(spec.agents):
         issue = _check_when(agent, params, ("agents", i))
         if issue:
@@ -440,9 +492,13 @@ def _resolve_params(
         return {**run_params, **overrides}
     declared = group_spec.params
     values = {name: decl.default for name, decl in declared.items()}
-    issues: list[ConfigIssue] = []
     known = ", ".join(sorted(declared)) or "keine"
-    for loc_prefix, given in ((("topology", "params"), run_params), (("params",), overrides)):
+    layers = (
+        (("topology", "params"), run_params, RUN_SOURCE),
+        (("params",), overrides, OVERRIDES_SOURCE),
+    )
+    for loc_prefix, given, source in layers:
+        issues: list[ConfigIssue] = []
         for name, value in given.items():
             path = format_loc((*loc_prefix, name))
             if name not in declared:
@@ -458,8 +514,8 @@ def _resolve_params(
                 issues.append(ConfigIssue(path, f"Parameter „{name}“: {problem}"))
                 continue
             values[name] = value
-    if issues:
-        raise ConfigError(issues)
+        if issues:
+            raise ConfigError(issues, source=source)
     return values
 
 
@@ -472,14 +528,6 @@ def _dump(model: BaseModel) -> dict[str, Any]:
     return model.model_dump(exclude_unset=True, by_alias=True)
 
 
-def _provider_of(layers: Sequence[dict[str, Any]]) -> Provider:
-    provider = Provider.CLAUDE
-    for layer in layers:
-        if layer.get("provider") is not None:
-            provider = Provider(layer["provider"])
-    return provider
-
-
 def _apply(target: dict[str, Any], layer: Mapping[str, Any]) -> None:
     for key, value in layer.items():
         if key == "tools" and isinstance(value, dict):
@@ -488,35 +536,89 @@ def _apply(target: dict[str, Any], layer: Mapping[str, Any]) -> None:
             target[key] = value
 
 
+@dataclass
+class _Merged:
+    """Result of merging the layers of one agent replica."""
+
+    data: dict[str, Any]
+    provider: Provider
+    switched_by_mix: bool  # the mix entry changed the provider of the agent
+    skipped: dict[str, tuple[Any, Provider]]  # provider-bound values of other providers
+
+
 def _merge_agent(
     spec: dict[str, Any],
     mix: dict[str, Any] | None,
     defaults_layers: Sequence[dict[str, Any]],
     settings: WorkfolderSettings,
     project_settings: ProjectSettings | None,
-) -> dict[str, Any]:
+) -> _Merged:
+    """Merge the layers of one replica (see the module docstring).
+
+    Every layer has an effective provider: `defaults` their own `provider`, else that of the
+    layers below (built-in: claude); the agent its own, else that of the `defaults`; a `mix`
+    entry its own, else the agent's. `model`, `auth` and `effort` are only taken from layers
+    whose effective provider equals the final provider.
+    """
     own = {k: v for k, v in spec.items() if k not in _SPEC_ONLY}
-    provider = _provider_of([*defaults_layers, own, mix or {}])
+    effective = Provider.CLAUDE
+    layers: list[tuple[Mapping[str, Any], Provider]] = []
+    for layer in defaults_layers:
+        if layer.get("provider") is not None:
+            effective = Provider(layer["provider"])
+        layers.append((layer, effective))
+    if own.get("provider") is not None:
+        effective = Provider(own["provider"])
+    agent_provider = effective
+    layers.append((own, agent_provider))
+    final = agent_provider
+    if mix:
+        final = Provider(mix["provider"]) if mix.get("provider") is not None else agent_provider
+        layers.append((mix, final))
+
     merged: dict[str, Any] = {
-        "provider": provider,
         "workspace": {"mode": "copy"},
         "tools": {},
         "skills": [],
         "read_dirs": list(project_settings.read_dirs) if project_settings else [],
     }
-    provider_defaults = settings.defaults.get(provider)
+    provider_defaults = settings.defaults.get(final)
     if provider_defaults is not None:
         _apply(merged, provider_defaults.model_dump(exclude_none=True))
-    for layer in defaults_layers:
-        layer_provider = layer.get("provider")
-        if layer_provider is not None and Provider(layer_provider) is not provider:
+    skipped: dict[str, tuple[Any, Provider]] = {}
+    for layer, provider in layers:
+        if provider is not final:
+            skipped.update({k: (layer[k], provider) for k in _PROVIDER_BOUND if layer.get(k)})
             layer = {k: v for k, v in layer.items() if k not in _PROVIDER_BOUND}
         _apply(merged, layer)
-    _apply(merged, own)
-    if mix:
-        _apply(merged, mix)
-    merged["provider"] = provider
-    return merged
+    merged["provider"] = final
+    return _Merged(merged, final, final is not agent_provider, skipped)
+
+
+@dataclass
+class _Disabled:
+    """Agents switched off by `when` or `count: 0`; they drop out of members silently."""
+
+    ids: set[str] = field(default_factory=set)
+    count_bases: set[str] = field(default_factory=set)  # every `<base>-<n>` is off
+
+    def add(self, spec: AgentSpec) -> None:
+        self.ids.add(spec.id)
+        if spec.count is not None:
+            self.count_bases.add(spec.id)
+
+    def __contains__(self, agent_id: str) -> bool:
+        if agent_id in self.ids:
+            return True
+        base, _, number = agent_id.rpartition("-")
+        return base in self.count_bases and number.isdigit()
+
+    def matches(self, pattern: str) -> bool:
+        """True if the pattern matches any switched-off ID (replicas up to `MAX_COUNT`)."""
+        candidates = list(self.ids)
+        for base in self.count_bases:
+            candidates += [f"{base}-{n}" for n in range(1, MAX_COUNT + 1)]
+        return any(fnmatchcase(candidate, pattern) for candidate in candidates)
 
 
 def _resolve_agents(
@@ -526,11 +628,11 @@ def _resolve_agents(
     defaults_layers: Sequence[dict[str, Any]],
     settings: WorkfolderSettings,
     project_settings: ProjectSettings | None,
-) -> tuple[list[AgentConfig], set[str]]:
-    """Expand and merge agent specs. Returns active agents and IDs switched off by `when`."""
+) -> tuple[list[AgentConfig], _Disabled]:
+    """Expand and merge agent specs. Returns active agents and the switched-off ones."""
     issues: list[ConfigIssue] = []
     agents: list[AgentConfig] = []
-    disabled: set[str] = set()
+    disabled = _Disabled()
     positions: dict[str, Loc] = {}
     for index, original in enumerate(specs):
         loc: Loc = ("agents", index)
@@ -550,24 +652,22 @@ def _resolve_agents(
         if isinstance(spec.count, str):  # unresolved placeholder; reported above
             continue
         count = spec.count
-        replicas: list[tuple[str, int | None, MixEntry | None]]
+        replicas: list[tuple[str, int | None, int | None]]  # id, replica, mix index
         if count is None:
             replicas = [(spec.id, None, None)]
         else:
-            mix = spec.mix or []
+            mix_len = len(spec.mix or [])
             replicas = [
-                (f"{spec.id}-{k}", k, mix[(k - 1) % len(mix)] if mix else None)
+                (f"{spec.id}-{k}", k, (k - 1) % mix_len if mix_len else None)
                 for k in range(1, count + 1)
             ]
         included = spec.when.matches(params[spec.when.param]) if spec.when else True
         if not included or not replicas:
-            disabled.add(spec.id)
-            disabled.update(agent_id for agent_id, _, _ in replicas)
-            if count is not None:
-                disabled.add(f"{spec.id}-1")  # representative replica ID for patterns
+            disabled.add(spec)
             continue
         spec_data = _dump(spec)
-        for agent_id, replica, mix_entry in replicas:
+        for agent_id, replica, mix_index in replicas:
+            mix_entry = spec.mix[mix_index] if spec.mix and mix_index is not None else None
             merged = _merge_agent(
                 spec_data,
                 _dump(mix_entry) if mix_entry else None,
@@ -575,13 +675,14 @@ def _resolve_agents(
                 settings,
                 project_settings,
             )
-            missing = _missing_required(agent_id, merged, loc)
+            mix_loc = (*loc, "mix", mix_index) if merged.switched_by_mix else loc
+            missing = _missing_required(agent_id, merged, mix_loc)
             if missing:
                 issues += missing
                 continue
-            merged.update(id=agent_id, base_id=spec.id, replica=replica)
+            data = {**merged.data, "id": agent_id, "base_id": spec.id, "replica": replica}
             try:
-                agent = AgentConfig.model_validate(merged)
+                agent = AgentConfig.model_validate(data)
             except ValidationError as exc:
                 issues += validation_issues(exc, prefix=loc)
                 continue
@@ -608,25 +709,25 @@ def _resolve_agents(
     return agents, disabled
 
 
-def _missing_required(agent_id: str, merged: Mapping[str, Any], loc: Loc) -> list[ConfigIssue]:
-    provider = merged["provider"]
+def _missing_required(agent_id: str, merged: _Merged, loc: Loc) -> list[ConfigIssue]:
+    """Report a missing `model` / `auth` for the final provider (docs/08 §8.4 pattern).
+
+    `loc` points to the mix entry when that entry switched the provider.
+    """
+    provider = merged.provider
+    where = "im mix-Eintrag" if merged.switched_by_mix else "beim Agenten bzw. unter „defaults“"
     issues = []
-    if not merged.get("model"):
-        issues.append(
-            ConfigIssue(
-                format_loc((*loc, "model")),
-                f"Für „{agent_id}“ ist kein Modell festgelegt. Trage „model“ beim Agenten, "
-                f"unter „defaults“ oder in arr.yaml unter „defaults.{provider}“ ein.",
-            )
+    for key, what in (("model", "ein Modell"), ("auth", "ein Auth-Profil")):
+        if merged.data.get(key):
+            continue
+        text = (
+            f"Für {provider} fehlt {what} („{agent_id}“). Ergänze „{key}“ {where} oder lege "
+            f"in arr.yaml „defaults.{provider}“ fest."
         )
-    if not merged.get("auth"):
-        issues.append(
-            ConfigIssue(
-                format_loc((*loc, "auth")),
-                f"Für „{agent_id}“ ist kein Auth-Profil festgelegt. Trage „auth“ beim Agenten, "
-                f"unter „defaults“ oder in arr.yaml unter „defaults.{provider}“ ein.",
-            )
-        )
+        if key in merged.skipped:
+            value, other = merged.skipped[key]
+            text += f" „{value}“ gilt für {other} und wird deshalb nicht übernommen."
+        issues.append(ConfigIssue(format_loc((*loc, key)), text))
     return issues
 
 
@@ -643,7 +744,7 @@ def _match_agents(
     entries: Sequence[str],
     loc: Loc,
     active: Sequence[str],
-    disabled: set[str],
+    disabled: _Disabled,
     issues: list[ConfigIssue],
 ) -> list[str]:
     """Resolve IDs and `fnmatch` patterns to active agent IDs in a stable order.
@@ -657,7 +758,7 @@ def _match_agents(
         path = format_loc((*loc, index))
         if _is_pattern(entry):
             hits = [a for a in active if fnmatchcase(a, entry)]
-            if not hits and not any(fnmatchcase(d, entry) for d in disabled):
+            if not hits and not disabled.matches(entry):
                 issues.append(
                     ConfigIssue(
                         path,
@@ -695,7 +796,7 @@ def _resolve_channels(
     source: str,
     params: Mapping[str, Any],
     active: Sequence[str],
-    disabled: set[str],
+    disabled: _Disabled,
 ) -> list[GroupChatConfig]:
     issues: list[ConfigIssue] = []
     resolved: list[GroupChatConfig] = []
@@ -741,7 +842,11 @@ def _resolve_channels(
 
 
 def _resolve_stages(
-    stages: Sequence[StageSpec], source: str, params: Mapping[str, Any], active: Sequence[str]
+    stages: Sequence[StageSpec],
+    source: str,
+    params: Mapping[str, Any],
+    active: Sequence[str],
+    disabled: _Disabled,
 ) -> list[StageSpec]:
     issues: list[ConfigIssue] = []
     resolved: list[StageSpec] = []
@@ -755,6 +860,15 @@ def _resolve_stages(
             stage = StageSpec.model_validate(data)
         except ValidationError as exc:
             issues += validation_issues(exc, prefix=loc)
+            continue
+        if stage.agent in disabled:
+            issues.append(
+                ConfigIssue(
+                    format_loc((*loc, "agent")),
+                    f"Die Stufe „{stage.name}“ nennt „{stage.agent}“, der durch „when“ bzw. "
+                    "„count“ ausgeschaltet ist. Passe die Bedingung an oder entferne die Stufe.",
+                )
+            )
             continue
         if stage.agent not in active:
             issues.append(
@@ -776,7 +890,10 @@ def _resolve_stages(
 # --------------------------------------------------------------------------------------------
 
 
-def _merged_model[M: BaseModel](model: type[M], layers: Sequence[BaseModel | None], path: str) -> M:
+def _merged_model[M: BaseModel](
+    model: type[M], layers: Sequence[BaseModel | None], path: str, source: str | None = None
+) -> M:
+    """Merge partial layers field by field (fields given in a layer win) and validate once."""
     data: dict[str, Any] = {}
     for layer in layers:
         if layer is not None:
@@ -784,7 +901,7 @@ def _merged_model[M: BaseModel](model: type[M], layers: Sequence[BaseModel | Non
     try:
         return model.model_validate(data)
     except ValidationError as exc:
-        raise ConfigError(validation_issues(exc, prefix=(path,))) from None
+        raise ConfigError(validation_issues(exc, prefix=(path,)), source=source) from None
 
 
 def resolve_run(
@@ -868,7 +985,7 @@ def resolve_run(
     channels = _resolve_channels(chats, chats_source, params, active, disabled)
 
     stage_specs, stages_source = pick(run_input.stages, "stages")
-    stages = _resolve_stages(stage_specs, stages_source, params, active)
+    stages = _resolve_stages(stage_specs, stages_source, params, active, disabled)
 
     rater_entries, raters_source = pick(run_input.raters, "raters")
     issues = []
@@ -881,11 +998,19 @@ def resolve_run(
 
     limits = _merged_model(
         Limits,
-        [workfolder_settings.limits, group_spec.limits if group_spec else None, run_input.limits],
+        [
+            BUILTIN_LIMITS,
+            workfolder_settings.limits,
+            group_spec.limits if group_spec else None,
+            run_input.limits,
+        ],
         "limits",
     )
     approvals = _merged_model(
-        ApprovalSettings, [workfolder_settings.approvals, run_input.approvals], "approvals"
+        ApprovalSettings,
+        [workfolder_settings.approvals, run_input.approvals],
+        "approvals",
+        source=RUN_SOURCE,
     )
 
     agents = [

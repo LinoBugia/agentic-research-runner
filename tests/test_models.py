@@ -6,6 +6,7 @@ import pytest
 from arr.errors import ConfigError
 from arr.models import (
     ACTIVE_RUN_STATUSES,
+    BUILTIN_LIMITS,
     AgentStatus,
     AuthKind,
     AuthProfile,
@@ -107,6 +108,9 @@ def test_param_spec_checks() -> None:
     assert "Typ" in (spec.problem(True) or "")
     assert ParamSpec(default=None).problem("tex/b.tex") is None
     assert ParamSpec(default=0.5).problem(1) is None
+    assert ParamSpec(default=7).problem(7.5) is None, "W1-01.1 #11: numbers are one kind"
+    assert "Typ" in (ParamSpec(default=7).problem(True) or "")
+    assert "Typ" in (ParamSpec(default=0.5).problem(False) or "")
     with pytest.raises(ValueError, match="größer als „max“"):
         ParamSpec(min=3, max=1)
 
@@ -124,7 +128,12 @@ def test_rubric_pass_score_in_scale() -> None:
 
 def test_workfolder_defaults_without_file() -> None:
     settings = WorkfolderSettings()
-    assert settings.limits.wall_time == timedelta(hours=2)
+    assert settings.limits == Limits(), "arr.yaml limits are a partial layer"
+    assert BUILTIN_LIMITS.model_dump() == {
+        "wall_time": timedelta(hours=2),
+        "turns_per_agent": 40,
+        "budget_usd": 20,
+    }
     assert settings.approvals.timeout == timedelta(minutes=20)
     assert settings.user_agent_runs.require_approval is True
 

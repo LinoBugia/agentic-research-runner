@@ -209,7 +209,6 @@ def test_load_errors_carry_line_numbers() -> None:
         ({"judges": 0}, "params.judges", "kleiner als das Minimum 1"),
         ({"verdict": "vote"}, "params.verdict", "„vote“ ist nicht erlaubt"),
         ({"judges": "drei"}, "params.judges", "Falscher Typ: erwartet ganze Zahl"),
-        ({"judges": 2.5}, "params.judges", "Falscher Typ"),
         ({"reviewers": 2}, "params.reviewers", "Unbekannter Parameter „reviewers“"),
     ],
 )
@@ -507,7 +506,8 @@ def test_missing_model_and_auth(settings: WorkfolderSettings) -> None:
     with pytest.raises(ConfigError) as info:
         resolve_run(free_run([{"id": "a"}]), None, WorkfolderSettings())
     assert [i.path for i in info.value.issues] == ["agents[0].model", "agents[0].auth"]
-    assert "kein Modell festgelegt" in info.value.issues[0].message
+    assert "Für claude fehlt ein Modell („a“)" in info.value.issues[0].message
+    assert "Für claude fehlt ein Auth-Profil" in info.value.issues[1].message
     assert "defaults.claude" in info.value.issues[1].message
 
 

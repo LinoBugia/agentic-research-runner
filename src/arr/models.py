@@ -363,14 +363,20 @@ class Tools(StrictModel):
 
 
 class Limits(StrictModel):
-    """Run limits; `None` means no limit at this level (docs/02 §1.1, docs/01 §6).
+    """Run limits, given field by field (docs/02 §1.1, docs/01 §6).
 
-    Resolution merges field by field: `arr.yaml` < `group.yaml` < `run.yaml`.
+    Resolution merges field by field: `BUILTIN_LIMITS` < `arr.yaml` < `group.yaml` <
+    `run.yaml`. A field that is not given keeps the value of the layer below; an explicit
+    `null` (e.g. `budget_usd: null`) switches that limit off.
     """
 
     wall_time: Duration | None = None
     turns_per_agent: int | None = Field(default=None, ge=1)
     budget_usd: float | None = Field(default=None, ge=0)
+
+
+BUILTIN_LIMITS = Limits(wall_time=timedelta(hours=2), turns_per_agent=40, budget_usd=20)
+"""Lowest limits layer: the standard limits from docs/02 §1.1 (2h, 40 turns, 20 $)."""
 
 
 class AgentSettings(StrictModel):
@@ -427,6 +433,10 @@ PLACEHOLDER_RE = re.compile(r"\{\{\s*(.*?)\s*\}\}")
 """Matches `{{ … }}`; only `{{ params.<name> }}` is valid (docs/03 §3)."""
 
 
+MAX_COUNT = 50
+"""Upper limit for `count`, independent of `params.max` (protects against typos)."""
+
+
 def _check_count(value: Any) -> Any:
     if value is None:
         return value
@@ -435,6 +445,11 @@ def _check_count(value: Any) -> Any:
     if isinstance(value, int):
         if value < 0:
             raise ValueError("„count“ muss eine ganze Zahl ≥ 0 sein.")
+        if value > MAX_COUNT:
+            raise ValueError(
+                f"„count“ darf höchstens {MAX_COUNT} sein, gefunden {value}. "
+                "Verringere die Zahl oder teile die Gruppe auf mehrere Runs auf."
+            )
         return value
     if isinstance(value, str) and PLACEHOLDER_RE.fullmatch(value.strip()):
         return value.strip()
@@ -566,11 +581,11 @@ def _type_label(value: Any) -> str:
 
 
 def _same_kind(default: Any, value: Any) -> bool:
+    # Numbers are one kind: `pass_score: {default: 7}` accepts 7.5. Where a whole number is
+    # required (`count`), the field itself checks it. Booleans are never numbers.
     if isinstance(default, bool) or isinstance(value, bool):
         return isinstance(default, bool) and isinstance(value, bool)
-    if isinstance(default, int):
-        return isinstance(value, int)
-    if isinstance(default, float):
+    if _is_number(default):
         return _is_number(value)
     for kind in (str, list, dict):
         if isinstance(default, kind):
@@ -653,6 +668,7 @@ class GroupSpec(StrictModel):
     """Content of a group skill's `group.yaml`: a saved research group setup (docs/03 §3).
 
     Same structure as `run.yaml` without `project` and `task`, plus declared `params`.
+    `topology` accepts `review` and `{kind: review}`; parameters belong under `params:`.
     """
 
     kind: Literal["research-group"] = "research-group"
@@ -660,6 +676,25 @@ class GroupSpec(StrictModel):
     description: str | None = None
     topology: TopologyKind
     params: dict[str, ParamSpec] = Field(default_factory=dict)
+
+    @field_validator("topology", mode="before")
+    @classmethod
+    def _long_form(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        if "params" in value:
+            raise ValueError(
+                "In group.yaml stehen Parameter unter „params:“ (mit default, min, max …), "
+                "nicht unter „topology.params“. Verschiebe sie dorthin."
+            )
+        unknown = sorted(str(k) for k in value if k != "kind")
+        if unknown or "kind" not in value:
+            raise ValueError(
+                "„topology“ ist entweder ein Name wie „review“ oder „{kind: review}“"
+                + (f", unbekannt: {', '.join(unknown)}." if unknown else ".")
+            )
+        return value["kind"]
+
     rubric: Rubric | None = None
     limits: Limits | None = None
     defaults: AgentDefaults | None = None
@@ -698,6 +733,18 @@ class ApprovalSettings(StrictModel):
         return self
 
 
+class ApprovalOverride(StrictModel):
+    """`approvals:` in `run.yaml`: a partial layer over `arr.yaml approvals` (docs/07 §3 ④).
+
+    Checked only after merging, so `decider: gatekeeper` is valid when `arr.yaml` provides
+    the `gatekeeper` section.
+    """
+
+    decider: Decider | None = None
+    timeout: Duration | None = None
+    gatekeeper: GatekeeperSettings | None = None
+
+
 class RunInput(StrictModel):
     """Content of a `run.yaml` as passed in, stored as `run.input.yaml` (docs/02 §3).
 
@@ -716,7 +763,7 @@ class RunInput(StrictModel):
     topology: TopologyConfig | None = None
     rubric: Rubric | None = None
     limits: Limits | None = None
-    approvals: ApprovalSettings | None = None
+    approvals: ApprovalOverride | None = None
     defaults: AgentDefaults | None = None
     agents: list[AgentSpec] = Field(default_factory=list)
     groupchats: list[GroupChatConfig] = Field(default_factory=list)
@@ -823,21 +870,18 @@ class RetentionSettings(StrictModel):
     max_runs_size_gb: float | None = Field(default=50, gt=0)
 
 
-def _default_limits() -> Limits:
-    return Limits(wall_time=timedelta(hours=2), turns_per_agent=40, budget_usd=20)
-
-
 class WorkfolderSettings(StrictModel):
     """Content of `<workfolder>/arr.yaml` (docs/02-workfolder-und-runs.md §1.1). No secrets.
 
-    `permissions` holds deviations from the fixed rules; its schema belongs to the
-    PolicyEngine (docs/07 §3 ②) and is kept as plain data here.
+    `limits` is a partial layer above `BUILTIN_LIMITS`. `permissions` holds deviations from
+    the fixed rules; its schema belongs to the PolicyEngine (docs/07 §3 ②) and is kept as
+    plain data here.
     """
 
     version: Literal[1] = 1
     defaults: dict[Provider, ProviderDefaults] = Field(default_factory=dict)
     concurrency: dict[Slug, Annotated[int, Field(ge=1)]] = Field(default_factory=dict)
-    limits: Limits = Field(default_factory=_default_limits)
+    limits: Limits = Field(default_factory=Limits)
     user_agent_runs: UserAgentRunSettings = Field(default_factory=UserAgentRunSettings)
     toolchain: Toolchain = Field(default_factory=Toolchain)
     approvals: ApprovalSettings = Field(default_factory=ApprovalSettings)
