@@ -1,0 +1,41 @@
+# Einstellungen dieses Workfolders. Keine Secrets hier.
+# Die Werte unten sind die Standards von arr. Zeilen mit „#“ sind Beispiele zum Einkommentieren.
+version: 1
+
+# Standard-Modell, Login-Profil und Denktiefe pro Anbieter (Profile legst du in der GUI an).
+# defaults:
+#   claude: { auth: max-privat, model: claude-sonnet-5-5, effort: high }
+#   codex:  { auth: chatgpt-privat, model: <modell>, effort: high }
+
+# Maximal gleichzeitige Agenten pro Login-Profil.
+# concurrency:
+#   max-privat: 4
+#   chatgpt-privat: 3
+
+# Standard-Limits pro Run. Im Run feldweise überschreibbar; abschalten nur mit „null“.
+limits:
+  wall_time: 2h
+  turns_per_agent: 40
+  budget_usd: 20
+
+# Runs, die dein Claude-Code-Agent startet, brauchen immer deine Freigabe (nicht abschaltbar).
+user_agent_runs:
+  require_approval: true
+
+# Umgebung der Research-Agenten: Python-Umgebung und zusätzliche Ordner im PATH.
+toolchain:
+  # python: ~/.venvs/mathe
+  # extra_path: []
+  run_venv: overlay          # overlay | off
+
+# Wer Berechtigungsanfragen der Agenten entscheidet: user | gatekeeper | gatekeeper_then_user.
+approvals:
+  decider: user
+  timeout: 20m
+  # gatekeeper: { model: claude-sonnet-5-5, mandate: mandates/standard.md }
+
+# Aufräumregeln. arr verschlankt und archiviert nur, gelöscht wird nie automatisch.
+retention:
+  slim_after_days: 14        # Arbeitskopien löschen, Protokolle behalten
+  archive_after_days: 90
+  max_runs_size_gb: 50       # Warnung in der GUI

@@ -1,0 +1,31 @@
+kind: research-group
+version: 1
+description: Breite Ideensuche mit mehreren Explorern und einem Ranker
+topology: exploration
+
+params:
+  explorers: { default: 2, min: 1, max: 6, doc: "Anzahl der Explorer" }
+  final_ranking: { default: true }
+
+defaults:
+  provider: claude
+  model: claude-sonnet-5-5
+  auth: max-privat
+  effort: high
+
+agents:
+  - id: explorer
+    count: "{{ params.explorers }}"
+    role: roles/explorer.md
+    skills: [sympy-check]
+  - id: ranker
+    role: roles/ranker.md
+    workspace: { mode: empty }
+    read_dirs: ["run:output"]
+
+groupchats:
+  - name: main
+    purpose: "Zwischenstände teilen"
+    members: [explorer-*]
+  - name: ranking
+    members: [ranker]

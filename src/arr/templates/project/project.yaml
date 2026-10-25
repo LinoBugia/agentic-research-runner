@@ -1,0 +1,4 @@
+# Optionale Einstellungen dieses Projekts für arr.
+skills: all                  # oder eine Liste: [arr, proof-review, sympy-check]
+copy_exclude: []             # nicht in die Arbeitskopien der Agenten kopieren, z. B. ["data/big/**", "*.pdf"]
+read_dirs: []                # Ordner, die Research-Agenten zusätzlich lesen dürfen
