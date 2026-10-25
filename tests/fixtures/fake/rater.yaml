@@ -1,0 +1,28 @@
+# Rolle Rater: Ergebnis aus dem Kontextpaket bewerten und über einen Vorschlag abstimmen.
+# Erwartet im Auftrag context.result_ids (Liste von Ergebnis-IDs).
+version: 1
+cost_kind: estimated
+turns:
+  - steps:
+      - do: room
+        action: get_assignment
+        save_as: assignment
+      - do: thinking
+        text: "Ich bewerte nach Korrektheit und Originalität."
+      - do: room
+        action: submit_rating
+        args:
+          result_id: "${assignment.context.result_ids.0}"
+          score: 7.5
+          comment: "Tragfähig, der Randfall n = 1 fehlt noch."
+          criteria: { correctness: 8, originality: 7 }
+      - do: room
+        action: vote
+        args:
+          proposal_id: "${assignment.context.proposal_id}"
+          choice: "yes"
+          reason: "Der Vorschlag ist begründet."
+      - do: usage
+        input: 700
+        output: 120
+        cost_usd: 0.02

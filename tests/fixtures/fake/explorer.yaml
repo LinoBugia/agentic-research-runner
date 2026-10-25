@@ -1,0 +1,51 @@
+# Rolle Explorer: eine Idee entwickeln, im Kanal teilen, als Ergebnis abgeben.
+version: 1
+cost_kind: estimated
+turns:
+  - steps:
+      - do: thinking
+        text: "Die Aufgabe lässt sich über die 2-adische Darstellung angehen."
+      - do: text
+        text: "Ich prüfe zuerst kleine Fälle."
+      - do: tool
+        name: Bash
+        input: { command: "python check.py --n 1000" }
+        result: "alle 1000 Fälle erreichen 1"
+      - do: room
+        action: post_message
+        args:
+          channel: main
+          kind: idea
+          body: "Idee: 2-adische Darstellung der Stoppzeiten."
+        save_as: posted
+      - do: room
+        action: submit_result
+        args:
+          kind: idea
+          title: "2-adische Darstellung"
+          body: "Skizze: Stoppzeiten über die Binärdarstellung abschätzen."
+        save_as: result
+      - do: room
+        action: set_status
+        args: { status: done, note: "Idee abgegeben" }
+      - do: usage
+        input: 1200
+        output: 340
+        cache_read: 18000
+        cost_usd: 0.04
+  # Turn 2: auf Rückfragen antworten.
+  - steps:
+      - do: room
+        action: inbox
+        save_as: inbox
+      - do: room
+        action: post_message
+        args:
+          channel: main
+          kind: answer
+          reply_to: "${inbox.open_questions.0.id}"
+          body: "Die Abschätzung gilt für alle n ab 2."
+      - do: usage
+        input: 400
+        output: 90
+        cost_usd: 0.01

@@ -1,0 +1,44 @@
+# Alle Schritt-Arten in einem Turn.
+version: 1
+cost_kind: billed
+turns:
+  - steps:
+      - { do: thinking, text: "Plan: erst lesen, dann schreiben.", summarized: true }
+      - { do: text, text: "Los geht's." }
+      - do: tool
+        name: Read
+        input: { file_path: "notes/idea.md" }
+        result: "# Idee"
+      - do: tool
+        name: Bash
+        input: { command: "false" }
+        result: "exit 1"
+        is_error: true
+      - do: room
+        action: post_message
+        args: { channel: main, kind: idea, body: "Idee A" }
+        save_as: idea
+      - do: room
+        action: post_message
+        args: { channel: main, kind: question, to: [critic-1], body: "Stimmt das?" }
+      - do: room
+        action: post_message
+        args: { channel: main, kind: answer, reply_to: "${idea.id}", body: "Ja." }
+      - do: room
+        action: submit_result
+        args: { kind: idea, title: "Idee A", body: "Text" }
+        save_as: result
+      - do: room
+        action: submit_rating
+        args: { result_id: "${result.id}", score: 8, comment: "gut", criteria: { clarity: 9 } }
+      - do: room
+        action: vote
+        args: { proposal_id: 3, choice: "no", reason: "zu vage" }
+      - do: room
+        action: set_status
+        args: { status: working, note: "rechnet" }
+      - { do: rate_limit, status: allowed_warning, utilization: 0.82, resets_at: 1761240000 }
+      - { do: usage, input: 1000, output: 200, cost_usd: 0.05 }
+      - { do: delay, seconds: 0.01 }
+      - { do: error, message: "Werkzeug kurz nicht erreichbar", recoverable: true }
+      - { do: text, text: "Fertig." }

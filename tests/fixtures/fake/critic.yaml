@@ -1,0 +1,34 @@
+# Rolle Kritiker: Beiträge lesen, Einwand und Rückfrage an den Explorer.
+version: 1
+cost_kind: estimated
+turns:
+  - steps:
+      - do: room
+        action: read_messages
+        args: { channel: main }
+      - do: thinking
+        text: "Die Abschätzung nutzt n ≥ 2, das steht nirgends."
+      - do: room
+        action: post_message
+        args:
+          channel: main
+          kind: objection
+          body: "Die Schranke gilt nur für n ≥ 2. Der Fall n = 1 fehlt."
+      - do: room
+        action: post_message
+        args:
+          channel: main
+          kind: question
+          to: [explorer-1]
+          body: "Gilt die Abschätzung auch für n = 1?"
+      - do: usage
+        input: 900
+        output: 210
+        cost_usd: 0.03
+  - steps:
+      - do: text
+        text: "Danke, damit ist der Einwand geklärt."
+      - do: usage
+        input: 300
+        output: 40
+        cost_usd: 0.005
