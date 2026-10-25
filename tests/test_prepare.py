@@ -44,6 +44,22 @@ NOW = datetime(2026, 10, 25, 13, 5)
 RUN_ID_RE = re.compile(r"^20261025-1305_collatz_exploration_[0-9a-f]{4}$")
 
 
+@pytest.fixture(autouse=True, params=["native", "copy"])
+def clone_mode(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Run every test twice: with the platform's `clonefile` (APFS clones on macOS, the real
+    copy fallback elsewhere) and with `clonefile` forced to fail, as on the Linux CI.
+
+    Tests that patch `_clonefile` themselves override this, because their patch comes later.
+    """
+    if request.param == "copy":
+
+        def no_clone(src: str, dst: str) -> None:
+            raise OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP), src)
+
+        monkeypatch.setattr(prepare_module, "_clonefile", no_clone)
+    return str(request.param)
+
+
 @pytest.fixture
 def workfolder(tmp_path: Path) -> Path:
     root = init_workfolder(tmp_path / "wf")
@@ -130,7 +146,7 @@ def test_run_folder_structure(run: PreparedRun, workfolder: Path) -> None:
     assert RUN_ID_RE.fullmatch(run.run_id)
     assert run.run_dir == workfolder / "runs" / run.run_id
     top = sorted(p.name for p in run.run_dir.iterdir())
-    assert top == [
+    expected = [
         "agents",
         "base",
         "groupchats",
@@ -141,6 +157,10 @@ def test_run_folder_structure(run: PreparedRun, workfolder: Path) -> None:
         "skills",
         "task.md",
     ]
+    # Without APFS clones (Linux CI, other volume) the fallback warning goes to the run log.
+    if any("Kopie statt Klon" in w for w in run.warnings):
+        expected.append("orchestrator.jsonl")
+    assert top == sorted(expected)
     assert sorted(p.name for p in (run.run_dir / "agents").iterdir()) == [
         "explorer-1",
         "explorer-2",
