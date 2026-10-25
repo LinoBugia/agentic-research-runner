@@ -363,3 +363,45 @@ def test_replace_block_swaps_appends_and_dedupes() -> None:
 def test_block_span_rejects_a_lone_mark() -> None:
     with pytest.raises(ArrError, match="ohne öffnendes"):
         block_span("x <!-- /arr:user-agent -->", "user-agent")
+
+
+# --------------------------------------------------------------------------------------------
+# W1-02.1
+# --------------------------------------------------------------------------------------------
+
+
+def test_setup_project_linked_from_outside_the_workfolder(workfolder: Path, tmp_path: Path) -> None:
+    real = tmp_path / "woanders" / "collatz"
+    real.mkdir(parents=True)
+    linked = workfolder / "projects" / "collatz"
+    linked.symlink_to(real)
+
+    setup_project(linked)
+
+    for name in ("arr", "exploration", "sympy-check"):
+        assert (linked / ".claude" / "skills" / name / "SKILL.md").is_file(), name
+    # a broken link from the old computation is repaired by the next setup
+    broken = real / ".claude" / "skills" / "arr"
+    broken.unlink()
+    broken.symlink_to("../../../../skills/arr")
+    assert not broken.exists()
+    result = setup_project(linked)
+    assert result.skill_links == ["arr"]
+    assert (broken / "SKILL.md").is_file()
+
+
+def test_init_without_write_permission_is_a_clear_error(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root may write anywhere")
+    locked = tmp_path / "gesperrt"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        with pytest.raises(ArrError, match="Kein Schreibrecht"):
+            init_workfolder(locked / "wf")
+        result = runner.invoke(app, ["init", str(locked / "wf")])
+        assert result.exit_code == 1
+        assert "Kein Schreibrecht" in result.output
+        assert "Traceback" not in result.output
+    finally:
+        locked.chmod(0o700)

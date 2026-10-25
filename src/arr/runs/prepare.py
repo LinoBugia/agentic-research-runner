@@ -23,7 +23,7 @@ import shutil
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from string import Template
@@ -52,6 +52,7 @@ from arr.skills import (
     check_research_skills,
     discover_skills,
     install_codex_skills,
+    internal_link_target,
     snapshot_skills,
     write_claude_plugin,
 )
@@ -88,9 +89,14 @@ DEFAULT_ROLE = (
     "Du bist ein Research-Agent in diesem Run. Für dich ist keine Rolle festgelegt: "
     "Bearbeite die Aufgabe selbstständig und gib deine Ergebnisse mit `submit_result` ab.\n"
 )
-ALWAYS_EXCLUDED = (".claude/skills", ".agents/skills")
-"""Not copied into snapshots and working copies: skills reach research agents only by explicit
-listing, through the plugin (Claude) or `.agents/skills` (Codex), never from the project."""
+ALWAYS_EXCLUDED = (".claude/skills", ".agents/skills", "/.mcp.json", "/AGENTS.override.md")
+"""Never copied into `base/` and the working copies.
+
+Skills reach research agents only by explicit listing, through the plugin (Claude) or
+`.agents/skills` (Codex), never from the project. `.mcp.json` connects the user agent to arr,
+which research agents must not have (E11). `AGENTS.override.md` would take precedence over the
+generated `AGENTS.md` in Codex and hide the research block."""
+_MAX_LINK_WARNINGS = 20
 
 _SDK_PACKAGES = ("claude-agent-sdk", "openai-codex")
 _RUN_ID_RE = re.compile(r"^\d{8}-\d{4}_[A-Za-z0-9-]+_[A-Za-z0-9-]+_[0-9a-f]{4}$")
@@ -122,9 +128,24 @@ class AgentFile(Record):
 
     All paths are relative to the run folder (POSIX style), so the folder can be moved or
     archived. `path_prepend` holds absolute folders for the `PATH` of the agent's processes
-    (base venv `bin/` first, then `toolchain.extra_path`). `generated_paths` lists what the
-    preparer wrote into `work_dir` (relative to it), so `changes.diff` can leave it out.
-    There is no secret in here, only the auth profile's name (docs/01 §8).
+    (base venv `bin/` first, then `toolchain.extra_path`). `base_python` is the folder of the
+    base venv from `toolchain.python` (also when an interpreter was given there), or None if
+    none is set or it does not exist; then its `bin/` is not in `path_prepend` either.
+    `generated_paths` lists what the preparer wrote into `work_dir` (relative to it), so
+    `changes.diff` can leave it out. There is no secret in here, only the auth profile's name
+    (docs/01 §8).
+
+    Project context for the first prompt (E10): `context_file` (`agents/<id>/context.md`) always
+    holds the agent's own processed context (project `CLAUDE.md` with the research block, or the
+    block alone for `empty`). In `copy` and `empty` mode, `AGENTS.md` in `work_dir` (and
+    `CLAUDE.md`, if the project has one) contain exactly the same text. In `shared` mode they
+    hold a neutral variant without name, role and channels, because several agents share the
+    folder. So:
+
+    - Codex reads `AGENTS.md` from its `cwd` itself and needs `context.md` in the first prompt
+      only in `shared` mode (otherwise it would get the text twice).
+    - Claude with `setting_sources=[]` loads no `CLAUDE.md` (docs/spikes/S1 §3.3), so the Claude
+      backend puts `context.md` into the first prompt in every mode and again after a compaction.
     """
 
     config: AgentConfig
@@ -328,6 +349,7 @@ class CopyStats:
     bytes_copied: int = 0
     symlinks: int = 0
     skipped_special: int = 0
+    external_links: list[str] = field(default_factory=list)
 
     @property
     def method(self) -> Literal["clone", "copy"]:
@@ -340,11 +362,17 @@ def copy_tree(src: Path, dst: Path, excludes: ExcludeSet | None = None) -> CopyS
 
     Every regular file is cloned with `clonefile(2)` (never a whole folder, which the man page
     discourages, and never `cp -c`, which silently copies for real). On `EXDEV`/`ENOTSUP` the
-    rest of the tree is copied for real with `shutil.copy2`; other errors are raised. Symlinks
-    stay symlinks, sockets and the like are skipped. See docs/spikes/S5 §5, §7.
+    rest of the tree is copied for real with `shutil.copy2`; other errors are raised. See
+    docs/spikes/S5 §5, §7.
+
+    Symlinks whose target (fully resolved, also absolute links) lies inside `src` are copied as
+    relative links that point into the copy. Links leading out of `src`, broken links and loops
+    are left out and listed in `CopyStats.external_links`, so nothing in the copy can write
+    through to the original or to files elsewhere. Sockets and the like are skipped.
     """
     stats = CopyStats()
     can_clone = True
+    root_real = os.path.realpath(src)
 
     def copy_file(source: str, target: Path) -> None:
         nonlocal can_clone
@@ -373,8 +401,12 @@ def copy_tree(src: Path, dst: Path, excludes: ExcludeSet | None = None) -> CopyS
                 continue
             target = target_dir / entry.name
             if entry.is_symlink():
-                os.symlink(os.readlink(entry.path), target)
-                stats.symlinks += 1
+                text = internal_link_target(Path(entry.path), root_real)
+                if text is None:
+                    stats.external_links.append(rel_path)
+                else:
+                    os.symlink(text, target)
+                    stats.symlinks += 1
             elif is_dir:
                 walk(Path(entry.path), target, rel_path)
             elif entry.is_file(follow_symlinks=False):
@@ -493,27 +525,59 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _read_text_if_file(path: Path) -> str | None:
-    return path.read_text(encoding="utf-8") if path.is_file() else None
+@dataclass(frozen=True, slots=True)
+class _ContextSource:
+    """The project context a run starts from: text and whether it came from `CLAUDE.md`."""
+
+    text: str = ""
+    from_claude_md: bool = False
+
+
+def _context_source(project: Path) -> _ContextSource:
+    """Read the project's context: `CLAUDE.md`, else `AGENTS.md`, else nothing.
+
+    The single place that decides the source, for the working copies and `context.md` alike. It
+    reads from the project, not from `base/`, so `copy_exclude` cannot drop the context. A link
+    leading out of the project is not followed (same rule as for copies). Raises `ArrError` for
+    an unreadable file or a mark without its partner.
+    """
+    root_real = os.path.realpath(project)
+    for name in ("CLAUDE.md", "AGENTS.md"):
+        file = project / name
+        if file.is_symlink() and internal_link_target(file, root_real) is None:
+            continue
+        if not file.is_file():
+            continue
+        try:
+            text = file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            raise ArrError(
+                f"Die Datei {file} ist nicht lesbar (keine UTF-8-Textdatei oder keine Rechte)."
+            ) from None
+        for kind in (USER_AGENT_BLOCK, RESEARCH_AGENT_BLOCK):
+            try:
+                block_span(text, kind)
+            except ArrError as exc:
+                raise ArrError(f"{file}: {exc.message}") from None
+        return _ContextSource(text, from_claude_md=name == "CLAUDE.md")
+    return _ContextSource()
+
+
+def _context_text(source: _ContextSource, mode: WorkspaceMode, block: str) -> str:
+    """Processed context: the project's text with the research block, only the block if empty."""
+    return _processed_context("" if mode is WorkspaceMode.EMPTY else source.text, block)
 
 
 def _write_context_files(
-    work_dir: Path, base_dir: Path, mode: WorkspaceMode, block: str
+    work_dir: Path, source: _ContextSource, mode: WorkspaceMode, block: str
 ) -> list[str]:
-    """Write `CLAUDE.md` (if the project has one) and `AGENTS.md` with the processed context.
+    """Write `AGENTS.md` and, if the project's context is a `CLAUDE.md`, also `CLAUDE.md`.
 
-    Returns the file names written. For `empty` there is no project context: only the block.
+    Both get the same processed text. Returns the file names written.
     """
-    source = None
-    claude_text = None
-    if mode is not WorkspaceMode.EMPTY:
-        claude_text = _read_text_if_file(base_dir / "CLAUDE.md")
-        source = (
-            claude_text if claude_text is not None else _read_text_if_file(base_dir / "AGENTS.md")
-        )
-    text = _processed_context(source or "", block)
+    text = _context_text(source, mode, block)
     written = []
-    if claude_text is not None:
+    if source.from_claude_md and mode is not WorkspaceMode.EMPTY:
         _write_text(work_dir / "CLAUDE.md", text)
         written.append("CLAUDE.md")
     _write_text(work_dir / "AGENTS.md", text)
@@ -529,6 +593,7 @@ def _write_context_files(
 @dataclass(slots=True)
 class _Plan:
     task_text: str
+    context: _ContextSource
     group_skill: SkillInfo | None
     roles: dict[str, Path | None]
     agent_skills: dict[str, list[SkillInfo]]
@@ -536,12 +601,13 @@ class _Plan:
 
 
 def _resolve_role(role: str, folders: Sequence[Path]) -> Path | None:
+    """Find the role file in the first folder that has it; links must stay inside that folder."""
     parts = Path(role).parts
     if Path(role).is_absolute() or ".." in parts:
         return None
     for folder in folders:
-        candidate = folder / role
-        if candidate.is_file():
+        candidate = (folder / role).resolve()
+        if candidate.is_relative_to(folder.resolve()) and candidate.is_file():
             return candidate
     return None
 
@@ -575,6 +641,39 @@ def _check_profiles(
             )
 
 
+def _read_task_file(
+    task_file: str, task_base: Path | None, allow_external: bool
+) -> tuple[str, ConfigIssue | None]:
+    """Read `task_file`; it must resolve to a file under `task_base` unless `allow_external`.
+
+    Absolute paths, `~`, `..` and links leading out of `task_base` are refused, so a run cannot
+    send arbitrary files of the user to the model providers (E19).
+    """
+    raw = Path(task_file).expanduser()
+    if not raw.is_absolute() and task_base is None:
+        return "", ConfigIssue(
+            "task_file",
+            f"Die Aufgabendatei „{task_file}“ ist relativ, aber es ist kein Ordner bekannt, auf "
+            "den sie sich bezieht. Gib die Aufgabe direkt unter „task“ an.",
+        )
+    path = (raw if raw.is_absolute() else Path(task_base or ".") / raw).resolve()
+    inside = task_base is not None and path.is_relative_to(Path(task_base).resolve())
+    if not (inside or allow_external):
+        return "", ConfigIssue(
+            "task_file",
+            f"Die Aufgabendatei „{task_file}“ liegt außerhalb des Ordners der Run-Konfiguration. "
+            "Lege sie in diesen Ordner oder gib die Aufgabe direkt unter „task“ an.",
+        )
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except (OSError, UnicodeDecodeError):
+        return "", ConfigIssue(
+            "task_file",
+            f"Die Aufgabendatei „{task_file}“ ist nicht lesbar. Prüfe den Pfad oder gib die "
+            "Aufgabe direkt unter „task“ an.",
+        )
+
+
 def _make_plan(
     root: Path,
     project: Path,
@@ -582,6 +681,7 @@ def _make_plan(
     catalog: SkillCatalog,
     task_base: Path | None,
     profiles: ProfilesFile | None,
+    allow_external_task_file: bool,
 ) -> _Plan:
     """Check everything the preparer reads and report all problems at once (docs/02 §3.3)."""
     issues: list[ConfigIssue] = []
@@ -590,22 +690,16 @@ def _make_plan(
     if resolved.task is not None:
         task_text = resolved.task
     elif resolved.task_file is not None:
-        task_path = Path(resolved.task_file).expanduser()
-        if not task_path.is_absolute():
-            task_path = (task_base / task_path) if task_base else task_path
+        task_text, issue = _read_task_file(resolved.task_file, task_base, allow_external_task_file)
+        if issue is not None:
+            issues.append(issue)
+
+    context = _ContextSource()
+    if any(a.workspace.mode is not WorkspaceMode.EMPTY for a in resolved.agents):
         try:
-            if not task_path.is_absolute() and task_base is None:
-                raise FileNotFoundError
-            task_text = task_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            where = f" ({task_path})" if task_base is not None else ""
-            issues.append(
-                ConfigIssue(
-                    "task_file",
-                    f"Die Aufgabendatei „{resolved.task_file}“ ist nicht lesbar{where}. "
-                    "Prüfe den Pfad oder gib die Aufgabe direkt unter „task“ an.",
-                )
-            )
+            context = _context_source(project)
+        except ArrError as exc:
+            issues.append(ConfigIssue("project", exc.message))
 
     group_skill: SkillInfo | None = None
     skill_failed = False
@@ -663,7 +757,7 @@ def _make_plan(
         _check_profiles(resolved, profiles, issues)
     if issues:
         raise ConfigError(issues, source=RUN_SOURCE)
-    return _Plan(task_text, group_skill, roles, agent_skills, shared_names)
+    return _Plan(task_text, context, group_skill, roles, agent_skills, shared_names)
 
 
 # --------------------------------------------------------------------------------------------
@@ -682,16 +776,20 @@ def _toolchain(
         python = Path(toolchain.python).expanduser()
         if not python.is_absolute():
             python = root / python
-        base_python = str(python)
-        bin_dir = python.parent if python.is_file() else python / "bin"
-        if not bin_dir.is_dir():
+        if python.is_file():  # an interpreter such as <venv>/bin/python
+            venv, bin_dir = python.parent.parent, python.parent
+        else:
+            venv, bin_dir = python, python / "bin"
+        if bin_dir.is_dir():
+            base_python = str(venv)
+            prepend.append(str(bin_dir))
+        else:
             log.warning(
                 "toolchain_missing",
                 f"Die Python-Umgebung „{toolchain.python}“ wurde nicht gefunden ({bin_dir}). "
                 "Die Agenten nutzen das System-Python. Prüfe „toolchain.python“ in arr.yaml.",
                 path=str(bin_dir),
             )
-        prepend.append(str(bin_dir))
     for entry in toolchain.extra_path:
         folder = Path(entry).expanduser()
         if not folder.is_absolute():
@@ -758,20 +856,24 @@ def prepare_run(
     profiles: ProfilesFile | None = None,
     now: datetime | None = None,
     run_id: str | None = None,
+    allow_external_task_file: bool = False,
 ) -> PreparedRun:
     """Create the run folder for a resolved run and return what was prepared.
 
     - `run_input` is stored as `run.input.yaml` (as given), `resolved` as `run.yaml`; the task
-      goes to `task.md` (from `task`, or from `task_file` relative to `task_base`).
+      goes to `task.md` (from `task`, or from `task_file` relative to `task_base`). `task_file`
+      must lie under `task_base`; only `allow_external_task_file=True` (for a file the user
+      names on the command line) lifts that.
     - `base/` is a clone of the project without `copy_exclude` (and without project skills);
       working copies are clones of `base/`. `shared/<name>/` for `shared`, an empty folder for
       `empty`. If cloning is impossible the files are copied for real and a warning goes to
-      `orchestrator.jsonl` and `PreparedRun.warnings`.
+      `orchestrator.jsonl` and `PreparedRun.warnings`. Symlinks leading out of the project
+      (or skill) are left out, with a warning `external_symlink`.
     - Skills: snapshot in `skills/`; Claude agents get a generated plugin in `agents/<id>/plugin/`,
       Codex agents `.agents/skills/` in their working folder. Group skills and `arr` are never
       installed for research agents (E11).
     - Each working copy gets the processed project context as `CLAUDE.md` (if the project has
-      one) and `AGENTS.md`, and each agent a `context.md` with the same text (E10).
+      one) and `AGENTS.md`, and each agent a `context.md` (E10, see `AgentFile`).
     - `meta.json` gets the status `preparing`. Starting the agents is up to the RunManager.
 
     All configuration problems (unknown project, role or skill, bad profile …) are collected and
@@ -787,7 +889,9 @@ def prepare_run(
     project_settings = load_project_settings(project)
     excludes = ExcludeSet(project_settings.copy_exclude, always=ALWAYS_EXCLUDED)
     catalog = discover_skills(root / "skills")
-    plan = _make_plan(root, project, resolved, catalog, task_base, profiles)
+    plan = _make_plan(
+        root, project, resolved, catalog, task_base, profiles, allow_external_task_file
+    )
 
     moment = now or datetime.now()
     run_id, run_dir = _reserve_run_dir(
@@ -850,6 +954,7 @@ def _build_run(
     base_dir = run_dir / "base"
     base_stats = copy_tree(project, base_dir, excludes)
     _warn_if_copied(log, "base/", base_stats)
+    _warn_external_links(log, "im Projekt", "aus dem Projekt", base_stats.external_links)
 
     used: dict[str, SkillInfo] = {}
     if plan.group_skill is not None:
@@ -857,7 +962,8 @@ def _build_run(
     for skills in plan.agent_skills.values():
         used.update({s.name: s for s in skills})
     snapshot_dir = run_dir / "skills"
-    snapshot_skills(list(used.values()), snapshot_dir)
+    skipped_links = snapshot_skills(list(used.values()), snapshot_dir)
+    _warn_external_links(log, "im Skill", "aus dem Skill", skipped_links)
 
     prepend, base_python = _toolchain(root, settings, log)
 
@@ -893,19 +999,11 @@ def _build_run(
             else:
                 work_dir.mkdir()
             block = _research_block(run_id, resolved, agent, mode)
-            generated = _write_context_files(work_dir, base_dir, mode, block)
+            generated = _write_context_files(work_dir, plan.context, mode, block)
 
         own_block = _research_block(run_id, resolved, agent, mode, agent.workspace.name)
-        source = (
-            None
-            if mode is WorkspaceMode.EMPTY
-            else (
-                _read_text_if_file(base_dir / "CLAUDE.md")
-                or _read_text_if_file(base_dir / "AGENTS.md")
-            )
-        )
         (agent_dir / "context.md").write_text(
-            _processed_context(source or "", own_block), encoding="utf-8"
+            _context_text(plan.context, mode, own_block), encoding="utf-8"
         )
 
         skills = plan.agent_skills[agent.id]
@@ -936,7 +1034,7 @@ def _build_run(
             copy_method=copy_method,
         )
 
-    _finish_shared(run_dir, base_dir, snapshot_dir, resolved, run_id, plan, prepared)
+    _finish_shared(run_dir, snapshot_dir, resolved, run_id, plan, prepared)
 
     for agent_id, file in prepared.items():
         (run_dir / "agents" / agent_id / "agent.json").write_text(
@@ -955,7 +1053,6 @@ def _build_run(
 
 def _finish_shared(
     run_dir: Path,
-    base_dir: Path,
     snapshot_dir: Path,
     resolved: ResolvedRun,
     run_id: str,
@@ -967,7 +1064,7 @@ def _finish_shared(
         members = [a for a in resolved.agents if a.workspace.name == name]
         folder = run_dir / "shared" / name
         block = _research_block(run_id, resolved, None, WorkspaceMode.SHARED, name)
-        generated = _write_context_files(folder, base_dir, WorkspaceMode.SHARED, block)
+        generated = _write_context_files(folder, plan.context, WorkspaceMode.SHARED, block)
         codex_skills: dict[str, SkillInfo] = {}
         for member in members:
             if member.provider is Provider.CODEX:
@@ -979,6 +1076,24 @@ def _finish_shared(
             prepared[member.id] = prepared[member.id].model_copy(
                 update={"generated_paths": generated}
             )
+
+
+def _warn_external_links(log: _RunLog, where: str, out_of: str, links: Sequence[str]) -> None:
+    """One warning per left-out link (path only, never the target), at most a few."""
+    for rel in links[:_MAX_LINK_WARNINGS]:
+        log.warning(
+            "external_symlink",
+            f"Der Symlink „{rel}“ {where} zeigt {out_of} hinaus oder ins Leere und wurde nicht "
+            "übernommen. Lege die Datei selbst dort ab, wenn die Agenten sie brauchen.",
+            path=rel,
+        )
+    if len(links) > _MAX_LINK_WARNINGS:
+        rest = len(links) - _MAX_LINK_WARNINGS
+        log.warning(
+            "external_symlink",
+            f"Dazu {rest} weitere Symlinks {where}, die nicht übernommen wurden.",
+            count=rest,
+        )
 
 
 def _warn_if_copied(log: _RunLog, label: str, stats: CopyStats) -> None:

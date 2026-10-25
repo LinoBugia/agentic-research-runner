@@ -70,10 +70,20 @@ def init_workfolder(path: Path) -> Path:
             f"„{root}“ ist kein Ordner. Gib einen Ordner für den Workfolder an, "
             "z. B. „arr init ~/arr“."
         )
-    for sub in _WORKFOLDER_DIRS:
-        (root / sub).mkdir(parents=True, exist_ok=True)
-    for target, template in _WORKFOLDER_FILES:
-        _write_new(root / target, read_template("workfolder", template))
+    try:
+        for sub in _WORKFOLDER_DIRS:
+            (root / sub).mkdir(parents=True, exist_ok=True)
+        for target, template in _WORKFOLDER_FILES:
+            _write_new(root / target, read_template("workfolder", template))
+    except PermissionError as exc:
+        raise ArrError(
+            f"Kein Schreibrecht für „{exc.filename or root}“. Wähle einen Ordner, in dem du "
+            "schreiben darfst, z. B. „arr init ~/arr“."
+        ) from None
+    except OSError as exc:
+        raise ArrError(
+            f"Der Workfolder „{root}“ ließ sich nicht anlegen ({exc.strerror or exc})."
+        ) from None
     return root
 
 

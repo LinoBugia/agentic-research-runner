@@ -34,8 +34,10 @@ __all__ = [
     "SkillCatalog",
     "SkillInfo",
     "check_research_skills",
+    "copy_skill_tree",
     "discover_skills",
     "install_codex_skills",
+    "internal_link_target",
     "link_user_skills",
     "load_skill",
     "skills_for_research_agent",
@@ -370,9 +372,70 @@ def skills_for_research_agent(
 # --------------------------------------------------------------------------------------------
 
 
-def _copy_skill(source: Path, target: Path) -> None:
-    """Copy a skill folder as plain files; links inside are followed so the copy is complete."""
-    shutil.copytree(source, target, symlinks=False, ignore_dangling_symlinks=True)
+def internal_link_target(link: Path, root_real: str) -> str | None:
+    """Relative link text for a symlink whose target lies inside `root_real`, else None.
+
+    `root_real` is the resolved root of the tree being copied. The link is resolved fully
+    (also absolute links and chains); a target outside the tree, a broken link or a loop gives
+    None. The returned text is relative to the link's folder, so it points into the copy.
+    """
+    try:
+        real = os.path.realpath(link, strict=True)
+    except OSError:
+        return None
+    if real != root_real and not real.startswith(root_real.rstrip(os.sep) + os.sep):
+        return None
+    return os.path.relpath(real, start=os.path.realpath(link.parent))
+
+
+def copy_skill_tree(source: Path, target: Path) -> list[str]:
+    """Copy a skill folder without following symlinks out of it.
+
+    Links that stay inside the skill are kept as relative links, all others are left out;
+    their paths (relative to the skill) are returned. Copy errors become a `ConfigError`.
+    """
+    root_real = os.path.realpath(source)
+    skipped: list[str] = []
+
+    def walk(source_dir: Path, target_dir: Path, rel: str) -> None:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with os.scandir(source_dir) as scan:
+            entries = sorted(scan, key=lambda e: e.name)
+        for entry in entries:
+            rel_path = f"{rel}/{entry.name}" if rel else entry.name
+            destination = target_dir / entry.name
+            if entry.is_symlink():
+                text = internal_link_target(Path(entry.path), root_real)
+                if text is None:
+                    skipped.append(rel_path)
+                else:
+                    os.symlink(text, destination)
+            elif entry.is_dir(follow_symlinks=False):
+                walk(Path(entry.path), destination, rel_path)
+            elif entry.is_file(follow_symlinks=False):
+                shutil.copy2(entry.path, destination)
+
+    try:
+        walk(source, target, "")
+    except OSError as exc:
+        raise ConfigError.single(
+            "",
+            f"Der Skill „{source.name}“ konnte nicht kopiert werden "
+            f"({exc.strerror or exc}). Prüfe die Dateien im Skill-Ordner.",
+            source=str(source),
+        ) from None
+    return skipped
+
+
+def _managed_link(link: Path, target_real: str, skills_real: str, name: str) -> bool:
+    """True if `link` is a skill link arr made: it points into the workfolder `skills/`, or
+    it is broken and its text ends in `skills/<name>` (e.g. computed from a linked project)."""
+    text = os.readlink(link)
+    points_to = os.path.normpath(os.path.join(target_real, text))
+    if os.path.dirname(points_to) == skills_real:
+        return True
+    parts = os.path.normpath(text).split(os.sep)
+    return not link.exists() and parts[-2:] == ["skills", name]
 
 
 def link_user_skills(
@@ -380,13 +443,14 @@ def link_user_skills(
 ) -> tuple[list[str], list[str]]:
     """Maintain the symlinks `<project>/.claude/skills/<name>` for the user agent.
 
-    Links are relative (`../../../../skills/<name>` inside a workfolder), so the workfolder can
-    be moved. Links that arr manages (pointing into `skills_dir`) but are no longer wanted are
-    removed. Real folders, files and links to other places are never touched.
+    Links are relative and computed from the resolved folders (`../../../../skills/<name>`
+    inside a workfolder), so they also work when `projects/<p>` is a link to a folder elsewhere.
+    Links that arr manages but are no longer wanted are removed, wrong ones are repaired. Real
+    folders, files and links to other places are never touched.
     Returns the names of the links created or changed and of the entries left alone.
     """
     target_dir = project_dir / ".claude" / "skills"
-    skills_root = Path(os.path.normpath(skills_dir.absolute()))
+    skills_real = os.path.realpath(skills_dir)
     wanted = {s.name: s for s in skills}
     changed: list[str] = []
     skipped: list[str] = []
@@ -394,23 +458,24 @@ def link_user_skills(
     if not wanted and not target_dir.is_dir():
         return changed, skipped
     target_dir.mkdir(parents=True, exist_ok=True)
+    target_real = os.path.realpath(target_dir)
 
     for entry in sorted(target_dir.iterdir(), key=lambda p: p.name):
-        if not entry.is_symlink():
-            continue
-        points_to = Path(os.path.normpath(target_dir.absolute() / os.readlink(entry)))
-        if points_to.parent == skills_root and entry.name not in wanted:
+        if (
+            entry.is_symlink()
+            and entry.name not in wanted
+            and _managed_link(entry, target_real, skills_real, entry.name)
+        ):
             entry.unlink()
             changed.append(entry.name)
 
     for name, skill in wanted.items():
         link = target_dir / name
-        relative = os.path.relpath(skills_root / skill.path.name, start=target_dir.absolute())
+        relative = os.path.relpath(os.path.join(skills_real, skill.path.name), start=target_real)
         if link.is_symlink():
             if os.readlink(link) == relative:
                 continue
-            points_to = Path(os.path.normpath(target_dir.absolute() / os.readlink(link)))
-            if points_to.parent != skills_root:
+            if not _managed_link(link, target_real, skills_real, name):
                 skipped.append(name)
                 continue
             link.unlink()
@@ -422,11 +487,18 @@ def link_user_skills(
     return changed, skipped
 
 
-def snapshot_skills(skills: Sequence[SkillInfo], snapshot_dir: Path) -> None:
-    """Copy the given skills to `<snapshot_dir>/<name>/` (the run's `skills/` snapshot)."""
+def snapshot_skills(skills: Sequence[SkillInfo], snapshot_dir: Path) -> list[str]:
+    """Copy the given skills to `<snapshot_dir>/<name>/` (the run's `skills/` snapshot).
+
+    Returns the symlinks left out because they lead out of their skill, as `<skill>/<path>`.
+    """
     snapshot_dir.mkdir(parents=True, exist_ok=True)
+    skipped: list[str] = []
     for skill in skills:
-        _copy_skill(skill.path, snapshot_dir / skill.name)
+        skipped += [
+            f"{skill.name}/{rel}" for rel in copy_skill_tree(skill.path, snapshot_dir / skill.name)
+        ]
+    return skipped
 
 
 def write_claude_plugin(plugin_dir: Path, snapshot_dir: Path, names: Sequence[str]) -> list[str]:
@@ -448,7 +520,7 @@ def write_claude_plugin(plugin_dir: Path, snapshot_dir: Path, names: Sequence[st
     skills_root = plugin_dir / "skills"
     skills_root.mkdir(exist_ok=True)
     for name in names:
-        _copy_skill(snapshot_dir / name, skills_root / name)
+        copy_skill_tree(snapshot_dir / name, skills_root / name)
     return [f"{PLUGIN_NAME}:{name}" for name in names]
 
 
@@ -457,4 +529,4 @@ def install_codex_skills(work_dir: Path, snapshot_dir: Path, names: Sequence[str
     target = work_dir / ".agents" / "skills"
     target.mkdir(parents=True, exist_ok=True)
     for name in names:
-        _copy_skill(snapshot_dir / name, target / name)
+        copy_skill_tree(snapshot_dir / name, target / name)

@@ -1,3 +1,4 @@
+import os
 import shutil
 from pathlib import Path
 
@@ -9,7 +10,9 @@ from arr.resolve import load_group_spec
 from arr.skills import (
     SkillAudience,
     check_research_skills,
+    copy_skill_tree,
     discover_skills,
+    link_user_skills,
     load_skill,
     skills_for_research_agent,
     skills_for_user_agent,
@@ -193,3 +196,70 @@ def test_research_agent_never_gets_group_skills_or_arr(skills_dir: Path) -> None
     assert "User-Agent" in issues[1].message
     with pytest.raises(ConfigError):
         skills_for_research_agent(catalog, ["exploration"])
+
+
+# --------------------------------------------------------------------------------------------
+# W1-02.1: copying skills without following links out (G3), links of linked projects (G4)
+# --------------------------------------------------------------------------------------------
+
+
+def test_copy_skill_tree_keeps_inner_links_and_drops_outer_ones(
+    skills_dir: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "aussen.txt"
+    outside.write_text("aussen", encoding="utf-8")
+    skill = skills_dir / "sympy-check"
+    (skill / "innen.md").symlink_to("SKILL.md")
+    (skill / "abs-innen.md").symlink_to(skill / "SKILL.md")
+    (skill / "aussen.txt").symlink_to(outside)
+    (skill / "schleife").symlink_to("..")
+    (skill / "kaputt").symlink_to("fehlt")
+
+    skipped = copy_skill_tree(skill, tmp_path / "kopie")
+
+    copy = tmp_path / "kopie"
+    assert sorted(skipped) == ["aussen.txt", "kaputt", "schleife"]
+    assert os.readlink(copy / "innen.md") == "SKILL.md"
+    assert os.readlink(copy / "abs-innen.md") == "SKILL.md"
+    assert (copy / "scripts" / "check.py").is_file()
+    for name in skipped:
+        assert not os.path.lexists(copy / name)
+
+
+def test_copy_skill_tree_reports_errors_in_german(skills_dir: Path, tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root can read everything")
+    secret = skills_dir / "sympy-check" / "scripts" / "check.py"
+    secret.chmod(0o000)
+    try:
+        with pytest.raises(ConfigError, match="konnte nicht kopiert werden") as caught:
+            copy_skill_tree(skills_dir / "sympy-check", tmp_path / "kopie")
+        assert "Traceback" not in str(caught.value)
+    finally:
+        secret.chmod(0o644)
+
+
+def test_skill_links_work_for_a_project_linked_from_elsewhere(
+    skills_dir: Path, tmp_path: Path
+) -> None:
+    real_project = tmp_path / "anderswo" / "tief" / "projekt"
+    real_project.mkdir(parents=True)
+    workfolder_projects = tmp_path / "projects"
+    workfolder_projects.mkdir()
+    linked = workfolder_projects / "p"
+    linked.symlink_to(real_project)
+    skills = [discover_skills(skills_dir).skills["sympy-check"]]
+
+    changed, _ = link_user_skills(linked, skills_dir, skills)
+
+    assert changed == ["sympy-check"]
+    assert (linked / ".claude" / "skills" / "sympy-check" / "SKILL.md").is_file()
+
+    # a link computed from the unresolved path (as before W1-02.1) is repaired
+    link = real_project / ".claude" / "skills" / "sympy-check"
+    link.unlink()
+    link.symlink_to("../../../../skills/sympy-check")
+    assert not link.exists()
+    changed, skipped = link_user_skills(linked, skills_dir, skills)
+    assert changed == ["sympy-check"] and skipped == []
+    assert (link / "SKILL.md").is_file()

@@ -381,14 +381,14 @@ def test_skill_folders_of_the_project_are_never_copied() -> None:
     assert ".agents/skills" in ALWAYS_EXCLUDED
 
 
-def test_copy_tree_keeps_symlinks_and_metadata(tmp_path: Path) -> None:
+def test_copy_tree_keeps_internal_symlinks_and_metadata(tmp_path: Path) -> None:
     src = tmp_path / "src"
     (src / "sub").mkdir(parents=True)
     (src / "sub" / "f.txt").write_text("inhalt", encoding="utf-8")
     (src / "run.sh").write_text("#!/bin/sh\n", encoding="utf-8")
     (src / "run.sh").chmod(0o755)
     (src / "link").symlink_to("sub/f.txt")
-    (src / "dangling").symlink_to("/nonexistent/ziel")
+    (src / "dirlink").symlink_to("sub")
     os.utime(src / "sub" / "f.txt", (1_700_000_000, 1_700_000_000))
 
     stats = copy_tree(src, tmp_path / "dst")
@@ -397,10 +397,80 @@ def test_copy_tree_keeps_symlinks_and_metadata(tmp_path: Path) -> None:
     assert (dst / "sub" / "f.txt").read_text("utf-8") == "inhalt"
     assert os.access(dst / "run.sh", os.X_OK)
     assert (dst / "link").is_symlink() and os.readlink(dst / "link") == "sub/f.txt"
-    assert os.readlink(dst / "dangling") == "/nonexistent/ziel"
+    assert os.readlink(dst / "dirlink") == "sub"
     assert int((dst / "sub" / "f.txt").stat().st_mtime) == 1_700_000_000
     assert stats.cloned + stats.copied == 2
     assert stats.symlinks == 2
+    assert stats.external_links == []
+
+
+def test_copy_tree_drops_links_that_leave_the_tree(tmp_path: Path) -> None:
+    """M1: no link in a copy may lead to the original or to anything outside."""
+    outside = tmp_path / "aussen"
+    (outside / "ordner").mkdir(parents=True)
+    (outside / "geheim.txt").write_text("geheim", encoding="utf-8")
+    (outside / "ordner" / "x.txt").write_text("x", encoding="utf-8")
+    src = tmp_path / "projekt"
+    (src / "notes").mkdir(parents=True)
+    (src / "notes" / "ideen.md").write_text("Original", encoding="utf-8")
+    (src / "notes" / "abs-intern.md").symlink_to(src / "notes" / "ideen.md")  # absolute, inside
+    (src / "notes" / "raus.txt").symlink_to("../../aussen/geheim.txt")  # relative with ..
+    (src / "ordner-aussen").symlink_to(outside / "ordner")  # folder outside
+    (src / "kaputt").symlink_to("gibts-nicht")  # broken
+    (src / "zyklus-a").symlink_to("zyklus-b")  # loop
+    (src / "zyklus-b").symlink_to("zyklus-a")
+
+    stats = copy_tree(src, tmp_path / "kopie")
+
+    dst = tmp_path / "kopie"
+    assert os.readlink(dst / "notes" / "abs-intern.md") == "ideen.md", "absolute → relative"
+    assert sorted(stats.external_links) == [
+        "kaputt",
+        "notes/raus.txt",
+        "ordner-aussen",
+        "zyklus-a",
+        "zyklus-b",
+    ]
+    for name in ("kaputt", "notes/raus.txt", "ordner-aussen", "zyklus-a", "zyklus-b"):
+        assert not os.path.lexists(dst / name), name
+
+    # writing in the copy changes neither the project nor anything outside
+    (dst / "notes" / "abs-intern.md").write_text("geändert", encoding="utf-8")
+    assert (dst / "notes" / "ideen.md").read_text("utf-8") == "geändert"
+    assert (src / "notes" / "ideen.md").read_text("utf-8") == "Original"
+    assert (outside / "geheim.txt").read_text("utf-8") == "geheim"
+
+
+def test_external_links_are_reported_and_cannot_reach_the_original(
+    workfolder: Path, settings: WorkfolderSettings, tmp_path: Path
+) -> None:
+    outside = tmp_path / "aussen.txt"
+    outside.write_text("aussen", encoding="utf-8")
+    project = workfolder / "projects" / "collatz"
+    (project / "notes" / "abs-link.md").symlink_to(project / "notes" / "ideen.md")
+    (project / "extern").symlink_to(outside)
+
+    result = prepare(workfolder, settings)
+
+    work = result.agents["explorer-1"].work_dir
+    assert os.readlink(work / "notes" / "abs-link.md") == "ideen.md"
+    assert not os.path.lexists(work / "extern")
+    (work / "notes" / "abs-link.md").write_text("vom Agenten", encoding="utf-8")
+    assert "2-adische" in (project / "notes" / "ideen.md").read_text("utf-8")
+    assert outside.read_text("utf-8") == "aussen"
+
+    link_warnings = [w for w in result.warnings if "Symlink" in w]
+    assert link_warnings == [
+        "Der Symlink „extern“ im Projekt zeigt aus dem Projekt hinaus oder ins Leere und wurde "
+        "nicht übernommen. Lege die Datei selbst dort ab, wenn die Agenten sie brauchen."
+    ]
+    assert str(outside) not in " ".join(result.warnings), "the target is never named"
+    log = [
+        json.loads(line)
+        for line in (result.run_dir / "orchestrator.jsonl").read_text("utf-8").splitlines()
+    ]
+    entries = [e["data"] for e in log if e["data"]["code"] == "external_symlink"]
+    assert entries == [{"code": "external_symlink", "message": link_warnings[0], "path": "extern"}]
 
 
 # --------------------------------------------------------------------------------------------
@@ -701,13 +771,30 @@ def test_missing_toolchain_paths_warn_but_do_not_fail(
         }
     )
     result = prepare(workfolder, missing)
-    assert len(result.warnings) == 2
-    assert "Python-Umgebung" in result.warnings[0]
-    assert "extra_path" in result.warnings[1]
-    assert result.agents["ranker"].file.path_prepend == [
-        str(tmp_path / "nirgends" / "bin"),
-        str(tmp_path / "weg"),
-    ]
+    toolchain = [w for w in result.warnings if "Kopie statt Klon" not in w]
+    assert len(toolchain) == 2
+    assert "Python-Umgebung" in toolchain[0]
+    assert "extra_path" in toolchain[1]
+    file = result.agents["ranker"].file
+    assert file.base_python is None, "G7: a missing venv is not handed on"
+    assert file.path_prepend == [str(tmp_path / "weg")]
+
+
+def test_base_python_is_always_the_venv_folder(
+    workfolder: Path, settings: WorkfolderSettings
+) -> None:
+    venv = Path(str(settings.toolchain.python))
+    (venv / "bin" / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+    as_interpreter = settings.model_copy(
+        update={
+            "toolchain": settings.toolchain.model_copy(
+                update={"python": str(venv / "bin" / "python"), "extra_path": []}
+            )
+        }
+    )
+    file = prepare(workfolder, as_interpreter).agents["explorer-1"].file
+    assert file.base_python == str(venv)
+    assert file.path_prepend == [str(venv / "bin")]
 
 
 def test_no_toolchain_means_no_path_prefix(workfolder: Path, settings: WorkfolderSettings) -> None:
@@ -883,3 +970,236 @@ def test_project_settings_default_when_no_project_yaml(
     result = prepare(workfolder, settings)
     assert (result.run_dir / "base" / "literatur.pdf").is_file(), "nothing excluded any more"
     assert (result.run_dir / "base" / "data" / "big" / "daten.bin").is_file()
+
+
+# --------------------------------------------------------------------------------------------
+# W1-02.1: task_file stays inside task_base (M2)
+# --------------------------------------------------------------------------------------------
+
+
+def with_task_file(task_file: str) -> Callable[[dict[str, Any]], None]:
+    def mutate(data: dict[str, Any]) -> None:
+        data["task_file"] = task_file
+
+    return mutate
+
+
+@pytest.fixture
+def task_base(tmp_path: Path) -> Path:
+    base = tmp_path / "konfig"
+    base.mkdir()
+    (base / "task.md").write_text("Aufgabe aus dem Konfig-Ordner", encoding="utf-8")
+    (tmp_path / "geheim.txt").write_text("GEHEIM", encoding="utf-8")
+    return base
+
+
+def refused_task(
+    workfolder: Path, settings: WorkfolderSettings, task_file: str, base: Path
+) -> None:
+    with pytest.raises(ConfigError) as caught:
+        prepare(workfolder, settings, with_task_file(task_file), task_base=base)
+    assert caught.value.path == "task_file"
+    assert "außerhalb" in caught.value.issue_message
+    assert "GEHEIM" not in str(caught.value)
+    assert runs_are_empty(workfolder)
+
+
+def test_task_file_absolute_outside_is_refused(
+    workfolder: Path, settings: WorkfolderSettings, task_base: Path, tmp_path: Path
+) -> None:
+    refused_task(workfolder, settings, str(tmp_path / "geheim.txt"), task_base)
+
+
+def test_task_file_with_tilde_is_refused(
+    workfolder: Path,
+    settings: WorkfolderSettings,
+    task_base: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    refused_task(workfolder, settings, "~/geheim.txt", task_base)
+
+
+def test_task_file_with_dotdot_is_refused(
+    workfolder: Path, settings: WorkfolderSettings, task_base: Path
+) -> None:
+    refused_task(workfolder, settings, "../geheim.txt", task_base)
+
+
+def test_task_file_symlink_out_of_task_base_is_refused(
+    workfolder: Path, settings: WorkfolderSettings, task_base: Path, tmp_path: Path
+) -> None:
+    (task_base / "link.md").symlink_to(tmp_path / "geheim.txt")
+    refused_task(workfolder, settings, "link.md", task_base)
+
+
+def test_task_file_inside_task_base_is_accepted(
+    workfolder: Path, settings: WorkfolderSettings, task_base: Path
+) -> None:
+    for task_file in ("task.md", str(task_base / "task.md"), "./sub/../task.md"):
+        result = prepare(workfolder, settings, with_task_file(task_file), task_base=task_base)
+        assert (result.run_dir / "task.md").read_text("utf-8") == "Aufgabe aus dem Konfig-Ordner"
+
+
+def test_task_file_outside_only_with_explicit_switch(
+    workfolder: Path, settings: WorkfolderSettings, task_base: Path, tmp_path: Path
+) -> None:
+    outside = str(tmp_path / "geheim.txt")
+    with pytest.raises(ConfigError, match="außerhalb"):
+        prepare(workfolder, settings, with_task_file(outside), task_base=None)
+    result = prepare(
+        workfolder,
+        settings,
+        with_task_file(outside),
+        task_base=None,
+        allow_external_task_file=True,
+    )
+    assert (result.run_dir / "task.md").read_text("utf-8") == "GEHEIM"
+
+
+# --------------------------------------------------------------------------------------------
+# W1-02.1: context source (G1, G2, G5) and files kept away from agents (G6)
+# --------------------------------------------------------------------------------------------
+
+
+def test_empty_claude_md_gives_the_same_text_everywhere(
+    workfolder: Path, settings: WorkfolderSettings
+) -> None:
+    (workfolder / "projects" / "collatz" / "CLAUDE.md").write_text("", encoding="utf-8")
+    result = prepare(workfolder, settings)
+    for agent_id in ("explorer-1", "explorer-gpt"):
+        agent = result.agents[agent_id]
+        context = (agent.agent_dir / "context.md").read_text("utf-8")
+        assert (agent.work_dir / "AGENTS.md").read_text("utf-8") == context
+        assert (agent.work_dir / "CLAUDE.md").read_text("utf-8") == context
+        assert context.startswith("<!-- arr:research-agent -->")
+        assert "Hinweise für Agenten" not in context
+
+
+def test_context_comes_from_the_project_even_if_excluded(
+    workfolder: Path, settings: WorkfolderSettings
+) -> None:
+    (workfolder / "projects" / "collatz" / "project.yaml").write_text(
+        'copy_exclude: ["*.md"]\n', encoding="utf-8"
+    )
+    result = prepare(workfolder, settings)
+    assert not (result.run_dir / "base" / "CLAUDE.md").exists()
+    agent = result.agents["explorer-1"]
+    context = (agent.agent_dir / "context.md").read_text("utf-8")
+    assert "Stoppzeit: σ(n)." in context
+    assert (agent.work_dir / "AGENTS.md").read_text("utf-8") == context
+
+
+def test_broken_mark_in_claude_md_is_reported_before_the_run(
+    workfolder: Path, settings: WorkfolderSettings
+) -> None:
+    (workfolder / "projects" / "collatz" / "CLAUDE.md").write_text(
+        "# X\n<!-- arr:user-agent -->\nohne Ende\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError) as caught:
+        prepare(workfolder, settings)
+    assert caught.value.path == "project"
+    assert "CLAUDE.md" in caught.value.issue_message
+    assert "<!-- /arr:user-agent -->" in caught.value.issue_message
+    assert runs_are_empty(workfolder)
+
+
+def test_claude_md_linked_out_of_the_project_is_not_read(
+    workfolder: Path, settings: WorkfolderSettings, tmp_path: Path
+) -> None:
+    outside = tmp_path / "fremd.md"
+    outside.write_text("# Fremder Kontext\n", encoding="utf-8")
+    project = workfolder / "projects" / "collatz"
+    (project / "CLAUDE.md").unlink()
+    (project / "CLAUDE.md").symlink_to(outside)
+    result = prepare(workfolder, settings)
+    context = (result.agents["explorer-1"].agent_dir / "context.md").read_text("utf-8")
+    assert "Fremder Kontext" not in context
+    assert context.startswith("# Hinweise für Agenten"), "falls back to the project's AGENTS.md"
+
+
+def test_override_and_mcp_json_never_reach_research_agents(
+    workfolder: Path, settings: WorkfolderSettings
+) -> None:
+    project = workfolder / "projects" / "collatz"
+    (project / "AGENTS.override.md").write_text("Überschreibt alles\n", encoding="utf-8")
+    (project / ".mcp.json").write_text('{"mcpServers": {"arr": {}}}\n', encoding="utf-8")
+    assert "/AGENTS.override.md" in ALWAYS_EXCLUDED
+    assert "/.mcp.json" in ALWAYS_EXCLUDED
+    result = prepare(workfolder, settings)
+    for folder in (
+        result.run_dir / "base",
+        result.agents["explorer-1"].work_dir,
+        result.agents["explorer-gpt"].work_dir,
+    ):
+        assert not (folder / "AGENTS.override.md").exists()
+        assert not (folder / ".mcp.json").exists()
+    assert (project / "AGENTS.override.md").is_file(), "the project keeps its files"
+
+
+# --------------------------------------------------------------------------------------------
+# W1-02.1: skills and roles do not follow links out of their folder (G3)
+# --------------------------------------------------------------------------------------------
+
+
+def test_skill_links_out_of_the_skill_are_left_out(
+    workfolder: Path, settings: WorkfolderSettings, tmp_path: Path
+) -> None:
+    outside = tmp_path / "privat"
+    outside.mkdir()
+    (outside / "notizen.txt").write_text("privat", encoding="utf-8")
+    skill = workfolder / "skills" / "sympy-check"
+    (skill / "privat").symlink_to(outside)
+    (skill / "scripts" / "hilfe.md").symlink_to("../SKILL.md")
+    (skill / "zurueck").symlink_to("..")  # loop out of the skill
+
+    def codex_skills(data: dict[str, Any]) -> None:
+        data["agents"][1]["skills"] = ["sympy-check"]
+
+    result = prepare(workfolder, settings, codex_skills)
+    for copy in (
+        result.run_dir / "skills" / "sympy-check",
+        result.agents["explorer-1"].work_dir.parent / "plugin" / "skills" / "sympy-check",
+        result.agents["explorer-gpt"].work_dir / ".agents" / "skills" / "sympy-check",
+    ):
+        assert not os.path.lexists(copy / "privat"), copy
+        assert not os.path.lexists(copy / "zurueck"), copy
+        assert os.readlink(copy / "scripts" / "hilfe.md") == "../SKILL.md"
+        assert (copy / "scripts" / "check.py").is_file()
+    assert "privat" not in "".join(
+        p.read_text("utf-8", errors="ignore") for p in result.run_dir.rglob("*.txt")
+    )
+    skill_warnings = sorted(w for w in result.warnings if "im Skill" in w)
+    assert len(skill_warnings) == 2
+    assert "„sympy-check/privat“" in skill_warnings[0]
+    assert "„sympy-check/zurueck“" in skill_warnings[1]
+
+
+def test_role_file_linked_out_of_the_skill_is_refused(
+    workfolder: Path, settings: WorkfolderSettings, tmp_path: Path
+) -> None:
+    outside = tmp_path / "hosts"
+    outside.write_text("geheim", encoding="utf-8")
+    (workfolder / "skills" / "exploration" / "roles" / "evil.md").symlink_to(outside)
+
+    def evil(data: dict[str, Any]) -> None:
+        data["agents"][2]["role"] = "roles/evil.md"
+
+    with pytest.raises(ConfigError) as caught:
+        prepare(workfolder, settings, evil)
+    assert [i.path for i in caught.value.issues] == ["agents[3].role"]
+    assert runs_are_empty(workfolder)
+
+
+def test_role_file_linked_inside_the_skill_is_fine(
+    workfolder: Path, settings: WorkfolderSettings
+) -> None:
+    (workfolder / "skills" / "exploration" / "roles" / "alias.md").symlink_to("ranker.md")
+
+    def alias(data: dict[str, Any]) -> None:
+        data["agents"][2]["role"] = "roles/alias.md"
+
+    result = prepare(workfolder, settings, alias)
+    assert "Ranker" in (result.agents["ranker"].agent_dir / "role.md").read_text("utf-8")
+    assert not (result.agents["ranker"].agent_dir / "role.md").is_symlink()
