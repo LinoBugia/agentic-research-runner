@@ -12,10 +12,14 @@ call: the MCP server runs synchronous tools in worker threads.
 See docs/01-architektur.md §5, docs/02-workfolder-und-runs.md §4-§5, docs/06-gruppenchats.md.
 """
 
+import errno
 import json
+import math
 import os
+import re
 import shutil
 import sqlite3
+import stat
 import string
 import time
 import uuid
@@ -34,8 +38,11 @@ from arr.models import (
     AgentStatus,
     ChannelMode,
     GroupChatConfig,
+    ResolvedRun,
+    Rubric,
     WorkspaceMode,
 )
+from arr.resolve import load_yaml_model
 from arr.room.types import (
     AgentStatusRecord,
     Assignment,
@@ -66,6 +73,9 @@ USER = "user"
 BUSY_TIMEOUT_S = 30.0
 MAX_READ_LIMIT = 200
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+_COPY_CHUNK = 1024 * 1024
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK  # NONBLOCK: a FIFO must not hang
 AGENT_STATUSES = (AgentStatus.WORKING, AgentStatus.DONE)
 """Statuses an agent may set itself; `idle` and `blocked` are set by the orchestrator."""
 
@@ -89,6 +99,7 @@ CREATE TABLE IF NOT EXISTS result(id INTEGER PRIMARY KEY, ts REAL, agent TEXT, s
     kind TEXT, title TEXT, body TEXT, path TEXT, attempt INTEGER);
 CREATE TABLE IF NOT EXISTS rating(id INTEGER PRIMARY KEY, ts REAL, rater TEXT,
     result_id INTEGER, score REAL, criteria TEXT, comment TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS rating_once ON rating(rater, result_id);
 CREATE TABLE IF NOT EXISTS assignment(agent TEXT, turn INTEGER, stage TEXT, prompt TEXT,
     context TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS poll(proposal_id INTEGER PRIMARY KEY, channel TEXT, rule TEXT,
@@ -174,14 +185,17 @@ class _Channel:
         return (self.members.get(agent) or agent) if self.anonymous else agent
 
     def resolve(self, name: str) -> str | None:
-        """Agent ID for an ID or alias (`Mitglied A`, `A`), None if not a member."""
-        if name in self.members:
-            return name
-        if self.anonymous:
-            wanted = name.strip().casefold()
-            for agent, alias in self.members.items():
-                if alias and wanted in (alias.casefold(), alias.split()[-1].casefold()):
-                    return agent
+        """Agent ID for a name given by an agent, None if it names no member.
+
+        Anonymous channels accept only aliases (`Mitglied A`, `A`), never real IDs, so the
+        answer reveals nothing about who is behind an alias (W1-03.1).
+        """
+        if not self.anonymous:
+            return name if name in self.members else None
+        wanted = name.strip().casefold()
+        for agent, alias in self.members.items():
+            if alias and wanted in (alias.casefold(), alias.split()[-1].casefold()):
+                return agent
         return None
 
 
@@ -205,6 +219,20 @@ def _enum[E: StrEnum](cls: type[E], value: Any, what: str) -> E:
 
 def _now() -> float:
     return time.time()
+
+
+_HEADING_RE = re.compile(r"^(\s*)(#)")
+
+
+def _quote(body: str) -> str:
+    """A message body as a Markdown quote; `#` at a line start is escaped.
+
+    No line of a body can then look like the heading of another message in the export.
+    """
+    return "\n".join(
+        "> " + _HEADING_RE.sub(r"\1\\\2", line) if line.strip() else ">"
+        for line in body.splitlines() or [""]
+    )
 
 
 def _format_ts(ts: float) -> str:
@@ -428,9 +456,24 @@ class RoomStore:
     def set_channel_state(self, channel: str, state: ChannelState) -> None:
         """Open a `waiting` channel (`open_from` reached) or close one (orchestrator)."""
         with self._write() as con:
-            cur = con.execute("UPDATE channel SET state=? WHERE name=?", (state.value, channel))
-            if cur.rowcount == 0:
+            if not self._set_channel_state(con, channel, state):
                 raise ArrError(f"Den Kanal „{channel}“ gibt es nicht.")
+
+    @staticmethod
+    def _set_channel_state(con: sqlite3.Connection, channel: str, state: ChannelState) -> bool:
+        cur = con.execute("UPDATE channel SET state=? WHERE name=?", (state.value, channel))
+        if state is ChannelState.CLOSED:
+            # Nobody can answer in a closed channel, so its questions are no longer open.
+            con.execute("UPDATE msg SET open=0 WHERE channel=? AND open=1", (channel,))
+        return cur.rowcount > 0
+
+    def rubric(self) -> Rubric:
+        """Rubric of the run from `run.yaml` (docs/03 §3); the default scale without one."""
+        if not hasattr(self, "_rubric"):
+            run_yaml = self.run_dir / "run.yaml"
+            run = load_yaml_model(run_yaml, ResolvedRun) if run_yaml.is_file() else None
+            self._rubric = run.rubric if run and run.rubric else Rubric()
+        return self._rubric
 
     def open_channel(self, channel: str) -> None:
         """Open a channel whose `open_from` stage has been reached (W2-03)."""
@@ -892,7 +935,7 @@ class RoomStore:
                 meta.append(f"Zustellung: {m.delivery.status.value}")
             if meta:
                 lines += ["*" + " · ".join(meta) + "*", ""]
-            lines.append(m.body)
+            lines.append(_quote(m.body))
             if m.refs:
                 lines.append("")
                 lines += [f"- Anhang: [{a.name}]({link_base}{a.path})" for a in m.refs]
@@ -902,9 +945,19 @@ class RoomStore:
     # Agent view
     # ----------------------------------------------------------------------------------------
 
-    def for_agent(self, agent_id: str, work_dir: Path | None = None) -> "AgentRoom":
-        """View of one research agent; `work_dir` defaults to the folder from `agent.json`."""
-        return AgentRoom(self, agent_id, work_dir or agent_work_dir(self.run_dir, agent_id))
+    def for_agent(
+        self, agent_id: str, work_dir: Path | None = None, *, rubric: Rubric | None = None
+    ) -> "AgentRoom":
+        """View of one research agent; `work_dir` defaults to the folder from `agent.json`.
+
+        `rubric` defaults to the rubric of `run.yaml` (checked by `submit_rating`).
+        """
+        return AgentRoom(
+            self,
+            agent_id,
+            work_dir or agent_work_dir(self.run_dir, agent_id),
+            rubric=rubric or self.rubric(),
+        )
 
 
 def agent_work_dir(run_dir: Path, agent_id: str) -> Path:
@@ -925,12 +978,15 @@ class AgentRoom:
     raise `RoomError` with a German message.
     """
 
-    def __init__(self, store: RoomStore, agent_id: str, work_dir: Path) -> None:
+    def __init__(
+        self, store: RoomStore, agent_id: str, work_dir: Path, *, rubric: Rubric | None = None
+    ) -> None:
         if agent_id in RESERVED_SENDERS:
             raise ValueError(f"{agent_id!r} is reserved and cannot act as an agent")
         self.store = store
         self._agent_id = agent_id
         self.work_dir = Path(work_dir).absolute()
+        self.rubric = rubric or Rubric()
 
     @property
     def agent_id(self) -> str:
@@ -1025,25 +1081,104 @@ class AgentRoom:
         with self.store._read() as con:
             return [ch.name for ch in self._moderated(con)]
 
-    def _source_file(self, rel: str) -> Path:
-        """A file in the working folder, given relative to it; no escape via `..` or links."""
-        if not rel or Path(rel).is_absolute():
+    @staticmethod
+    def _source_parts(rel: str) -> list[str]:
+        if not rel or rel.startswith("/"):
             raise RoomError(
                 f"„{rel}“: Gib den Pfad relativ zu deinem Arbeitsordner an, z. B. „notes/lemma.md“."
             )
-        root = self.work_dir.resolve()
-        path = (root / rel).resolve()
-        if not path.is_relative_to(root):
+        parts = [p for p in rel.split("/") if p not in ("", ".")]
+        if not parts or ".." in parts:
             raise RoomError(f"„{rel}“ liegt nicht in deinem Arbeitsordner.")
-        if not path.is_file():
-            raise RoomError(f"Die Datei „{rel}“ gibt es in deinem Arbeitsordner nicht.")
-        size = path.stat().st_size
+        return parts
+
+    @staticmethod
+    def _open_error(
+        rel: str, dir_fd: int, walked: list[str], exc: OSError, *, final: bool
+    ) -> RoomError:
+        """German message for a failed open; `lstat` only chooses the text, it checks nothing."""
+        part = walked[-1]
+        try:
+            is_link = stat.S_ISLNK(os.stat(part, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+        except OSError:
+            is_link = False
+        if is_link or exc.errno == errno.ELOOP:
+            if final:
+                return RoomError(
+                    f"„{rel}“ ist ein Verweis (Symlink). Hänge die eigentliche Datei an."
+                )
+            return RoomError(
+                f"„{rel}“ führt über den Verweis (Symlink) „{'/'.join(walked)}“. "
+                "Gib den Pfad zur eigentlichen Datei an."
+            )
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return RoomError(f"Die Datei „{rel}“ gibt es in deinem Arbeitsordner nicht.")
+        return RoomError(f"Die Datei „{rel}“ lässt sich nicht lesen ({exc.strerror}).")
+
+    def _open_source(self, rel: str) -> tuple[int, str]:
+        """Open a regular file below the working folder without following any symlink.
+
+        Walks from the working folder component by component (`openat` with `O_NOFOLLOW`),
+        so swapping a file or folder for a link between check and copy cannot lead outside
+        (TOCTOU, E19). Returns the open descriptor and the file name; the caller copies from
+        the descriptor and closes it.
+        """
+        parts = self._source_parts(rel)
+        try:
+            dir_fd = os.open(self.work_dir, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError as exc:
+            raise RoomError(f"Dein Arbeitsordner ist nicht lesbar ({exc.strerror}).") from None
+        try:
+            for i, part in enumerate(parts):
+                last = i == len(parts) - 1
+                try:
+                    fd = os.open(part, _FILE_FLAGS if last else _DIR_FLAGS, dir_fd=dir_fd)
+                except OSError as exc:
+                    raise self._open_error(rel, dir_fd, parts[: i + 1], exc, final=last) from None
+                if last:
+                    break
+                os.close(dir_fd)
+                dir_fd = fd
+        finally:
+            os.close(dir_fd)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise RoomError(f"„{rel}“ ist keine normale Datei. Hänge nur Dateien an.")
+            self._check_size(rel, info.st_size)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd, parts[-1]
+
+    @staticmethod
+    def _check_size(rel: str, size: int) -> None:
         if size > MAX_ATTACHMENT_BYTES:
             raise RoomError(
                 f"„{rel}“ ist zu groß ({size // (1024 * 1024)} MB, erlaubt "
                 f"{MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB)."
             )
-        return path
+
+    def _copy_source(self, rel: str, target: Path) -> str:
+        """Copy a file of the working folder to `target` via its descriptor; returns its name."""
+        fd, name = self._open_source(rel)
+        try:
+            with os.fdopen(fd, "rb") as src, target.open("xb") as dst:
+                copied = 0
+                while chunk := src.read(_COPY_CHUNK):
+                    copied += len(chunk)
+                    self._check_size(rel, copied)  # the file may grow after fstat
+                    dst.write(chunk)
+        except OSError as exc:
+            target.unlink(missing_ok=True)
+            raise RoomError(
+                f"Die Datei „{rel}“ ließ sich nicht kopieren ({exc.strerror}). "
+                "Hat sie sich beim Kopieren geändert?"
+            ) from None
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        return name
 
     def unread_counts(self) -> tuple[dict[str, int], int]:
         """Unread messages per readable channel and the number of open questions to me."""
@@ -1223,9 +1358,8 @@ class AgentRoom:
             raise RoomError("Stimmen gibst du mit dem Tool „vote“ ab, nicht als Nachricht.")
         if not body.strip() and kind is not MessageKind.PASS:
             raise RoomError("Die Nachricht ist leer.")
-        sources = self._attachment_sources(refs or [])
         # Copy before taking the write lock; inside the transaction only a rename remains.
-        staging = self._stage_attachments(sources) if sources else None
+        staging, names = self._stage_attachments(refs or [])
         final_dir: Path | None = None
         try:
             with self.store._write() as con:
@@ -1247,11 +1381,11 @@ class AgentRoom:
                 msg_id = con.execute("SELECT coalesce(max(id), 0) + 1 FROM msg").fetchone()[0]
                 attachments = [
                     Attachment(
-                        name=src.name,
-                        size=(staging / src.name).stat().st_size,
-                        path=f"{ROOM_DIR}/{ATTACHMENTS_DIR}/{msg_id}/{src.name}",
+                        name=name,
+                        size=(staging / name).stat().st_size,
+                        path=f"{ROOM_DIR}/{ATTACHMENTS_DIR}/{msg_id}/{name}",
                     )
-                    for src in sources
+                    for name in names
                     if staging is not None
                 ]
                 self.store._insert_msg(
@@ -1291,26 +1425,25 @@ class AgentRoom:
             targets.append(agent)
         return list(dict.fromkeys(targets))
 
-    def _attachment_sources(self, refs: list[str]) -> list[Path]:
-        sources = [self._source_file(rel) for rel in refs]
-        names = [p.name for p in sources]
+    def _stage_attachments(self, refs: list[str]) -> tuple[Path | None, list[str]]:
+        """Copy `refs` into a fresh staging folder; returns it (None without refs) and names."""
+        if not refs:
+            return None, []
+        names = [self._source_parts(rel)[-1] for rel in refs]
         dupes = sorted({n for n in names if names.count(n) > 1})
         if dupes:
             raise RoomError(
                 f"Mehrere Anhänge heißen gleich ({', '.join(dupes)}). Benenne sie eindeutig."
             )
-        return sources
-
-    def _stage_attachments(self, sources: list[Path]) -> Path:
         staging = self.store.attachments_dir / f".staging-{uuid.uuid4().hex}"
         staging.mkdir(parents=True)
         try:
-            for src in sources:
-                shutil.copy2(src, staging / src.name)
+            for rel, name in zip(refs, names, strict=True):
+                self._copy_source(rel, staging / name)
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
             raise
-        return staging
+        return staging, names
 
     def get_attachment(self, msg_id: int, name: str) -> Path:
         """Absolute path of an attachment of a message in one of my readable channels."""
@@ -1375,14 +1508,14 @@ class AgentRoom:
             raise RoomError("„kind“ und „title“ dürfen nicht leer sein.")
         if not (body and body.strip()) and not path:
             raise RoomError("Gib den Inhalt in „body“ an oder eine Datei in „path“.")
-        source = self._source_file(path) if path else None
         results_dir = self.store.run_dir / RESULTS_DIR
         staged: Path | None = None
         final: Path | None = None
-        if source is not None:
+        suffix = ""
+        if path:
             results_dir.mkdir(parents=True, exist_ok=True)
             staged = results_dir / f".staging-{uuid.uuid4().hex}"
-            shutil.copy2(source, staged)
+            suffix = Path(self._copy_source(path, staged)).suffix
         try:
             with self.store._write() as con:
                 assignment = self.store._latest_assignment(con, self.agent_id)
@@ -1405,11 +1538,9 @@ class AgentRoom:
                 )
                 result_id = cur.lastrowid
                 assert result_id is not None
-                if staged is not None and source is not None:
+                if staged is not None:
                     safe_kind = "".join(c if c.isalnum() or c in "-_" else "-" for c in kind)
-                    final = (
-                        results_dir / f"{result_id:03d}-{self.agent_id}-{safe_kind}{source.suffix}"
-                    )
+                    final = results_dir / f"{result_id:03d}-{self.agent_id}-{safe_kind}{suffix}"
                     staged.rename(final)
                     staged = None
                     rel = final.relative_to(self.store.run_dir).as_posix()
@@ -1430,20 +1561,45 @@ class AgentRoom:
         comment: str,
         criteria: dict[str, float] | None = None,
     ) -> Rating:
-        """Rate a result of another agent."""
+        """Rate a result of another agent; a second rating of the same result replaces the first.
+
+        `score` and the values in `criteria` must lie on the scale of the rubric; with
+        criteria in the rubric only those names are allowed.
+        """
+        criteria = dict(criteria or {})
+        self._check_score("score", score)
+        known = self.rubric.criteria
+        unknown = sorted(set(criteria) - set(known)) if known else []
+        if unknown:
+            raise RoomError(
+                f"Unbekannte Kriterien: {', '.join(unknown)}. Die Rubrik kennt: {', '.join(known)}."
+            )
+        for name, value in criteria.items():
+            self._check_score(f"criteria[„{name}“]", value)
         with self.store._write() as con:
             row = con.execute("SELECT agent FROM result WHERE id=?", (result_id,)).fetchone()
             if row is None:
                 raise RoomError(f"Das Ergebnis #{result_id} gibt es nicht.")
             if row["agent"] == self.agent_id:
                 raise RoomError("Eigene Ergebnisse kannst du nicht bewerten.")
-            cur = con.execute(
+            con.execute(
                 "INSERT INTO rating(ts, rater, result_id, score, criteria, comment) "
-                "VALUES(?,?,?,?,?,?)",
-                (_now(), self.agent_id, result_id, score, json.dumps(criteria or {}), comment),
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(rater, result_id) DO UPDATE SET "
+                "ts=excluded.ts, score=excluded.score, criteria=excluded.criteria, "
+                "comment=excluded.comment",
+                (_now(), self.agent_id, result_id, score, json.dumps(criteria), comment),
             )
-            new = con.execute("SELECT * FROM rating WHERE id=?", (cur.lastrowid,)).fetchone()
+            new = con.execute(
+                "SELECT * FROM rating WHERE rater=? AND result_id=?", (self.agent_id, result_id)
+            ).fetchone()
             return _row_to_rating(new)
+
+    def _check_score(self, what: str, value: float) -> None:
+        low, high = self.rubric.scale
+        if not isinstance(value, int | float) or not math.isfinite(value):
+            raise RoomError(f"„{what}“ muss eine Zahl sein (Skala {low:g} bis {high:g}).")
+        if not low <= value <= high:
+            raise RoomError(f"„{what}“ = {value:g} liegt außerhalb der Skala {low:g} bis {high:g}.")
 
     def get_assignment(self) -> Assignment | None:
         """Current assignment with stage and context package."""
@@ -1507,7 +1663,5 @@ class AgentRoom:
             msg_id = self.store._insert_msg(
                 con, ch.name, self.agent_id, MessageKind.DECISION, decision, pinned=True
             )
-            con.execute(
-                "UPDATE channel SET state=? WHERE name=?", (ChannelState.CLOSED.value, ch.name)
-            )
+            self.store._set_channel_state(con, ch.name, ChannelState.CLOSED)
             return self._view(self.store._load_msg(con, msg_id), ch)

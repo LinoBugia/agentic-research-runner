@@ -9,6 +9,7 @@ plain lines (`arr.log`) so the orchestrator can copy it into the run log.
 See docs/01-architektur.md §5, docs/06-gruppenchats.md §9, docs/spikes/S4_room.md §5.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -16,9 +17,11 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import ValidationError
 
 from arr.errors import ArrError
 from arr.log import setup_logging
@@ -40,6 +43,18 @@ INSTRUCTIONS = (
     "„ungelesen: …“."
 )
 INTERNAL_ERROR = "Interner Fehler im Gruppenchat. Die Details stehen im Run-Log."
+_EXPECTED = {
+    "list_type": 'eine Liste sein, z. B. ["critic"]',
+    "string_type": "ein Text sein",
+    "int_type": "eine ganze Zahl sein",
+    "int_parsing": "eine ganze Zahl sein",
+    "int_from_float": "eine ganze Zahl sein",
+    "float_type": "eine Zahl sein",
+    "float_parsing": "eine Zahl sein",
+    "bool_type": "true oder false sein",
+    "bool_parsing": "true oder false sein",
+    "dict_type": 'ein Objekt sein, z. B. {"Klarheit": 7}',
+}
 
 
 # --------------------------------------------------------------------------------------------
@@ -164,13 +179,50 @@ def _attachment_text(path: Path) -> str:
 # --------------------------------------------------------------------------------------------
 
 
+def argument_error(tool: str, exc: ValidationError) -> str:
+    """German text for arguments that do not match the tool schema (wrong type, missing)."""
+    problems: list[str] = []
+    for err in exc.errors():
+        field = ".".join(str(part) for part in err["loc"]) or "?"
+        if err["type"] == "missing":
+            text = f"„{field}“ fehlt"
+        else:
+            text = f"„{field}“ muss {_EXPECTED.get(err['type'], 'einen gültigen Wert haben')}"
+        if text not in problems:
+            problems.append(text)
+    return f"Ungültige Argumente für „{tool}“: " + "; ".join(problems) + "."
+
+
+class RoomServer(MCPServer):
+    """`MCPServer` that reports argument errors in German with the footer (W1-03.1).
+
+    `mcp` validates arguments before the tool runs and would pass pydantic's English text
+    to the agent.
+    """
+
+    def __init__(self, room: AgentRoom) -> None:
+        super().__init__("arr-room", instructions=INSTRUCTIONS)
+        self.room = room
+
+    async def call_tool(self, name: str, arguments: dict[str, Any], context: Any = None) -> Any:
+        """Call a tool; a `ValidationError` of the arguments becomes a German `ToolError`."""
+        try:
+            return await super().call_tool(name, arguments, context)
+        except ToolError as exc:
+            if not isinstance(exc.__cause__, ValidationError):
+                raise
+            text = argument_error(name, exc.__cause__)
+            text = await asyncio.to_thread(_with_footer, self.room, text)
+            raise ToolError(text) from exc.__cause__
+
+
 def build_server(room: AgentRoom) -> MCPServer:
     """MCP server with the room tools of docs/06 §9 bound to `room.agent_id`.
 
     Moderator tools are only registered if the agent moderates at least one channel; the
     store checks the moderator for every call as well.
     """
-    server = MCPServer("arr-room", instructions=INSTRUCTIONS)
+    server = RoomServer(room)
 
     @server.tool(
         description="Posteingang: offene Fragen an dich, neue Nachrichten pro Kanal, "
@@ -347,7 +399,16 @@ def _add_moderator_tools(server: MCPServer, room: AgentRoom) -> None:
 def main() -> None:
     """Entry point of the room process: read `AGENT_ID` and `RUN_DIR`, serve over stdio."""
     # Before MCPServer exists: its own logging setup then leaves our plain handler alone.
-    setup_logging(os.environ.get(LOG_LEVEL_ENV, "INFO"))
+    level = os.environ.get(LOG_LEVEL_ENV, "INFO").strip().upper()
+    valid = level in logging.getLevelNamesMapping()
+    setup_logging(level if valid else "INFO")
+    if not valid:
+        log.warning(
+            "Ungültiger Wert %s=%r. Erlaubt: DEBUG, INFO, WARNING, ERROR, CRITICAL. "
+            "Der Room-Server nutzt INFO.",
+            LOG_LEVEL_ENV,
+            os.environ.get(LOG_LEVEL_ENV),
+        )
     agent_id = os.environ.get(AGENT_ID_ENV)
     run_dir = os.environ.get(RUN_DIR_ENV)
     if not agent_id or not run_dir:

@@ -1,5 +1,6 @@
 """In-process tests of the room MCP server with `mcp.Client` (W1-03, docs/06 §9, S4 §5)."""
 
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -248,3 +249,47 @@ def test_main_needs_environment(
     with pytest.raises(SystemExit) as exc:
         room_server.main()
     assert exc.value.code == 1
+
+
+async def test_wrong_argument_types_are_german(store: RoomStore) -> None:
+    """W1-03.1 point 6: pydantic errors of the arguments reach the agent in German."""
+    async with Client(build_server(store.for_agent("explorer-1"))) as client:
+        agent = Agent(client)
+        text = await agent.error("post_message", channel="main", body="x", to="critic")
+        assert (
+            text == "Ungültige Argumente für „post_message“: „to“ muss eine Liste sein, "
+            'z. B. ["critic"].'
+        )
+        text = await agent.error("read_messages", limit="viele", only_new="vielleicht")
+        assert "„limit“ muss eine ganze Zahl sein" in text
+        assert "„only_new“ muss true oder false sein" in text
+        assert await agent.error("post_message", body="x") == (
+            "Ungültige Argumente für „post_message“: „channel“ fehlt."
+        )
+        text = await agent.error("submit_rating", result_id=1, score=5, comment="x", criteria=[1])
+        assert "„criteria“ muss ein Objekt sein" in text
+    assert agent.footers[-1] == "ungelesen: #main 1, #seminar 1"
+    assert all("validation error" not in f for f in agent.footers)
+    assert [m.sender for m in store.messages("main")] == ["orchestrator"]
+
+
+def test_invalid_log_level_falls_back_to_info(
+    monkeypatch: pytest.MonkeyPatch,
+    restore_root_logger: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """W1-03.1 point 7: no crash, a German warning on stderr, level INFO."""
+    monkeypatch.setenv("ARR_LOG_LEVEL", "foo")
+    monkeypatch.delenv("AGENT_ID", raising=False)
+    monkeypatch.delenv("RUN_DIR", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        room_server.main()
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "WARNING  arr.room.server: Ungültiger Wert ARR_LOG_LEVEL='foo'" in err
+    assert "nutzt INFO" in err
+    assert restore_root_logger.level == logging.INFO
+    monkeypatch.setenv("ARR_LOG_LEVEL", "debug")
+    with pytest.raises(SystemExit):
+        room_server.main()
+    assert restore_root_logger.level == logging.DEBUG
