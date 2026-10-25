@@ -141,6 +141,11 @@ SENSITIVE_HOME_PATHS = (
     ".node_repl_history",
     ".psql_history",
     ".sqlite_history",
+    ".mysql_history",
+    ".rediscli_history",
+    ".Rhistory",
+    ".local/share/fish",
+    ".julia/logs",
     ".ipython",
     ".config/op",
     ".config/Bitwarden",
@@ -172,11 +177,13 @@ SENSITIVE_HOME_PATHS = (
 """Paths below `~` that are never readable (docs/07 §3 ②: keys, `~/.arr`, keychain, browsers)."""
 
 SENSITIVE_HOME_PATTERNS = (
+    ".*history",
+    ".*_history*",
     "Library/Group Containers/*1password*",
     "Library/Group Containers/*bitwarden*",
     "Library/Group Containers/*keepass*",
 )
-"""Sensitive folders below `~` whose name varies (team IDs); matched case-insensitively."""
+"""Sensitive paths below `~` whose name varies (team IDs, histories); matched case-insensitively."""
 
 SENSITIVE_NAME_PATTERNS = ("*.kdbx", "*.keychain", "*.keychain-db", "*.agilekeychain")
 """File names that are sensitive wherever they lie (password databases, keychains)."""
@@ -267,7 +274,6 @@ NETWORK_PROGRAMS = frozenset(
         "https",
         "aria2c",
         "gh",
-        "rsync",
         "ping",
         "dig",
         "nslookup",
@@ -337,6 +343,15 @@ _R_NO_RUN_VENV = (
     "nicht möglich. Arbeite mit den vorhandenen Paketen weiter."
 )
 _R_TOO_DEEP = "Der Befehl ist zu tief verschachtelt, um ihn sicher zu prüfen."
+_R_NET_WORD = (
+    "Das Wort „{word}“ heißt wie ein verbotenes Programm, und arr kann hier nicht sicher "
+    "erkennen, dass es nur Text ist. Ist es ein Suchmuster, ein Dateiname oder Text, formuliere "
+    "den Befehl anders (z. B. als Argument von grep oder cat, oder in einem Python-Skript)."
+)
+_R_NET_GIT = (
+    "„git … push“ steht im Befehl. Pushen ist nicht erlaubt, Ergebnisse bleiben im Run. Ist "
+    "„push“ nur Text, formuliere den Befehl anders."
+)
 _R_SHELL_UNKNOWN_PATH = (
     "Der Befehl enthält einen Pfad mit Variable, Befehlsersetzung oder fremdem Home, den arr "
     "nicht sicher prüfen kann. Schreibe den Pfad aus (z. B. relativ zum Arbeitsordner)."
@@ -927,27 +942,75 @@ _WRITE_LAST_ARG = frozenset({"cp", "mv", "ln", "install", "rsync", "ditto"})
 _WRITE_OPTS_WITH_ARG = frozenset({"-s", "-m", "-o", "-g", "--size", "--mode"})
 
 
+_DATA_ONLY_PROGRAMS = frozenset(
+    {"grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "ls", "mkdir", "touch"}
+    | {"echo", "printf", "less"}
+)
+"""Programs whose arguments are only data: search patterns, file names, text to print.
+
+None of them runs a command given as an argument, so words in their arguments are not
+checked by the fail-closed net (W1-05.2). `rg`, `man` and `python <file>` count as well,
+unless an option makes them run something (see `_DATA_UNSAFE_OPTIONS`, `_python_runs_file`).
+Everything else (`-c`, `eval`, `exec`, `xargs`, `find -exec`, `env`, interpreters with
+`-c`/`-e`, unknown programs) stays under the net.
+"""
+
+_DATA_UNSAFE_OPTIONS: Mapping[str, tuple[str, ...]] = {
+    "rg": ("--pre",),  # runs a preprocessor command
+    "man": ("-P", "--pager", "-H", "--html"),  # run a pager or browser command
+}
+
+_PYTHON_FLAGS = frozenset({"-u", "-B", "-O", "-OO", "-E", "-s", "-S", "-I", "-q", "-b", "-bb"})
+
+_FEEDABLE = _SHELLS | frozenset({"eval", "source", ".", "python", "perl", "ruby", "node", "php"})
+"""Programs that run what they read: a download piped into one of them is high risk."""
+
+_SCRIPT_RUNNERS = _SHELLS | frozenset({"eval", "source", "."})
+"""Programs whose here-document is a script (unlike `python3 - <<EOF`, which is data here)."""
+
+_RSYNC_REMOTE_RE = re.compile(r"^[^/\s]+::?|://")
+
+
 @dataclass(slots=True)
 class CommandInfo:
     """Coarse classification of a shell command (docs/07 §3 ②).
 
-    `forbidden`: German reasons for a hard ban. `categories`: grey-zone categories.
-    `hosts`: hosts found in URLs and install options. `writes`: write targets (redirections,
-    `tee`, `cp`/`mv`/`ln` targets, `dd of=` …), unnormalized. `risky`: install from a URL,
-    VCS or foreign index, or download piped into a shell.
+    `forbidden`: German reasons for a hard ban (with alternative), `ban_categories` their
+    request category. `categories`: grey-zone categories. `hosts`: hosts found in URLs and
+    install options. `writes`: write targets (redirections, `tee`, `cp`/`mv`/`ln` targets,
+    `dd of=` …), unnormalized. `risky`: install from a URL, VCS or foreign index, or a
+    download that feeds a shell or interpreter (`curl … | sh`, `sh <(curl …)`).
     """
 
     forbidden: list[str] = field(default_factory=list)
+    ban_categories: dict[str, RequestCategory | None] = field(default_factory=dict)
     categories: set[RequestCategory] = field(default_factory=set)
     hosts: list[str] = field(default_factory=list)
     writes: list[str] = field(default_factory=list)
     risky: bool = False
     user_install: bool = False
     programs: list[str] = field(default_factory=list)
+    program_hits: set[str] = field(default_factory=set)
+    safe_args: list[str] = field(default_factory=list)
+    feeds_stdin: bool = False
+    script_file: bool = False
+    strict: int = 0
 
-    def ban(self, reason: str) -> None:
+    def ban(self, reason: str, category: RequestCategory | None = None) -> None:
         if reason not in self.forbidden:
             self.forbidden.append(reason)
+            self.ban_categories[reason] = category
+
+    def merge(self, other: "CommandInfo") -> None:
+        for reason in other.forbidden:
+            self.ban(reason, other.ban_categories.get(reason))
+        self.categories |= other.categories
+        self.hosts += other.hosts
+        self.writes += other.writes
+        self.risky = self.risky or other.risky
+        self.user_install = self.user_install or other.user_install
+        self.programs += other.programs
+        self.program_hits |= other.program_hits
 
 
 def _tokens(command: str) -> tuple[list[str], bool]:
@@ -961,17 +1024,29 @@ def _tokens(command: str) -> tuple[list[str], bool]:
         return re.sub(r"[;&|()'\"]", " ", text).split(), False
 
 
-def _split_segments(tokens: list[str], parsed: bool) -> list[list[str]]:
+def _split_with_separators(tokens: list[str], parsed: bool) -> list[tuple[str | None, list[str]]]:
+    """Simple commands with the separator before each (`|`, `;`, `<(`, …)."""
     if not parsed:
         # Broken quoting: the shell would refuse it, but every word may start a command.
-        return [tokens[i:] for i in range(len(tokens))]
-    segments: list[list[str]] = [[]]
+        return [(None, tokens[i:]) for i in range(len(tokens))]
+    result: list[tuple[str | None, list[str]]] = []
+    current: list[str] = []
+    separator: str | None = None
     for token in tokens:
         if token in _SEPARATORS or (token and set(token) <= _SEPARATOR_CHARS):
-            segments.append([])
+            if current:
+                result.append((separator, current))
+            current = []
+            separator = token
         else:
-            segments[-1].append(token)
-    return [s for s in segments if s]
+            current.append(token)
+    if current:
+        result.append((separator, current))
+    return result
+
+
+def _split_segments(tokens: list[str], parsed: bool) -> list[list[str]]:
+    return [argv for _, argv in _split_with_separators(tokens, parsed)]
 
 
 def _segments(command: str) -> list[list[str]]:
@@ -984,24 +1059,46 @@ def _program(token: str) -> str:
     return match.group(1) if match else name
 
 
+def _forbidden_call(name: str) -> str:
+    return f"„{name}“ wird hier als Programm aufgerufen. {FORBIDDEN_PROGRAMS[name]}{_ALTERNATIVE}"
+
+
 def _net(tokens: list[str], info: CommandInfo) -> None:
-    """Fail-closed net: forbidden program names and `git … push` anywhere in the words."""
+    """Fail-closed net: forbidden program names and `git … push` anywhere in the words.
+
+    Words the parser already found at a program position keep the parser's reason; the net
+    gives its own reason, because the word may just be text (W1-05.2, N9).
+    """
     git_seen = defaults_seen = False
     for token in tokens:
-        name = _program(token)
+        name = _program(token.strip("`'\""))
         lowered = token.casefold()
-        if name in FORBIDDEN_PROGRAMS:
-            info.ban(FORBIDDEN_PROGRAMS[name])
+        value = token.split("=", 1)[1] if token.startswith("-") and "=" in token else ""
+        for word in (name, _program(value) if value else ""):
+            if word in FORBIDDEN_PROGRAMS and word not in info.program_hits:
+                category = _BAN_CATEGORIES[FORBIDDEN_PROGRAMS[word]]
+                info.ban(_R_NET_WORD.format(word=word), category)
         if name == "git":
             git_seen = True
-        elif git_seen and lowered in _GIT_FORBIDDEN:
-            info.ban(_GIT_PUSH)
+        elif git_seen and lowered in _GIT_FORBIDDEN and "git push" not in info.program_hits:
+            info.ban(_R_NET_GIT, RequestCategory.NETWORK)
         elif git_seen and lowered.startswith("alias."):
-            info.ban(_GIT_ALIAS)
+            info.ban(_GIT_ALIAS + _ALTERNATIVE, RequestCategory.NETWORK)
         if name == "defaults":
             defaults_seen = True
         elif defaults_seen and lowered in ("write", "delete", "import", "rename"):
-            info.ban(_SYSTEM)
+            info.ban(_SYSTEM + _ALTERNATIVE, RequestCategory.PRIVILEGED)
+
+
+def _without(tokens: list[str], exempt: list[str]) -> list[str]:
+    """`tokens` minus the exempt words (each removed once, from the end)."""
+    remaining = list(tokens)
+    for word in reversed(exempt):
+        for index in range(len(remaining) - 1, -1, -1):
+            if remaining[index] == word:
+                del remaining[index]
+                break
+    return remaining
 
 
 def _take_redirections(argv: list[str], info: CommandInfo) -> list[str]:
@@ -1040,6 +1137,8 @@ def _unwrap(argv: list[str], info: CommandInfo, depth: int) -> list[str]:
         spec = _WRAPPERS.get(name)
         if spec is None:
             return argv
+        if name in ("xargs", "parallel"):
+            info.feeds_stdin = True  # input lines become arguments of a command
         args = argv[1:]
         index = 0
         while index < len(args) and args[index].startswith("-") and len(args[index]) > 1:
@@ -1082,30 +1181,96 @@ def _shell_script(args: list[str]) -> tuple[str | None, bool]:
     return None, True
 
 
-def _classify_argv(argv: list[str], info: CommandInfo, depth: int) -> bool:
-    """Classify one simple command; returns True if it is a shell reading its script from stdin."""
+def _python_runs_file(args: list[str]) -> bool:
+    """`python [flags] <file> …`: runs a file; `-c`, `-m`, `-` or stdin do not count."""
+    for arg in args:
+        if arg in _PYTHON_FLAGS:
+            continue
+        return not arg.startswith("-")
+    return False
+
+
+def _data_only(name: str, args: list[str]) -> bool:
+    """Whether the arguments of this call are only data (exempt from the net, W1-05.2)."""
+    if name in _DATA_ONLY_PROGRAMS:
+        return True
+    if name in _DATA_UNSAFE_OPTIONS:
+        unsafe = _DATA_UNSAFE_OPTIONS[name]
+        return not any(arg.startswith(option) for arg in args for option in unsafe)
+    return name == "python" and _python_runs_file(args)
+
+
+def _option_commands(name: str, args: list[str]) -> list[str]:
+    """Values of options that run a command (`man -P`, `man --pager=`, `rg --pre`)."""
+    commands = []
+    for index, arg in enumerate(args):
+        for option in _DATA_UNSAFE_OPTIONS.get(name, ()):
+            if arg == option and index + 1 < len(args):
+                commands.append(args[index + 1])
+            elif arg.startswith(option + "="):
+                commands.append(arg.split("=", 1)[1])
+            elif len(option) == 2 and arg.startswith(option) and len(arg) > 2:
+                commands.append(arg[2:])
+    return commands
+
+
+def _downloads(text: str) -> bool:
+    """Whether a command substitution in `text` fetches something from the network."""
+    for match in _SUBST_RE.finditer(text):
+        inner = next(g for g in match.groups() if g is not None)
+        if RequestCategory.NETWORK in classify_command(inner).categories:
+            return True
+    return False
+
+
+def _classify_argv(argv: list[str], info: CommandInfo, depth: int) -> None:
+    """Classify one simple command into `info` (a fresh info per segment)."""
     argv = _unwrap(_take_redirections(argv, info), info, depth)
     if not argv:
-        return False
+        return
     if any(char.isspace() for char in argv[0]):
         # A whole command as one word, e.g. `watch 'sudo ls'` or `parallel 'git push' …`.
         _classify(" ".join(argv), info, depth + 1)
-        return False
+        return
     name = _program(argv[0])
     args = argv[1:]
     lowered = [a.casefold() for a in args]
     info.programs.append(name)
     if name in FORBIDDEN_PROGRAMS:
-        info.ban(FORBIDDEN_PROGRAMS[name])
-        return False
-    if name in _SHELLS or name == "eval":
-        if name == "eval":
-            _classify(" ".join(args), info, depth + 1)
-            return False
+        info.program_hits.add(name)
+        info.ban(_forbidden_call(name), _BAN_CATEGORIES[FORBIDDEN_PROGRAMS[name]])
+        return
+    if _data_only(name, args):
+        info.safe_args += args
+    for command in _option_commands(name, args):
+        # `man -P …`, `rg --pre …`: the option value is a command of its own.
+        info.strict += 1
+        _classify(command, info, depth + 1)
+        info.strict -= 1
+    if name == "defaults" and lowered[:1] and lowered[0] in ("write", "delete", "import"):
+        info.ban(_SYSTEM + _ALTERNATIVE, RequestCategory.PRIVILEGED)
+        return
+    if name == "eval":
+        script = " ".join(args)
+        info.risky = info.risky or _downloads(script)
+        _classify(script, info, depth + 1)
+        return
+    if name in ("source", "."):
+        if args:
+            info.script_file = True
+        else:
+            info.feeds_stdin = True  # `source <(…)`, `. /dev/stdin`
+        return
+    if name in _SHELLS:
         script, reads_stdin = _shell_script(args)
         if script is not None:
+            info.risky = info.risky or _downloads(script)
             _classify(script, info, depth + 1)
-        return reads_stdin
+        elif reads_stdin:
+            info.feeds_stdin = True
+        else:
+            info.script_file = True
+        return
     if name == "find":
         for index, arg in enumerate(args):
             if arg in _FIND_EXEC:
@@ -1114,20 +1279,26 @@ def _classify_argv(argv: list[str], info: CommandInfo, depth: int) -> bool:
                     len(args),
                 )
                 _classify_argv(args[index + 1 : end], info, depth + 1)
-        return False
+        return
     if name == "git":
         sub = _git_subcommand(args)
         if sub in _GIT_FORBIDDEN:
-            info.ban(_GIT_PUSH)
+            info.program_hits.add("git push")
+            info.ban(_GIT_PUSH + _ALTERNATIVE, RequestCategory.NETWORK)
         elif sub in _GIT_NETWORK:
             info.categories.add(RequestCategory.NETWORK)
-        return False
+        return
     _collect_writes(name, args, info)
+    if name == "rsync":
+        # Local copies are no network; a host (`host:path`, `rsync://`) or `-e` is.
+        remote = any(_RSYNC_REMOTE_RE.search(a) for a in args if not a.startswith("-"))
+        if remote or any(a in ("-e", "--rsh") or a.startswith("--rsh=") for a in args):
+            info.categories.add(RequestCategory.NETWORK)
+        return
     if name in NETWORK_PROGRAMS:
         info.categories.add(RequestCategory.NETWORK)
-        return False
+        return
     _classify_install(name, args, lowered, info)
-    return False
 
 
 def _collect_writes(name: str, args: list[str], info: CommandInfo) -> None:
@@ -1201,17 +1372,17 @@ def _classify_install(name: str, args: list[str], lowered: list[str], info: Comm
         elif sub in ("add", "sync"):
             install_args = args[1:]
         elif lowered[:2] == ["tool", "install"]:
-            info.ban(_GLOBAL_INSTALL)
+            info.ban(_GLOBAL_INSTALL + _ALTERNATIVE, RequestCategory.INSTALL)
             return
     elif name in ("conda", "mamba", "micromamba") and sub in ("install", "create", "update"):
         install_args = args[1:]
     elif name in ("npm", "pnpm", "yarn") and sub in ("install", "i", "add", "ci"):
         if any(a in ("-g", "--global") for a in lowered):
-            info.ban(_GLOBAL_INSTALL)
+            info.ban(_GLOBAL_INSTALL + _ALTERNATIVE, RequestCategory.INSTALL)
             return
         install_args = args[1:]
     elif name == "cargo" and sub == "install":
-        info.ban(_GLOBAL_INSTALL)
+        info.ban(_GLOBAL_INSTALL + _ALTERNATIVE, RequestCategory.INSTALL)
         return
     elif name == "sage" and lowered[:2] == ["-pip", "install"]:
         install_args = args[2:]
@@ -1272,37 +1443,77 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
 
 def _classify(command: str, info: CommandInfo, depth: int) -> None:
     if depth > _MAX_DEPTH:
-        info.ban(_R_TOO_DEEP)
+        info.ban(_R_TOO_DEEP + _ALTERNATIVE)
         return
     command, heredocs = _split_heredocs(command)
     for opening, body in heredocs:
         # A here-document is data for its program, a script only when it feeds a shell.
-        words = _tokens(opening)[0]
-        if any(_program(w) in _SHELLS or _program(w) == "eval" for w in words):
+        if any(_program(w) in _SCRIPT_RUNNERS for w in _tokens(opening)[0]):
             _classify(body, info, depth + 1)
     tokens, parsed = _tokens(command)
-    _net(tokens, info)
+    # The output of a substitution becomes command text: check its content strictly.
+    info.strict += 1
     for match in _SUBST_RE.finditer(command):
         inner = next(g for g in match.groups() if g is not None)
         _classify(inner, info, depth + 1)
-    reads_stdin = False
-    for argv in _split_segments(tokens, parsed):
-        reads_stdin = _classify_argv(argv, info, depth) or reads_stdin
-    if reads_stdin or "<<<" in tokens:
+    info.strict -= 1
+    exempt: list[str] = []
+    feeds_stdin = script_file = pipeline_download = False
+    previous: tuple[str | None, str] | None = None
+    for separator, argv in _split_with_separators(tokens, parsed):
+        segment = CommandInfo(strict=info.strict)
+        _classify_argv(argv, segment, depth)
+        program = segment.programs[0] if segment.programs else None
+        download = RequestCategory.NETWORK in segment.categories
+        # High risk only when a download feeds a shell or interpreter (W1-05.2, N1); an
+        # outer `zsh -lc '…'` alone is just the Codex envelope.
+        if separator in ("|", "|&"):
+            if pipeline_download and program in _FEEDABLE:
+                segment.risky = True
+            pipeline_download = pipeline_download or download
+        else:
+            pipeline_download = download
+        fed_by_substitution = separator == "<(" or (
+            separator == "(" and previous is not None and previous[1].endswith("$")
+        )
+        if download and fed_by_substitution and previous is not None:
+            segment.risky = segment.risky or previous[0] in _FEEDABLE
+        feeds_stdin = feeds_stdin or segment.feeds_stdin
+        script_file = script_file or segment.script_file
+        exempt += segment.safe_args
+        info.merge(segment)
+        previous = (program, argv[-1])
+    # The net is sharp everywhere text may still become a command: stdin-fed shells, here
+    # strings, substitutions, script files, broken quoting, or inside such text.
+    substitution = any(mark in command for mark in ("$(", "`", "<(", ">("))
+    strict = (
+        info.strict > 0
+        or feeds_stdin
+        or script_file
+        or substitution
+        or not parsed
+        or "<<<" in tokens
+    )
+    _net(tokens if strict else _without(tokens, exempt), info)
+    if feeds_stdin or "<<<" in tokens:
         # `echo 'sudo ls' | sh`, `sh <<< '…'`: any quoted text may become a script.
+        info.strict += 1
         for token in tokens:
             if any(char.isspace() for char in token):
                 _classify(token, info, depth + 1)
+        info.strict -= 1
 
 
 def classify_command(command: str) -> CommandInfo:
     """Classify a shell command coarsely: bans, network, installs, hosts, writes (07 §3 ②).
 
     Handles `;`, `&&`, `|`, newlines, `$(…)`, backticks, `sh/bash/zsh -c` with combined
-    flags (`-lc`, the Codex form), `eval`, shell keywords (`if`, `{`, `!` …), wrappers with
-    their options (`env -S`, `timeout -s`, `xargs`, `script` …), `find -exec`, variable
-    assignments, full program paths and letter case. A fail-closed net additionally bans every
-    word that names a forbidden program and every `git … push`, wherever it stands.
+    flags (`-lc`, the Codex form), `eval`, `source`, shell keywords (`if`, `{`, `!` …),
+    wrappers with their options (`env -S`, `timeout -s`, `xargs`, `script` …), `find -exec`,
+    variable assignments, full program paths and letter case. A fail-closed net additionally
+    bans every word that names a forbidden program and every `git … push`, wherever it
+    stands, except plain data arguments of programs like `grep`, `cat`, `ls`, `echo`
+    (`_DATA_ONLY_PROGRAMS`) when nothing in the command can run text as a command.
     Not a full shell parser: the OS sandbox stays the main protection.
     """
     info = CommandInfo()
@@ -1314,10 +1525,6 @@ def classify_command(command: str) -> CommandInfo:
             info.categories.add(RequestCategory.NETWORK)
     info.hosts += [h.lower() for h in _SCP_HOST_RE.findall(command)]
     info.hosts = list(dict.fromkeys(info.hosts))
-    if RequestCategory.NETWORK in info.categories and set(info.programs) & _SHELLS:
-        info.risky = True
-    if RequestCategory.NETWORK in info.categories and "python" in info.programs and "|" in command:
-        info.risky = True
     return info
 
 
@@ -1674,9 +1881,8 @@ class PolicyEngine:
                 self._write(LogEvent.RULE, request, decision, item_id=item_id, rule=rule)
                 return Remembered(decision, rule=rule)
             note = _R_SECRET_IN_RULE
-            decision = decision.model_copy(
-                update={"scope": DecisionScope.RUN, "reason": f"{decision.reason} {note}"}
-            )
+            reason = " ".join(part for part in (decision.reason.strip(), note) if part)
+            decision = decision.model_copy(update={"scope": DecisionScope.RUN, "reason": reason})
         agent_id = request.agent_id if decision.scope is DecisionScope.AGENT else None
         grant = Grant(item_id, request.run_id, agent_id, decision, items, redact_request(request))
         self._grants[item_id] = grant
@@ -1909,7 +2115,7 @@ class PolicyEngine:
         command = request.command or ""
         info = classify_command(command)
         for reason in info.forbidden:
-            analysis.ban(reason + _ALTERNATIVE, _BAN_CATEGORIES.get(reason))
+            analysis.ban(reason, info.ban_categories.get(reason))
         for raw in [*command_paths(command, base), *request.paths]:
             self._check_command_read(raw, base, profile, analysis)
         for raw in info.writes:
