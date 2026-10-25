@@ -61,10 +61,11 @@ def test_app_dir_expands_user(monkeypatch: pytest.MonkeyPatch) -> None:
     assert app_dir() == Path.home() / "arr-x"
 
 
-def test_gui_mock_placeholder() -> None:
-    result = runner.invoke(app, ["gui", "--mock"])
+def test_gui_without_mock_is_not_available_yet() -> None:
+    # `arr gui --mock` starts the prototype (W1-06, tests/test_gui*.py); real data follow in W3-01.
+    result = runner.invoke(app, ["gui"])
     assert result.exit_code == 1
-    assert "kommt mit Auftrag W1-06" in result.output
+    assert "kommt mit Auftrag W3-01" in result.output
 
 
 def test_init_and_gui_call_their_targets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
