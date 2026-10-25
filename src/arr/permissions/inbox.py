@@ -12,13 +12,15 @@ See docs/07-berechtigungen-und-freigaben.md §3-§6.
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable
 from datetime import timedelta
-from typing import Protocol
+from typing import Any, Protocol
 
 from arr.errors import ArrError
 from arr.permissions.policy import (
@@ -39,6 +41,7 @@ from arr.permissions.types import (
     Decision,
     DecisionAction,
     DecisionScope,
+    EscalatedBy,
     PermissionRequest,
     RequestCategory,
     RiskLevel,
@@ -47,8 +50,10 @@ from arr.permissions.types import (
 __all__ = [
     "ApprovalDecider",
     "ApprovalInbox",
+    "DeciderUnavailable",
     "TerminalDecider",
     "format_item",
+    "item_id_prefix",
 ]
 
 logger = logging.getLogger(__name__)
@@ -56,14 +61,26 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = timedelta(minutes=20)
 """Approval timeout without configuration (docs/07 §3 ③)."""
 
-_ID_RE = re.compile(r"^apr_(\d+)$")
+
+def item_id_prefix(run_id: str) -> str:
+    """Run part of an item ID: `apr_<6 hex of sha1(run_id)>`; IDs are `<prefix>_<NNNN>`.
+
+    The counter runs per run and continues after a restart from `approvals.jsonl`; the hash
+    keeps IDs of different runs in one workfolder apart (deep links of the GUI inbox).
+    """
+    return "apr_" + hashlib.sha1(run_id.encode("utf-8")).hexdigest()[:6]
+
+
+class DeciderUnavailable(ArrError):
+    """A decider cannot ask (no real terminal, input closed); the item becomes obsolete."""
 
 
 class ApprovalDecider(Protocol):
     """Whoever answers open items: terminal (W1-05), GUI inbox (W3-03), gatekeeper (W4-04).
 
     `decide` presents the item and returns a decision, or `None` if the decision arrives
-    another way (`ApprovalInbox.resolve`). It is cancelled when the item expires.
+    another way (`ApprovalInbox.resolve`). It is cancelled when the item expires and may
+    raise `DeciderUnavailable` if it cannot ask at all.
     """
 
     async def decide(self, item: ApprovalItem) -> Decision | None:
@@ -76,9 +93,15 @@ class ApprovalInbox:
 
     `handle` is the single entry point for the adapters: it asks the PolicyEngine and, on
     `ask`, opens an item and waits for a decision or the timeout. `resolve` is where the
-    terminal, the GUI or the gatekeeper put their decision. Final decisions with scope
-    agent/run/always are passed to `PolicyEngine.remember`; new „Immer“ rules go to
-    `on_rule` so the caller can store them in `arr.yaml`.
+    terminal, the GUI or the gatekeeper put their decision; it may be called from another
+    thread (GUI). `escalate` records who passed an item on to the user. Final decisions with
+    scope agent/run/always are passed to `PolicyEngine.remember`; new „Immer“ rules go to
+    `on_rule` so the caller can store them in `arr.yaml`, hints for the user to `on_note` and
+    to the decider's `notify` (if it has one).
+
+    Items, grants and new rules live in memory: after a restart open items are gone (the
+    waiting agents too) and grants with scope agent/run no longer apply, so those requests
+    ask again (fail-safe).
     """
 
     def __init__(
@@ -89,32 +112,38 @@ class ApprovalInbox:
         timeout: timedelta | float = DEFAULT_TIMEOUT,
         log: ApprovalLog | None = None,
         on_rule: Callable[[AlwaysRule], None] | None = None,
+        on_note: Callable[[str], None] | None = None,
     ) -> None:
         self.engine = engine
         self.decider = decider
         self.timeout = timeout.total_seconds() if isinstance(timeout, timedelta) else timeout
         self.log = log if log is not None else engine.log
         self.on_rule = on_rule
+        self.on_note = on_note
+        self._lock = threading.RLock()
         self._items: dict[str, ApprovalItem] = {}
         self._waiters: dict[str, asyncio.Future[Decision]] = {}
-        self._counter = self._last_id()
+        self._counters: dict[str, int] = {}
 
     # -- queries ------------------------------------------------------------------------
 
     def get(self, item_id: str) -> ApprovalItem:
         """Return an item by ID; `ArrError` if it does not exist."""
-        try:
-            return self._items[item_id]
-        except KeyError:
-            raise ArrError(f"Die Freigabe „{item_id}“ gibt es nicht.") from None
+        with self._lock:
+            try:
+                return self._items[item_id]
+            except KeyError:
+                raise ArrError(f"Die Freigabe „{item_id}“ gibt es nicht.") from None
 
     def pending(self) -> list[ApprovalItem]:
         """Open items, oldest first."""
-        return [i for i in self._items.values() if i.status is ApprovalStatus.OPEN]
+        with self._lock:
+            return [i for i in self._items.values() if i.status is ApprovalStatus.OPEN]
 
     def items(self) -> list[ApprovalItem]:
         """All items of this inbox, oldest first."""
-        return list(self._items.values())
+        with self._lock:
+            return list(self._items.values())
 
     # -- flow -----------------------------------------------------------------------------
 
@@ -130,64 +159,82 @@ class ApprovalInbox:
 
         Never raises because of the decider; a cancelled wait marks the item obsolete.
         """
-        item = self._open(assessment)
         loop = asyncio.get_running_loop()
         waiter: asyncio.Future[Decision] = loop.create_future()
-        self._waiters[item.id] = waiter
+        with self._lock:
+            item = self._open(assessment)
+            self._waiters[item.id] = waiter
         task = asyncio.create_task(self._run_decider(item)) if self.decider else None
         try:
             return await asyncio.wait_for(asyncio.shield(waiter), self.timeout)
         except TimeoutError:
             return self._expire(item.id)
         except asyncio.CancelledError:
-            if self._items[item.id].status is ApprovalStatus.OPEN:
-                self.cancel(item.id, "Die wartende Anfrage wurde abgebrochen.")
+            self.cancel(item.id, "Die wartende Anfrage wurde abgebrochen.")
             raise
         finally:
-            self._waiters.pop(item.id, None)
+            with self._lock:
+                self._waiters.pop(item.id, None)
             if task is not None and not task.done():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
     def resolve(self, item_id: str, decision: Decision) -> ApprovalItem:
-        """Record the decision for an open item and wake the waiting agent.
+        """Record the decision for an open item and wake the waiting agent (thread-safe).
 
         Only `allow` and `deny` fit a permission request; `always` only by the user (both
-        enforced by the types). Raises `ArrError` if the item is not open any more.
+        enforced by the types). Raises `ArrError` if the item is not open any more. If the
+        request contains a secret, an „Immer“ decision is kept with scope `run` (no rule in
+        `arr.yaml`) and the user gets a hint.
         """
-        item = self.get(item_id)
-        if item.status is not ApprovalStatus.OPEN:
-            raise ArrError(
-                f"Die Freigabe „{item_id}“ ist nicht mehr offen ({item.status}). "
-                "Eine Entscheidung ist nicht mehr nötig."
-            )
-        if decision.action not in (DecisionAction.ALLOW, DecisionAction.DENY):
-            raise ArrError("Eine Berechtigungsanfrage lässt sich nur erlauben oder ablehnen.")
-        if decision.risk is None:
-            decision = decision.model_copy(update={"risk": item.risk})
-        item = self._update(item, ApprovalStatus.DECIDED, decision)
-        self._write(LogEvent.DECIDED, item)
-        assert item.request is not None
-        rule = self.engine.remember(item.id, item.request, decision)
-        if rule is not None and self.on_rule is not None:
-            self.on_rule(rule)
+        with self._lock:
+            item = self.get(item_id)
+            if item.status is not ApprovalStatus.OPEN:
+                raise ArrError(
+                    f"Die Freigabe „{item_id}“ ist nicht mehr offen ({item.status}). "
+                    "Eine Entscheidung ist nicht mehr nötig."
+                )
+            if decision.action not in (DecisionAction.ALLOW, DecisionAction.DENY):
+                raise ArrError("Eine Berechtigungsanfrage lässt sich nur erlauben oder ablehnen.")
+            if decision.risk is None:
+                decision = decision.model_copy(update={"risk": item.risk})
+            assert item.request is not None
+            remembered = self.engine.remember(item.id, item.request, decision)
+            decision = remembered.decision
+            item = self._update(item, ApprovalStatus.DECIDED, decision)
+            self._write(LogEvent.DECIDED, item, note=remembered.note)
+        if remembered.rule is not None and self.on_rule is not None:
+            self.on_rule(remembered.rule)
+        if remembered.note is not None:
+            self._notify(remembered.note)
         self._wake(item.id, decision)
+        return item
+
+    def escalate(self, item_id: str, escalated_by: EscalatedBy) -> ApprovalItem:
+        """Record who passed an open item on to the user, and why (docs/08 §5.0, W4-04)."""
+        with self._lock:
+            item = self.get(item_id)
+            if item.status is not ApprovalStatus.OPEN:
+                raise ArrError(f"Die Freigabe „{item_id}“ ist nicht mehr offen ({item.status}).")
+            item = self._update(item, ApprovalStatus.OPEN, None, escalated_by=escalated_by)
+            self._write(LogEvent.ESCALATED, item, note=escalated_by.note or None)
         return item
 
     def cancel(self, item_id: str, note: str = "Der Run wurde gestoppt.") -> ApprovalItem:
         """Mark an open item obsolete and release the agent with a `deny` (stop, docs/07 §7)."""
-        item = self.get(item_id)
-        if item.status is not ApprovalStatus.OPEN:
-            return item
-        decision = Decision(
-            action=DecisionAction.DENY,
-            decided_by=DecidedBy.FIXED_RULE,
-            reason=f"{note} Die Anfrage ist damit hinfällig.",
-            risk=item.risk,
-        )
-        item = self._update(item, ApprovalStatus.OBSOLETE, decision)
-        self._write(LogEvent.OBSOLETE, item, note=note)
+        with self._lock:
+            item = self.get(item_id)
+            if item.status is not ApprovalStatus.OPEN:
+                return item
+            decision = Decision(
+                action=DecisionAction.DENY,
+                decided_by=DecidedBy.FIXED_RULE,
+                reason=f"{note} Die Anfrage ist damit hinfällig.",
+                risk=item.risk,
+            )
+            item = self._update(item, ApprovalStatus.OBSOLETE, decision)
+            self._write(LogEvent.OBSOLETE, item, note=note)
         self._wake(item.id, decision)
         return item
 
@@ -197,35 +244,52 @@ class ApprovalInbox:
             self.cancel(item.id, note)
 
     def revoke(self, item_id: str) -> ApprovalItem:
-        """Withdraw a decision with scope agent/run (docs/07 §4); later requests ask again."""
-        item = self.get(item_id)
-        if not item.revocable:
-            raise ArrError(
-                f"Die Entscheidung „{item_id}“ lässt sich nicht zurückziehen. Zurückziehen "
-                "geht nur bei Entscheidungen des Aufsichts-Agenten und bei deinen eigenen mit "
-                "Reichweite „Agent“ oder „Run“."
-            )
-        self.engine.revoke(item_id)  # logs the revocation
-        return self._update(item, ApprovalStatus.REVOKED, item.decision)
+        """Withdraw a decision (docs/07 §4); later requests ask again.
+
+        Scope agent/run: the grant is removed. A one-time decision of the gatekeeper only
+        applied to its request; it is marked revoked without further effect.
+        """
+        with self._lock:
+            item = self.get(item_id)
+            if not item.revocable or item.decision is None:
+                raise ArrError(
+                    f"Die Entscheidung „{item_id}“ lässt sich nicht zurückziehen. Zurückziehen "
+                    "geht nur bei Entscheidungen des Aufsichts-Agenten und bei deinen eigenen "
+                    "mit Reichweite „Agent“ oder „Run“."
+                )
+            note = None
+            if item.decision.scope is DecisionScope.ONCE:
+                note = "Einmalige Entscheidung: Sie galt nur für ihre Anfrage."
+            else:
+                try:
+                    self.engine.revoke(item_id)  # logs the revocation
+                except ArrError:
+                    note = "Die Entscheidung war nicht mehr aktiv (z. B. nach einem Neustart)."
+            item = self._update(item, ApprovalStatus.REVOKED, item.decision)
+            if note is not None:
+                self._write(LogEvent.REVOKED, item, note=note)
+        return item
 
     # -- internals ----------------------------------------------------------------------
 
-    def _last_id(self) -> int:
-        if self.log is None:
-            return 0
-        numbers = [0]
-        for entry in self.log.entries():
-            match = _ID_RE.match(str(entry.get("item_id") or ""))
-            if match:
-                numbers.append(int(match.group(1)))
-        return max(numbers)
+    def _next_id(self, run_id: str) -> str:
+        prefix = item_id_prefix(run_id)
+        if prefix not in self._counters:
+            pattern = re.compile(rf"^{prefix}_(\d+)$")
+            numbers = [0]
+            for entry in self.log.entries() if self.log is not None else []:
+                match = pattern.match(str(entry.get("item_id") or ""))
+                if match:
+                    numbers.append(int(match.group(1)))
+            self._counters[prefix] = max(numbers)
+        self._counters[prefix] += 1
+        return f"{prefix}_{self._counters[prefix]:04d}"
 
     def _open(self, assessment: Assessment) -> ApprovalItem:
-        self._counter += 1
         now = time.time()
         request = assessment.request
         item = ApprovalItem(
-            id=f"apr_{self._counter:04d}",
+            id=self._next_id(request.run_id),
             type=ApprovalType.PERMISSION,
             created_at=now,
             run_id=request.run_id,
@@ -240,17 +304,18 @@ class ApprovalInbox:
         return item
 
     def _expire(self, item_id: str) -> Decision:
-        item = self._items[item_id]
-        if item.status is not ApprovalStatus.OPEN and item.decision is not None:
-            return item.decision
-        decision = Decision(
-            action=DecisionAction.DENY,
-            decided_by=DecidedBy.FIXED_RULE,
-            reason=TIMEOUT_REASON,
-            risk=item.risk,
-        )
-        item = self._update(item, ApprovalStatus.EXPIRED, decision)
-        self._write(LogEvent.EXPIRED, item)
+        with self._lock:
+            item = self._items[item_id]
+            if item.status is not ApprovalStatus.OPEN and item.decision is not None:
+                return item.decision
+            decision = Decision(
+                action=DecisionAction.DENY,
+                decided_by=DecidedBy.FIXED_RULE,
+                reason=TIMEOUT_REASON,
+                risk=item.risk,
+            )
+            item = self._update(item, ApprovalStatus.EXPIRED, decision)
+            self._write(LogEvent.EXPIRED, item)
         return decision
 
     async def _run_decider(self, item: ApprovalItem) -> None:
@@ -259,30 +324,56 @@ class ApprovalInbox:
             decision = await self.decider.decide(item)
         except asyncio.CancelledError:
             raise
+        except DeciderUnavailable as error:
+            self.cancel(item.id, str(error))
+            return
         except Exception:
             # A broken decider must never end the agent's client (S2 §15); the item stays
             # open for other deciders until the deadline.
             logger.exception("Entscheider für %s fehlgeschlagen", item.id)
             return
-        if decision is not None and self._items[item.id].status is ApprovalStatus.OPEN:
+        if decision is not None and self.get(item.id).status is ApprovalStatus.OPEN:
             try:
                 self.resolve(item.id, decision)
             except (ArrError, ValueError):
                 logger.exception("Entscheidung für %s ungültig", item.id)
 
+    def _notify(self, text: str) -> None:
+        if self.on_note is not None:
+            self.on_note(text)
+        notify = getattr(self.decider, "notify", None)
+        if callable(notify):
+            notify(text)
+
     def _update(
-        self, item: ApprovalItem, status: ApprovalStatus, decision: Decision | None
+        self,
+        item: ApprovalItem,
+        status: ApprovalStatus,
+        decision: Decision | None,
+        **changes: Any,
     ) -> ApprovalItem:
         data = item.model_dump(by_alias=True)
-        data.update(status=status, decision=decision)
+        data.update(status=status, decision=decision, **changes)
         updated = ApprovalItem.model_validate(data)
         self._items[item.id] = updated
         return updated
 
     def _wake(self, item_id: str, decision: Decision) -> None:
-        waiter = self._waiters.get(item_id)
-        if waiter is not None and not waiter.done():
-            waiter.set_result(decision)
+        with self._lock:
+            waiter = self._waiters.get(item_id)
+        if waiter is None:
+            return
+        loop = waiter.get_loop()
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            _set_once(waiter, decision)
+        else:
+            # Called from another thread (GUI): hand the result to the agent's loop.
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(_set_once, waiter, decision)
 
     def _write(
         self,
@@ -390,25 +481,38 @@ def format_item(item: ApprovalItem) -> str:
 class TerminalDecider:
     """Asks in the terminal whether to allow a request (docs/07 §6: Phase 1 without GUI).
 
-    Answers are whole German words, never a single key or an empty line (docs/07 §6); „immer“
-    must be confirmed. Prompts are serialized, so parallel requests are asked one after
-    the other. `read_line` and `write` can be replaced for tests. A line typed for an
-    expired request is discarded, never applied to the next one.
+    Asks only with a real terminal: standard input and output must both be a TTY, or a
+    terminal object (`read_line`) is passed explicitly. Otherwise, e.g. with a pipe, it
+    refuses at once (`DeciderUnavailable` → item obsolete), so nobody can approve „through
+    a pipe“ past the user (docs/07 §4 Nr. 3, §6). Answers are whole German words, never a
+    single key or an empty line; „immer“ must be confirmed. Prompts are serialized, so
+    parallel requests are asked one after the other. A line typed for an expired request is
+    discarded, never applied to the next one.
     """
 
     def __init__(
         self,
         *,
-        read_line: Callable[[str], str] = input,
+        read_line: Callable[[str], str] | None = None,
         write: Callable[[str], None] | None = None,
+        is_terminal: Callable[[], bool] | None = None,
     ) -> None:
-        self._read_line = read_line
+        self._read_line = read_line or input
         self._write = write or (lambda text: print(text, flush=True))
+        if is_terminal is None:
+            is_terminal = (lambda: True) if read_line is not None else _stdio_is_tty
+        self._is_terminal = is_terminal
         self._lock = asyncio.Lock()
         self._pending: asyncio.Future[str | None] | None = None
 
+    def notify(self, text: str) -> None:
+        """Show a hint of the inbox, e.g. why „immer“ became „run“."""
+        self._write(f"Hinweis: {text}")
+
     async def decide(self, item: ApprovalItem) -> Decision | None:
-        """Show the item and read the answer; `deny` if the terminal is closed."""
+        """Show the item and read the answer; refuse without a real terminal."""
+        if not self._is_terminal():
+            raise DeciderUnavailable(_NO_TTY)
         async with self._lock:
             if item.deadline is not None and item.deadline <= time.time():
                 return None
@@ -426,7 +530,7 @@ class TerminalDecider:
         while True:
             line = await self._read("Deine Entscheidung: ")
             if line is None:
-                return _closed_terminal(item)
+                raise DeciderUnavailable(_CLOSED)
             answer = line.strip().casefold()
             if answer in _DENY_WORDS:
                 text = await self._read("Begründung für den Agenten (Enter für Standard): ")
@@ -484,15 +588,20 @@ class TerminalDecider:
         return line
 
 
-def _set_once(future: "asyncio.Future[str | None]", value: str | None) -> None:
+_NO_TTY = (
+    "Keine Freigabe ohne echtes Terminal: Ein- oder Ausgabe ist kein Terminal (z. B. eine "
+    "Pipe). " + TIMEOUT_REASON
+)
+_CLOSED = "Im Terminal ist keine Eingabe möglich. " + TIMEOUT_REASON
+
+
+def _stdio_is_tty() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _set_once(future: "asyncio.Future[Any]", value: Any) -> None:
     if not future.done():
         future.set_result(value)
-
-
-def _closed_terminal(item: ApprovalItem) -> Decision:
-    return Decision(
-        action=DecisionAction.DENY,
-        decided_by=DecidedBy.FIXED_RULE,
-        reason="Im Terminal ist keine Eingabe möglich. " + TIMEOUT_REASON,
-        risk=item.risk,
-    )

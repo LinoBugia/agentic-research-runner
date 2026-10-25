@@ -19,6 +19,7 @@ reason plus alternative, or `ask` (grey zone, goes to the inbox in `arr.permissi
 - Every decision is appended to `runs/<id>/approvals.jsonl`, with secrets redacted.
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -70,6 +71,7 @@ __all__ = [
     "LogEvent",
     "PermissionRules",
     "PolicyEngine",
+    "Remembered",
     "RunPaths",
     "SandboxProfile",
     "TIMEOUT_REASON",
@@ -98,14 +100,17 @@ WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "fileChan
 SHELL_TOOLS = frozenset({"Bash", "shell", "exec", "commandExecution", "local_shell"})
 """Terminal tools (Claude `Bash`, Codex `commandExecution` and its older names)."""
 
-NETWORK_TOOLS = frozenset({"SandboxNetworkAccess", "WebFetch", "WebSearch"})
-"""Requests that are about network access only; the host comes in `hosts` or `urls`."""
+NETWORK_TOOLS = frozenset({"SandboxNetworkAccess"})
+"""Network access from the terminal or Python; the host comes in `hosts` or `urls`."""
+
+WEB_TOOLS = frozenset({"WebFetch", "WebSearch", "webSearch", "web_search"})
+"""Web tools of the backends; allowed only with `tools.web: true` (Lead decision W1-05.1)."""
 
 HARMLESS_TOOLS = frozenset({"Skill", "TodoWrite"})
 """Tools without file, shell or network access of their own."""
 
-ROOM_TOOL_PREFIXES = ("mcp__room__", "mcp__arr-room__", "mcp__arr_room__")
-"""MCP tools of arr's own room server (docs/06); always allowed."""
+ROOM_TOOL_PREFIX = "mcp__arr-room__"
+"""MCP tools of arr's own room server `arr-room` (docs/01 §5, W1-04 FakeBackend); allowed."""
 
 SENSITIVE_HOME_PATHS = (
     ".ssh",
@@ -120,6 +125,26 @@ SENSITIVE_HOME_PATHS = (
     ".pypirc",
     ".npmrc",
     ".password-store",
+    ".vault-token",
+    ".terraform.d",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".m2/settings.xml",
+    ".local/share/keyrings",
+    ".zsh_history",
+    ".zsh_sessions",
+    ".bash_history",
+    ".bash_sessions",
+    ".sh_history",
+    ".python_history",
+    ".lesshst",
+    ".node_repl_history",
+    ".psql_history",
+    ".sqlite_history",
+    ".ipython",
+    ".config/op",
+    ".config/Bitwarden",
+    ".config/KeePassXC",
     ".config/gh",
     ".config/gcloud",
     ".codex",
@@ -138,8 +163,23 @@ SENSITIVE_HOME_PATHS = (
     "Library/Application Support/Microsoft Edge",
     "Library/Application Support/Arc",
     "Library/Application Support/com.apple.TCC",
+    "Library/Application Support/1Password",
+    "Library/Application Support/Bitwarden",
+    "Library/Application Support/KeePassXC",
+    "Library/Containers/com.bitwarden.desktop",
+    "Library/Containers/com.1password.1password",
 )
 """Paths below `~` that are never readable (docs/07 §3 ②: keys, `~/.arr`, keychain, browsers)."""
+
+SENSITIVE_HOME_PATTERNS = (
+    "Library/Group Containers/*1password*",
+    "Library/Group Containers/*bitwarden*",
+    "Library/Group Containers/*keepass*",
+)
+"""Sensitive folders below `~` whose name varies (team IDs); matched case-insensitively."""
+
+SENSITIVE_NAME_PATTERNS = ("*.kdbx", "*.keychain", "*.keychain-db", "*.agilekeychain")
+"""File names that are sensitive wherever they lie (password databases, keychains)."""
 
 SENSITIVE_ABSOLUTE_PATHS = ("/Library/Keychains",)
 """Sensitive paths outside `~`."""
@@ -154,6 +194,11 @@ _GIT_PUSH = "„git push“ ist nicht erlaubt. Ergebnisse bleiben im Run."
 _GLOBAL_INSTALL = (
     "Installationen außerhalb der Run-venv (systemweit oder global) sind nicht erlaubt."
 )
+_DESKTOP = (
+    "Programme der Oberfläche starten, die Zwischenablage oder den Bildschirm lesen ist nicht "
+    "erlaubt."
+)
+_GIT_ALIAS = "Git-Aliase über „git -c alias.…“ sind nicht erlaubt."
 
 FORBIDDEN_PROGRAMS: Mapping[str, str] = {
     "sudo": _PRIVILEGED,
@@ -181,7 +226,12 @@ FORBIDDEN_PROGRAMS: Mapping[str, str] = {
     "profiles": _SYSTEM,
     "kextload": _SYSTEM,
     "diskutil": _SYSTEM,
-    "osascript": _SYSTEM,
+    "osascript": _DESKTOP,
+    "open": _DESKTOP,
+    "pbpaste": _DESKTOP,
+    "pbcopy": _DESKTOP,
+    "screencapture": _DESKTOP,
+    "killall": _SYSTEM,
     "crontab": _SYSTEM,
     "shutdown": _SYSTEM,
     "reboot": _SYSTEM,
@@ -231,16 +281,14 @@ NETWORK_PROGRAMS = frozenset(
 _GIT_NETWORK = frozenset({"clone", "fetch", "pull", "ls-remote", "submodule", "remote"})
 _GIT_FORBIDDEN = frozenset({"push", "send-email"})
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish"})
-_WRAPPERS = frozenset(
-    {"env", "command", "builtin", "exec", "nohup", "time", "nice", "timeout", "xargs"}
-)
-_WRAPPERS_WITH_ARG = {"nice": {"-n"}, "timeout": set(), "env": {"-u"}, "xargs": {"-n", "-I"}}
 
 _BAN_CATEGORIES = {
     _PRIVILEGED: RequestCategory.PRIVILEGED,
     _CREDENTIALS: RequestCategory.PRIVILEGED,
     _SYSTEM: RequestCategory.PRIVILEGED,
+    _DESKTOP: RequestCategory.PRIVILEGED,
     _GIT_PUSH: RequestCategory.NETWORK,
+    _GIT_ALIAS: RequestCategory.NETWORK,
     _GLOBAL_INSTALL: RequestCategory.INSTALL,
 }
 
@@ -288,6 +336,27 @@ _R_NO_RUN_VENV = (
     "Dieser Run hat keine Run-venv (toolchain.run_venv: off), deshalb sind Installationen "
     "nicht möglich. Arbeite mit den vorhandenen Paketen weiter."
 )
+_R_TOO_DEEP = "Der Befehl ist zu tief verschachtelt, um ihn sicher zu prüfen."
+_R_SHELL_UNKNOWN_PATH = (
+    "Der Befehl enthält einen Pfad mit Variable, Befehlsersetzung oder fremdem Home, den arr "
+    "nicht sicher prüfen kann. Schreibe den Pfad aus (z. B. relativ zum Arbeitsordner)."
+)
+_R_SHELL_GLOB = (
+    "Das Muster im Befehl kann geschützte Pfade oder Pfade außerhalb der Erlaubnisliste "
+    "treffen. Schränke es auf deinen Arbeitsordner oder einen Lese-Ordner ein."
+)
+_R_WEB_OFF = (
+    "Web-Werkzeuge sind für diesen Agenten aus (tools.web). Arbeite ohne Web weiter oder "
+    "frage im Chat nach."
+)
+_R_CODEX_ESCALATION = (
+    "Codex will diesen Befehl ohne Sandbox ausführen; das braucht immer eine Freigabe."
+)
+_R_SECRET_IN_RULE = (
+    "Die Anfrage enthält ein Geheimnis, deshalb wird daraus keine „Immer“-Regel (sie stünde "
+    "in arr.yaml). Die Entscheidung gilt nur für diesen Run."
+)
+_DEVICE_WRITES = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"})
 _ALTERNATIVE = " Arbeite im Arbeitsordner weiter oder beschreibe im Chat, was du brauchst."
 
 # --------------------------------------------------------------------------------------------
@@ -350,12 +419,17 @@ def _dedupe(paths: Iterable[Path], case_insensitive: bool) -> tuple[Path, ...]:
 
 
 def _strip_glob(raw: str) -> str:
-    """Cut a glob pattern at the first component with wildcards (`~/.ssh/*` → `~/.ssh`)."""
+    """Cut a glob pattern at the first component with wildcards (`~/.ssh/*` → `~/.ssh`).
+
+    A relative pattern without a folder (`*.py`, `**/*.py`) means the base folder (`.`).
+    """
     parts = raw.split("/")
     for index, part in enumerate(parts):
         if any(char in part for char in "*?[{"):
             prefix = "/".join(parts[:index])
-            return prefix if prefix or not raw.startswith("/") else "/"
+            if prefix:
+                return prefix
+            return "/" if raw.startswith("/") else "."
     return raw
 
 
@@ -406,8 +480,9 @@ class PermissionRules(StrictModel):
 class RunPaths:
     """Folders of one run that the profile needs (docs/02 §1, §4).
 
-    Run-tmp is `<run>/tmp`, the run venv `<run>/.venv`. Relative read folders are resolved
-    against the workfolder.
+    Run-tmp is `<run>/tmp`, the run venv `<run>/.venv`, the Claude plugin of an agent
+    `agents/<id>/plugin` (Codex skills live in `work/.agents/skills`). Relative read folders
+    are resolved against the workfolder.
     """
 
     workfolder: Path
@@ -434,6 +509,15 @@ class RunPaths:
         """Chat attachments, readable for all agents (docs/07 §3 ②)."""
         return self.run_dir / "groupchats" / "attachments"
 
+    @property
+    def skills_dir(self) -> Path:
+        """Snapshot of the skills used by the run (docs/02 §4); read-only for agents."""
+        return self.run_dir / "skills"
+
+    def plugin_dir(self, agent: AgentConfig) -> Path:
+        """Generated Claude plugin of an agent (W1-02: `agents/<id>/plugin`); read-only."""
+        return self.run_dir / "agents" / agent.id / "plugin"
+
     def work_dir(self, agent: AgentConfig) -> Path:
         """Working folder of an agent: `shared/<name>` or `agents/<id>/work` (docs/02 §3.1)."""
         if agent.workspace.mode is WorkspaceMode.SHARED and agent.workspace.name:
@@ -448,7 +532,8 @@ class SandboxProfile:
     All paths are normalized. Reading: a sensitive path is never readable; otherwise the
     most specific entry of `read_allow` and `read_deny` wins (deny on a tie), and a path
     under neither stays readable (system folders outside `~`). Writing: only below
-    `write_roots`.
+    `write_roots`. `web` switches the web tools on (WebFetch/WebSearch, Codex web search);
+    network from the terminal always needs an approval per host (docs/07 §3 ②).
     """
 
     agent_id: str
@@ -461,8 +546,10 @@ class SandboxProfile:
     read_allow: tuple[Path, ...]
     read_deny: tuple[Path, ...]
     sensitive: tuple[Path, ...]
-    network: bool
+    web: bool
     allowed_domains: tuple[str, ...] = ()
+    sensitive_patterns: tuple[str, ...] = SENSITIVE_HOME_PATTERNS
+    sensitive_names: tuple[str, ...] = SENSITIVE_NAME_PATTERNS
     run_venv: bool = True
     case_insensitive: bool = field(default_factory=default_case_insensitive)
 
@@ -484,14 +571,41 @@ class SandboxProfile:
                 best = max(best, len(root_key))
         return best
 
+    def _pattern_key(self, pattern: str) -> str:
+        return pattern.casefold() if self.case_insensitive else pattern
+
     def is_sensitive(self, path: Path) -> bool:
-        """True if `path` is a sensitive path or lies below one."""
-        return self._within_any(path, self.sensitive) >= 0
+        """True if `path` is a sensitive path, lies below one or matches a sensitive pattern."""
+        if self._within_any(path, self.sensitive) >= 0:
+            return True
+        key = self.key(path)
+        names = [self._pattern_key(n) for n in self.sensitive_names]
+        if any(fnmatch.fnmatchcase(part, n) for part in key.split("/") for n in names):
+            return True
+        home = self.key(self.home)
+        if not _key_within(key, home) or key == home:
+            return False
+        parts = key[len(home.rstrip("/")) + 1 :].split("/")
+        for pattern in self.sensitive_patterns:
+            pattern_parts = self._pattern_key(pattern).split("/")
+            head = parts[: len(pattern_parts)]
+            if len(head) == len(pattern_parts) and all(
+                fnmatch.fnmatchcase(part, pat)
+                for part, pat in zip(head, pattern_parts, strict=True)
+            ):
+                return True
+        return False
 
     def contains_sensitive(self, path: Path) -> bool:
         """True if a sensitive path lies below `path` (e.g. `~` or `/`)."""
         key = self.key(path)
-        return any(_key_within(self.key(s), key) for s in self.sensitive)
+        if any(_key_within(self.key(s), key) for s in self.sensitive):
+            return True
+        for pattern in self.sensitive_patterns:
+            fixed = pattern.split("*", 1)[0].rsplit("/", 1)[0]
+            if _key_within(self.key(self.home / fixed), key):
+                return True
+        return False
 
     def can_read(self, path: Path) -> bool:
         """Whether the read profile allows `path` (same answer for file tools and Bash)."""
@@ -525,6 +639,19 @@ def _venv_base(venv: Path) -> Path | None:
     return None
 
 
+def _existing_matches(home: Path, patterns: Iterable[str]) -> list[Path]:
+    """Existing folders below `home` that match the patterns (for the backend options)."""
+    found = []
+    for pattern in patterns:
+        parent, _, name = pattern.rpartition("/")
+        try:
+            entries = list(os.scandir(home / parent))
+        except OSError:
+            continue
+        found += [Path(e.path) for e in entries if fnmatch.fnmatchcase(e.name.casefold(), name)]
+    return found
+
+
 def profile_for(
     agent: AgentConfig,
     run_paths: RunPaths,
@@ -537,9 +664,10 @@ def profile_for(
 
     Write roots: the work folder, Run-tmp and, with `run_venv: overlay`, the run venv.
     Read allowlist: write roots, `output/`, chat attachments, `read_dirs`, the Python
-    environment (base venv, its installation prefix, `extra_path`) and paths of always-allow
-    read rules. Read blocks: `~`, `/Volumes` and the workfolder (other projects, other
-    agents). Network: `tools.web`; always-allow host rules become allowed domains.
+    environment (base venv, its installation prefix, `extra_path`), the run's `skills/`, the
+    agent's Claude plugin and paths of always-allow read rules. Read blocks: `~`, `/Volumes`
+    and the workfolder (other projects, other agents). `tools.web` switches the web tools
+    on; always-allow host rules become allowed domains of the Claude sandbox.
     """
     rules = rules or PermissionRules()
     home = Path(os.path.realpath(home or Path.home()))
@@ -558,6 +686,7 @@ def profile_for(
 
     read_allow = list(write_roots)
     read_allow += [norm(paths.output_dir), norm(paths.attachments_dir)]
+    read_allow += [norm(paths.skills_dir), norm(paths.plugin_dir(agent))]
     for entry in agent.read_dirs:
         if entry.startswith("run:"):
             read_allow.append(norm(run_dir / entry.removeprefix("run:")))
@@ -583,6 +712,7 @@ def profile_for(
     sensitive += [norm(p) for p in SENSITIVE_ABSOLUTE_PATHS]
     sensitive += [norm(app_dir()), norm(workfolder / ".arr")]
     sensitive += [norm(p) for p in rules.sensitive_paths]
+    sensitive += [norm(p) for p in _existing_matches(home, SENSITIVE_HOME_PATTERNS)]
 
     read_deny = [home, *(norm(p) for p in READ_BLOCKED_ROOTS), workfolder]
 
@@ -597,7 +727,7 @@ def profile_for(
         read_allow=_dedupe(read_allow, ci),
         read_deny=_dedupe(read_deny, ci),
         sensitive=_dedupe(sensitive, ci),
-        network=agent.tools.web,
+        web=agent.tools.web,
         allowed_domains=tuple(dict.fromkeys(domains)),
         run_venv=run_venv,
         case_insensitive=ci,
@@ -620,6 +750,8 @@ class ClaudeOptions:
 
     `add_dirs` holds only writable run folders; read folders are bound read-only through
     `Read(//…)` rules and `sandbox.filesystem.allowRead`. Never a bare `Read`/`Bash` rule.
+    `allowed_tools` also holds the room tools (`mcp__arr-room__*`) and, with `tools.web`,
+    `WebFetch`/`WebSearch`.
     """
 
     cwd: str
@@ -634,11 +766,14 @@ class ClaudeOptions:
 def claude_options(profile: SandboxProfile) -> ClaudeOptions:
     """Translate a profile into Claude options (W2-01 checks that the SDK enforces them)."""
     writable = [p for p in profile.write_roots if p != profile.work_dir]
-    allowed = [
+    allowed = [f"{ROOM_TOOL_PREFIX}*"]
+    allowed += [
         f"Read({_claude_path(p, tree=True)})"
         for p in profile.read_allow
         if p not in profile.write_roots
     ]
+    if profile.web:
+        allowed += ["WebFetch", "WebSearch"]
     disallowed: list[str] = []
     for path in profile.sensitive:
         for tool in ("Read", "Edit"):
@@ -679,6 +814,8 @@ class CodexOptions:
     `permission_profile` is the read allowlist as neutral data (`path` + `access`
     `write`/`read`/`deny`, most specific entry wins). ⚠️ The concrete Codex syntax
     (`[permissions.<id>]`, `FileSystemSandboxEntry`) is tested first in W2-02.
+    `network_access` stays off: network from the shell goes through an approval per host;
+    `web_search` follows `tools.web`.
     """
 
     cwd: str
@@ -687,6 +824,7 @@ class CodexOptions:
     approvals_reviewer: str
     env: dict[str, str]
     permission_profile: dict[str, Any]
+    web_search: bool
 
 
 def codex_options(profile: SandboxProfile) -> CodexOptions:
@@ -705,13 +843,14 @@ def codex_options(profile: SandboxProfile) -> CodexOptions:
         sandbox="workspace_write",
         sandbox_workspace_write={
             "writable_roots": [str(p) for p in profile.write_roots if p != profile.work_dir],
-            "network_access": profile.network,
+            "network_access": False,
             "exclude_slash_tmp": True,
             "exclude_tmpdir_env_var": True,
         },
         approvals_reviewer="user",
         env={"TMPDIR": str(profile.tmp_dir)},
         permission_profile={"name": f"arr-{profile.agent_id}", "filesystem": entries},
+        web_search=profile.web,
     )
 
 
@@ -719,14 +858,20 @@ def codex_options(profile: SandboxProfile) -> CodexOptions:
 # Command classification
 # --------------------------------------------------------------------------------------------
 
-_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "|&", ";;", "(", ")", "\n"})
-_REDIRECTS_RE = re.compile(r"^\d*[<>]+&?\d*$")
+_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "|&", ";;", "(", ")", "()", "<(", ">("})
+_SEPARATOR_CHARS = frozenset(";&|()")
+_WRITE_REDIRECT_RE = re.compile(r"^(?:>|>>|>\||&>|&>>|>&)$")
+_READ_REDIRECT_RE = re.compile(r"^(?:<|<<|<<-|<>)$")
+_FD_RE = re.compile(r"^\d+$")
 _SUBST_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|<\(([^()]*)\)")
 _URL_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"`<>]+")
 _SCP_HOST_RE = re.compile(r"(?:^|\s)[\w.-]+@([\w-]+(?:\.[\w-]+)+):")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _VERSIONED_RE = re.compile(r"^(python|pip)[0-9.]*$")
+_C_FLAG_RE = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
+_VARIABLE_RE = re.compile(r"\$[A-Za-z_{(]|`")
 _METACHARS = frozenset(";&|`$<>()\n")
+_MAX_DEPTH = 6
 _CMD_PATH_RE = re.compile(
     r"(?:(?<=[\s'\"=(,:])|^)("
     r"(?:~|\$HOME|\$\{HOME\})(?=/|$|[\s'\";|&)])[^\s'\"`;|&<>(),]*"
@@ -736,44 +881,101 @@ _CMD_PATH_RE = re.compile(
     r")"
 )
 
+_SHELL_KEYWORDS = frozenset(
+    {"!", "{", "}", "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done"}
+    | {"case", "esac", "function", "coproc", "select"}
+)
+"""Reserved words that may precede a command; skipped like a transparent prefix."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Wrapper:
+    with_arg: frozenset[str] = frozenset()
+    positional: int = 0
+
+
+_WRAPPERS: Mapping[str, _Wrapper] = {
+    "env": _Wrapper(frozenset({"-u", "--unset", "-C", "--chdir", "-P"})),
+    "command": _Wrapper(),
+    "builtin": _Wrapper(),
+    "nohup": _Wrapper(),
+    "setsid": _Wrapper(),
+    "unbuffer": _Wrapper(),
+    "exec": _Wrapper(frozenset({"-a"})),
+    "time": _Wrapper(frozenset({"-o", "-f"})),
+    "nice": _Wrapper(frozenset({"-n", "--adjustment"})),
+    "ionice": _Wrapper(frozenset({"-c", "-n", "-p"})),
+    "timeout": _Wrapper(frozenset({"-s", "--signal", "-k", "--kill-after"}), positional=1),
+    "gtimeout": _Wrapper(frozenset({"-s", "--signal", "-k", "--kill-after"}), positional=1),
+    "stdbuf": _Wrapper(frozenset({"-i", "-o", "-e"})),
+    "caffeinate": _Wrapper(frozenset({"-t", "-w"})),
+    "arch": _Wrapper(frozenset({"-arch", "-e"})),
+    "script": _Wrapper(frozenset({"-t", "-T", "-I"}), positional=1),
+    "sandbox-exec": _Wrapper(frozenset({"-f", "-n", "-p", "-D"})),
+    "watch": _Wrapper(frozenset({"-n", "--interval"})),
+    "xargs": _Wrapper(frozenset({"-n", "-I", "-L", "-P", "-d", "-E", "-s", "-a", "-J", "-R"})),
+    "parallel": _Wrapper(frozenset({"-j", "--jobs", "-S", "--sshlogin", "-a", "--arg-file"})),
+    "flock": _Wrapper(frozenset({"-w", "-E"}), positional=1),
+    "chroot": _Wrapper(positional=1),
+    "taskpolicy": _Wrapper(frozenset({"-c", "-d", "-g", "-t", "-l", "-p"})),
+}
+"""Programs that start another program, with their options that take a value (docs/07 §3 ②)."""
+
+_FIND_EXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_WRITE_ALL_ARGS = frozenset({"tee", "touch", "mkdir", "rm", "rmdir", "truncate"})
+_WRITE_LAST_ARG = frozenset({"cp", "mv", "ln", "install", "rsync", "ditto"})
+_WRITE_OPTS_WITH_ARG = frozenset({"-s", "-m", "-o", "-g", "--size", "--mode"})
+
 
 @dataclass(slots=True)
 class CommandInfo:
     """Coarse classification of a shell command (docs/07 §3 ②).
 
     `forbidden`: German reasons for a hard ban. `categories`: grey-zone categories.
-    `hosts`: hosts found in URLs. `risky`: install from a URL or VCS, or download piped
-    into a shell.
+    `hosts`: hosts found in URLs and install options. `writes`: write targets (redirections,
+    `tee`, `cp`/`mv`/`ln` targets, `dd of=` …), unnormalized. `risky`: install from a URL,
+    VCS or foreign index, or download piped into a shell.
     """
 
     forbidden: list[str] = field(default_factory=list)
     categories: set[RequestCategory] = field(default_factory=set)
     hosts: list[str] = field(default_factory=list)
+    writes: list[str] = field(default_factory=list)
     risky: bool = False
     user_install: bool = False
     programs: list[str] = field(default_factory=list)
 
+    def ban(self, reason: str) -> None:
+        if reason not in self.forbidden:
+            self.forbidden.append(reason)
 
-def _segments(command: str) -> list[list[str]]:
+
+def _tokens(command: str) -> tuple[list[str], bool]:
+    """Shell words of a command; `False` if the quoting is broken (then plain words)."""
     text = command.replace("\n", " ; ")
     try:
         lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
-        tokens = list(lexer)
+        return list(lexer), True
     except ValueError:
-        tokens = None
-    if tokens is None:
-        # Unbalanced quotes: the shell would refuse it, but be conservative and treat every
-        # word as a possible program start.
-        words = re.sub(r"([;&|()'\"])", r" ", text).split()
-        return [words[i:] for i in range(len(words))]
+        return re.sub(r"[;&|()'\"]", " ", text).split(), False
+
+
+def _split_segments(tokens: list[str], parsed: bool) -> list[list[str]]:
+    if not parsed:
+        # Broken quoting: the shell would refuse it, but every word may start a command.
+        return [tokens[i:] for i in range(len(tokens))]
     segments: list[list[str]] = [[]]
     for token in tokens:
-        if token in _SEPARATORS or (token and set(token) <= set(";&|()")):
+        if token in _SEPARATORS or (token and set(token) <= _SEPARATOR_CHARS):
             segments.append([])
         else:
             segments[-1].append(token)
     return [s for s in segments if s]
+
+
+def _segments(command: str) -> list[list[str]]:
+    return _split_segments(*_tokens(command))
 
 
 def _program(token: str) -> str:
@@ -782,25 +984,184 @@ def _program(token: str) -> str:
     return match.group(1) if match else name
 
 
-def _strip_wrappers(argv: list[str]) -> list[str]:
-    argv = list(argv)
+def _net(tokens: list[str], info: CommandInfo) -> None:
+    """Fail-closed net: forbidden program names and `git … push` anywhere in the words."""
+    git_seen = defaults_seen = False
+    for token in tokens:
+        name = _program(token)
+        lowered = token.casefold()
+        if name in FORBIDDEN_PROGRAMS:
+            info.ban(FORBIDDEN_PROGRAMS[name])
+        if name == "git":
+            git_seen = True
+        elif git_seen and lowered in _GIT_FORBIDDEN:
+            info.ban(_GIT_PUSH)
+        elif git_seen and lowered.startswith("alias."):
+            info.ban(_GIT_ALIAS)
+        if name == "defaults":
+            defaults_seen = True
+        elif defaults_seen and lowered in ("write", "delete", "import", "rename"):
+            info.ban(_SYSTEM)
+
+
+def _take_redirections(argv: list[str], info: CommandInfo) -> list[str]:
+    """Remove redirections from `argv`; write targets go to `info.writes`."""
+    result: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        target = argv[index + 1] if index + 1 < len(argv) else None
+        if _WRITE_REDIRECT_RE.match(token):
+            if target is not None and not (
+                token == ">&" and (_FD_RE.match(target) or target == "-")
+            ):
+                info.writes.append(target)
+            if result and _FD_RE.match(result[-1]):
+                result.pop()  # `2>file`: the 2 belongs to the redirection
+            index += 2
+        elif _READ_REDIRECT_RE.match(token) or token == "<<<":
+            if result and _FD_RE.match(result[-1]):
+                result.pop()
+            index += 2
+        else:
+            result.append(token)
+            index += 1
+    return result
+
+
+def _unwrap(argv: list[str], info: CommandInfo, depth: int) -> list[str]:
+    """Skip keywords, variable assignments and wrappers such as `env`, `timeout`, `xargs`."""
     while argv:
-        while argv and _ASSIGN_RE.match(argv[0]):
-            argv.pop(0)
-        if not argv:
-            break
-        name = _program(argv[0])
-        if name not in _WRAPPERS:
-            break
-        argv.pop(0)
-        with_arg = _WRAPPERS_WITH_ARG.get(name, set())
-        while argv and (argv[0].startswith("-") or _ASSIGN_RE.match(argv[0])):
-            flag = argv.pop(0)
-            if flag in with_arg and argv:
-                argv.pop(0)
-        if name == "timeout" and argv:
-            argv.pop(0)
+        head = argv[0]
+        if head in _SHELL_KEYWORDS or _ASSIGN_RE.match(head):
+            argv = argv[1:]
+            continue
+        name = _program(head)
+        spec = _WRAPPERS.get(name)
+        if spec is None:
+            return argv
+        args = argv[1:]
+        index = 0
+        while index < len(args) and args[index].startswith("-") and len(args[index]) > 1:
+            option = args[index]
+            if option == "--":
+                index += 1
+                break
+            if name == "env" and option.startswith(("-S", "--split-string")):
+                if "=" in option:
+                    script = option.split("=", 1)[1]
+                    rest = args[index + 1 :]
+                elif option in ("-S", "--split-string"):
+                    script = args[index + 1] if index + 1 < len(args) else ""
+                    rest = args[index + 2 :]
+                else:
+                    script = option[2:]
+                    rest = args[index + 1 :]
+                _classify(" ".join([script, shlex.join(rest)]), info, depth + 1)
+                return []
+            index += 2 if option in spec.with_arg else 1
+        argv = args[index + spec.positional :] if index < len(args) else []
     return argv
+
+
+def _shell_script(args: list[str]) -> tuple[str | None, bool]:
+    """Script of `sh/bash/zsh … -c` (also `-lc`, `-ec`, `--command`); flag: reads stdin."""
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+            index += 2
+        elif arg.startswith("--command="):
+            return arg.split("=", 1)[1], False
+        elif arg == "--command" or _C_FLAG_RE.fullmatch(arg):
+            return (args[index + 1] if index + 1 < len(args) else ""), False
+        elif arg.startswith(("-", "+")):
+            index += 1
+        else:
+            return None, False  # a script file: only the sandbox sees its content
+    return None, True
+
+
+def _classify_argv(argv: list[str], info: CommandInfo, depth: int) -> bool:
+    """Classify one simple command; returns True if it is a shell reading its script from stdin."""
+    argv = _unwrap(_take_redirections(argv, info), info, depth)
+    if not argv:
+        return False
+    if any(char.isspace() for char in argv[0]):
+        # A whole command as one word, e.g. `watch 'sudo ls'` or `parallel 'git push' …`.
+        _classify(" ".join(argv), info, depth + 1)
+        return False
+    name = _program(argv[0])
+    args = argv[1:]
+    lowered = [a.casefold() for a in args]
+    info.programs.append(name)
+    if name in FORBIDDEN_PROGRAMS:
+        info.ban(FORBIDDEN_PROGRAMS[name])
+        return False
+    if name in _SHELLS or name == "eval":
+        if name == "eval":
+            _classify(" ".join(args), info, depth + 1)
+            return False
+        script, reads_stdin = _shell_script(args)
+        if script is not None:
+            _classify(script, info, depth + 1)
+        return reads_stdin
+    if name == "find":
+        for index, arg in enumerate(args):
+            if arg in _FIND_EXEC:
+                end = next(
+                    (i for i in range(index + 1, len(args)) if args[i] in (";", "+")),
+                    len(args),
+                )
+                _classify_argv(args[index + 1 : end], info, depth + 1)
+        return False
+    if name == "git":
+        sub = _git_subcommand(args)
+        if sub in _GIT_FORBIDDEN:
+            info.ban(_GIT_PUSH)
+        elif sub in _GIT_NETWORK:
+            info.categories.add(RequestCategory.NETWORK)
+        return False
+    _collect_writes(name, args, info)
+    if name in NETWORK_PROGRAMS:
+        info.categories.add(RequestCategory.NETWORK)
+        return False
+    _classify_install(name, args, lowered, info)
+    return False
+
+
+def _collect_writes(name: str, args: list[str], info: CommandInfo) -> None:
+    if name == "dd":
+        info.writes += [a.split("=", 1)[1] for a in args if a.startswith("of=")]
+        return
+    if name not in _WRITE_ALL_ARGS and name not in _WRITE_LAST_ARG:
+        return
+    positional: list[str] = []
+    target_dir: str | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ("-t", "--target-directory") and index + 1 < len(args):
+            target_dir = args[index + 1]
+            index += 2
+        elif arg.startswith("--target-directory="):
+            target_dir = arg.split("=", 1)[1]
+            index += 1
+        elif arg in _WRITE_OPTS_WITH_ARG and name in ("truncate", "mkdir", "install"):
+            index += 2
+        elif arg.startswith("-") and len(arg) > 1:
+            index += 1
+        else:
+            positional.append(arg)
+            index += 1
+    if name in _WRITE_ALL_ARGS:
+        info.writes += positional
+    elif target_dir is not None:
+        info.writes.append(target_dir)
+    elif len(positional) >= 2:
+        info.writes.append(positional[-1])
+    elif name == "ln" and positional:
+        info.writes.append(".")
 
 
 def _git_subcommand(args: list[str]) -> str | None:
@@ -824,41 +1185,7 @@ def _host_of(url: str) -> str | None:
     return host.rstrip(".").lower() if host else None
 
 
-def _classify_argv(argv: list[str], info: CommandInfo, depth: int) -> None:
-    argv = _strip_wrappers(argv)
-    argv = [a for a in argv if not _REDIRECTS_RE.match(a)]
-    if not argv:
-        return
-    name = _program(argv[0])
-    args = argv[1:]
-    lowered = [a.casefold() for a in args]
-    info.programs.append(name)
-    if name in FORBIDDEN_PROGRAMS:
-        info.forbidden.append(FORBIDDEN_PROGRAMS[name])
-        return
-    if name == "defaults" and lowered[:1] and lowered[0] in ("write", "delete", "import"):
-        info.forbidden.append(_SYSTEM)
-        return
-    if name in _SHELLS or name == "eval":
-        script = None
-        if name == "eval":
-            script = " ".join(args)
-        elif "-c" in args and args.index("-c") + 1 < len(args):
-            script = args[args.index("-c") + 1]
-        if script and depth < 4:
-            _classify(script, info, depth + 1)
-        return
-    if name == "git":
-        sub = _git_subcommand(args)
-        if sub in _GIT_FORBIDDEN:
-            info.forbidden.append(_GIT_PUSH)
-        elif sub in _GIT_NETWORK:
-            info.categories.add(RequestCategory.NETWORK)
-        return
-    if name in NETWORK_PROGRAMS:
-        info.categories.add(RequestCategory.NETWORK)
-        return
-    _classify_install(name, args, lowered, info)
+_INDEX_OPTIONS = ("--index-url", "--extra-index-url", "-i", "--find-links", "-f", "--trusted-host")
 
 
 def _classify_install(name: str, args: list[str], lowered: list[str], info: CommandInfo) -> None:
@@ -874,45 +1201,108 @@ def _classify_install(name: str, args: list[str], lowered: list[str], info: Comm
         elif sub in ("add", "sync"):
             install_args = args[1:]
         elif lowered[:2] == ["tool", "install"]:
-            info.forbidden.append(_GLOBAL_INSTALL)
+            info.ban(_GLOBAL_INSTALL)
             return
     elif name in ("conda", "mamba", "micromamba") and sub in ("install", "create", "update"):
         install_args = args[1:]
     elif name in ("npm", "pnpm", "yarn") and sub in ("install", "i", "add", "ci"):
         if any(a in ("-g", "--global") for a in lowered):
-            info.forbidden.append(_GLOBAL_INSTALL)
+            info.ban(_GLOBAL_INSTALL)
             return
         install_args = args[1:]
     elif name == "cargo" and sub == "install":
-        info.forbidden.append(_GLOBAL_INSTALL)
+        info.ban(_GLOBAL_INSTALL)
         return
     elif name == "sage" and lowered[:2] == ["-pip", "install"]:
         install_args = args[2:]
     if install_args is None:
         return
     info.categories |= {RequestCategory.INSTALL, RequestCategory.NETWORK}
-    if any(a.casefold() == "--user" for a in install_args):
-        info.user_install = True
-    if any(
-        "://" in a or a.casefold().startswith(("git+", "-e", "--editable")) for a in install_args
-    ):
-        info.risky = True
+    for index, arg in enumerate(install_args):
+        folded = arg.casefold()
+        if folded == "--user":
+            info.user_install = True
+        if "://" in arg or folded.startswith(("git+", "-e", "--editable")):
+            info.risky = True
+        option, _, value = arg.partition("=")
+        if option in _INDEX_OPTIONS:
+            info.risky = True
+            value = value or (install_args[index + 1] if index + 1 < len(install_args) else "")
+            host = _host_of(value) if "://" in value else value.split("/")[0].lower()
+            if host:
+                info.hosts.append(host)
+
+
+def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
+    """Separate here-document bodies from the command lines.
+
+    Returns the command without bodies and `(opening line, body)` pairs. Only a `<<` outside
+    quotes with a terminating line counts; anything else stays a command line (fail-closed).
+    """
+    lines = command.split("\n")
+    kept: list[str] = []
+    docs: list[tuple[str, str]] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        index += 1
+        tokens, parsed = _tokens(line)
+        if not parsed:
+            continue
+        for position, token in enumerate(tokens[:-1]):
+            if token != "<<":
+                continue
+            strip_tabs = tokens[position + 1].startswith("-")
+            delimiter = tokens[position + 1].removeprefix("-")
+            end = next(
+                (
+                    i
+                    for i in range(index, len(lines))
+                    if (lines[i].lstrip("\t") if strip_tabs else lines[i]) == delimiter
+                ),
+                None,
+            )
+            if not delimiter or end is None:
+                continue
+            docs.append((line, "\n".join(lines[index:end])))
+            index = end + 1
+    return "\n".join(kept), docs
 
 
 def _classify(command: str, info: CommandInfo, depth: int) -> None:
+    if depth > _MAX_DEPTH:
+        info.ban(_R_TOO_DEEP)
+        return
+    command, heredocs = _split_heredocs(command)
+    for opening, body in heredocs:
+        # A here-document is data for its program, a script only when it feeds a shell.
+        words = _tokens(opening)[0]
+        if any(_program(w) in _SHELLS or _program(w) == "eval" for w in words):
+            _classify(body, info, depth + 1)
+    tokens, parsed = _tokens(command)
+    _net(tokens, info)
     for match in _SUBST_RE.finditer(command):
         inner = next(g for g in match.groups() if g is not None)
-        if depth < 4:
-            _classify(inner, info, depth + 1)
-    for argv in _segments(command):
-        _classify_argv(argv, info, depth)
+        _classify(inner, info, depth + 1)
+    reads_stdin = False
+    for argv in _split_segments(tokens, parsed):
+        reads_stdin = _classify_argv(argv, info, depth) or reads_stdin
+    if reads_stdin or "<<<" in tokens:
+        # `echo 'sudo ls' | sh`, `sh <<< '…'`: any quoted text may become a script.
+        for token in tokens:
+            if any(char.isspace() for char in token):
+                _classify(token, info, depth + 1)
 
 
 def classify_command(command: str) -> CommandInfo:
-    """Classify a shell command coarsely: bans, network, installs, hosts (docs/07 §3 ②).
+    """Classify a shell command coarsely: bans, network, installs, hosts, writes (07 §3 ②).
 
-    Handles `;`, `&&`, `|`, newlines, `$(…)`, backticks, `bash -c`, `eval`, wrappers such as
-    `env`/`nohup`/`timeout`, variable assignments, full program paths and letter case.
+    Handles `;`, `&&`, `|`, newlines, `$(…)`, backticks, `sh/bash/zsh -c` with combined
+    flags (`-lc`, the Codex form), `eval`, shell keywords (`if`, `{`, `!` …), wrappers with
+    their options (`env -S`, `timeout -s`, `xargs`, `script` …), `find -exec`, variable
+    assignments, full program paths and letter case. A fail-closed net additionally bans every
+    word that names a forbidden program and every `git … push`, wherever it stands.
     Not a full shell parser: the OS sandbox stays the main protection.
     """
     info = CommandInfo()
@@ -935,8 +1325,9 @@ def command_paths(command: str, base: Path | None = None) -> list[str]:
     """Path-like words in a command, unnormalized (docs/07 §3 ②).
 
     Finds absolute paths, `~`, `$HOME`, `./` and `../` anywhere (also inside `python -c`
-    strings), and words of the command line that contain `/` or, with `base`, name an
-    existing entry below `base` (e.g. a symlink in the work folder).
+    strings), and words of the command line that contain `/` (without spaces), start with
+    `~` or, with `base`, name an existing entry below `base` (e.g. a symlink in the work
+    folder).
     """
     found = [m.group(1) for m in _CMD_PATH_RE.finditer(command)]
     for argv in _segments(command):
@@ -944,9 +1335,35 @@ def command_paths(command: str, base: Path | None = None) -> list[str]:
             value = word.split("=", 1)[1] if word.startswith("-") and "=" in word else word
             if not value or value.startswith("-") or "://" in value:
                 continue
-            if "/" in value or (base is not None and os.path.lexists(base / value)):
+            if any(char.isspace() for char in value):
+                continue
+            if (
+                "/" in value
+                or value.startswith("~")
+                or (base is not None and os.path.lexists(base / value))
+            ):
                 found.append(value)
     return list(dict.fromkeys(found))
+
+
+def _strip_pattern(raw: str) -> tuple[str | None, bool]:
+    """Fixed prefix of a path with wildcards or variables; `None` if not determinable.
+
+    Returns the prefix and whether something was cut. A relative pattern without fixed part
+    (`*.py`) yields `.`; a path that starts with a variable or substitution yields `None`.
+    """
+    parts = raw.split("/")
+    for index, part in enumerate(parts):
+        if _VARIABLE_RE.search(part):
+            if index == 0:
+                return None, True
+            return "/".join(parts[:index]) or "/", True
+        if any(char in part for char in "*?[{"):
+            prefix = "/".join(parts[:index])
+            if prefix:
+                return prefix, True
+            return ("/" if raw.startswith("/") else "."), True
+    return raw, False
 
 
 def _normalize_command(command: str) -> str:
@@ -1026,6 +1443,8 @@ class LogEvent(StrEnum):
     """An „Immer“ decision became a fixed rule."""
     OBSOLETE = "obsolete"
     """An open item is no longer needed (run stopped, waiting agent gone)."""
+    ESCALATED = "escalated"
+    """The gatekeeper or a mandate rule passed an open item on to the user."""
 
 
 class ApprovalLogEntry(Record):
@@ -1080,6 +1499,7 @@ class _Analysis:
     facts: set[ItemKey] = field(default_factory=set)
     labels: dict[ItemKey, str] = field(default_factory=dict)
     risky: bool = False
+    no_rules: bool = False
 
     def ban(self, reason: str, category: RequestCategory | None = None) -> None:
         if reason not in self.forbidden:
@@ -1100,6 +1520,21 @@ class Assessment:
     decision: Decision
     request: PermissionRequest
     items: frozenset[ItemKey]
+
+
+@dataclass(frozen=True, slots=True)
+class Remembered:
+    """What `PolicyEngine.remember` kept: a new always rule, a grant, or nothing.
+
+    `decision` is the decision as kept; its scope is lowered from `always` to `run` when the
+    request contains a secret (an always rule would write it to `arr.yaml`). `note` explains
+    that to the user.
+    """
+
+    decision: Decision
+    rule: "AlwaysRule | None" = None
+    grant: "Grant | None" = None
+    note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1212,36 +1647,40 @@ class PolicyEngine:
             return decision
         return None
 
-    def remember(
-        self, item_id: str, request: PermissionRequest, decision: Decision
-    ) -> AlwaysRule | None:
+    def remember(self, item_id: str, request: PermissionRequest, decision: Decision) -> Remembered:
         """Keep a final decision according to its scope (docs/07 §3 ④).
 
         `once` is not kept. `agent` and `run` become grants that cover the same items later.
-        `always` (user only, enforced by `Decision`) becomes an `AlwaysRule` in `self.rules`;
-        it is returned so the caller can store it in `arr.yaml`.
+        `always` (user only, enforced by `Decision`) becomes an `AlwaysRule` in `self.rules`,
+        returned so the caller can store it in `arr.yaml`. If an item of the request contains
+        a secret, no always rule is made; the decision is kept with scope `run` instead.
         """
         if decision.action not in (DecisionAction.ALLOW, DecisionAction.DENY):
-            return None
+            return Remembered(decision)
         if decision.scope is DecisionScope.ONCE:
-            return None
+            return Remembered(decision)
         profile = self._profiles.get(request.agent_id)
         if profile is None:
-            return None
+            return Remembered(decision)
         analysis = self._analyze(request, profile)
         items = frozenset(analysis.grey)
         if not items:
-            return None
+            return Remembered(decision)
+        note = None
         if decision.scope is DecisionScope.ALWAYS:
             rule = _rule_from_items(analysis, decision)
-            self.rules.always.append(rule)
-            self._write(LogEvent.RULE, request, decision, item_id=item_id, rule=rule)
-            return rule
+            if not _contains_secret(rule):
+                self.rules.always.append(rule)
+                self._write(LogEvent.RULE, request, decision, item_id=item_id, rule=rule)
+                return Remembered(decision, rule=rule)
+            note = _R_SECRET_IN_RULE
+            decision = decision.model_copy(
+                update={"scope": DecisionScope.RUN, "reason": f"{decision.reason} {note}"}
+            )
         agent_id = request.agent_id if decision.scope is DecisionScope.AGENT else None
-        self._grants[item_id] = Grant(
-            item_id, request.run_id, agent_id, decision, items, redact_request(request)
-        )
-        return None
+        grant = Grant(item_id, request.run_id, agent_id, decision, items, redact_request(request))
+        self._grants[item_id] = grant
+        return Remembered(decision, grant=grant, note=note)
 
     def revoke(self, item_id: str) -> Grant:
         """Withdraw a decision with scope agent/run; it no longer applies (docs/07 §4).
@@ -1317,20 +1756,28 @@ class PolicyEngine:
                 reason="Innerhalb der Sandbox und der Erlaubnisliste erlaubt.",
                 risk=Risk(level=RiskLevel.LOW, text=_RISK_TEXT["allow"]),
             )
+        if analysis.risky:
+            # High risk is never allowed automatically: no rule, no grant (M4).
+            return Decision(
+                action=DecisionAction.ASK,
+                decided_by=DecidedBy.FIXED_RULE,
+                reason="Braucht immer eine Freigabe (hohes Risiko).",
+                risk=_risk(analysis, grey),
+            )
         open_items = {
             key: cat
             for key, cat in grey.items()
-            if not any(
+            if analysis.no_rules
+            or not any(
                 rule.action == "allow" and _rule_covers(rule, request, key, profile)
                 for rule in self.rules.always
             )
-            and not (profile.network and _web_covers(key, cat))
         }
         if not open_items:
             return Decision(
                 action=DecisionAction.ALLOW,
                 decided_by=DecidedBy.FIXED_RULE,
-                reason="Erlaubt durch eine feste Regel (arr.yaml oder tools.web).",
+                reason="Erlaubt durch eine feste Regel aus arr.yaml.",
                 risk=_risk(analysis, grey),
             )
         allow_grants = [
@@ -1345,10 +1792,13 @@ class PolicyEngine:
         if all(covering):
             return _from_grant(covering[0], "Erlaubt durch eine frühere Entscheidung")
         labels = ", ".join(_CATEGORY_LABELS[c] for c in sorted(set(open_items.values())))
+        reason = f"Braucht eine Freigabe ({labels})."
+        if analysis.no_rules:
+            reason = f"{reason} {_R_CODEX_ESCALATION}"
         return Decision(
             action=DecisionAction.ASK,
             decided_by=DecidedBy.FIXED_RULE,
-            reason=f"Braucht eine Freigabe ({labels}).",
+            reason=reason,
             risk=_risk(analysis, open_items),
         )
 
@@ -1359,7 +1809,7 @@ class PolicyEngine:
             base = profile.resolve(request.work_dir) if request.work_dir else profile.work_dir
         except ValueError:
             base = profile.work_dir
-        if tool.startswith(ROOM_TOOL_PREFIXES) or tool in HARMLESS_TOOLS:
+        if tool.startswith(ROOM_TOOL_PREFIX) or tool in HARMLESS_TOOLS:
             pass
         elif tool in READ_TOOLS:
             self._check_reads(request.paths, tool in SEARCH_TOOLS, base, profile, analysis)
@@ -1372,12 +1822,19 @@ class PolicyEngine:
         elif tool in NETWORK_TOOLS:
             if not request.hosts and not request.urls:
                 analysis.ask(("tool", tool), RequestCategory.NETWORK)
+        elif tool in WEB_TOOLS:
+            if not profile.web:
+                analysis.ban(_R_WEB_OFF, RequestCategory.NETWORK)
         else:
             analysis.ask(("tool", tool), RequestCategory.OTHER)
         hosts = [h.rstrip(".").lower() for h in request.hosts]
         hosts += [h for h in (_host_of(u) for u in request.urls) if h]
         for host in dict.fromkeys(hosts):
-            analysis.ask(("host", host.rsplit(":", 1)[0]), RequestCategory.NETWORK)
+            key: ItemKey = ("host", host.rsplit(":", 1)[0])
+            if tool in WEB_TOOLS:
+                analysis.facts.add(key)  # allowed with tools.web, but always-deny rules apply
+            else:
+                analysis.ask(key, RequestCategory.NETWORK)
         self._adapter_categories(request, analysis)
         return analysis
 
@@ -1409,7 +1866,7 @@ class PolicyEngine:
     ) -> None:
         for raw in paths:
             try:
-                path = profile.resolve(_strip_glob(raw), base)
+                path = profile.resolve(_strip_glob(_HOME_VAR_RE.sub("~", raw.strip())), base)
             except ValueError:
                 analysis.ban(_R_INVALID_PATH)
                 continue
@@ -1452,40 +1909,88 @@ class PolicyEngine:
         command = request.command or ""
         info = classify_command(command)
         for reason in info.forbidden:
-            analysis.ban(reason + _ALTERNATIVE, _BAN_CATEGORIES[reason])
+            analysis.ban(reason + _ALTERNATIVE, _BAN_CATEGORIES.get(reason))
         for raw in [*command_paths(command, base), *request.paths]:
-            try:
-                path = profile.resolve(raw, base)
-            except ValueError:
-                analysis.ban(_R_INVALID_PATH)
-                continue
-            analysis.facts.add(("read", profile.key(path)))
-            if profile.is_sensitive(path):
-                analysis.ban(_R_SENSITIVE, RequestCategory.READ_OUTSIDE)
-            elif not (profile.can_read(path) or profile.can_write(path)):
-                analysis.ban(_R_SHELL_READ, RequestCategory.READ_OUTSIDE)
+            self._check_command_read(raw, base, profile, analysis)
+        for raw in info.writes:
+            self._check_command_write(raw, base, profile, analysis)
         normalized = _normalize_command(command)
         analysis.facts.add(("command", normalized))
+        for host in info.hosts:
+            analysis.ask(("host", host), RequestCategory.NETWORK)
         if RequestCategory.INSTALL in info.categories:
             if info.user_install:
                 analysis.ban(_R_USER_INSTALL, RequestCategory.INSTALL)
             elif not profile.run_venv:
                 analysis.ban(_R_NO_RUN_VENV, RequestCategory.INSTALL)
             analysis.ask(("command", normalized), RequestCategory.INSTALL)
-            analysis.categories.add(RequestCategory.NETWORK)
-        elif RequestCategory.NETWORK in info.categories:
-            if info.hosts:
-                for host in info.hosts:
-                    analysis.ask(("host", host), RequestCategory.NETWORK)
-            else:
-                analysis.ask(("command", normalized), RequestCategory.NETWORK)
+        elif RequestCategory.NETWORK in info.categories and not info.hosts:
+            analysis.ask(("command", normalized), RequestCategory.NETWORK)
         analysis.categories |= info.categories
         analysis.risky = analysis.risky or info.risky
+        provider = request.provider or profile.provider
+        if provider is Provider.CODEX and command.strip():
+            # A Codex shell request wants to leave the sandbox: never allowed by a fixed
+            # rule, only by a decision (H2, S2 §15).
+            analysis.ask(("command", normalized), RequestCategory.OTHER)
+            analysis.categories.add(RequestCategory.OTHER)
+            analysis.no_rules = True
 
+    def _command_path(
+        self, raw: str, base: Path, profile: SandboxProfile
+    ) -> tuple[Path | None, bool]:
+        """Resolve a path word of a command; `None` if not determinable, flag: pattern cut."""
+        text = raw.strip()
+        for name, value in (("TMPDIR", profile.tmp_dir), ("PWD", base), ("HOME", profile.home)):
+            text = re.sub(rf"\$(?:{name}\b|\{{{name}\}})", lambda _, v=value: str(v), text)
+        if text.startswith("~") and text != "~" and not text.startswith("~/"):
+            return None, True  # another user's home
+        prefix, cut = _strip_pattern(text)
+        if prefix is None:
+            return None, True
+        return profile.resolve(prefix, base), cut
 
-def _web_covers(key: ItemKey, category: RequestCategory) -> bool:
-    # tools.web switches the network on for an agent; installs still need an approval.
-    return category is RequestCategory.NETWORK and key[0] in ("host", "command", "tool")
+    def _check_command_read(
+        self, raw: str, base: Path, profile: SandboxProfile, analysis: _Analysis
+    ) -> None:
+        try:
+            path, cut = self._command_path(raw, base, profile)
+        except ValueError:
+            analysis.ban(_R_INVALID_PATH)
+            return
+        if path is None:
+            analysis.ban(_R_SHELL_UNKNOWN_PATH, RequestCategory.READ_OUTSIDE)
+            return
+        analysis.facts.add(("read", profile.key(path)))
+        if profile.is_sensitive(path):
+            analysis.ban(_R_SENSITIVE, RequestCategory.READ_OUTSIDE)
+        elif cut and profile.contains_sensitive(path):
+            analysis.ban(_R_SHELL_GLOB, RequestCategory.READ_OUTSIDE)
+        elif not (profile.can_read(path) or profile.can_write(path)):
+            analysis.ban(_R_SHELL_GLOB if cut else _R_SHELL_READ, RequestCategory.READ_OUTSIDE)
+
+    def _check_command_write(
+        self, raw: str, base: Path, profile: SandboxProfile, analysis: _Analysis
+    ) -> None:
+        if raw in _DEVICE_WRITES or raw.startswith("/dev/fd/"):
+            return
+        try:
+            path, _ = self._command_path(raw, base, profile)
+        except ValueError:
+            analysis.ban(_R_INVALID_PATH)
+            return
+        if path is None:
+            analysis.ban(_R_SHELL_UNKNOWN_PATH, RequestCategory.WRITE_OUTSIDE)
+            return
+        analysis.facts.add(("write", profile.key(path)))
+        if profile.is_sensitive(path):
+            analysis.ban(_R_SENSITIVE, RequestCategory.WRITE_OUTSIDE)
+        elif profile.can_write(path):
+            return
+        elif any(_key_within(profile.key(path), profile.key(p)) for p in profile.read_only):
+            analysis.ban(_R_READ_ONLY, RequestCategory.WRITE_OUTSIDE)
+        else:
+            analysis.ban(_R_WRITE_OUTSIDE, RequestCategory.WRITE_OUTSIDE)
 
 
 def _rule_covers(
@@ -1525,6 +2030,11 @@ def _rule_from_items(analysis: _Analysis, decision: Decision) -> AlwaysRule:
         commands=sorted(v for k, v in items if k == "command"),
         reason=decision.reason,
     )
+
+
+def _contains_secret(rule: AlwaysRule) -> bool:
+    values = [*rule.tools, *rule.paths, *rule.hosts, *rule.commands]
+    return any(redact(value) != value for value in values)
 
 
 def _deny(reason: str, risk_key: str) -> Decision:

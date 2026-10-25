@@ -11,7 +11,7 @@ import pytest
 
 from arr.errors import ArrError
 from arr.models import AgentConfig
-from arr.permissions.inbox import ApprovalInbox, TerminalDecider, format_item
+from arr.permissions.inbox import ApprovalInbox, TerminalDecider, format_item, item_id_prefix
 from arr.permissions.policy import (
     TIMEOUT_REASON,
     AlwaysRule,
@@ -31,6 +31,7 @@ from arr.permissions.types import (
 )
 
 ALLOW, DENY = DecisionAction.ALLOW, DecisionAction.DENY
+FIRST = f"{item_id_prefix('r1')}_0001"
 SECRET = "sk-ant-api03-SECRETSECRETSECRET"
 
 
@@ -102,10 +103,10 @@ async def test_terminal_allow_once(engine: PolicyEngine) -> None:
     assert decision.action is ALLOW and decision.scope is DecisionScope.ONCE
     assert decision.decided_by is DecidedBy.USER
     item = inbox.items()[0]
-    assert item.id == "apr_0001" and item.status is ApprovalStatus.DECIDED
+    assert item.id == FIRST and item.status is ApprovalStatus.DECIDED
     text = terminal.text
     for part in [
-        "Freigabe-Anfrage apr_0001",
+        f"Freigabe-Anfrage {FIRST}",
         "explorer-1 (Rolle explorer, claude)",
         "Befehl:         pip install python-flint",
         "Begründung des Agenten: Ich brauche FLINT",
@@ -324,7 +325,7 @@ async def test_log_records_the_whole_flow_without_secrets(engine: PolicyEngine) 
         reason=f"Test mit ANTHROPIC_API_KEY={SECRET}",
     )
     await inbox.handle(request)
-    inbox.revoke("apr_0001")
+    inbox.revoke(FIRST)
     entries = engine.log.entries()
     assert [e["event"] for e in entries] == ["decision", "open", "decided", "revoked"]
     for entry in entries:
@@ -336,7 +337,7 @@ async def test_log_records_the_whole_flow_without_secrets(engine: PolicyEngine) 
     assert SECRET not in engine.log.path.read_text()
     assert SECRET not in terminal.text
     # A new inbox on the same log continues the numbering.
-    assert ApprovalInbox(engine)._counter == 1
+    assert ApprovalInbox(engine)._next_id("r1") == f"{item_id_prefix('r1')}_0002"
 
 
 def test_format_item_redacts_and_is_german(engine: PolicyEngine) -> None:
@@ -376,3 +377,127 @@ def test_reader_thread_is_daemon(engine: PolicyEngine) -> None:
     asyncio.run(run())
     threads = [t for t in threading.enumerate() if t.name == "arr-approval-input"]
     assert all(t.daemon for t in threads)
+
+
+# ============================================================================================
+# Nacharbeit W1-05.1
+# ============================================================================================
+
+import io  # noqa: E402
+import re  # noqa: E402
+import sys  # noqa: E402
+
+from arr.permissions.types import EscalatedBy  # noqa: E402
+
+
+async def test_b2_terminal_always_with_secret_becomes_run(engine: PolicyEngine) -> None:
+    assert engine.log is not None
+    rules: list[AlwaysRule] = []
+    notes: list[str] = []
+    terminal = FakeTerminal("immer", "ja immer")
+    inbox = ApprovalInbox(
+        engine,
+        decider=terminal.decider(),
+        timeout=5,
+        on_rule=rules.append,
+        on_note=notes.append,
+    )
+    request = install().model_copy(update={"command": f"OPENAI_API_KEY={SECRET} pip install sympy"})
+    decision = await inbox.handle(request)
+    assert decision.action is ALLOW and decision.scope is DecisionScope.RUN
+    assert not rules and not engine.rules.always
+    assert notes and "Geheimnis" in notes[0]
+    assert "Hinweis:" in terminal.text and "Geheimnis" in terminal.text
+    assert inbox.items()[0].decision is not None
+    assert inbox.items()[0].decision.scope is DecisionScope.RUN
+    decided = [e for e in engine.log.entries() if e["event"] == "decided"][0]
+    assert "Geheimnis" in decided["note"]
+    assert SECRET not in engine.log.path.read_text()
+
+
+async def test_b2_no_terminal_no_approval(
+    engine: PolicyEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A pipe is no terminal: the user agent cannot approve through `printf … | arr run`.
+    monkeypatch.setattr(sys, "stdin", io.StringIO("immer\nja immer\n"))
+    output: list[str] = []
+    inbox = ApprovalInbox(engine, decider=TerminalDecider(write=output.append), timeout=5)
+    decision = await inbox.handle(install())
+    assert decision.action is DENY and decision.decided_by is DecidedBy.FIXED_RULE
+    assert "kein Terminal" in decision.reason
+    item = inbox.items()[0]
+    assert item.status is ApprovalStatus.OBSOLETE
+    assert not engine.rules.always and not output
+    explicit = TerminalDecider(read_line=lambda _: "einmal", is_terminal=lambda: False)
+    inbox = ApprovalInbox(engine, decider=explicit, timeout=5)
+    assert (await inbox.handle(install())).action is DENY
+
+
+async def test_b3_escalated_by(engine: PolicyEngine) -> None:
+    assert engine.log is not None
+    inbox = ApprovalInbox(engine, timeout=5)
+    waiting = asyncio.create_task(inbox.handle(install()))
+    await asyncio.sleep(0.01)
+    [item] = inbox.pending()
+    note = "Domain nicht in der Vollmacht."
+    escalated = inbox.escalate(item.id, EscalatedBy(decider=DecidedBy.GATEKEEPER, note=note))
+    assert escalated.status is ApprovalStatus.OPEN
+    assert escalated.escalated_by is not None and escalated.escalated_by.note == note
+    assert escalated.risk is not None and escalated.risk.text
+    inbox.resolve(item.id, Decision(action=DENY, decided_by=DecidedBy.USER, reason="nein"))
+    await waiting
+    assert inbox.get(item.id).escalated_by is not None
+    events = [(e["event"], e.get("note")) for e in engine.log.entries()]
+    assert ("escalated", note) in events
+    with pytest.raises(ArrError):
+        inbox.escalate(item.id, EscalatedBy(decider=DecidedBy.MANDATE_RULE))
+
+
+async def test_b3_ids_are_unique_across_runs(engine: PolicyEngine) -> None:
+    inbox = ApprovalInbox(engine, timeout=5)
+    ids = [inbox._next_id(run) for run in ("r1", "r1", "r2", "20261023-1742_collatz_a3f9")]
+    assert len(set(ids)) == 4
+    assert all(re.fullmatch(r"apr_[0-9a-f]{6}_\d{4}", i) for i in ids)
+    assert ids[0].endswith("_0001") and ids[1].endswith("_0002") and ids[2].endswith("_0001")
+    assert ids[0].rsplit("_", 1)[0] != ids[2].rsplit("_", 1)[0]
+
+
+async def test_b3_resolve_from_another_thread(engine: PolicyEngine) -> None:
+    inbox = ApprovalInbox(engine, timeout=5)
+    waiting = asyncio.create_task(inbox.handle(install()))
+    await asyncio.sleep(0.01)
+    [item] = inbox.pending()
+    decision = Decision(action=ALLOW, decided_by=DecidedBy.USER)
+    results: list[str] = []
+
+    def gui(i: int) -> None:
+        try:
+            inbox.resolve(item.id, decision)
+            results.append("ok")
+        except ArrError:
+            results.append("closed")
+
+    threads = [threading.Thread(target=gui, args=(i,)) for i in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert (await asyncio.wait_for(waiting, 2)).action is ALLOW
+    assert sorted(results) == ["closed"] * 4 + ["ok"]
+
+
+async def test_b3_revoke_gatekeeper_once_is_a_no_op(engine: PolicyEngine) -> None:
+    assert engine.log is not None
+    inbox = ApprovalInbox(engine, timeout=5)
+    waiting = asyncio.create_task(inbox.handle(install()))
+    await asyncio.sleep(0.01)
+    [item] = inbox.pending()
+    inbox.resolve(item.id, Decision(action=ALLOW, decided_by=DecidedBy.GATEKEEPER))
+    await waiting
+    assert inbox.get(item.id).revocable
+    revoked = inbox.revoke(item.id)
+    assert revoked.status is ApprovalStatus.REVOKED
+    last = engine.log.entries()[-1]
+    assert last["event"] == "revoked" and "Einmalige" in last["note"]
+    # the next identical request asks again (nothing was remembered)
+    assert engine.evaluate(install()).action is DecisionAction.ASK
