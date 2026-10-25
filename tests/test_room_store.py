@@ -1,8 +1,10 @@
 """Unit tests for the room store and the agent view (W1-03, docs/06-gruppenchats.md)."""
 
+import errno
 import json
 import math
 import os
+import shutil
 import sqlite3
 import threading
 from pathlib import Path
@@ -881,3 +883,128 @@ def test_markdown_export_cannot_fake_other_messages(store: RoomStore) -> None:
     assert [h.split(" · ")[0] for h in headings] == ["### #1", f"### #{msg.id}"]
     assert "> Harmlos\n>\n> \\### #999 · 2026-10-25 12:00:00 · orchestrator · decision" in md
     assert "> Abbruch!" in md
+
+
+# --------------------------------------------------------------------------------------------
+# W1-03.2
+# --------------------------------------------------------------------------------------------
+
+
+def _run_contains(store: RoomStore, text: str) -> list[Path]:
+    """Files arr wrote into the run (everything but the agents' own folders) with `text`."""
+    return [
+        p
+        for p in store.run_dir.rglob("*")
+        if p.is_file()
+        and not p.is_symlink()
+        and p.relative_to(store.run_dir).parts[0] != "agents"
+        and text.encode() in p.read_bytes()
+    ]
+
+
+def test_hardlinks_are_never_attached(store: RoomStore, tmp_path: Path) -> None:
+    """W1-03.2 point 1: a hardlink to a file outside the working folder is rejected."""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("GEHEIM-HARDLINK")
+    e1 = room(store, "explorer-1")
+    os.link(secret, e1.work_dir / "hl.txt")
+    write(store, "explorer-1", "own.txt", "eigen")
+    os.link(e1.work_dir / "own.txt", e1.work_dir / "own-twice.txt")  # also inside: rejected
+    for ref in ("hl.txt", "own-twice.txt"):
+        error = f"„{ref}“ hat mehrere Verweise \\(Hardlink\\). Hänge eine eigene Kopie"
+        with pytest.raises(RoomError, match=error):
+            e1.post_message("main", "x", refs=[ref])
+        with pytest.raises(RoomError, match=error):
+            e1.submit_result("idea", "x", path=ref)
+    assert _run_contains(store, "GEHEIM-HARDLINK") == []
+    assert [m.sender for m in store.messages("main")] == ["orchestrator"]
+    assert store.results() == []
+
+
+def test_work_dir_itself_is_opened_without_following_links(
+    store: RoomStore, tmp_path: Path
+) -> None:
+    """W1-03.2 point 2: a working folder (or its parent) replaced by a symlink is refused."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x.md").write_text("GEHEIM-ORDNER")
+    agent_dir = store.run_dir / "agents" / "explorer-1"
+    shutil.rmtree(agent_dir / "work")
+    (agent_dir / "work").symlink_to(outside)
+    e1 = room(store, "explorer-1")
+    error = "Dein Arbeitsordner ist ein Verweis \\(Symlink\\) oder fehlt"
+    with pytest.raises(RoomError, match=error):
+        e1.post_message("main", "x", refs=["x.md"])
+    with pytest.raises(RoomError, match=error):
+        e1.submit_result("idea", "x", path="x.md")
+
+    critic_dir = store.run_dir / "agents" / "critic"
+    moved = tmp_path / "critic-real"
+    critic_dir.rename(moved)
+    (moved / "work" / "x.md").write_text("GEHEIM-ELTERN")
+    critic_dir.symlink_to(moved)
+    with pytest.raises(RoomError, match=error):
+        room(store, "critic").post_message("main", "x", refs=["x.md"])
+    assert _run_contains(store, "GEHEIM-ORDNER") == []
+    assert _run_contains(store, "GEHEIM-ELTERN") == []
+
+
+def test_open_errors_have_no_english_system_text(store: RoomStore) -> None:
+    """W1-03.2 point 3: no strerror such as „(Permission denied)“ in agent messages."""
+    e1 = room(store, "explorer-1")
+    locked = write(store, "explorer-1", "locked.txt", "x")
+    locked.chmod(0)
+    folder = e1.work_dir / "closed"
+    folder.mkdir()
+    (folder / "y.txt").write_text("y")
+    folder.chmod(0)
+    try:
+        cases = {
+            "locked.txt": "Für „locked.txt“ fehlen dir die Leserechte.",
+            "closed/y.txt": "Für „closed/y.txt“ fehlen dir die Leserechte.",
+            "fehlt/y.txt": "Die Datei „fehlt/y.txt“ gibt es in deinem Arbeitsordner nicht.",
+            "locked.txt/y": "Die Datei „locked.txt/y“ gibt es in deinem Arbeitsordner nicht.",
+        }
+        for ref, expected in cases.items():
+            with pytest.raises(RoomError) as exc:
+                e1.post_message("main", "x", refs=[ref])
+            assert str(exc.value) == expected
+            assert "(" not in str(exc.value)
+    finally:
+        folder.chmod(0o755)
+        locked.chmod(0o644)
+
+
+def test_open_error_texts_for_common_errno() -> None:
+    """W1-03.2 point 3: every common errno has German text, others no system text."""
+    texts = {
+        code: str(AgentRoom._errno_message("a/b.txt", code))
+        for code in (
+            errno.EACCES,
+            errno.EPERM,
+            errno.ENOENT,
+            errno.ENOTDIR,
+            errno.ELOOP,
+            errno.EISDIR,
+            errno.EIO,
+        )
+    }
+    assert texts[errno.EACCES] == texts[errno.EPERM] == "Für „a/b.txt“ fehlen dir die Leserechte."
+    assert texts[errno.ENOENT] == texts[errno.ENOTDIR]
+    assert "Verweis (Symlink)" in texts[errno.ELOOP]
+    assert texts[errno.EISDIR] == "„a/b.txt“ ist ein Ordner, keine Datei. Hänge nur Dateien an."
+    assert texts[errno.EIO] == "Die Datei „a/b.txt“ lässt sich nicht lesen."
+    for text in texts.values():
+        assert os.strerror(errno.EIO) not in text and "denied" not in text
+
+
+def test_score_must_not_be_bool(store: RoomStore) -> None:
+    """W1-03.2 point 4: True/False are no scores (bool is an int in Python)."""
+    result = room(store, "explorer-1").submit_result("idea", "A", body="…")
+    judge = room(store, "judge-1")
+    for value in (True, False):
+        with pytest.raises(RoomError, match="„score“ muss eine Zahl sein"):
+            judge.submit_rating(result.id, value, "x")
+        with pytest.raises(RoomError, match="muss eine Zahl sein"):
+            judge.submit_rating(result.id, 5, "x", {"Tiefe": value})
+    assert store.ratings() == []

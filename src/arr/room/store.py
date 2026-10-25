@@ -14,6 +14,7 @@ See docs/01-architektur.md §5, docs/02-workfolder-und-runs.md §4-§5, docs/06-
 
 import errno
 import json
+import logging
 import math
 import os
 import re
@@ -62,6 +63,8 @@ from arr.room.types import (
     VoteChoice,
     VoteRule,
 )
+
+log = logging.getLogger(__name__)
 
 ROOM_DIR = "groupchats"
 DB_NAME = "room.sqlite"
@@ -1102,18 +1105,58 @@ class AgentRoom:
             is_link = stat.S_ISLNK(os.stat(part, dir_fd=dir_fd, follow_symlinks=False).st_mode)
         except OSError:
             is_link = False
-        if is_link or exc.errno == errno.ELOOP:
-            if final:
-                return RoomError(
-                    f"„{rel}“ ist ein Verweis (Symlink). Hänge die eigentliche Datei an."
-                )
+        log.info("open %r failed at %r: %s", rel, "/".join(walked), exc.strerror)
+        if (is_link or exc.errno == errno.ELOOP) and not final:
             return RoomError(
                 f"„{rel}“ führt über den Verweis (Symlink) „{'/'.join(walked)}“. "
                 "Gib den Pfad zur eigentlichen Datei an."
             )
-        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+        return AgentRoom._errno_message(rel, errno.ELOOP if is_link else exc.errno)
+
+    @staticmethod
+    def _errno_message(rel: str, code: int | None) -> RoomError:
+        """German message for an `errno`, without the English system text (W1-03.2)."""
+        if code in (errno.EACCES, errno.EPERM):
+            return RoomError(f"Für „{rel}“ fehlen dir die Leserechte.")
+        if code in (errno.ENOENT, errno.ENOTDIR):
             return RoomError(f"Die Datei „{rel}“ gibt es in deinem Arbeitsordner nicht.")
-        return RoomError(f"Die Datei „{rel}“ lässt sich nicht lesen ({exc.strerror}).")
+        if code == errno.ELOOP:
+            return RoomError(f"„{rel}“ ist ein Verweis (Symlink). Hänge die eigentliche Datei an.")
+        if code == errno.EISDIR:
+            return RoomError(f"„{rel}“ ist ein Ordner, keine Datei. Hänge nur Dateien an.")
+        return RoomError(f"Die Datei „{rel}“ lässt sich nicht lesen.")
+
+    def _open_work_dir(self) -> int:
+        """Open the working folder without following links (W1-03.2).
+
+        Below the run folder every component from the resolved run folder on is opened with
+        `O_NOFOLLOW`; a working folder elsewhere (given explicitly) at least in its last one.
+        """
+        run_dir = self.store.run_dir
+        if self.work_dir.is_relative_to(run_dir):
+            anchor, parts = run_dir.resolve(), self.work_dir.relative_to(run_dir).parts
+        else:
+            anchor, parts = self.work_dir.parent.resolve(), (self.work_dir.name,)
+        try:
+            fd = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError as exc:
+            log.warning("cannot open anchor of work dir %s: %s", anchor, exc.strerror)
+            raise RoomError("Dein Arbeitsordner ist nicht lesbar.") from None
+        for part in parts:
+            try:
+                next_fd = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            except OSError as exc:
+                os.close(fd)
+                log.warning("work dir %s refused at %r: %s", self.work_dir, part, exc.strerror)
+                if exc.errno in (errno.EACCES, errno.EPERM):
+                    raise RoomError("Dein Arbeitsordner ist nicht lesbar.") from None
+                raise RoomError(
+                    "Dein Arbeitsordner ist ein Verweis (Symlink) oder fehlt. "
+                    "Anhänge gehen nur aus dem echten Arbeitsordner."
+                ) from None
+            os.close(fd)
+            fd = next_fd
+        return fd
 
     def _open_source(self, rel: str) -> tuple[int, str]:
         """Open a regular file below the working folder without following any symlink.
@@ -1124,10 +1167,7 @@ class AgentRoom:
         the descriptor and closes it.
         """
         parts = self._source_parts(rel)
-        try:
-            dir_fd = os.open(self.work_dir, os.O_RDONLY | os.O_DIRECTORY)
-        except OSError as exc:
-            raise RoomError(f"Dein Arbeitsordner ist nicht lesbar ({exc.strerror}).") from None
+        dir_fd = self._open_work_dir()
         try:
             for i, part in enumerate(parts):
                 last = i == len(parts) - 1
@@ -1145,6 +1185,12 @@ class AgentRoom:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):
                 raise RoomError(f"„{rel}“ ist keine normale Datei. Hänge nur Dateien an.")
+            if info.st_nlink > 1:
+                # A hardlink is a regular file, but may point at a file outside (E19).
+                raise RoomError(
+                    f"„{rel}“ hat mehrere Verweise (Hardlink). "
+                    "Hänge eine eigene Kopie der Datei an."
+                )
             self._check_size(rel, info.st_size)
         except BaseException:
             os.close(fd)
@@ -1171,9 +1217,9 @@ class AgentRoom:
                     dst.write(chunk)
         except OSError as exc:
             target.unlink(missing_ok=True)
+            log.info("copy of %r failed: %s", rel, exc.strerror)
             raise RoomError(
-                f"Die Datei „{rel}“ ließ sich nicht kopieren ({exc.strerror}). "
-                "Hat sie sich beim Kopieren geändert?"
+                f"Die Datei „{rel}“ ließ sich nicht kopieren. Hat sie sich beim Kopieren geändert?"
             ) from None
         except BaseException:
             target.unlink(missing_ok=True)
@@ -1596,7 +1642,11 @@ class AgentRoom:
 
     def _check_score(self, what: str, value: float) -> None:
         low, high = self.rubric.scale
-        if not isinstance(value, int | float) or not math.isfinite(value):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+        ):
             raise RoomError(f"„{what}“ muss eine Zahl sein (Skala {low:g} bis {high:g}).")
         if not low <= value <= high:
             raise RoomError(f"„{what}“ = {value:g} liegt außerhalb der Skala {low:g} bis {high:g}.")
