@@ -61,12 +61,6 @@ def test_app_dir_expands_user(monkeypatch: pytest.MonkeyPatch) -> None:
     assert app_dir() == Path.home() / "arr-x"
 
 
-def test_init_placeholder() -> None:
-    result = runner.invoke(app, ["init", "irgendwo"])
-    assert result.exit_code == 1
-    assert "„arr init“ kommt mit Auftrag W1-02." in result.output
-
-
 def test_gui_mock_placeholder() -> None:
     result = runner.invoke(app, ["gui", "--mock"])
     assert result.exit_code == 1

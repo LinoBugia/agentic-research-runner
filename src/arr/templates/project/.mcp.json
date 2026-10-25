@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "arr": { "command": "arr", "args": ["mcp"] }
+  }
+}
