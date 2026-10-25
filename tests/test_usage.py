@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from arr import usage as arr_usage
 from arr.backends.base import CostKind, EventKind
 from arr.backends.fake import FakeBackend
 from arr.models import AgentConfig
@@ -353,3 +354,83 @@ async def test_fake_backend_through_logger_into_usage_json(tmp_path: Path) -> No
     assert usage.total.usage.cost_kind is CostKind.ESTIMATED
     assert usage.by_model == {"m-1": usage.by_model["m-1"]} and usage.by_model["m-1"].turns == 2
     assert EventKind.TURN_END.value == "turn_end"
+
+
+# --------------------------------------------------------------------------------------------
+# W1-04.1
+# --------------------------------------------------------------------------------------------
+
+
+def test_costs_are_kept_apart_by_kind_in_total_and_by_model() -> None:
+    """API-key agent and subscription agent on the same model (point 1, 08 §5.9)."""
+    records = [
+        rec("api-1", 1, "api-key", "sonnet", input=10, cost=0.3, kind="billed"),
+        rec("api-1", 2, "api-key", "sonnet", input=10, cost=0.2, kind="billed"),
+        rec("abo-1", 1, "max", "sonnet", input=10, cost=1.5, kind="estimated"),
+        rec("abo-1", 2, "max", "sonnet", input=10, cost=0.25, kind="estimated"),
+        rec("cx-1", 1, "gpt", "sonnet", input=10),  # no cost
+        rec("odd-1", 1, "x", "sonnet", input=10, cost=9.0),  # cost of unknown kind
+    ]
+    usage = aggregate_usage(records)
+
+    for part in (usage.total, usage.by_model["sonnet"]):
+        assert part.cost_billed_usd == pytest.approx(0.5)
+        assert part.cost_estimated_usd == pytest.approx(1.75)
+        assert part.cost_unknown_turns == 2
+        assert part.turns == 6
+    # the combined sum of W1-01 stays as it was: one number, kind unknown (odd-1)
+    assert usage.total.usage.cost_usd == pytest.approx(11.25)
+    assert usage.total.usage.cost_kind is None
+
+    assert usage.by_profile["api-key"].cost_billed_usd == pytest.approx(0.5)
+    assert usage.by_profile["api-key"].cost_estimated_usd == 0
+    assert usage.by_profile["max"].cost_estimated_usd == pytest.approx(1.75)
+    assert usage.by_agent["api-1"].cost_billed_usd == pytest.approx(0.5)
+    assert usage.by_agent["abo-1"].models["sonnet"].cost_estimated_usd == pytest.approx(1.75)
+    assert usage.by_agent["cx-1"].cost_unknown_turns == 1
+    assert aggregate_usage([], agents=["a"]).by_agent["a"].cost_unknown_turns == 0
+
+
+def test_usage_json_has_the_separate_cost_fields(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run-1"
+    write_transcript(
+        run_dir, "api-1", [turn_end("api-1", 1, input=1, cost=0.4, kind="billed", model="m")]
+    )
+    write_transcript(
+        run_dir, "abo-1", [turn_end("abo-1", 1, input=1, cost=2.0, kind="estimated", model="m")]
+    )
+    write_transcript(run_dir, "cx-1", [turn_end("cx-1", 1, input=1, model="m")])
+    configs = [
+        config("api-1", auth="api-key"),
+        config("abo-1", auth="max"),
+        config("cx-1", "codex", "chatgpt"),
+    ]
+    data = json.loads(write_usage_json(run_dir, configs).read_text(encoding="utf-8"))
+    for part in (data["total"], data["by_model"]["m"]):
+        assert part["cost_billed_usd"] == pytest.approx(0.4)
+        assert part["cost_estimated_usd"] == pytest.approx(2.0)
+        assert part["cost_unknown_turns"] == 1
+    assert data["by_profile"]["chatgpt"]["cost_unknown_turns"] == 1
+    assert data["by_agent"]["api-1"]["models"]["m"]["cost_billed_usd"] == pytest.approx(0.4)
+
+
+def test_a_turn_without_turn_end_does_not_count(tmp_path: Path) -> None:
+    """Crashed turns add nothing, even with `usage` events (point 11, documented behaviour)."""
+    records = [
+        turn_end("a", 1, input=100, output=10, cost=0.5, kind="estimated"),
+        {
+            "seq": 5,
+            "ts": 5.0,
+            "agent": "a",
+            "turn": 2,
+            "kind": "usage",
+            "data": {"input": 999, "output": 999},
+        },  # fmt: skip
+        {"seq": 6, "ts": 6.0, "agent": "a", "turn": 2, "kind": "text", "data": {"text": "..."}},
+    ]
+    write_transcript(tmp_path, "a", records)
+    usage = compute_run_usage(tmp_path, [config("a")])
+    assert usage.total.turns == 1
+    assert (usage.total.usage.input, usage.total.usage.output) == (100, 10)
+    assert usage.total.cost_estimated_usd == 0.5
+    assert "without `turn_end`" in (arr_usage.__doc__ or "")  # documented in the module

@@ -12,6 +12,7 @@ See docs/02-workfolder-und-runs.md §4, §6.
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -65,15 +66,35 @@ def _json_default(obj: object) -> Any:
     return _safe_str(obj)
 
 
+def _clean(value: Any, path: frozenset[int] = frozenset()) -> Any:
+    """Slow path of `_dumps`: plain JSON data with `null` for NaN/Infinity and cycles."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, str | int):  # bool is an int
+        return value
+    if id(value) in path:
+        return "<zirkulär>"
+    path = path | {id(value)}
+    if isinstance(value, Mapping):
+        return {str(key): _clean(item, path) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_clean(item, path) for item in value]
+    return _clean(_json_default(value), path)
+
+
 def _dumps(value: Any) -> str:
-    text = json.dumps(value, ensure_ascii=False, default=_json_default)
+    """Serialize as valid JSON (no `NaN`/`Infinity`) on one line; never raises for odd objects."""
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=_json_default, allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        text = json.dumps(_clean(value), ensure_ascii=False, allow_nan=False)
     # Keep one record per line even for tools that split on the Unicode line separators.
     return text.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
 
 
 def _encode_line(record: dict[str, Any], payload_key: str) -> str:
-    """Encode `record` as one JSON line; if `record[payload_key]` cannot be serialized
-    (circular references, non-string keys, …), replace it with a note and its `repr`."""
+    """Encode `record` as one JSON line; if `record[payload_key]` cannot be serialized at all,
+    replace it with a note and its `repr`."""
     try:
         return _dumps(record)
     except Exception:
@@ -133,8 +154,9 @@ class EventLogger:
         self.raw_path = self.agent_dir / RAW_FILE
         self.blobs_dir = self.agent_dir / BLOBS_DIR
         self._lock = threading.Lock()
-        self._seq = self._repair(self.transcript_path)
-        self._repair(self.raw_path)
+        # A crash between the two writes can leave a raw line without transcript line: continue
+        # after the higher `seq` so no `seq` is ever used twice in `raw.jsonl`.
+        self._seq = max(self._repair(self.transcript_path), self._repair(self.raw_path))
         self._transcript: IO[str] | None = self.transcript_path.open(
             "a", encoding="utf-8", newline="\n"
         )
@@ -238,8 +260,17 @@ def _quote(text: str) -> str:
     return "\n".join(f"> {line}".rstrip() for line in text.splitlines() or [""])
 
 
-def _clock(ts: float, tz: tzinfo | None) -> str:
-    return datetime.fromtimestamp(ts, tz).strftime("%H:%M:%S")
+def _clock(ts: Any, tz: tzinfo | None) -> str:
+    """`HH:MM:SS`, or „–“ when `ts` is not a usable time stamp."""
+    try:
+        return datetime.fromtimestamp(float(ts), tz).strftime("%H:%M:%S")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "–"
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    """`value` if it is a mapping, else an empty one (damaged records must not break rendering)."""
+    return value if isinstance(value, Mapping) else {}
 
 
 def _tokens(n: int) -> str:
@@ -253,11 +284,16 @@ def _tokens(n: int) -> str:
     return str(n)
 
 
-def _money(value: float, kind: str | None) -> str:
-    """Cost as in docs/08 §8.7: `18,40 $`; estimated (subscription) with `≈`."""
+def _money(value: float, kind: str | None, *, explain: bool) -> str:
+    """Cost as in docs/08 §8.7: `18,40 $`; estimated (subscription) with `≈`.
+
+    `explain` adds „(rechnerisch)“, which belongs to the first estimated amount only.
+    """
     digits = 2 if value >= 0.01 or value == 0 else 4
     text = f"{value:.{digits}f}".replace(".", ",") + " $"
-    return f"≈ {text} (rechnerisch)" if kind == "estimated" else text
+    if kind != "estimated":
+        return text
+    return f"≈ {text} (rechnerisch)" if explain else f"≈ {text}"
 
 
 def _truncate(text: str) -> str:
@@ -273,21 +309,33 @@ def _truncate(text: str) -> str:
     return cut
 
 
-def _usage_text(data: Mapping[str, Any]) -> str:
-    usage = data.get("usage") or {}
+@dataclasses.dataclass
+class _RenderState:
+    """What the renderer remembers between records."""
+
+    tz: tzinfo | None
+    explained_estimate: bool = False
+
+
+def _usage_text(data: Mapping[str, Any], state: _RenderState) -> str:
+    usage = _mapping(data.get("usage"))
     parts = []
     for label, key in (("ein", "input"), ("aus", "output"), ("Cache", "cache_read")):
         if isinstance(usage.get(key), int):
             parts.append(f"{label} {_tokens(usage[key])}")
-    if isinstance(data.get("cost_usd"), int | float):
-        parts.append(_money(float(data["cost_usd"]), data.get("cost_kind")))
+    cost = data.get("cost_usd")
+    if isinstance(cost, int | float) and not isinstance(cost, bool) and math.isfinite(cost):
+        kind = data.get("cost_kind")
+        parts.append(_money(float(cost), kind, explain=not state.explained_estimate))
+        if kind == "estimated":
+            state.explained_estimate = True
     return " · ".join(parts)
 
 
-def _render_event(rec: Mapping[str, Any], tz: tzinfo | None) -> str | None:
+def _render_event(rec: Mapping[str, Any], state: _RenderState) -> str | None:
     kind = rec.get("kind")
-    data: Mapping[str, Any] = rec.get("data") or {}
-    clock = _clock(float(rec.get("ts", 0)), tz)
+    data = _mapping(rec.get("data"))
+    clock = _clock(rec.get("ts"), state.tz)
     match kind:
         case "text":
             return str(data.get("text", ""))
@@ -308,7 +356,8 @@ def _render_event(rec: Mapping[str, Any], tz: tzinfo | None) -> str | None:
             return f"{head}\n\n{_fence(_truncate(str(content)))}"
         case "rate_limit":
             used = data.get("utilization")
-            extra = f", Auslastung {round(used * 100)} %" if isinstance(used, int | float) else ""
+            shown = isinstance(used, int | float) and math.isfinite(used)
+            extra = f", Auslastung {round(used * 100)} %" if shown else ""
             return f"*Rate-Limit: {data.get('status', '?')}{extra}*"
         case "error":
             tail = "behebbar" if data.get("recoverable") else "nicht behebbar"
@@ -316,10 +365,11 @@ def _render_event(rec: Mapping[str, Any], tz: tzinfo | None) -> str | None:
         case "hint":
             where = f" aus #{data['channel']}" if data.get("channel") else ""
             return _quote(f"**Hinweis{where}** ({data.get('method', '?')}): {data.get('text', '')}")
-        case "usage":
-            return None  # token counts show up summed in `turn_end`
-        case _:
+        case _:  # `usage` shows up summed in `turn_end`; unknown kinds are not shown
             return None
+
+
+_UNFINISHED = "---\n*Turn ohne Abschluss: der Lauf wurde unterbrochen.*"
 
 
 def render_transcript(
@@ -331,41 +381,55 @@ def render_transcript(
     """Render normalized events (records of `transcript.jsonl`) as readable Markdown.
 
     Thinking is set off as a quote, tool calls and results as labeled code blocks, each turn
-    has a heading and a closing line with status, tokens and cost. A turn without `turn_end`
-    (crash) is marked. `tz` is the time zone of the time stamps (default: local).
+    has a heading and a closing line with status, tokens and cost („(rechnerisch)“ only at the
+    first estimated amount). Every turn without `turn_end` (crash, restart) is marked; a
+    second `turn_start` of the same turn shows as „Neustart“ with its prompt. Damaged records
+    are tolerated: unusable values show as „–“, a record that cannot be rendered is noted.
+    `tz` is the time zone of the time stamps (default: local).
     """
-    records = list(records)
+    records = [rec for rec in records if isinstance(rec, Mapping)]
     agent = agent_id or (records[0].get("agent") if records else None) or "?"
     out: list[str] = [f"# Transkript – {agent}"]
     if records and records[0].get("run"):
         out.append(f"Run `{records[0]['run']}` · {len(records)} Ereignisse")
+    state = _RenderState(tz)
     turn: Any = None
+    seen_turns: set[Any] = set()
     open_turn = False
     for rec in records:
-        if rec.get("turn") != turn:
-            turn = rec.get("turn")
-            open_turn = True
-            head = f"## Turn {turn} · {_clock(float(rec.get('ts', 0)), tz)}"
-            if rec.get("kind") == "turn_start":
-                data = rec.get("data") or {}
-                if data.get("stage"):
-                    head += f"\n\n**Stufe:** {data['stage']}"
-                head += f"\n\n{_quote(str(data.get('prompt', '')))}"
-            out.append(head)
-            if rec.get("kind") == "turn_start":
-                continue
-        if rec.get("kind") == "turn_end":
-            data = rec.get("data") or {}
-            summary = f"Turn {turn} beendet: {data.get('status', '?')}"
-            if details := _usage_text(data):
-                summary += f" · {details}"
-            out.append(f"---\n*{summary}*")
-            open_turn = False
-            continue
-        if rendered := _render_event(rec, tz):
-            out.append(rendered)
+        try:
+            is_start = rec.get("kind") == "turn_start"
+            if is_start or rec.get("turn") != turn:
+                if open_turn:
+                    out.append(_UNFINISHED)
+                turn = rec.get("turn")
+                restart = is_start and turn in seen_turns
+                seen_turns.add(turn)
+                open_turn = True
+                label = f"Turn {turn}" + (" (Neustart)" if restart else "")
+                head = f"## {label} · {_clock(rec.get('ts'), tz)}"
+                if is_start:
+                    data = _mapping(rec.get("data"))
+                    if data.get("stage"):
+                        head += f"\n\n**Stufe:** {data['stage']}"
+                    head += f"\n\n{_quote(str(data.get('prompt', '')))}"
+                out.append(head)
+                if is_start:
+                    continue
+            if rec.get("kind") == "turn_end":
+                data = _mapping(rec.get("data"))
+                summary = f"Turn {turn} beendet: {data.get('status', '?')}"
+                if details := _usage_text(data, state):
+                    summary += f" · {details}"
+                out.append(f"---\n*{summary}*")
+                open_turn = False
+            elif rendered := _render_event(rec, state):
+                out.append(rendered)
+        except Exception:
+            log.warning("Datensatz seq %s nicht darstellbar", rec.get("seq"), exc_info=True)
+            out.append(f"*(Ereignis {rec.get('seq', '?')} nicht darstellbar)*")
     if open_turn:
-        out.append("---\n*Turn ohne Abschluss: der Lauf wurde unterbrochen.*")
+        out.append(_UNFINISHED)
     return "\n\n".join(out) + "\n"
 
 

@@ -40,5 +40,8 @@ turns:
       - { do: rate_limit, status: allowed_warning, utilization: 0.82, resets_at: 1761240000 }
       - { do: usage, input: 1000, output: 200, cost_usd: 0.05 }
       - { do: delay, seconds: 0.01 }
+      - { do: hang, seconds: 0.01 }
       - { do: error, message: "Werkzeug kurz nicht erreichbar", recoverable: true }
       - { do: text, text: "Fertig." }
+      - { do: end, status: ok }
+      - { do: text, text: "wird nach end nicht mehr gespielt" }

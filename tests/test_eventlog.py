@@ -165,7 +165,7 @@ def test_unserializable_raw_objects_do_not_break_logging(tmp_path: Path) -> None
     raw_records = read_events(tmp_path / "raw.jsonl")
     assert raw_records[1]["raw"] == [1, 2]
     assert raw_records[3]["raw"]["content"].startswith("<object object")
-    assert "unserializable" in raw_records[4]["raw"]
+    assert raw_records[4]["raw"] == ["<zirkulär>"]  # only the cycle is replaced
     transcript = read_events(tmp_path / "transcript.jsonl")
     assert [r["seq"] for r in transcript] == [1, 2, 3, 4, 5, 6, 7]
     assert transcript[5]["data"]["input"]["o"].startswith("<object object")
@@ -314,3 +314,159 @@ def test_write_transcript_md_from_agent_folder(tmp_path: Path) -> None:
     assert target == agent_dir / "transcript.md"
     assert text.startswith("# Transkript – explorer-1")
     assert "Antwort" in text and "*Turn 1 beendet: ok · ein 10 · aus 5 · 18,40 $*" in text
+
+
+# --------------------------------------------------------------------------------------------
+# W1-04.1
+# --------------------------------------------------------------------------------------------
+
+
+def test_seq_continues_after_a_raw_line_without_transcript_line(tmp_path: Path) -> None:
+    """Crash between the raw write and the transcript write must not reuse a `seq` (point 3)."""
+    with EventLogger(tmp_path) as logger:
+        logger.log(event(EventKind.TEXT, {"text": "eins"}, raw={"n": 1}))
+    with (tmp_path / "raw.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write('{"seq": 2, "ts": 1.0, "raw": {"n": 2}}\n')  # transcript line 2 never written
+    with EventLogger(tmp_path) as logger:
+        assert logger.seq == 2
+        logger.log(event(EventKind.TEXT, {"text": "drei"}, raw={"n": 3}))
+    assert [r["seq"] for r in read_events(tmp_path / "raw.jsonl")] == [1, 2, 3]
+    assert [r["seq"] for r in read_events(tmp_path / "transcript.jsonl")] == [1, 3]
+
+
+def test_seq_continues_when_only_the_raw_file_has_a_torn_line(tmp_path: Path) -> None:
+    with EventLogger(tmp_path) as logger:
+        logger.log(event(EventKind.TEXT, {"text": "eins"}, raw={"n": 1}))
+    with (tmp_path / "raw.jsonl").open("ab") as handle:
+        handle.write(b'{"seq": 2, "raw"')
+    with EventLogger(tmp_path) as logger:
+        assert logger.log(event(EventKind.TEXT, {"text": "zwei"}, raw={"n": 2}))["seq"] == 2
+    assert [r["seq"] for r in read_events(tmp_path / "raw.jsonl")] == [1, 2]
+
+
+def strict_json(path: Path) -> list[Any]:
+    """Parse like a strict parser (browser `JSON.parse`): `NaN`/`Infinity` are errors."""
+
+    def refuse(name: str) -> Any:
+        raise ValueError(f"nicht erlaubt: {name}")
+
+    return [json.loads(line, parse_constant=refuse) for line in path.read_text().splitlines()]
+
+
+def test_non_finite_numbers_are_written_as_null(tmp_path: Path) -> None:
+    @dataclasses.dataclass
+    class Sdk:
+        ratio: float
+
+    nan, inf = float("nan"), float("inf")
+    with EventLogger(tmp_path) as logger:
+        logger.log(
+            event(
+                EventKind.RATE_LIMIT,
+                {"status": "x", "utilization": nan, "resets_at": -inf, "more": [inf, 1.5]},
+                raw={"nan": nan, "sdk": Sdk(ratio=inf)},
+            )
+        )
+        logger.log(event(EventKind.TEXT, {"text": "danach"}))
+    transcript = strict_json(tmp_path / "transcript.jsonl")
+    assert transcript[0]["data"] == {
+        "status": "x",
+        "utilization": None,
+        "resets_at": None,
+        "more": [None, 1.5],
+    }
+    assert transcript[1]["data"]["text"] == "danach"
+    assert strict_json(tmp_path / "raw.jsonl")[0]["raw"] == {"nan": None, "sdk": {"ratio": None}}
+
+
+def test_open_turns_in_the_middle_are_marked_and_restarts_shown() -> None:
+    """Snapshot covers it; this pins the individual rules (point 4)."""
+    rendered = render_transcript(read_events(FIXTURES / "transcript_sample.jsonl"), tz=UTC)
+    assert rendered.count("*Turn ohne Abschluss: der Lauf wurde unterbrochen.*") == 2
+    mid = rendered.index("## Turn 3 · ")
+    assert rendered.index("Turn ohne Abschluss") < mid  # turn 2 is marked before turn 3 starts
+    restart = rendered[rendered.index("## Turn 3 (Neustart)") :]
+    assert "> Fasse noch einmal zusammen." in restart and "**Stufe:** wrapup" in restart
+
+
+def test_second_turn_start_in_the_same_turn_is_a_restart_with_prompt() -> None:
+    records = [
+        {"seq": 1, "ts": 0, "kind": "turn_start", "turn": 1, "data": {"prompt": "alt"}},
+        {"seq": 2, "ts": 1, "kind": "turn_start", "turn": 1, "data": {"prompt": "neu"}},
+        {"seq": 3, "ts": 2, "kind": "turn_end", "turn": 1, "data": {"status": "ok"}},
+    ]
+    rendered = render_transcript(records, tz=UTC)
+    assert "## Turn 1 · 00:00:00" in rendered and "## Turn 1 (Neustart) · 00:00:01" in rendered
+    assert "> alt" in rendered and "> neu" in rendered
+    assert rendered.count("Turn ohne Abschluss") == 1  # the first start never ended
+    assert rendered.rstrip().endswith("*Turn 1 beendet: ok*")
+
+
+def test_renderer_tolerates_damaged_records(tmp_path: Path) -> None:
+    """JSON-valid but wrongly shaped records must not stop `write_transcript_md` (point 5)."""
+    agent_dir = tmp_path / "explorer-1"
+    agent_dir.mkdir()
+    damaged = [
+        {"seq": 1, "ts": 0, "run": "r", "agent": "a", "turn": 1, "kind": "turn_start", "data": {}},
+        {"seq": 2, "ts": "abc", "turn": 1, "kind": "text", "data": {"text": "Zeit kaputt"}},
+        {"seq": 3, "ts": 3, "turn": 1, "kind": "tool_call", "data": ["keine", "Map"]},
+        {
+            "seq": 4,
+            "ts": None,
+            "turn": 1,
+            "kind": "tool_call",
+            "data": {"name": "Bash", "input": 1},
+        },
+        {
+            "seq": 5,
+            "ts": 5,
+            "turn": 1,
+            "kind": "turn_end",
+            "data": {"status": "ok", "usage": "kaputt"},
+        },
+        {
+            "seq": 6,
+            "ts": 6,
+            "turn": 2,
+            "kind": "turn_end",
+            "data": {"cost_usd": "viel", "usage": []},
+        },
+        {"seq": 7, "ts": 7, "turn": 2, "kind": "rate_limit", "data": "x"},
+        {"seq": 8, "ts": 8, "turn": 2, "kind": "hint", "data": None},
+        {"seq": 9, "ts": float("nan"), "turn": 3, "kind": "text", "data": {"text": "NaN-Zeit"}},
+    ]
+    (agent_dir / "transcript.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in damaged) + '[1, 2]\n"nur ein String"\n',
+        encoding="utf-8",
+    )
+    text = write_transcript_md(agent_dir, tz=UTC).read_text(encoding="utf-8")
+    assert "Zeit kaputt" in text and "NaN-Zeit" in text
+    assert "**Werkzeug** `Bash` · –" in text  # unusable time stamp shows as „–“
+    assert "*Turn 1 beendet: ok*" in text  # usage "kaputt" is ignored
+    assert "## Turn 3 · –" in text
+
+
+def test_renderer_notes_a_record_it_cannot_render(caplog: pytest.LogCaptureFixture) -> None:
+    class Boom(dict):  # type: ignore[type-arg]
+        def get(self, key: str, default: Any = None) -> Any:
+            if key == "kind":
+                raise RuntimeError("kaputt")
+            return super().get(key, default)
+
+    rendered = render_transcript([Boom(seq=4), {"seq": 5, "kind": "text", "data": {"text": "ok"}}])
+    assert "*(Ereignis 4 nicht darstellbar)*" in rendered and "ok" in rendered
+
+
+def test_rechnerisch_only_at_the_first_estimated_amount() -> None:
+    def end(seq: int, turn: int, cost: float, kind: str | None) -> dict[str, Any]:
+        data = {"status": "ok", "usage": {}, "cost_usd": cost, "cost_kind": kind}
+        return {"seq": seq, "ts": seq, "turn": turn, "kind": "turn_end", "data": data}
+
+    rendered = render_transcript(
+        [end(1, 1, 18.4, "billed"), end(2, 2, 0.5, "estimated"), end(3, 3, 0.25, "estimated")],
+        tz=UTC,
+    )
+    assert "Turn 1 beendet: ok · 18,40 $*" in rendered  # billed: no ≈
+    assert "Turn 2 beendet: ok · ≈ 0,50 $ (rechnerisch)*" in rendered
+    assert "Turn 3 beendet: ok · ≈ 0,25 $*" in rendered
+    assert rendered.count("(rechnerisch)") == 1

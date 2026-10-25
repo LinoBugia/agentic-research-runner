@@ -8,7 +8,13 @@ from the same records (docs/02 §8).
 
 `cost_kind` says whether a cost is `billed` (API key) or `estimated` (subscription, shown with
 „≈“, docs/08-ux-konzept.md §8.7); `None` means unknown, e.g. Codex reports no cost. When
-parts are summed, `Usage.__add__` decides the kind of the sum.
+parts are summed, `Usage.__add__` decides the kind of the sum. Because a mixed sum cannot say
+how much was billed and how much estimated (docs/08 §5.9), every `UsageTotal` also keeps the
+amounts apart: `cost_billed_usd`, `cost_estimated_usd` and the number of turns without a known
+cost (`cost_unknown_turns`).
+
+Only finished turns count: a turn without `turn_end` (crash) adds nothing to `usage.json`,
+even if `usage` events with tokens were logged. Such usage is not made up afterwards.
 """
 
 import logging
@@ -45,15 +51,30 @@ class UsageRecord(Record):
 
 
 class UsageTotal(Record):
-    """Summed usage with the number of turns it covers."""
+    """Summed usage with the number of turns it covers.
+
+    `usage` is the sum by `Usage.__add__` (one cost, one kind). The three fields below keep
+    the cost apart by kind: `cost_billed_usd` (API key) and `cost_estimated_usd`
+    (subscription, „≈“) are exact; `cost_unknown_turns` counts turns without a known cost
+    (no `cost_usd`, e.g. Codex) or with a cost of unknown kind.
+    """
 
     usage: Usage = Field(default_factory=Usage)
     turns: int = 0
+    cost_billed_usd: float = Field(default=0, ge=0)
+    cost_estimated_usd: float = Field(default=0, ge=0)
+    cost_unknown_turns: int = Field(default=0, ge=0)
 
     def add(self, usage: Usage) -> None:
         """Add the usage of one turn."""
         self.usage = self.usage + usage
         self.turns += 1
+        if usage.cost_usd is not None and usage.cost_kind is CostKind.BILLED:
+            self.cost_billed_usd += usage.cost_usd
+        elif usage.cost_usd is not None and usage.cost_kind is CostKind.ESTIMATED:
+            self.cost_estimated_usd += usage.cost_usd
+        else:
+            self.cost_unknown_turns += 1
 
 
 class AgentUsage(UsageTotal):

@@ -1,6 +1,7 @@
 """FakeBackend (W1-04 A3, A4): all step kinds, room calls through RoomAPI, interrupt, hints."""
 
 import asyncio
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -49,8 +50,8 @@ class StubRoom:
     def agent_id(self) -> str:
         return self._agent_id
 
-    def _record(self, name: str, **kwargs: Any) -> None:
-        self.calls.append((name, kwargs))
+    def _record(self, method: str, /, **kwargs: Any) -> None:
+        self.calls.append((method, kwargs))
         if self.fail_next:
             message, self.fail_next = self.fail_next, None
             raise RoomError(message)
@@ -758,3 +759,165 @@ async def test_usage_events_have_tokens_and_model_but_no_cost() -> None:
         "input": 3, "output": None, "cache_read": None, "cache_write": None,
         "reasoning": None, "model": "fake-model",
     }  # fmt: skip
+
+
+# --------------------------------------------------------------------------------------------
+# W1-04.1
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"), [("ok", None), ("limit", "limit"), ("error", "fake_error")]
+)
+async def test_end_step_ends_the_turn_with_the_given_status(
+    status: str, error_type: str | None
+) -> None:
+    backend = await started(
+        {
+            "turns": [
+                {
+                    "steps": [
+                        {"do": "text", "text": "vorher"},
+                        {"do": "end", "status": status, "message": "Budget erreicht"},
+                        {"do": "text", "text": "nie"},
+                    ]
+                }
+            ]
+        }
+    )
+    events = await play(backend)
+    if error_type is None:
+        assert kinds(events) == ["turn_start", "text", "turn_end"]
+    else:
+        assert kinds(events) == ["turn_start", "text", "error", "turn_end"]
+        assert events[2].data == {
+            "message": "Budget erreicht",
+            "type": error_type,
+            "recoverable": False,
+        }
+    assert events[-1].data["status"] == status
+
+
+async def test_end_step_without_message_uses_a_default() -> None:
+    backend = await started({"turns": [{"steps": [{"do": "end", "status": "limit"}]}]})
+    events = await play(backend)
+    assert events[1].data["message"] == "Limit erreicht"
+    assert events[-1].data["status"] == "limit"
+
+
+def test_end_step_rejects_other_statuses() -> None:
+    with pytest.raises(ConfigError):
+        load_script({"turns": [{"steps": [{"do": "end", "status": "interrupted"}]}]})
+
+
+async def test_leaving_a_turn_with_break_does_not_block_the_next_turn() -> None:
+    backend = await started(
+        {
+            "turns": [
+                {"steps": [{"do": "text", "text": "a"}, {"do": "delay", "seconds": 30}]},
+                {"steps": [{"do": "text", "text": "b"}]},
+            ],
+        }
+    )
+    async for event in backend.run_turn("erster"):
+        if event.kind is EventKind.TEXT:
+            break  # no aclose(): the iterator is simply dropped
+    events = await asyncio.wait_for(play(backend, "zweiter"), timeout=1)  # no "läuft schon"
+    assert kinds(events) == ["turn_start", "text", "turn_end"]
+    assert events[0].turn == 2 and events[1].data["text"] == "b"
+    assert events[-1].data["status"] == "ok"
+    await asyncio.sleep(0.01)  # the loop finalizes the abandoned generator meanwhile
+    assert await backend.deliver_hint("x") is False  # its late cleanup left the state idle
+
+
+async def test_a_live_but_paused_turn_still_blocks_a_second_one() -> None:
+    backend = await started({"turns": [{"steps": [{"do": "text", "text": "a"}]}] * 2})
+    stream = backend.run_turn("a")  # still referenced: not abandoned
+    await anext(stream)
+    with pytest.raises(RuntimeError, match="läuft schon"):
+        await anext(backend.run_turn("b"))
+    await stream.aclose()
+
+
+async def test_aclosing_ends_an_early_left_turn() -> None:
+    backend = await started(
+        {"repeat_last": True, "turns": [{"steps": [{"do": "text", "text": "a"}]}] * 1}
+    )
+    async with contextlib.aclosing(backend.run_turn("x")) as stream:
+        async for _ in stream:
+            break
+    assert await backend.deliver_hint("x") is False  # no turn runs any more
+    assert (await play(backend))[-1].data["status"] == "ok"
+
+
+async def test_hang_ignores_interrupt_until_its_time_is_up() -> None:
+    backend = await started(
+        {
+            "turns": [
+                {
+                    "steps": [
+                        {"do": "hang", "seconds": 0.3},
+                        {"do": "text", "text": "kommt nicht mehr"},
+                    ]
+                }
+            ]
+        }
+    )
+    stream = backend.run_turn("x")
+    await anext(stream)  # turn_start
+    started_at = time.monotonic()
+    next_event = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0.05)
+    await backend.interrupt()
+    with pytest.raises(TimeoutError):  # interrupt() does not cut the hang short
+        await asyncio.wait_for(asyncio.shield(next_event), timeout=0.1)
+    end = await next_event
+    assert time.monotonic() - started_at >= 0.3
+    assert end.kind is EventKind.TURN_END and end.data["status"] == "interrupted"
+
+
+async def test_moderator_and_reading_actions_run_against_the_room() -> None:
+    room = StubRoom("mod-1")
+    room.messages.append(
+        Message(
+            id=1, ts=1.0, channel="main", sender="explorer-1", body="Vorschlag", kind="proposal"
+        )
+    )
+    steps = [
+        {"do": "room", "action": "inbox", "save_as": "inbox"},
+        {"do": "room", "action": "list_channels"},
+        {"do": "room", "action": "get_attachment", "args": {"msg_id": 1, "name": "beweis.pdf"}},
+        {"do": "room", "action": "give_floor", "args": {"agent": "explorer-1", "prompt": "Bitte"}},
+        {"do": "room", "action": "call_vote", "args": {"proposal_id": 1, "rule": "unanimous"}},
+        {"do": "room", "action": "pin", "args": {"msg_id": 1}},
+        {
+            "do": "room",
+            "action": "close_discussion",
+            "args": {"decision": "Wir nehmen Idee A.", "channel": "main"},
+            "save_as": "decision",
+        },
+    ]
+    backend = await started({"turns": [{"steps": steps}]}, room, agent="mod-1")
+    events = await play(backend)
+
+    assert [name for name, _ in room.calls] == [
+        "inbox",
+        "list_channels",
+        "get_attachment",
+        "give_floor",
+        "call_vote",
+        "pin",
+        "close_discussion",
+        "post_message",  # the stub posts the decision
+    ]
+    results = [e for e in events if e.kind is EventKind.TOOL_RESULT]
+    assert len(results) == 7 and not any(r.data["is_error"] for r in results)
+    assert json.loads(results[0].data["content"])["unread"] == {"main": 2}
+    assert json.loads(results[1].data["content"]) == []
+    assert json.loads(results[2].data["content"]).endswith("beweis.pdf")  # Path → str
+    assert [r.data["content"] for r in results[3:6]] == ["ok", "ok", "ok"]
+    assert json.loads(results[6].data["content"])["kind"] == "decision"
+    assert room.calls[3][1] == {"agent": "explorer-1", "prompt": "Bitte", "channel": None}
+    assert room.calls[4][1]["rule"] is VoteRule.UNANIMOUS
+    assert room.calls[5][1] == {"msg_id": 1}
+    assert events[-1].data["status"] == "ok"

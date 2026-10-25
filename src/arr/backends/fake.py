@@ -22,7 +22,9 @@ Script format (YAML)::
             args: {channel: main, body: "Idee 1", kind: idea}
             save_as: posted         # later: reply_to: "${posted.id}"
           - {do: usage, input: 1200, output: 300, cost_usd: 0.02}
-          - {do: delay, seconds: 0.5}
+          - {do: delay, seconds: 0.5}      # interruptible wait
+          - {do: hang, seconds: 2}         # wait that ignores interrupt()
+          - {do: end, status: limit, message: "Budget erreicht"}   # end the turn now
 
 String values of room `args` that consist of exactly `${name.path}` are replaced by a value
 saved earlier with `save_as` (dotted path; list items by index).
@@ -32,6 +34,7 @@ import asyncio
 import inspect
 import json
 import re
+import weakref
 from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -181,6 +184,28 @@ class ErrorStep(StrictModel):
     recoverable: bool = False
 
 
+class HangStep(StrictModel):
+    """Wait the full time and ignore `interrupt()` (to test timeouts, docs/01 §4.2).
+
+    After the wait the pending interrupt takes effect before the next step.
+    """
+
+    do: Literal["hang"]
+    seconds: float = Field(ge=0)
+
+
+class EndStep(StrictModel):
+    """End the turn now with `status`.
+
+    `limit` and `error` are preceded by an `error` event (`type: limit` / `fake_error`,
+    not recoverable) carrying `message`; `ok` just stops (remaining steps are skipped).
+    """
+
+    do: Literal["end"]
+    status: Literal["ok", "limit", "error"] = "ok"
+    message: str = ""
+
+
 Step = Annotated[
     TextStep
     | ThinkingStep
@@ -189,6 +214,8 @@ Step = Annotated[
     | UsageStep
     | RateLimitStep
     | DelayStep
+    | HangStep
+    | EndStep
     | ErrorStep,
     Field(discriminator="do"),
 ]
@@ -284,6 +311,7 @@ class _TurnState:
     tool_calls: int = 0
     saved: dict[str, Any] = field(default_factory=dict)
     status: TurnStatus = TurnStatus.OK
+    ended: bool = False
 
 
 class FakeBackend:
@@ -312,10 +340,15 @@ class FakeBackend:
         self._turn = 0
         self._started = False
         self._closed = False
-        self._running = False
+        self._current: tuple[object, weakref.ref[Any]] | None = None
         self._interrupted = asyncio.Event()
         self._wake = asyncio.Event()
         self._hints: list[str] = []
+
+    @property
+    def _running(self) -> bool:
+        """True while a turn runs; a turn whose generator was dropped does not count."""
+        return self._current is not None and self._current[1]() is not None
 
     # -- lifecycle ------------------------------------------------------------------------
 
@@ -353,13 +386,28 @@ class FakeBackend:
 
     # -- turn -----------------------------------------------------------------------------
 
-    async def run_turn(self, prompt: str, *, stage: str | None = None) -> AsyncIterator[AgentEvent]:
-        """Play the next turn of the script; ends with `turn_end` also after interrupt/errors."""
+    def run_turn(self, prompt: str, *, stage: str | None = None) -> AsyncIterator[AgentEvent]:
+        """Play the next turn of the script; ends with `turn_end` also after interrupt/errors.
+
+        Callers that may leave the loop early should wrap the iterator in
+        `contextlib.aclosing(...)`, which ends the turn at once. A turn that was abandoned
+        without that (the iterator is gone) is detected and closed by the next `run_turn`.
+        A second turn while the first iterator is still alive raises `RuntimeError`.
+        """
+        holder: list[weakref.ref[Any]] = []
+        events = self._run_turn(prompt, stage, holder)
+        holder.append(weakref.ref(events))
+        return events
+
+    async def _run_turn(
+        self, prompt: str, stage: str | None, holder: list[weakref.ref[Any]]
+    ) -> AsyncIterator[AgentEvent]:
         if not self._started or self._closed:
             raise RuntimeError("FakeBackend: start() fehlt oder close() ist schon erfolgt")
         if self._running:
             raise RuntimeError("FakeBackend: es läuft schon ein Turn")
-        self._running = True
+        token = object()  # identifies this turn; a late cleanup of an abandoned one must not
+        self._current = (token, holder[0])  # clear the state of its successor
         self._interrupted.clear()
         self._wake.clear()
         self._hints.clear()
@@ -379,15 +427,19 @@ class FakeBackend:
                     EventKind.ERROR,
                     ErrorData(message=str(exc), type=type(exc).__name__, recoverable=False),
                 )
-            if self._interrupted.is_set() and state.status is TurnStatus.OK:
+            if self._interrupted.is_set() and state.status is TurnStatus.OK and not state.ended:
                 state.status = TurnStatus.INTERRUPTED
             tail = list(self._take_hints(state))
-            self._running = False  # no hint is accepted after the last drain
+            self._release(token)  # no hint is accepted after the last drain
             for event in tail:
                 yield event
             yield self._turn_end(state)
         finally:
-            self._running = False
+            self._release(token)
+
+    def _release(self, token: object) -> None:
+        if self._current is not None and self._current[0] is token:
+            self._current = None
 
     async def _play(self, state: _TurnState) -> AsyncIterator[AgentEvent]:
         for step in self._turn_script(state.n).steps:
@@ -397,7 +449,7 @@ class FakeBackend:
                 return
             async for event in self._step(step, state):
                 yield event
-            if state.status is not TurnStatus.OK:
+            if state.status is not TurnStatus.OK or state.ended:
                 return
 
     def _turn_script(self, n: int) -> TurnScript:
@@ -486,6 +538,21 @@ class FakeBackend:
             case DelayStep():
                 async for hint in self._wait(step.seconds, state):
                     yield hint
+            case HangStep():
+                await asyncio.sleep(step.seconds)
+            case EndStep():
+                state.ended = True
+                if step.status != "ok":
+                    state.status = TurnStatus(step.status)
+                    default = "Limit erreicht" if step.status == "limit" else "Fehler im Turn"
+                    yield event(
+                        EventKind.ERROR,
+                        ErrorData(
+                            message=step.message or default,
+                            type="limit" if step.status == "limit" else "fake_error",
+                            recoverable=False,
+                        ),
+                    )
             case ErrorStep():
                 yield event(
                     EventKind.ERROR,

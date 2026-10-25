@@ -15,3 +15,8 @@
 {"seq": 15, "ts": 1761234060.0, "run": "20261023-1742_collatz_exploration_a3f9", "agent": "explorer-1", "turn": 2, "kind": "turn_start", "data": {"prompt": "Antworte auf die Frage.", "stage": null}}
 {"seq": 16, "ts": 1761234062.0, "run": "20261023-1742_collatz_exploration_a3f9", "agent": "explorer-1", "turn": 2, "kind": "text", "data": {"text": "Die Abschätzung gilt ab n = 2."}}
 {"seq": 17, "ts": 1761234063.0, "run": "20261023-1742_collatz_exploration_a3f9", "agent": "explorer-1", "turn": 2, "kind": "tool_call", "data": {"id": "toolu_04", "name": "Bash", "input": {"command": "python slow.py"}}}
+{"seq": 18, "ts": 1761234120.0, "run": "20261023-1742_collatz_exploration_a3f9", "agent": "explorer-1", "turn": 3, "kind": "turn_start", "data": {"prompt": "Fasse zusammen.", "stage": "wrapup"}}
+{"seq": 19, "ts": 1761234121.0, "run": "20261023-1742_collatz_exploration_a3f9", "agent": "explorer-1", "turn": 3, "kind": "text", "data": {"text": "Zusammenfassung: die Idee trägt."}}
+{"seq": 20, "ts": 1761234125.0, "run": "20261023-1742_collatz_exploration_a3f9", "agent": "explorer-1", "turn": 3, "kind": "turn_end", "data": {"status": "ok", "usage": {"input": 800, "output": 120, "cache_read": null, "cache_write": null, "reasoning": null}, "cost_usd": 0.12, "cost_kind": "estimated", "session": "s-1", "num_turns": 1}}
+{"seq": 21, "ts": 1761234200.0, "run": "20261023-1742_collatz_exploration_a3f9", "agent": "explorer-1", "turn": 3, "kind": "turn_start", "data": {"prompt": "Fasse noch einmal zusammen.", "stage": "wrapup"}}
+{"seq": 22, "ts": 1761234201.0, "run": "20261023-1742_collatz_exploration_a3f9", "agent": "explorer-1", "turn": 3, "kind": "text", "data": {"text": "Zweiter Anlauf …"}}

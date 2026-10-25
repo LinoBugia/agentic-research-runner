@@ -1,6 +1,6 @@
 # Transkript – explorer-1
 
-Run `20261023-1742_collatz_exploration_a3f9` · 17 Ereignisse
+Run `20261023-1742_collatz_exploration_a3f9` · 22 Ereignisse
 
 ## Turn 1 · 15:40:00
 
@@ -120,6 +120,28 @@ Die Abschätzung gilt ab n = 2.
   "command": "python slow.py"
 }
 ```
+
+---
+*Turn ohne Abschluss: der Lauf wurde unterbrochen.*
+
+## Turn 3 · 15:42:00
+
+**Stufe:** wrapup
+
+> Fasse zusammen.
+
+Zusammenfassung: die Idee trägt.
+
+---
+*Turn 3 beendet: ok · ein 800 · aus 120 · ≈ 0,12 $*
+
+## Turn 3 (Neustart) · 15:43:20
+
+**Stufe:** wrapup
+
+> Fasse noch einmal zusammen.
+
+Zweiter Anlauf …
 
 ---
 *Turn ohne Abschluss: der Lauf wurde unterbrochen.*
