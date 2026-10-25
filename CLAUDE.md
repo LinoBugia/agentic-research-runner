@@ -30,7 +30,7 @@ Vor jedem Commit: `uv run pytest && uv run ruff check && uv run ruff format --ch
 ## Struktur
 
 - `src/arr/` – Paket nach [01 §2](docs/01-architektur.md#2-paketstruktur-vorschlag); Einstieg CLI: `arr.cli:app` (Typer), neue Befehle als Unterbefehle anhängen. Logging: `arr.log.setup_logging()`.
-- `templates/` – Vorlagen für Workfolder, Projekte, Vollmachten, Start-Skills
+- `src/arr/templates/` – Vorlagen für Workfolder, Projekte, Vollmachten, Start-Skills (Paketdaten, gelesen über `importlib.resources`)
 - `tests/` – pytest, `asyncio_mode = "auto"`
 - `spikes/` – Wegwerf-Code, siehe [spikes/README.md](spikes/README.md); wird nie von `arr` importiert
 - Laufzeit-Abhängigkeiten bewusst klein halten. Agent-SDKs liegen vorerst nur in der Gruppe `spikes`; `mcp` und NiceGUI sind Laufzeit-Abhängigkeiten.

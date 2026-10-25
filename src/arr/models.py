@@ -480,7 +480,9 @@ class AgentSpec(AgentSettings):
 
 
 class AgentConfig(StrictModel):
-    """Fully resolved configuration of one agent, stored as `agents/<id>/agent.json` (docs/01 §3).
+    """Fully resolved configuration of one agent (docs/01 §3).
+
+    Stored as `config` in `agents/<id>/agent.json` (`AgentFile` in `arr.runs.prepare`).
 
     Contains only the auth profile's name, never a secret (docs/01 §8).
     """
