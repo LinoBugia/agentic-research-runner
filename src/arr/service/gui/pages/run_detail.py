@@ -55,9 +55,11 @@ from arr.service.gui.components.banner import banner
 from arr.service.gui.components.base import esc, icon, raw, set_disabled
 from arr.service.gui.components.copy_field import copy_html
 from arr.service.gui.components.dialog import ConfirmDialog
-from arr.service.gui.components.message import question_hint_html
+from arr.service.gui.components.message import message_dom_id, question_hint_html
 from arr.service.gui.components.meter import run_meters_html
+from arr.service.gui.components.page_state import forced_state
 from arr.service.gui.components.stage_bar import stage_bar_html
+from arr.service.gui.components.transcript_event import event_dom_id
 from arr.service.gui.layout import Frame
 from arr.service.gui.pages.run_detail_channel import ChannelView, unread_count
 from arr.service.gui.pages.run_detail_overview import (
@@ -66,7 +68,7 @@ from arr.service.gui.pages.run_detail_overview import (
     questions_to_user_html,
     results_short_html,
 )
-from arr.service.gui.pages.run_detail_results import ResultsView
+from arr.service.gui.pages.run_detail_results import ResultsView, result_dom_id
 from arr.service.gui.pages.run_detail_transcript import TranscriptView
 from arr.service.gui.texts import RISK, STARTER_PHRASE, WAITING_FOR_YOU, run_status
 
@@ -901,8 +903,18 @@ def register() -> None:
         nachricht: str = "",
         ansicht: str = "",
         ergebnis: str = "",
+        zustand: str = "",
     ) -> None:
         api = get_api()
+        if zustand in ("laedt", "fehler"):
+            frame = Frame(
+                api, active="runs", title="Run", crumbs=[("Runs", "/runs"), ("Run", None)]
+            )
+            await frame.start()
+            workfolder = await api.get_workfolder()
+            folder = f"{workfolder.path}/runs/{run_id}"
+            forced_state(frame, zustand, "run", title="Run", path=f"/runs/{run_id}", folder=folder)
+            return
         try:
             detail = await api.get_run(run_id)
         except ApiException as exc:
@@ -929,13 +941,18 @@ def register() -> None:
             f'<script src="{STATIC_URL}/run_detail.js?v={version}" defer></script>'
             f'<script src="{STATIC_URL}/math.js?v={version}" data-katex="{KATEX_URL}" defer>'
             "</script>"
+            # docs/08 §4.3 writes a message link as „?kanal=main#m7“: same as „&nachricht=7“
+            "<script>(function(){var m=location.hash.match(/^#m(\\d+)$/),"
+            "p=new URLSearchParams(location.search);if(m&&p.get('kanal')&&!p.get('nachricht'))"
+            "{p.set('nachricht',m[1]);location.replace(location.pathname+'?'+p.toString());}})();"
+            "</script>"
         )
         frame = Frame(
             api,
             active="runs",
             title=detail.run.name,
             crumbs=[("Runs", "/runs"), (detail.run.name, None)],
-            focus="#run-title",
+            focus=_deep_link_focus(agent, seq, kanal, nachricht, ergebnis),
         )
         await frame.start()
         params = {
@@ -949,3 +966,22 @@ def register() -> None:
         with frame.content:
             page = RunDetailPage(frame, detail, params)
             await page.build()
+        if agent and not seq:
+            # the agent card is a link: focus it without taking it out of the Tab order
+            card = f'.rd-left .agent[data-sel="agent:{agent}"]'
+            frame.js(
+                f"arr.whenEl({card!r}, (el) => setTimeout(() => "
+                "el.focus({preventScroll: true}), 250))"
+            )
+
+
+def _deep_link_focus(agent: str, seq: str, kanal: str, nachricht: str, ergebnis: str) -> str:
+    """Focus target of a deep link (docs/08 §4.3): the marked line, the message, the result
+    title, else the run title; never a button. The agent card is focused after the build."""
+    if agent and seq.isdigit():
+        return f"#{event_dom_id(int(seq))}"
+    if kanal and nachricht.isdigit():
+        return f"#{message_dom_id(kanal, int(nachricht))}"
+    if ergebnis.isdigit():
+        return f"#{result_dom_id(int(ergebnis))}-h"
+    return "#run-title"

@@ -18,20 +18,35 @@ class Toasts:
         self.container = ui.element("div").classes("toasts").props('aria-live="polite"')
 
     def show(
-        self, message: str, link: tuple[str, str] | None = None, *, error: bool = False
+        self,
+        message: str,
+        link: tuple[str, str] | None = None,
+        *,
+        error: bool = False,
+        sticky: bool = False,
     ) -> None:
-        """Show a toast; `link` is `(label, href)`, e.g. („Zum Run“, „/runs/…“)."""
+        """Show a toast; `link` is `(label, href)`, e.g. („Zum Run“, „/runs/…“).
+
+        `sticky` toasts (simulated macOS notifications) stay until closed, like errors.
+        """
         children = list(self.container.default_slot.children)
         for old in children[: max(0, len(children) - MAX_TOASTS + 1)]:
             old.delete()
         with self.container:
-            box = ui.element("div").classes("toast err" if error else "toast")
+            css = "toast err" if error else "toast note" if sticky else "toast"
+            box = ui.element("div").classes(css)
+            if sticky:  # like a macOS notification: light card with the „wartet“ edge
+                box.style(
+                    "background:var(--surface);color:var(--text);border:1px solid "
+                    "var(--border-strong);border-left:4px solid var(--wait-strong)"
+                )
             with box:
                 markup = esc(message)
                 if link:
-                    markup += f' <a href="{esc(link[1])}">{esc(link[0])}</a>'
+                    color = ' style="color:var(--text)"' if sticky else ""
+                    markup += f' <a href="{esc(link[1])}"{color}>{esc(link[0])}</a>'
                 raw(markup, tag="span")
-                if error:
+                if error or sticky:
                     button("×", lambda: _remove(box), classes="x", title="Schließen")
                 else:
                     ui.timer(TOAST_SECONDS, lambda: _remove(box), once=True)

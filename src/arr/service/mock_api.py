@@ -14,13 +14,17 @@ The counting rules of docs/08 §8.3 live in `count_waiting`, `count_active` and
 
 import asyncio
 import contextlib
+import dataclasses
 import random
+import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Any
+
+from pydantic import BaseModel
 
 from arr.backends.base import CostKind
 from arr.models import (
@@ -32,6 +36,7 @@ from arr.models import (
     RunStatus,
     Starter,
     TopologyKind,
+    WorkspaceMode,
 )
 from arr.permissions.types import (
     ApprovalStatus,
@@ -194,7 +199,9 @@ __all__ = [
     "ApiClient",
     "Dataset",
     "EventHub",
+    "ForcedStateApi",
     "MockApi",
+    "PageState",
     "Subscription",
     "count_active",
     "count_runs_waiting",
@@ -226,9 +233,14 @@ class Dataset(StrEnum):
 
     SCENARIO = "szenario"
     LOAD = "last"
+    ACCEPTANCE = "abnahme"
 
 
-DATASET_LABELS = {Dataset.SCENARIO: "Szenario (Wireframes)", Dataset.LOAD: "Last-Datensatz"}
+DATASET_LABELS = {
+    Dataset.SCENARIO: "Szenario (Wireframes)",
+    Dataset.LOAD: "Last-Datensatz",
+    Dataset.ACCEPTANCE: "Abnahme (UX-Abnahme 2)",
+}
 
 
 class MockClock:
@@ -1435,51 +1447,267 @@ _ROLES = {
 }
 
 
+_RUBRIC = {
+    "scale": "1–10",
+    "pass_score": 7,
+    "criteria": ["Korrektheit", "Vollständigkeit", "Strenge", "Klarheit"],
+}
+
+# Group skills of the start set (docs/03 §2): parameters, agents and channels as the GUI shows
+# them (docs/08 §5.4, §5.7); `count`, `mix` and `when` in plain words. The first line of a
+# parameter's `doc` is its German label, the rest the help text (gui/components/params.py).
+_GROUP_SKILLS: dict[str, dict[str, Any]] = {
+    "exploration": {
+        "description": "Ideen breit erkunden",
+        "long": "Mehrere Explorer verfolgen je eine Idee, ein Kritiker prüft im gemeinsamen "
+        "Kanal mit. Danach bewertet ein Ranker die Ergebnisse, eine Zusammenfassung schließt "
+        "den Run ab.",
+        "topology": TopologyKind.EXPLORATION,
+        "runs": 14,
+        "agents": 5,
+        "params": [
+            ParamInfo(
+                name="ideas",
+                type="str",
+                default=[],
+                doc="Vorgegebene Ideen\nLeer: Die Agenten erzeugen selbst 3 Ideen.",
+            ),
+            ParamInfo(
+                name="turns_per_idea",
+                type="int",
+                default=6,
+                min=1,
+                max=20,
+                doc="Turns pro Idee\nWie lange jeder Explorer an seiner Idee arbeitet.",
+            ),
+            ParamInfo(
+                name="exchange",
+                type="choice",
+                default="channel",
+                choices=["none", "channel", "summaries"],
+                doc="Austausch zwischen den Explorern\n„keiner“ ergibt unabhängige Ergebnisse, gut "
+                "für Vergleiche. „gemeinsamer Kanal“ lässt die Explorer in #main diskutieren.",
+            ),
+        ],
+        "agents_spec": [
+            {
+                "id": "explorer",
+                "role": "roles/explorer.md",
+                "count": "einer je Idee",
+                "model": "abwechselnd Claude Opus 5.5 und gpt-5.5",
+            },
+            {"id": "critic", "role": "roles/critic.md", "model": "Claude Sonnet 5.5"},
+            {
+                "id": "ranker",
+                "role": "roles/ranker.md",
+                "model": "Claude Sonnet 5.5",
+                "when": "ab Stufe „Bewertung“",
+            },
+        ],
+        "channels_spec": [
+            {"name": "main", "members": "explorer-*, critic", "mode": "ereignisgesteuert"},
+            {
+                "name": "ranking",
+                "members": "ranker, explorer-*",
+                "mode": "Runden",
+                "open_from": "Bewertung",
+            },
+        ],
+    },
+    "proof": {
+        "description": "Wasserfall mit Ratings",
+        "long": "Ein Stratege plant den Beweis, ein Beweiser arbeitet ihn in Stufen aus. Zwei "
+        "Rater bewerten jede Stufe; unter der Grenze gibt es Nacharbeit, nach der letzten "
+        "Nacharbeit entscheidest du.",
+        "topology": TopologyKind.WATERFALL,
+        "runs": 5,
+        "agents": 4,
+        "params": [
+            ParamInfo(
+                name="max_rework",
+                type="int",
+                default=2,
+                min=0,
+                max=5,
+                doc="Nacharbeiten je Stufe\nDanach entscheidest du, wie es weitergeht.",
+            ),
+            ParamInfo(
+                name="pass_score",
+                type="int",
+                default=7,
+                min=1,
+                max=10,
+                doc="Bestanden ab\nDurchschnitt der Ratings, ab dem eine Stufe bestanden ist.",
+            ),
+        ],
+        "agents_spec": [
+            {"id": "strategist", "role": "roles/strategist.md", "model": "Claude Opus 5.5"},
+            {"id": "prover", "role": "roles/prover.md", "model": "Claude Opus 5.5"},
+            {
+                "id": "rater",
+                "role": "roles/rater.md",
+                "count": "2",
+                "model": "Claude Sonnet 5.5 und gpt-5.5",
+            },
+        ],
+        "channels_spec": [
+            {"name": "werkstatt", "members": "strategist, prover", "mode": "ereignisgesteuert"},
+            {"name": "bewertung", "members": "prover, rater-*", "mode": "ereignisgesteuert"},
+        ],
+    },
+    "proof-review": {
+        "description": "Judges prüfen einen Beweis",
+        "long": "Lässt einen Beweis(entwurf) aus dem aktuellen Projekt von mehreren "
+        "unabhängigen Judges prüfen. Der Autor arbeitet Einwände nach, bis die Judges "
+        "zustimmen oder die Rundenzahl erreicht ist.",
+        "topology": TopologyKind.REVIEW,
+        "runs": 4,
+        "agents": 4,
+        "params": [
+            ParamInfo(
+                name="judges",
+                type="int",
+                default=3,
+                min=1,
+                max=6,
+                doc="Judges\nAnzahl unabhängiger Judges.",
+            ),
+            ParamInfo(
+                name="max_revisions",
+                type="int",
+                default=2,
+                min=0,
+                max=5,
+                doc="Überarbeitungen\nÜberarbeitungsrunden des Autors.",
+            ),
+            ParamInfo(
+                name="discussion_rounds",
+                type="int",
+                default=1,
+                min=0,
+                max=3,
+                doc="Diskussionsrunden\nRunden im Kanal #judges.",
+            ),
+            ParamInfo(
+                name="verdict",
+                type="choice",
+                default="majority",
+                choices=["majority", "unanimous", "meta_judge"],
+                doc="Urteil\nWie das Urteil entsteht.",
+            ),
+            ParamInfo(
+                name="judge_memory",
+                type="choice",
+                default="fresh",
+                choices=["fresh", "continue"],
+                doc="Gedächtnis der Judges\nJudges starten jede Runde neu oder setzen ihre "
+                "Sitzung fort.",
+            ),
+            ParamInfo(
+                name="artifact",
+                type="path",
+                default=None,
+                doc="Beweis-Datei\nPfad im Projekt. Leer: Der Autor schreibt zuerst.",
+            ),
+        ],
+        "agents_spec": [
+            {"id": "author", "role": "roles/author.md", "model": "Claude Opus 5.5"},
+            {
+                "id": "judge",
+                "role": "roles/judge.md",
+                "count": "judge-1 … judge-N (Parameter „Judges“)",
+                "model": "abwechselnd Claude Opus 5.5 und gpt-5.5",
+            },
+            {
+                "id": "meta-judge",
+                "role": "roles/meta-judge.md",
+                "when": "nur bei Urteil „Meta-Judge“",
+            },
+        ],
+        "channels_spec": [
+            {"name": "author-desk", "members": "author", "mode": "ereignisgesteuert"},
+            {
+                "name": "judges",
+                "members": "judge-*, meta-judge",
+                "mode": "Runden",
+                "anonymous": True,
+                "open_from": "Diskussion",
+            },
+        ],
+    },
+    "roundtable": {
+        "description": "Offene Diskussion",
+        "long": "Mehrere Agenten diskutieren eine Frage in Runden. Wer nichts beizutragen hat, "
+        "passt; nach der letzten Runde fasst ein Agent den Stand zusammen.",
+        "topology": TopologyKind.ROUNDTABLE,
+        "runs": 2,
+        "agents": 3,
+        "params": [
+            ParamInfo(
+                name="members",
+                type="int",
+                default=3,
+                min=2,
+                max=6,
+                doc="Teilnehmer\nAnzahl der Agenten am Tisch.",
+            ),
+            ParamInfo(
+                name="rounds",
+                type="int",
+                default=3,
+                min=1,
+                max=10,
+                doc="Runden\nAnzahl der Runden.",
+            ),
+        ],
+        "agents_spec": [
+            {
+                "id": "member",
+                "role": "roles/member.md",
+                "count": "Parameter „Teilnehmer“",
+                "model": "abwechselnd Claude Opus 5.5 und gpt-5.5",
+            }
+        ],
+        "channels_spec": [{"name": "main", "members": "member-*", "mode": "Runden"}],
+    },
+}
+
+
+# The parameter that drives the cost of each group skill: the budget error names its label.
+_COST_PARAM = {
+    "exploration": "turns_per_idea",
+    "proof": "max_rework",
+    "proof-review": "judges",
+    "roundtable": "rounds",
+}
+
+
+def _param_label(skill: str | None, name: str) -> str:
+    """German label of a parameter: the first line of its `doc` (as in the GUI form)."""
+    for p in _GROUP_SKILLS.get(skill or "", {}).get("params", []):
+        lines = (p.doc or "").splitlines()
+        if p.name == name and len(lines) >= 2:
+            return lines[0]
+    return name
+
+
 def _skills() -> list[SkillInfo]:
-    group = [
-        ("exploration", "Ideen breit erkunden", TopologyKind.EXPLORATION, 14, 5),
-        ("proof", "Wasserfall mit Ratings", TopologyKind.WATERFALL, 5, 4),
-        ("proof-review", "Judges prüfen einen Beweis", TopologyKind.REVIEW, 4, 4),
-        ("roundtable", "Offene Diskussion", TopologyKind.ROUNDTABLE, 2, 3),
-    ]
     skills = [
         SkillInfo(
             name=name,
-            description=desc,
+            description=spec["description"],
             kind=SkillKind.GROUP,
+            audience="Projekt-Agenten und Claude Code",
             files=["SKILL.md", "group.yaml", *[f"roles/{r}.md" for r in _ROLES[name]]],
-            used_by=SkillUsage(projects=["collatz"], runs_count=runs),
-            topology=topo,
-            agents_count=agents,
-            params=[
-                ParamInfo(
-                    name="judges",
-                    type="int",
-                    default=3,
-                    min=1,
-                    max=6,
-                    doc="Anzahl unabhängiger Judges",
-                ),
-                ParamInfo(
-                    name="max_revisions",
-                    type="int",
-                    default=2,
-                    min=0,
-                    max=5,
-                    doc="Überarbeitungsrunden des Autors",
-                ),
-                ParamInfo(
-                    name="verdict",
-                    type="choice",
-                    default="majority",
-                    choices=["majority", "unanimous", "meta_judge"],
-                    doc="Wie das Urteil entsteht",
-                ),
-            ]
-            if name == "proof-review"
-            else [],
+            used_by=SkillUsage(projects=["collatz"], runs_count=spec["runs"]),
+            topology=spec["topology"],
+            agents_count=spec["agents"],
+            params=spec["params"],
+            agents_spec=spec["agents_spec"],
+            channels_spec=spec["channels_spec"],
+            rubric=_RUBRIC if name != "roundtable" else None,
         )
-        for name, desc, topo, runs, agents in group
+        for name, spec in _GROUP_SKILLS.items()
     ]
     skills += [
         SkillInfo(
@@ -1586,11 +1814,54 @@ _BUILTIN_RULES = [
     (RuleEffect.ASK, "Lesen außerhalb des Runs, sonstiges Netzwerk, Paketinstallation"),
 ]
 
-_SKILL_FILE_TEXT = {
-    "SKILL.md": "---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\n"
-    "Wann du diesen Skill nutzt und wie die Research-Group arbeitet.\n",
-    "group.yaml": "kind: research-group\nversion: 1\ntopology: {topology}\nparams: {{}}\n",
-}
+
+def _skill_file_text(skill: SkillInfo, path: str) -> str:
+    """Sample content of a skill file (read only in v1, docs/08 §5.7)."""
+    spec = _GROUP_SKILLS.get(skill.name, {})
+    if path == "SKILL.md":
+        long = spec.get("long", skill.description)
+        return (
+            f"---\nname: {skill.name}\ndescription: {skill.description}\n---\n\n"
+            f"# {skill.name}\n\n{long}\n\n## Wann du diesen Skill nutzt\n\n"
+            "Wenn eine Frage mehrere Sichtweisen oder eine unabhängige Prüfung braucht. "
+            "Starte den Run über arr; jeder Start aus Claude Code braucht die Freigabe in "
+            "der GUI.\n"
+        )
+    if path == "group.yaml":
+        lines = [
+            "kind: research-group",
+            "version: 1",
+            f"topology: {skill.topology.value if skill.topology else 'solo'}",
+            "params:",
+        ]
+        for p in skill.params:
+            lines.append(f"  {p.name}:")
+            lines.append(
+                f"    default: {p.default!r}" if p.default is not None else "    default: ~"
+            )
+            if p.min is not None:
+                lines.append(f"    min: {_num(p.min)}")
+            if p.max is not None:
+                lines.append(f"    max: {_num(p.max)}")
+            if p.choices:
+                lines.append(f"    choices: [{', '.join(map(str, p.choices))}]")
+            if p.doc:
+                lines.append("    doc: |")
+                lines += [f"      {line}" for line in p.doc.splitlines()]
+        lines.append("agents:")
+        for agent in skill.agents_spec:
+            lines.append(f"  - id: {agent['id']}")
+            lines.append(f"    role: {agent.get('role', '')}")
+        lines.append("channels:")
+        for channel in skill.channels_spec:
+            lines.append(f"  - name: {channel['name']}")
+        return "\n".join(lines) + "\n"
+    role = path.removeprefix("roles/").removesuffix(".md")
+    return (
+        f"# Rolle: {role}\n\nDu arbeitest in der Research-Group von {skill.name}. "
+        "Lies den Posteingang, arbeite an deinem Auftrag und gib dein Ergebnis mit "
+        "submit_result ab.\n"
+    )
 
 
 # --- run details of the scenario --------------------------------------------------------------
@@ -3219,6 +3490,619 @@ def _build_satz2_detail(run: _Run) -> None:
 
 
 # --------------------------------------------------------------------------------------------
+# Resolving a new run (docs/08 §5.4, simulated `estimate_run`)
+# --------------------------------------------------------------------------------------------
+
+_DECIDER_TEXT = {
+    Decider.GATEKEEPER_THEN_USER.value: "Aufsichts-Agent, bei Zweifel du",
+    Decider.USER.value: "immer du",
+    Decider.GATEKEEPER.value: "nur Aufsichts-Agent",
+}
+
+
+def _num(value: float | None) -> str:
+    """`16` → „16“, `12.5` → „12,5“ (for messages)."""
+    if value is None:
+        return "–"
+    return str(int(value)) if float(value).is_integer() else f"{value:.1f}".replace(".", ",")
+
+
+def _limit_text(key: str, value: float) -> str:
+    """A limit as the GUI writes it: „6 h“, „90 min“, „60“, „30 $“."""
+    if key == "wall_time_s":
+        return f"{_num(value / 3600)} h" if value % 1800 == 0 else f"{int(value // 60)} min"
+    if key == "budget_usd":
+        return f"{_num(value)} $"
+    return _num(value)
+
+
+def _id_group(ids: list[str]) -> str:
+    """„judge-*“ when all IDs share a prefix with a number, else the IDs with commas."""
+    prefixes = {i.rsplit("-", 1)[0] for i in ids}
+    if len(ids) > 1 and len(prefixes) == 1:
+        return f"{prefixes.pop()}-*"
+    return ",".join(ids)
+
+
+def _resolve_channels(skill: str | None, agents: list[RunStartAgent]) -> list[RunStartChannel]:
+    """Channels of a skill with their resolved members (docs/06)."""
+    ids = [a.id for a in agents]
+
+    def having(*prefixes: str) -> list[str]:
+        return [i for i in ids if i.startswith(prefixes)]
+
+    if skill == "exploration":
+        return [
+            RunStartChannel(
+                name="main", members=having("explorer", "critic"), mode=ChannelMode.EVENT
+            ),
+            RunStartChannel(
+                name="ranking",
+                members=having("ranker", "explorer"),
+                mode=ChannelMode.ROUNDS,
+                open_from="Bewertung",
+            ),
+        ]
+    if skill == "proof":
+        return [
+            RunStartChannel(
+                name="werkstatt", members=having("strategist", "prover"), mode=ChannelMode.EVENT
+            ),
+            RunStartChannel(
+                name="bewertung", members=having("prover", "rater"), mode=ChannelMode.EVENT
+            ),
+        ]
+    if skill == "proof-review":
+        return [
+            RunStartChannel(name="author-desk", members=["author"], mode=ChannelMode.EVENT),
+            RunStartChannel(
+                name="judges",
+                members=having("judge", "meta-judge"),
+                mode=ChannelMode.ROUNDS,
+                anonymous=True,
+                open_from="Diskussion",
+            ),
+        ]
+    if skill == "roundtable":
+        return [RunStartChannel(name="main", members=ids, mode=ChannelMode.ROUNDS)]
+    return []
+
+
+def _estimate(skill: str | None, params: dict[str, Any], agents: list[RunStartAgent]) -> Estimate:
+    """Ranges for turns, cost and duration, like `estimate_run` (simulated)."""
+    if skill == "exploration":
+        ideas = len([i for i in params.get("ideas") or [] if str(i).strip()]) or 3
+        work = ideas * int(params.get("turns_per_idea") or 6)
+        turns = (work + 10, int(work * 1.5) + 20)
+        cost = (round(work * 0.5), round(work * 0.9))
+        minutes = (work * 5 // ideas, work * 10 // ideas)
+    elif skill == "proof":
+        rework = int(params.get("max_rework") or 0)
+        turns = (40, 60 + 15 * rework)
+        cost = (10, 14 + 2 * rework)
+        minutes = (90, 150 + 30 * rework)
+    elif skill == "proof-review":
+        judges = int(params.get("judges") or 3)
+        turns = (20 * judges, 30 * judges)
+        cost = (round(2.7 * judges), round(4.7 * judges))
+        minutes = (40, 70)
+    elif skill == "roundtable":
+        n = int(params.get("members") or 3) * int(params.get("rounds") or 3)
+        turns = (n, 2 * n)
+        cost = (round(n * 0.4), round(n * 0.8))
+        minutes = (int(params.get("rounds") or 3) * 10, int(params.get("rounds") or 3) * 20)
+    else:
+        turns, cost, minutes = (10, 40), (1, 4), (10, 40)
+    claude_sub = any(a.provider is Provider.CLAUDE for a in agents)
+    return Estimate(
+        turns=Range(min=turns[0], max=turns[1]),
+        cost_usd=Range(min=cost[0], max=max(cost[0], cost[1])),
+        cost_kind=CostKind.ESTIMATED if claude_sub else None,
+        duration_s=Range(min=minutes[0] * 60, max=minutes[1] * 60),
+    )
+
+
+def _run_yaml(
+    run_input: dict[str, Any],
+    skill: SkillInfo | None,
+    agents: list[RunStartAgent],
+    settings: WorkfolderSettingsInfo,
+) -> str:
+    """The resolved `run.yaml` as the preview shows it (read only)."""
+    limits = {**settings.limits.model_dump(), **(run_input.get("limits") or {})}
+    lines = [
+        "version: 1",
+        f'name: "{run_input.get("name") or ""}"',
+        f"project: {run_input.get('project') or ''}",
+        f"skill: {skill.name if skill else '~'}",
+        "topology:",
+        f"  kind: {skill.topology.value if skill and skill.topology else 'solo'}",
+    ]
+    params = run_input.get("params") or {}
+    if params:
+        lines.append("  params:")
+        lines += [
+            f"    {k}: {v!r}" if isinstance(v, str) else f"    {k}: {v}" for k, v in params.items()
+        ]
+    wall = limits.get("wall_time_s")
+    lines.append(
+        "limits: { "
+        + f"wall_time: {_limit_text('wall_time_s', wall) if wall else '~'}, "
+        + f"turns_per_agent: {limits.get('turns_per_agent')}, "
+        + f"budget_usd: {_num(limits.get('budget_usd'))} }}"
+    )
+    decider = run_input.get("decider") or settings.approvals.decider.value
+    lines.append(f"approvals: {{ decider: {decider} }}")
+    lines.append("agents:")
+    for a in agents:
+        lines += [
+            f"  - id: {a.id}",
+            f"    provider: {a.provider.value}",
+            f"    model: {a.model}",
+            f"    auth: {a.profile}",
+            f"    tools: {{ shell: true, web: {str(a.tools.web).lower()} }}",
+        ]
+        if a.read_dirs:
+            lines.append(f"    read_dirs: [{', '.join(a.read_dirs)}]")
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------------------------
+# Data set: acceptance test (docs/08 §9.2 Nr. 3)
+# --------------------------------------------------------------------------------------------
+# Same structure as the scenario, other names and contents, so that UX-Abnahme 2 measures
+# understanding, not recognition. Built from the scenario: every run detail is built, then all
+# texts pass through `_Translator` (exact texts first, then patterns for names and IDs); a few
+# objects get their own values afterwards (`_abnahme_overrides`).
+
+
+class _Translator:
+    """Deep text replacement over models, dataclasses and containers (enums stay as they are)."""
+
+    def __init__(self, exact: dict[str, str], patterns: list[tuple[str, str]]) -> None:
+        self.exact = exact
+        self.patterns = [(re.compile(p), r) for p, r in patterns]
+
+    def text(self, value: str) -> str:
+        if value in self.exact:
+            return self.exact[value]
+        for pattern, replacement in self.patterns:
+            value = pattern.sub(replacement, value)
+        return value
+
+    def __call__(self, value: Any) -> Any:
+        if value is None or isinstance(value, Enum | bool | int | float):
+            return value
+        if isinstance(value, str):
+            return self.text(value)
+        if isinstance(value, BaseModel):
+            update = {name: self(getattr(value, name)) for name in type(value).model_fields}
+            return value.model_copy(update=update)
+        if isinstance(value, dict):
+            return {
+                (self.text(key) if isinstance(key, str) and not isinstance(key, Enum) else key): (
+                    self(item)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [self(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self(item) for item in value)
+        if isinstance(value, _Channel):
+            return _Channel(
+                info=self(value.info),
+                fixed={k: self(m) for k, m in value.fixed.items()},
+                generated=value.generated,
+                gen=self.wrap(value.gen),
+                extra=self(value.extra),
+            )
+        if isinstance(value, _Transcript):
+            return _Transcript(
+                total_generated=value.total_generated,
+                gen=self.wrap(value.gen),
+                fixed={k: self(e) for k, e in value.fixed.items()},
+                extra=self(value.extra),
+                older=value.older,
+            )
+        if isinstance(value, _Run):
+            update = {}
+            for f in dataclasses.fields(value):
+                item = getattr(value, f.name)
+                if f.name in ("agents", "channels", "transcripts"):
+                    update[f.name] = {self.text(k): self(v) for k, v in item.items()}
+                elif f.name == "running_tools":
+                    update[f.name] = {self.text(k): v for k, v in item.items()}
+                else:
+                    update[f.name] = self(item)
+            return dataclasses.replace(value, **update)
+        return value
+
+    def wrap(self, gen: Callable[[int], Any] | None) -> Callable[[int], Any] | None:
+        """Translate what a generator of messages or transcript entries makes."""
+        if gen is None:
+            return None
+        return lambda n: self(gen(n))
+
+
+R_ABN_EXPLORE = "20261024-1412_goldbach-ternaer_exploration_a3f9"
+R_ABN_RAMSEY = "20261024-1305_ramsey-graphen_proof_b2e4"
+R_ABN_REVIEW = "20261024-1521_partitionen_proof-review_e81b"
+R_ABN_KONGRUENZ = "20261024-0930_partitionen_proof_7c21"
+
+_ABN_READ_DIR = "~/Documents/Partitionen-Daten"
+_ABN_COMMAND = "wget https://primes.utm.edu/lists/small/millions/primes1.zip"
+
+_ABN_REVIEW_TASK = """**Aussage:** Der Dyson-Rang teilt die Partitionen von $5n + 4$ in fünf \
+gleich große Klassen.
+
+**Beweis:** `tex/rang-lemma.tex` (Abschnitt 2).
+
+**Schwerpunkte:** Vollständigkeit der Fallunterscheidung modulo 5, Notation des Rangs gegenüber \
+der Kurbel (crank).
+
+**Ergebnis:** Je Judge ein Gutachten mit Urteil (accept, minor, major, reject) und \
+nummerierten Einwänden.
+
+**Hinweise:** Die Definition des Rangs folgt Dyson (1944). Abschnitt 1 von `tex/rang-lemma.tex` \
+ist nicht Teil der Prüfung.
+"""
+
+# Whole texts of the scenario and their counterpart (scenario text → acceptance text).
+_ABN_EXACT = {
+    # runs, projects, workfolder
+    "Collatz – Ideen-Exploration": "Ternäre Goldbach-Darstellungen – Exploration",
+    "R(4,5) ≤ 25 – Beweisweg ausarbeiten": "R(3,3,3)-Färbung – Beweis",
+    "Lemma 3 – unabhängige Prüfung": "Rang-Lemma – unabhängige Prüfung",
+    "Lemma 3 (Stoppzeit 4) – Beweis ausarbeiten": "Kongruenz p(5n+4) ≡ 0 mod 5 – Beweis",
+    "proof-review: Lemma 3 – unabhängige Prüfung": "proof-review: Rang-Lemma – unabhängige Prüfung",
+    "proof: Lemma 3 (Stoppzeit 4) – Beweis ausarbeiten": "proof: Kongruenz p(5n+4) ≡ 0 mod 5 – "
+    "Beweis",
+    "Primzahllücken – Roundtable": "Partitionen mod 7 – Roundtable",
+    "Collatz – Zyklen mod 2ᵏ": "Goldbach – Ausnahmen bis 10¹²",
+    "Terras-Lemma – Review": "Helfgott-Lemma – Review",
+    "Stoppzeiten bis 10⁹ – solo": "Darstellungen bis 10⁹ – solo",
+    "Collatz – erste Exploration": "Goldbach – erste Exploration",
+    "Collatz – Stoppzeiten-Statistik": "Goldbach – Darstellungs-Statistik",
+    "Terras-Satz – Beweisskizze": "Vinogradov-Satz – Beweisskizze",
+    "Paritätsvektoren mod 2¹⁶": "Summanden modulo 30",
+    "Collatz – 2-adische Ideen": "Goldbach – Kreismethode",
+    "Zyklen der Länge k – Exploration": "Ausnahmemenge – Exploration",
+    "Collatz – Heuristik ln(4/3)": "Goldbach – Heuristik nach Hardy–Littlewood",
+    "R(4,5) – Strategien": "R(3,3,3) – Strategien",
+    "R(3,3,3) – Färbungen": "R(4,4) – Färbungen",
+    "Primzahllücken – Statistik": "Partitionen – Statistik",
+    "Cramér-Vermutung – Review": "Crank-Vermutung – Review",
+    "Collatz-Varianten": "Ternäre Goldbach-Darstellungen",
+    "Ramsey-Zahlen, obere Schranken": "Ramsey-Graphen und Färbungen",
+    "Primzahllücken": "Partitionen und Kongruenzen",
+    "Mathe privat": "Forschung",
+    "Uni": "Lehre",
+    "~/Uni-Forschung": "~/Lehre",
+    "arr wurde beendet · Protokoll bis 23:41": "arr wurde beendet · Protokoll bis 23:41",
+    "Finde neue Zugänge zu Stoppzeiten der Collatz-Abbildung.": "Finde neue Zugänge zur Anzahl "
+    "$r_3(n)$ der Darstellungen ungerader $n$ als Summe dreier Primzahlen.",
+    # explorer agents → scouts
+    "Idee „2-adische Darstellung“": "Idee „Kreismethode mit expliziten Konstanten“",
+    "Idee „Stoppzeiten-Statistik“": "Idee „Statistik von r₃(n)“",
+    "Idee „Terras-Paritätsvektoren“": "Idee „Restklassen der Summanden“",
+    "python stoppzeiten.py --bis 10**8": "python darstellungen.py --bis 10**8",
+    "paritaet/terras.md": "restklassen/summanden.md",
+    # channel #labor (scenario #main)
+    "Die mittlere Gesamtstoppzeit von $T$ für $n < 10^7$ liegt bei $6{,}95 \\cdot \\ln n$ "
+    "(Abweichung unter 2 %). Das passt zur Heuristik $2 / \\ln(4/3) ≈ 6{,}95$.": "Für ungerade "
+    "$n < 10^7$ liegt $r_3(n)$ im Mittel bei "
+    "$0{,}98 \\cdot \\mathfrak{S}(n)\\, n^2 / (2 \\ln^3 n)$ "
+    "(Abweichung unter 2 %). Das passt zur Asymptotik von Hardy und Littlewood.",
+    "stoppzeiten_1e7.csv": "darstellungen_1e7.csv",
+    "groupchats/attachments/2/stoppzeiten_1e7.csv": "groupchats/attachments/2/"
+    "darstellungen_1e7.csv",
+    "Auf $\\mathbb{Z}_2$ ist die Collatz-Abbildung $T$ stetig und maßerhaltend und zur "
+    "Shift-Abbildung konjugiert (Lagarias 1985). Idee: Dichteaussagen über Stoppzeiten über "
+    "diese Konjugation übertragen.": "Die Kreismethode mit den expliziten Konstanten von "
+    "Helfgott (2013) liefert $r_3(n) > 0$ für alle ungeraden $n ≥ 10^{27}$. Idee: die Schranke "
+    "für die Nebenbögen mit unseren Zählungen bis $10^8$ vergleichen.",
+    "2adisch.md": "kreismethode.md",
+    "groupchats/attachments/3/2adisch.md": "groupchats/attachments/3/kreismethode.md",
+    "Terras (1976): Die Paritätsvektoren der Länge $k$ von $0, …, 2^k − 1$ sind paarweise "
+    "verschieden. Für $k ≤ 20$ nachgerechnet.": "Für $n ≡ 3 \\pmod 6$ gibt es eine Darstellung "
+    "mit $p_1 = 3$, sobald $n − 3$ eine Goldbach-Zerlegung hat. Für $n ≤ 10^6$ nachgerechnet.",
+    "check_terras.py": "check_summanden.py",
+    "groupchats/attachments/4/check_terras.py": "groupchats/attachments/4/check_summanden.py",
+    "Eine Abweichung von 2 % bei $10^7$ sagt wenig, die Konvergenz ist logarithmisch langsam. "
+    "Wie verhält sich der Fehler über die Dekaden $10^4 … 10^7$?": "Eine Abweichung von 2 % bei "
+    "$10^7$ sagt wenig, der Fehlerterm fällt nur logarithmisch. Wie verhält sich die Abweichung "
+    "über die Dekaden $10^4 … 10^7$?",
+    "Bitte prüfe auch $k$ bis 24, wenn es unter 2 Minuten bleibt.": "Bitte prüfe auch $n$ bis "
+    "$10^7$, wenn es unter 2 Minuten bleibt.",
+    "Überträgt die Konjugation zum Shift wirklich Aussagen über die natürliche Dichte in "
+    "$\\mathbb{N}$? Die Maß-Aussage gilt für das Haar-Maß auf $\\mathbb{Z}_2$, nicht für das "
+    "Zählen in $\\mathbb{N}$.": "Gelten Helfgotts Konstanten auch für deine ungewichtete "
+    "Zählung? Seine Schranke ist für die mit $\\log p_1 \\log p_2 \\log p_3$ gewichtete Summe "
+    "formuliert, nicht für $r_3(n)$ selbst.",
+    "Fehler über die Dekaden: $10^4$: 4,1 %, $10^5$: 3,0 %, $10^6$: 2,4 %, $10^7$: 1,9 %. Fällt "
+    "ungefähr wie $1 / \\log n$, Tabelle im Anhang.": "Abweichung über die Dekaden: $10^4$: "
+    "4,3 %, $10^5$: 3,1 %, $10^6$: 2,5 %, $10^7$: 1,9 %. Fällt ungefähr wie $1 / \\log n$, "
+    "Tabelle im Anhang.",
+    "fehlerterm.md": "abweichung.md",
+    "groupchats/attachments/8/fehlerterm.md": "groupchats/attachments/8/abweichung.md",
+    "$k ≤ 24$ geprüft (1 min 40 s), weiterhin bijektiv.": "$n ≤ 10^7$ geprüft (1 min 40 s), "
+    "weiterhin ohne Ausnahme.",
+    # transcript of scout-1
+    "Stufe Exploration, Turn 6 von 8. Idee: 2-adische Darstellung.\nPosteingang: 2 neue "
+    "Nachrichten in #main (explorer-gpt, critic). Keine offenen Fragen an dich.\nArbeite weiter "
+    'und gib am Ende von Turn 8 dein Ergebnis mit submit_result(kind="exploration") ab.': "Stufe "
+    "Exploration, Turn 6 von 8. Idee: Kreismethode mit expliziten Konstanten.\nPosteingang: 2 "
+    "neue Nachrichten in #labor (scout-gpt, skeptic). Keine offenen Fragen an dich.\nArbeite "
+    'weiter und gib am Ende von Turn 8 dein Ergebnis mit submit_result(kind="exploration") ab.',
+    "Ich will die Stoppzeit-Verteilung aus der Shift-Konjugation mit den Werten aus OEIS A006577 "
+    "vergleichen. Lokal habe ich nur meine eigenen Werte bis 10⁶. Zuerst prüfe ich, ob die "
+    "Stoppzeiten aus den Paritätsvektoren mod 2¹⁶ mit der direkten Rechnung übereinstimmen. "
+    "Danach brauche ich die b-Datei als unabhängige Referenz.": "Ich will meine Zählung von "
+    "r₃(n) mit einer unabhängigen Primzahlliste prüfen. Lokal habe ich nur mein eigenes Sieb "
+    "bis 10⁶. Zuerst prüfe ich, ob das Sieb mit der Zählung über Restklassen modulo 30 "
+    "übereinstimmt. Danach brauche ich die Liste der ersten Million Primzahlen als Referenz.",
+    "notizen/2adisch.md": "notizen/kreismethode.md",
+    "# 2-adische Sicht\nT: ℤ₂ → ℤ₂ …": "# Kreismethode\nHauptbögen: q ≤ Q …",
+    "python stoppzeit_2adisch.py --k 16": "python sieb_check.py --bis 10**6",
+    "k=16: 65536 Restklassen geprüft\nStoppzeit aus Paritätsvektor = direkte Rechnung: 65536 "
+    "von 65536\nLaufzeit 37,6 s": "78498 Primzahlen bis 10^6\nSieb = Zählung über Restklassen "
+    "mod 30: 78498 von 78498\nLaufzeit 37,6 s",
+    "Die Stoppzeiten aus den Paritätsvektoren stimmen mod 2¹⁶ mit der direkten Rechnung überein. "
+    "Für den Vergleich mit großen n brauche ich die b-Datei aus OEIS.": "Mein Sieb stimmt bis "
+    "10⁶ mit der Zählung über Restklassen überein. Für den Vergleich mit großen n brauche ich "
+    "die Primzahlliste von primes.utm.edu.",
+    "curl -sO https://oeis.org/A006577/b006577.txt": _ABN_COMMAND,
+    "https://oeis.org/A006577/b006577.txt": "https://primes.utm.edu/lists/small/millions/"
+    "primes1.zip",
+    # approvals
+    "Ich brauche die Tabelle A006577 (Schritte bis 1) für n ≤ 10 000, um meine "
+    "Stoppzeit-Verteilung aus der 2-adischen Darstellung mit veröffentlichten Werten zu "
+    "vergleichen. Die Datei ist reiner Text, etwa 90 kB.": "Ich brauche die Liste der ersten "
+    "Million Primzahlen, um meine Zählung von r₃(n) mit einer unabhängigen Quelle zu "
+    "vergleichen. Die Datei ist ein ZIP-Archiv mit reinem Text, etwa 1,7 MB.",
+    "Keine Entscheidung bis 15:36: gilt als abgelehnt.": "Keine Entscheidung bis 16:09: gilt als "
+    "abgelehnt.",
+    "~/Documents/Mathe-Literatur/lagarias-3x+1.pdf": "~/Documents/Fachliteratur/"
+    "helfgott-ternaer.pdf",
+    "~/Documents/Collatz-Daten/orbits.csv": "~/Documents/Goldbach-Daten/darstellungen.csv",
+    "Die Reduktion auf (4,5)-Graphen mit 24 Knoten ist richtig. Es fehlt aber, wie die "
+    "verbleibenden Fälle ausgeschlossen werden.": "Die Färbung des K₁₆ über die Kubikreste im "
+    "Körper mit 16 Elementen ist richtig angesetzt. Es fehlt aber, warum keine Farbklasse ein "
+    "Dreieck enthält.",
+    "Schritt 3 setzt R(3,5) = 14 voraus, ohne Quelle oder Beleg.": "Schritt 3 setzt voraus, dass "
+    "jede Farbklasse ein Clebsch-Graph ist, ohne Beleg.",
+    # finished run (scenario Lemma 3 → congruence)
+    "Fallunterscheidung nach $n \\bmod 16$.": "Über die Erzeugendenfunktion und Eulers "
+    "Pentagonalzahlensatz.",
+    "Fall n ≡ 7 fehlt.": "Der Schritt modulo 5 ist nicht begründet.",
+    "Rückrichtung unvollständig.": "Koeffizientenvergleich unvollständig.",
+    "**Beweis.** Sei $n = 16m + 3$ mit $m ≥ 0$. Dann gilt "
+    "$$T(n) = 24m + 5,\\ T^2(n) = 36m + 8,\\ T^3(n) = 18m + 4,\\ T^4(n) = 9m + 2 < n$$": "**Beweis."
+    "** Nach Ramanujan gilt $$\\sum_{n ≥ 0} p(5n+4)\\, q^n = 5 \\frac{(q^5;q^5)_\\infty^5}"
+    "{(q;q)_\\infty^6},$$ also sind alle Koeffizienten durch 5 teilbar.",
+    "Vollständig und korrekt. Die Rückrichtung ließe sich in einer Tabelle der Restklassen "
+    "zusammenfassen.": "Vollständig und korrekt. Die Herleitung der Identität ließe sich in einer "
+    "Tabelle der Restklassen modulo 5 zusammenfassen.",
+    "Korrekt. Bitte die vier Iterationen als Tabelle und die Definition von σ nach Terras "
+    "ausdrücklich zitieren.": "Korrekt. Bitte die Identität mit Quelle (Ramanujan 1919) zitieren "
+    "und den Schritt $(q;q)_\\infty^5 ≡ (q^5;q^5)_\\infty \\pmod 5$ ausschreiben.",
+    "**Lemma 3 ist bewiesen:** Für $n > 1$ gilt $σ(n) = 4$ genau dann, wenn $n ≡ 3 \\pmod{16}$. "
+    "Der Beweis rechnet die vier Schritte von $T$ für $n = 16m + 3$ aus und schließt die übrigen "
+    "Restklassen modulo 16 aus.\n\n- **Strategie (8,0):** Fallunterscheidung nach $n \\bmod 16$."
+    "\n- **Skizze:** Versuch 1 (6,0) übersah den Fall $n ≡ 7 \\pmod{16}$. Versuch 2 (8,5) "
+    "ergänzt ihn.\n- **Beweis (8,0):** rater-2 wünscht eine Tabelle der vier Iterationen.\n- "
+    "**Offen:** Verallgemeinerung auf $σ(n) = k$.": "**Die Kongruenz ist bewiesen:** Für alle "
+    "$n ≥ 0$ gilt $p(5n+4) ≡ 0 \\pmod 5$. Der Beweis nutzt Ramanujans Identität für die "
+    "Erzeugendenfunktion und $(q;q)_\\infty^5 ≡ (q^5;q^5)_\\infty \\pmod 5$.\n\n- **Strategie "
+    "(8,0):** über die Erzeugendenfunktion.\n- **Skizze:** Versuch 1 (6,0) ließ den Schritt "
+    "modulo 5 unbegründet. Versuch 2 (8,5) ergänzt ihn.\n- **Beweis (8,0):** rater-2 wünscht die "
+    "Quelle der Identität.\n- **Offen:** die Kongruenzen modulo 7 und 11.",
+    " und schlag vor, was wir nach tex/lemma3.tex übernehmen": " und schlag vor, was wir nach "
+    "tex/kongruenz5.tex übernehmen",
+    # review run (scenario proof-review → rank lemma)
+    _LEMMA3_TASK: _ABN_REVIEW_TASK,
+    # generated texts and the live stream
+    "Für $n ≡ 3 \\pmod{16}$ fällt die Folge nach vier Schritten unter $n$.": "Für "
+    "$n ≡ 3 \\pmod 6$ gibt es stets eine Darstellung mit $p_1 = 3$.",
+    "Die Restklasse $27 \\bmod 32$ bleibt der schwierige Fall.": "Die Restklasse "
+    "$n ≡ 1 \\bmod 30$ bleibt der schwierige Fall.",
+    "Abschätzung $T^k(n) < n$ für alle $k ≥ 4$ nachgerechnet bis $2^{24}$.": "Abschätzung "
+    "$r_3(n) > n^2 / (10 \\ln^3 n)$ nachgerechnet bis $2^{24}$.",
+    "Sage-Rechnung bestätigt die Tabelle der Iterationen.": "Sage-Rechnung bestätigt die "
+    "Tabelle der Darstellungen.",
+    "Die Rechnung bestätigt $T^4(n) < n$ für alle $n ≡ 3 \\pmod{16}$ bis $2^{20}$.": "Die Rechnung "
+    "bestätigt $r_3(n) > 0$ für alle ungeraden $n$ bis $2^{20}$.",
+    "Als Nächstes prüfe ich die Restklasse $27 \\bmod 32$ getrennt.": "Als Nächstes prüfe ich "
+    "die Restklasse $n ≡ 1 \\bmod 30$ getrennt.",
+    "# Ideen\n1. Restklassen modulo 64\n2. Paritätsvektoren": "# Ideen\n1. Restklassen modulo 30"
+    "\n2. Kreismethode",
+    "python stoppzeiten.py --bis 10**9": "python darstellungen.py --bis 10**9",
+    "Stoppzeiten bis 10^9 berechnet\nMittelwert 6,95 · ln n\nLaufzeit 41,2 s": "Darstellungen "
+    "bis 10^9 gezählt\nkleinster Quotient 0,97\nLaufzeit 41,2 s",
+}
+
+# Names and IDs inside texts; applied in this order when no whole text matches.
+_ABN_PATTERNS = [
+    (r"(?<!\w)max-privat", "max-forschung"),
+    (r"(?<!\w)chatgpt-privat", "chatgpt-forschung"),
+    (r"(?<!\w)claude-api-uni", "claude-api-lehrstuhl"),
+    (r"Mathe privat", "Forschung"),
+    (r"~/Mathe(?![\w-])", "~/Forschung"),
+    (r"Mathe-Literatur", "Fachliteratur"),
+    (r"oeis\.org", "primes.utm.edu"),
+    (r"explorer", "scout"),
+    (r"Explorer", "Scout"),
+    (r"critic", "skeptic"),
+    (r"Kritiker", "Skeptiker"),
+    (r"(?<![\w-])main(?![\w-])", "labor"),
+    (r"(?<![\w-])ranking(?![\w-])", "rangliste"),
+    (r"(?<![a-z-])collatz(?![a-z])", "goldbach-ternaer"),
+    (r"ramsey-schranken", "ramsey-graphen"),
+    (r"primzahl-luecken", "partitionen"),
+    (r"Collatz", "Goldbach"),
+]
+
+# Extra replacements for single runs of the scenario (checked before the general ones).
+_ABN_RUN_EXACT = {
+    R_LEMMA: {"collatz": "partitionen"},
+    R_REVIEW: {"collatz": "partitionen", "tex/lemma3.tex": "tex/rang-lemma.tex"},
+}
+_ABN_RUN_PATTERNS = {
+    R_LEMMA: [
+        (r"_collatz_", "_partitionen_"),
+        (r"tex/lemma3\.tex", "tex/kongruenz5.tex"),
+        (r"notes/stoppzeit4\.md", "notes/ramanujan5.md"),
+    ],
+    R_REVIEW: [
+        (r"_collatz_", "_partitionen_"),
+        (r"~/Documents/Mathe-Literatur", _ABN_READ_DIR),
+        (r"tex/lemma3\.tex", "tex/rang-lemma.tex"),
+    ],
+    R_RAMSEY: [(r"Skizze", "Konstruktion")],
+}
+
+
+def _abnahme_translator(run_id: str | None = None) -> _Translator:
+    """The translator for the whole data set, or for the texts of one scenario run."""
+    exact = {**_ABN_EXACT, **_ABN_RUN_EXACT.get(run_id or "", {})}
+    patterns = [*_ABN_RUN_PATTERNS.get(run_id or "", []), *_ABN_PATTERNS]
+    return _Translator(exact, patterns)
+
+
+def _abnahme_data(base: str) -> tuple[dict[str, _Run], dict[str, ApprovalItem]]:
+    """Runs (all details built) and inbox of the acceptance data set."""
+    runs = _scenario_runs(SCENARIO_NOW)
+    general = _abnahme_translator()
+    for run in runs.values():
+        if run.id not in _DETAIL_BUILDERS:
+            run.name = general.text(run.name)  # the generic summary repeats the name
+        _DETAIL_BUILDERS.get(run.id, _build_generic_detail)(run)
+        run.detail_built = True
+    new_runs = {}
+    for run in runs.values():
+        translated = _abnahme_translator(run.id)(run)
+        new_runs[translated.id] = translated
+    approvals = {}
+    for item in _scenario_approvals(base).values():
+        translated = _abnahme_translator(item.run.id)(item)
+        approvals[translated.id] = translated
+    _abnahme_overrides(new_runs, approvals)
+    return new_runs, approvals
+
+
+def _abnahme_overrides(runs: dict[str, _Run], approvals: dict[str, ApprovalItem]) -> None:
+    """What the acceptance data set has differently from the scenario (docs/08 §9.2)."""
+    # Permission of scout-1: domain not in the mandate; a longer deadline for the 50-minute test.
+    deadline = _at(24, 16, 9)
+    approvals["apr_0042"] = approvals["apr_0042"].model_copy(update={"deadline": deadline})
+    scout = runs[R_ABN_EXPLORE].agents["scout-1"]
+    assert scout.blocked_by is not None
+    runs[R_ABN_EXPLORE].agents["scout-1"] = scout.model_copy(
+        update={"blocked_by": scout.blocked_by.model_copy(update={"deadline": deadline})}
+    )
+    # Run start from Claude Code with two deviations: read folder and 6 h run time.
+    review = runs[R_ABN_REVIEW]
+    review.wall_time_s = 6 * 3600
+    review.turns_per_agent = 40
+    for aid, agent in list(review.agents.items()):
+        review.agents[aid] = agent.model_copy(
+            update={"tools": ToolAccess(shell=True, web=False), "turns_limit": 40}
+        )
+    item = approvals["apr_0041"]
+    no_web = ToolAccess(shell=True, web=False)
+    agents = [a.model_copy(update={"tools": no_web}) for a in item.agents]
+    approvals["apr_0041"] = item.model_copy(
+        update={
+            "agents": agents,
+            "limits": LimitsInfo(wall_time_s=6 * 3600, turns_per_agent=40, budget_usd=20),
+            "estimate": Estimate(
+                turns=Range(min=60, max=90),
+                cost_usd=Range(min=8, max=14),
+                cost_kind=CostKind.ESTIMATED,
+                duration_s=Range(min=2 * 3600, max=4 * 3600),
+            ),
+            "deviations": [
+                Deviation(
+                    path="defaults.read_dirs",
+                    label="Zusätzlicher Lese-Ordner",
+                    value_text=f"{_ABN_READ_DIR} für alle Agenten",
+                    default_text="keiner",
+                    default=[],
+                    value=[_ABN_READ_DIR],
+                    sensitive=True,
+                    providers=_shares(agents),
+                ),
+                Deviation(
+                    path="limits.wall_time_s",
+                    label="Laufzeit 6 h",
+                    value_text="",
+                    default_text="2 h",
+                    default=2 * 3600,
+                    value=6 * 3600,
+                    sensitive=False,
+                ),
+            ],
+            "standard_notes": [
+                _copy_note("partitionen", agents),
+                "Web-Zugriff",
+                "Turns pro Agent",
+                "Auth-Profile",
+                "Entscheider für Berechtigungsanfragen",
+                "Budget",
+            ],
+        }
+    )
+
+
+def _fit_storage(runs: dict[str, _Run], total_gb: float, freed_gb: float) -> None:
+    """Scale run sizes so that the runs use `total_gb` and slimming frees `freed_gb`.
+
+    The suggestion takes the 8 slimmable runs with the largest working copies (see
+    `MockApi.get_storage`); their working copies are scaled to `freed_gb`, no other run keeps
+    a larger one, and the protocols make up the rest per project.
+    """
+    finished = [r for r in runs.values() if not r.status.is_active]
+    candidates = sorted(
+        (r for r in finished if not (r.pinned or r.slimmed or r.archived) and r.size.work > 0),
+        key=lambda r: r.size.work,
+        reverse=True,
+    )
+    chosen, rest = candidates[:8], candidates[8:]
+    before = {p: 0 for p in {r.project for r in runs.values()}}
+    for r in runs.values():
+        before[r.project] += r.size.actual_bytes
+    factor = freed_gb * GB / sum(r.size.work for r in chosen)
+    for r in chosen:
+        r.size = r.size.model_copy(update={"work": int(r.size.work * factor)})
+    smallest = min(r.size.work for r in chosen)
+    for r in rest:
+        if r.size.work >= smallest:
+            r.size = r.size.model_copy(update={"work": int(smallest * 0.9)})
+    scale = total_gb * GB / sum(before.values())
+    for project, old in before.items():
+        members = [r for r in finished if r.project == project]
+        fixed = sum(r.size.actual_bytes for r in runs.values() if r.project == project) - sum(
+            r.size.actual_bytes for r in members
+        )
+        parts = sum(r.size.work + r.size.output + r.size.archive for r in members)
+        logs = sum(r.size.logs for r in members)
+        target_logs = max(0, int(old * scale) - fixed - parts)
+        for r in members:
+            share = r.size.logs / logs if logs else 1 / len(members)
+            new_logs = int(target_logs * share)
+            actual = r.size.work + new_logs + r.size.output + r.size.archive
+            ratio = r.size.logical_bytes / r.size.actual_bytes if r.size.actual_bytes else 1
+            r.size = r.size.model_copy(
+                update={
+                    "logs": new_logs,
+                    "actual_bytes": actual,
+                    "logical_bytes": max(actual, int(actual * ratio)),
+                }
+            )
+
+
+# --------------------------------------------------------------------------------------------
 # The mock
 # --------------------------------------------------------------------------------------------
 
@@ -3230,6 +4114,102 @@ _DETAIL_BUILDERS: dict[str, Callable[[_Run], None]] = {
     R_REVIEW: _build_review_detail,
     R_SATZ2: _build_satz2_detail,
 }
+
+
+def _requested_value(item: ApprovalItem, path: str) -> Any:
+    """Value of a run start request at `path` (`agents.<id>.tools.web`, `limits.<key>` …)."""
+    parts = path.split(".")
+    if parts[0] == "agents" and len(parts) >= 3:
+        agent = next((a for a in item.agents if a.id == parts[1]), None)
+        if agent is None:
+            return None
+        if parts[-1] == "web":
+            return agent.tools.web
+        if parts[-1] == "read_dirs":
+            return list(agent.read_dirs)
+        if parts[-1] == "model":
+            return agent.model
+        return None
+    if parts[0] == "limits" and item.limits is not None and len(parts) == 2:
+        return getattr(item.limits, parts[1], None)
+    if parts[0] == "decider":
+        return item.decider.value if item.decider else None
+    if parts[0] == "task_md":
+        return item.task_md
+    if parts[0] == "params" and len(parts) == 2:
+        return item.params.get(parts[1])
+    return None
+
+
+def _change_label(path: str, old: Any, new: Any, skill: str | None = None) -> str:
+    """German label of one change, e.g. „Web judge-1: an → aus“ (docs/08 §5.0 `changes`)."""
+    parts = path.split(".")
+
+    def dirs(value: Any) -> str:
+        return ", ".join(value) if value else "keiner"
+
+    if parts[0] == "agents" and parts[-1] == "web":
+        return f"Web {parts[1]}: {'an' if old else 'aus'} → {'an' if new else 'aus'}"
+    if parts[0] == "agents" and parts[-1] == "read_dirs":
+        return f"Lese-Ordner {parts[1]}: {dirs(old)} → {dirs(new)}"
+    if parts[0] == "agents" and parts[-1] == "model":
+        return f"Modell {parts[1]}: {old} → {new}"
+    if parts[0] == "limits" and len(parts) == 2:
+        label = {"wall_time_s": "Laufzeit", "turns_per_agent": "Turns pro Agent"}.get(
+            parts[1], "Budget"
+        )
+        old_text = _limit_text(parts[1], old) if isinstance(old, int | float) else "–"
+        new_text = _limit_text(parts[1], new) if isinstance(new, int | float) else "–"
+        return f"{label}: {old_text} → {new_text}"
+    if parts[0] == "decider":
+        return (
+            f"Entscheider: {_DECIDER_TEXT.get(str(old), old)} → {_DECIDER_TEXT.get(str(new), new)}"
+        )
+    if parts[0] == "task_md":
+        return "Aufgabe geändert"
+    if parts[0] == "params" and len(parts) == 2:
+        return f"{_param_label(skill, parts[1])}: {old} → {new}"
+    return f"{path}: {old} → {new}"
+
+
+def _size_text(num_bytes: int) -> str:
+    """Decimal size like the GUI shows it (docs/08 §8.7): „46,2 GB“, „38 MB“."""
+    if num_bytes >= GB and num_bytes % GB == 0:
+        return f"{num_bytes // GB} GB"
+    if num_bytes >= GB:
+        return f"{num_bytes / GB:.1f} GB".replace(".", ",")
+    return f"{round(num_bytes / MB)} MB"
+
+
+def _usage_tokens(row: UsageRow) -> int:
+    """All tokens of a usage row (input, output, cache, reasoning)."""
+    return sum(
+        v or 0 for v in (row.input, row.output, row.cache_read, row.cache_write, row.reasoning)
+    )
+
+
+def _add_usage(row: UsageRow, part: dict[str, Any]) -> UsageRow:
+    """Add the numbers of `part` to `row`; a value stays „–“ (None) while no part delivers it."""
+    update: dict[str, Any] = {}
+    for name in ("input", "output", "cache_read", "cache_write", "reasoning"):
+        value = part.get(name)
+        if value is not None:
+            update[name] = (getattr(row, name) or 0) + value
+    cost = part.get("cost_usd")
+    kind = part.get("cost_kind")
+    if cost is not None:
+        update["cost_usd"] = round((row.cost_usd or 0) + cost, 2)
+        # mixed rows (billed + estimated) are marked as estimated („≈“)
+        if row.cost_kind is CostKind.ESTIMATED or kind is CostKind.ESTIMATED:
+            update["cost_kind"] = CostKind.ESTIMATED
+        else:
+            update["cost_kind"] = kind
+    return row.model_copy(update=update)
+
+
+def _same(value: Any) -> Any:
+    """No translation (scenario and load data set)."""
+    return value
 
 
 def _not_found(what: str, ident: str) -> ApiException:
@@ -3260,6 +4240,7 @@ class MockApi:
         if dataset is Dataset.SCENARIO:
             self.clock = MockClock(SCENARIO_NOW)
             runs = _scenario_runs(SCENARIO_NOW)
+            _fit_storage(runs, total_gb=46.2, freed_gb=14.9)
             approvals = _scenario_approvals(self.base_url)
             warnings = _scenario_warnings()
             wf = WorkfolderInfo(
@@ -3276,6 +4257,38 @@ class MockApi:
                     WorkfolderRef(
                         name="Uni", path="~/Uni-Forschung", projects_count=1, active_runs=0
                     ),
+                ],
+                service_url=self.base_url,
+            )
+        elif dataset is Dataset.ACCEPTANCE:
+            self.clock = MockClock(SCENARIO_NOW)
+            runs, approvals = _abnahme_data(self.base_url)
+            _fit_storage(runs, total_gb=47.8, freed_gb=11.2)
+            tr = _abnahme_translator()
+            warnings = [
+                *tr(_scenario_warnings()),
+                WarningInfo(
+                    id="profile-claude-api-lehrstuhl",
+                    kind=WarningKind.PROFILE_ERROR,
+                    severity=Severity.ERROR,
+                    title="claude-api-lehrstuhl funktioniert nicht",
+                    text="Der API-Key wurde abgelehnt (401). Agenten mit diesem Profil starten "
+                    "nicht.",
+                    action=Action(label="Profil öffnen", url="/profile/claude-api-lehrstuhl"),
+                ),
+            ]
+            wf = WorkfolderInfo(
+                name="Forschung",
+                path="~/Forschung",
+                projects_count=3,
+                runs_count=len(runs),
+                disk_free_bytes=31 * GB,
+                apfs=True,
+                known=[
+                    WorkfolderRef(
+                        name="Forschung", path="~/Forschung", projects_count=3, active_runs=3
+                    ),
+                    WorkfolderRef(name="Lehre", path="~/Lehre", projects_count=1, active_runs=0),
                 ],
                 service_url=self.base_url,
             )
@@ -3361,7 +4374,61 @@ class MockApi:
             mandate_text=_MANDATE_TEXT,
             mandate_modified=_at(20, 9, 12),
         )
+        self._tr: Callable[[Any], Any] = _same
+        if dataset is Dataset.LOAD:
+            assert self.state.workfolder_settings is not None
+            self.state.workfolder_settings.retention.max_runs_size_gb = 500
+        if dataset is Dataset.ACCEPTANCE:
+            # names and texts of the acceptance data set also for what the mock makes later
+            self._tr = tr = _abnahme_translator()
+            st = self.state
+            st.profiles = tr(st.profiles)
+            st.skills = tr(st.skills)
+            st.projects = tr(_projects(_scenario_runs(SCENARIO_NOW), self.clock.now()))
+            st.app_settings = tr(st.app_settings)
+            st.workfolder_settings = tr(st.workfolder_settings)
+            st.mandate_text = tr(st.mandate_text)
         self.state.last_sim = self.clock.now()
+        self._refresh_storage_warning(publish=False)
+
+    def _retention(self) -> RetentionInfo:
+        assert self.state.workfolder_settings is not None
+        return self.state.workfolder_settings.retention
+
+    def _refresh_storage_warning(self, *, publish: bool = True) -> None:
+        """Warning „Speicher knapp“ from the current sizes (docs/08 §4.2: ≥ 90 % of the limit
+        or less than 20 GB free); it disappears once enough is freed (R7)."""
+        report = self._storage()
+        limit = report.limit_bytes or 50 * GB
+        others = [w for w in self.state.warnings if w.kind is not WarningKind.STORAGE_LOW]
+        warnings = others
+        if report.runs_actual >= 0.9 * limit or report.disk_free < 20 * GB:
+            hint = "Nichts zu verschlanken. Älteste Runs archivieren?"
+            if report.suggestion:
+                n = len(report.suggestion.run_ids)
+                hint = (
+                    f"{n} fertige Runs lassen sich verschlanken "
+                    f"({_size_text(report.suggestion.freed_bytes)})."
+                )
+            warning = WarningInfo(
+                id="storage",
+                kind=WarningKind.STORAGE_LOW,
+                title="Speicher knapp",
+                text=f"Runs belegen {_size_text(report.runs_actual)} von "
+                f"{_size_text(limit)}. {hint}",
+                action=Action(label="Speicher ansehen", url="/speicher"),
+            )
+            warnings = [warning, *others]
+        if warnings == self.state.warnings:
+            return
+        self.state.warnings = warnings
+        if publish:
+            self._publish(WarningsChangedEvent(seq=0, ts=self.now(), warnings=warnings))
+            self._publish_counts()
+
+    def forced(self, state: "PageState | str", page: str = "") -> "ForcedStateApi":
+        """This mock in a forced page state (`?zustand=leer|laedt|fehler`, W1-08) for `page`."""
+        return ForcedStateApi(self, PageState(state), page)
 
     def datasets(self) -> list[tuple[str, str]]:
         """Data sets as `(value, German label)` for the switch in the navigation (mock only)."""
@@ -3533,6 +4600,7 @@ class MockApi:
         return self.state.sim_rng.random() < min(1.0, per_second * self.stream_rate * dt)
 
     def _sim_append(self, run: _Run, agent: AgentState, ev: TranscriptEvent) -> None:
+        ev = self._tr(ev)
         transcript = run.transcripts.setdefault(agent.id, _Transcript())
         transcript.extra.append(ev)
         self._publish(
@@ -3540,6 +4608,7 @@ class MockApi:
         )
 
     def _sim_activity(self, run: _Run, agent: AgentState, act: Activity, now: float) -> None:
+        act = self._tr(act)
         run.agents[agent.id] = agent.model_copy(update={"activity": act})
         self._publish(
             AgentActivityEvent(seq=0, ts=now, run_id=run.id, agent_id=agent.id, activity=act)
@@ -3561,7 +4630,14 @@ class MockApi:
             if not self._sim_chance(0.3, dt):
                 continue
             run.running_tools.pop(agent_id)
-            output = next((o for n, a, o in self._SIM_TOOLS if a == ev.tool.input_summary), "ok")
+            output = next(
+                (
+                    self._tr(o)
+                    for n, a, o in self._SIM_TOOLS
+                    if self._tr(a) == ev.tool.input_summary
+                ),
+                "ok",
+            )
             done = ev.model_copy(
                 update={
                     "tool": ev.tool.model_copy(
@@ -3643,15 +4719,17 @@ class MockApi:
                     kind = rng.choice(self._SIM_KINDS)
                     others = [m for m in members if m != sender]
                     to = [rng.choice(others)] if kind is MessageKind.QUESTION and others else []
-                    msg = Message(
-                        id=ch.count + 1,
-                        ts=now,
-                        channel=ch.info.name,
-                        sender=sender,
-                        kind=kind,
-                        body=rng.choice(_MATH_SNIPPETS),
-                        to=to,
-                        open=bool(to),
+                    msg = self._tr(
+                        Message(
+                            id=ch.count + 1,
+                            ts=now,
+                            channel=ch.info.name,
+                            sender=sender,
+                            kind=kind,
+                            body=rng.choice(_MATH_SNIPPETS),
+                            to=to,
+                            open=bool(to),
+                        )
                     )
                     ch.extra.append(msg)
                     ch.info = ch.info.model_copy(
@@ -3711,6 +4789,7 @@ class MockApi:
             ),
             rule_label="Netzwerk zu arxiv.org",
         )
+        item = self._tr(item)
         st.approvals[aid] = item
         self._publish_approval("approval.created", item)
         self._publish_run(run)
@@ -4076,11 +5155,17 @@ class MockApi:
         run = self._run(item.run.id)
         changes: list[ChangeInfo] = []
         if request.action is DecisionAction.ADJUST:
-            by_path = {d.path: d for d in item.deviations}
             for path, value in (request.config or {}).items():
-                old = by_path[path].value if path in by_path else None
+                old = _requested_value(item, path)
                 if old != value:
-                    changes.append(ChangeInfo(path=path, from_=old, to=value))
+                    changes.append(
+                        ChangeInfo(
+                            path=path,
+                            from_=old,
+                            to=value,
+                            label=_change_label(path, old, value, item.skill),
+                        )
+                    )
             if not changes:
                 raise ApiException.of(
                     ErrorCode.INVALID,
@@ -4158,9 +5243,10 @@ class MockApi:
             if action is DecisionAction.ADJUST:
                 run.adjusted_by_user = True
                 run.changes = changes
+                self._apply_changes(run, changes)
             run.status = RunStatus.QUEUED
             run.status_since = now
-            run.status_detail = "wartet auf 2 Plätze bei max-privat"
+            run.status_detail = self._tr("wartet auf 2 Plätze bei max-privat")
             run.info = None
             self.state.pending_transitions += [
                 (now + 5, run.id, RunStatus.PREPARING),
@@ -4205,9 +5291,31 @@ class MockApi:
             run.stages = stages
         if option is EscalationOption.RETRY:
             run.info = "Noch ein Versuch läuft"
-            return "Noch ein Versuch: prover überarbeitet die Skizze."
+            worker = item.comment_to.id if item.comment_to else "Der Beweiser"
+            return f"Noch ein Versuch: {worker} überarbeitet die Stufe „{item.stage}“."
         run.info = "Trotzdem weiter"
         return "Trotzdem weiter: Die nächste Stufe startet."
+
+    def _apply_changes(self, run: _Run, changes: list[ChangeInfo]) -> None:
+        """Your changes from „Anpassen“ go into the run (docs/08 §5.2: same run ID)."""
+        detail = self._detail(run.id)
+        for change in changes:
+            parts = change.path.split(".")
+            if parts[0] == "limits" and len(parts) == 2 and hasattr(run, parts[1]):
+                setattr(run, parts[1], change.to)
+            elif parts[0] == "decider" and change.to:
+                run.decider = Decider(change.to)
+            elif parts[0] == "task_md":
+                run.task_md = str(change.to or "")
+            elif parts[0] == "agents" and parts[1] in detail.agents:
+                agent = detail.agents[parts[1]]
+                if parts[-1] == "web":
+                    agent = agent.model_copy(
+                        update={"tools": agent.tools.model_copy(update={"web": bool(change.to)})}
+                    )
+                elif parts[-1] == "read_dirs":
+                    agent = agent.model_copy(update={"read_dirs": list(change.to or [])})
+                detail.agents[agent.id] = agent
 
     async def revoke_approval(self, approval_id: str) -> ApprovalItem:
         """Withdraw a revocable decision (gatekeeper, or user with scope agent/run)."""
@@ -4333,7 +5441,7 @@ class MockApi:
             actions_allowed=actions,
             stages=run.stages,
             handoff_text=handoff,
-            run_dir=f"~/Mathe/runs/{run.id}",
+            run_dir=f"{self.state.workfolder.path}/runs/{run.id}",
             task_md=run.task_md,
         )
 
@@ -4414,6 +5522,10 @@ class MockApi:
             run.size = run.size.model_copy(
                 update={"actual_bytes": run.size.actual_bytes - run.size.work, "work": 0}
             )
+            wf = self.state.workfolder
+            self.state.workfolder = wf.model_copy(
+                update={"disk_free_bytes": wf.disk_free_bytes + (freed or 0)}
+            )
             message = f"Verschlankt: {run.name}"
         elif action is RunAction.ARCHIVE:
             run.archived = True
@@ -4421,9 +5533,12 @@ class MockApi:
         else:
             del self.state.runs[run_id]
             self._publish_counts()
+            self._refresh_storage_warning()
             return ActionResult(ok=True, message=f"In den Papierkorb verschoben: {run.name}")
         self._publish_run(run, prev)
         self._publish_counts()
+        if action in (RunAction.SLIM, RunAction.ARCHIVE):
+            self._refresh_storage_warning()
         return ActionResult(ok=True, message=message, run=self._summary(run), freed_bytes=freed)
 
     async def list_channels(self, run_id: str) -> list[ChannelInfo]:
@@ -4594,15 +5709,28 @@ class MockApi:
         raise _not_found("Projekt", name)
 
     async def list_skills(self, kind: SkillKind | None = None) -> list[SkillInfo]:
-        """Skills, optionally of one kind."""
-        return [s for s in self.state.skills if kind is None or s.kind is kind]
+        """Skills, optionally of one kind, with their use in the runs („Benutzt von“)."""
+        return [self._with_usage(s) for s in self.state.skills if kind is None or s.kind is kind]
 
     async def get_skill(self, name: str) -> SkillInfo:
         """One skill."""
         for s in self.state.skills:
             if s.name == name:
-                return s
+                return self._with_usage(s)
         raise _not_found("Skill", name)
+
+    def _with_usage(self, skill: SkillInfo) -> SkillInfo:
+        if skill.kind is not SkillKind.GROUP:
+            return skill
+        runs = [r for r in self.state.runs.values() if r.skill == skill.name]
+        if not runs:
+            return skill.model_copy(update={"used_by": SkillUsage()})
+        usage = SkillUsage(
+            projects=sorted({r.project for r in runs}),
+            runs_count=len(runs),
+            last_run_at=max(r.created_at for r in runs),
+        )
+        return skill.model_copy(update={"used_by": usage})
 
     # --- ApiClient: usage, storage, new run, setup --------------------------------------------
 
@@ -4613,7 +5741,15 @@ class MockApi:
         group_by: UsageGroupBy = UsageGroupBy.PROFILE,
         project: str | None = None,
     ) -> UsageReport:
-        """Usage aggregated from the runs of the data set."""
+        """Usage of the runs in the period, split by profile kind (docs/08 §5.9).
+
+        Subscriptions count at the API list price („≈“, `estimated`), API keys are billed,
+        Codex reports no price („–“). Each run is split over the profiles in fixed shares.
+        """
+        if group_by is UsageGroupBy.AGENT:
+            raise ApiException.of(
+                ErrorCode.INVALID, "Die Aufschlüsselung nach Agent kommt in einer späteren Version."
+            )
         now = self.now()
         from_ts = (
             from_ts
@@ -4627,74 +5763,125 @@ class MockApi:
             if from_ts <= r.created_at <= to_ts and (project is None or r.project == project)
         ]
         rows: dict[str, UsageRow] = {}
-
-        def key_of(r: _Run) -> tuple[str, str]:
-            if group_by is UsageGroupBy.PROJECT:
-                return r.project, r.project
-            if group_by is UsageGroupBy.RUN:
-                return r.id, r.name
-            if group_by is UsageGroupBy.MODEL:
-                return "claude-opus-5-5", "Claude Opus 5.5"
-            return "max-privat", "max-privat"
-
+        run_sets: dict[str, set[str]] = {}
         for r in runs:
-            k, label = key_of(r)
-            tokens = r.tokens_total or 0
-            row = rows.get(k) or UsageRow(
-                key=k,
-                label=label,
-                input=0,
-                output=0,
-                cache_read=0,
-                cache_write=0,
-                cost_usd=0.0,
-                cost_kind=CostKind.ESTIMATED,
-            )
-            rows[k] = row.model_copy(
-                update={
-                    "input": (row.input or 0) + int(tokens * 0.2),
-                    "output": (row.output or 0) + int(tokens * 0.05),
-                    "cache_read": (row.cache_read or 0) + int(tokens * 0.7),
-                    "cache_write": (row.cache_write or 0) + int(tokens * 0.05),
-                    "cost_usd": round((row.cost_usd or 0) + (r.spent_usd or 0), 2),
-                    "runs": row.runs + 1,
-                }
-            )
-        total = UsageRow(
-            key="total",
-            label="Gesamt",
-            input=sum(r.input or 0 for r in rows.values()),
-            output=sum(r.output or 0 for r in rows.values()),
-            cache_read=sum(r.cache_read or 0 for r in rows.values()),
-            cache_write=sum(r.cache_write or 0 for r in rows.values()),
-            cost_usd=round(sum(r.cost_usd or 0 for r in rows.values()), 2),
-            cost_kind=CostKind.ESTIMATED,
-            runs=sum(r.runs for r in rows.values()),
-        )
+            for part in self._usage_parts(r):
+                key, label = {
+                    UsageGroupBy.PROFILE: (part["profile"], part["profile_label"]),
+                    UsageGroupBy.MODEL: (part["model"], _model_label(part["model"])),
+                    UsageGroupBy.PROJECT: (r.project, r.project),
+                    UsageGroupBy.RUN: (r.id, r.name),
+                }[group_by]
+                row = rows.get(key) or UsageRow(key=key, label=label)
+                rows[key] = _add_usage(row, part)
+                run_sets.setdefault(key, set()).add(r.id)
+        for key, row in rows.items():
+            rows[key] = row.model_copy(update={"runs": len(run_sets[key])})
+        total = UsageRow(key="total", label="Gesamt")
+        for row in rows.values():
+            total = _add_usage(total, row.model_dump())
+        total = total.model_copy(update={"runs": len(runs)})
+        estimated_parts = [
+            p["cost_usd"]
+            for r in runs
+            for p in self._usage_parts(r)
+            if p["cost_kind"] is CostKind.ESTIMATED and p["cost_usd"] is not None
+        ]
+        billed_parts = [
+            p["cost_usd"]
+            for r in runs
+            for p in self._usage_parts(r)
+            if p["cost_kind"] is CostKind.BILLED and p["cost_usd"] is not None
+        ]
+        billed = round(sum(billed_parts), 2)
+        read = total.cache_read or 0
+        fed = read + (total.input or 0) + (total.cache_write or 0)
+        events = [
+            RateLimitEvent(
+                ts=_at(24, 15, 5),
+                profile="chatgpt-privat",
+                status="warning",
+                utilization=0.82,
+                run=R_EXPLORE,
+                agent="explorer-gpt",
+                consequence="keine, arbeitet weiter",
+            ),
+            RateLimitEvent(
+                ts=_at(22, 11, 9),
+                profile="chatgpt-privat",
+                status="error",
+                run="20261022-1105_primzahl-luecken_roundtable_19ab",
+                agent="alle",
+                consequence="Run fehlgeschlagen (Anmeldung abgelaufen)",
+            ),
+            RateLimitEvent(
+                ts=_at(19, 17, 5),
+                profile="max-privat",
+                status="throttled",
+                utilization=1.0,
+                run="20261019-1640_collatz_proof-review_0f3c",
+                agent="judge-1, judge-3",
+                consequence="12 min gewartet, dann weiter",
+            ),
+        ]
+        events = [
+            e
+            for e in self._tr(events)
+            if from_ts <= e.ts <= to_ts and (e.run is None or e.run in {r.id for r in runs})
+        ]
         return UsageReport(
             from_ts=from_ts,
             to_ts=to_ts,
             group_by=group_by,
-            rows=list(rows.values()),
+            rows=sorted(rows.values(), key=lambda row: -_usage_tokens(row)),
             totals=total,
-            billed_usd=0.0,
-            estimated_usd=total.cost_usd,
-            cache_read_ratio=0.7,
-            ratelimits=[
-                RateLimitEvent(
-                    ts=now - 3600,
-                    profile="chatgpt-privat",
-                    status="allowed_warning",
-                    utilization=0.82,
-                    run=R_EXPLORE,
-                    agent="explorer-gpt",
-                    consequence="arbeitet weiter, Warnung bei 80 %",
-                )
-            ],
+            billed_usd=billed,
+            estimated_usd=round(sum(estimated_parts), 2),
+            cache_read_ratio=round(read / fed, 2) if fed else None,
+            ratelimits=events,
         )
+
+    def _usage_parts(self, run: _Run) -> list[dict[str, Any]]:
+        """Fixed shares of a run per profile: Claude subscription, ChatGPT, sometimes an API key."""
+        tokens = run.tokens_total or 0
+        spent = run.spent_usd or 0.0
+        if not tokens:
+            return []
+        api_key = int(run.id[-4:], 16) % 5 == 0 if run.id[-4:].isalnum() else False
+        shares = [
+            ("max-privat", "Claude-Abo", "claude-opus-5-5", 0.58, 0.72, CostKind.ESTIMATED),
+            ("max-privat", "Claude-Abo", "claude-sonnet-5-5", 0.16, 0.16, CostKind.ESTIMATED),
+            ("chatgpt-privat", "ChatGPT-Abo", "gpt-5.5", 0.2, None, None),
+        ]
+        if api_key:
+            shares.append(("claude-api-uni", "API-Key", "claude-opus-5-5", 0.06, 0.12, None))
+        parts = []
+        for profile, _kind, model, share, cost_share, kind in shares:
+            t = int(tokens * share)
+            codex = model.startswith("gpt")
+            parts.append(
+                {
+                    "profile": self._tr(profile),
+                    "profile_label": self._tr(profile),
+                    "model": model,
+                    "input": int(t * 0.2),
+                    "output": int(t * 0.05),
+                    "cache_read": int(t * 0.7),
+                    "cache_write": None if codex else int(t * 0.05),
+                    "reasoning": int(t * 0.05) if codex else None,
+                    "cost_usd": None if cost_share is None else round(spent * cost_share, 2),
+                    "cost_kind": CostKind.BILLED
+                    if profile == "claude-api-uni"
+                    else (None if codex else kind),
+                }
+            )
+        return parts
 
     async def get_storage(self) -> StorageReport:
         """Disk use of the runs with a slimming suggestion."""
+        return self._storage()
+
+    def _storage(self) -> StorageReport:
         summaries = [self._summary(r) for r in self.state.runs.values()]
         actual = sum(s.size.actual_bytes for s in summaries)
         logical = sum(s.size.logical_bytes for s in summaries)
@@ -4723,7 +5910,8 @@ class MockApi:
                     protected_reason=reason,
                 )
             )
-        slim = [i for i in items if i.slimmable][:8]
+        slim = sorted((i for i in items if i.slimmable), key=lambda i: i.by_part.work, reverse=True)
+        slim = slim[:8]
         by_project: dict[str, ProjectStorage] = {}
         for s in summaries:
             p = by_project.get(s.project) or ProjectStorage(
@@ -4740,7 +5928,7 @@ class MockApi:
             runs_actual=actual,
             runs_logical=logical,
             by_part=parts,
-            limit_bytes=50 * GB,
+            limit_bytes=int((self._retention().max_runs_size_gb or 50) * GB),
             disk_free=self.state.workfolder.disk_free_bytes,
             disk_total=494 * GB,
             by_project=sorted(by_project.values(), key=lambda p: p.actual, reverse=True),
@@ -4759,32 +5947,308 @@ class MockApi:
         )
 
     async def resolve_run(self, run_input: dict[str, Any]) -> ResolveResult:
-        """Simulated resolution: checks the budget against a fixed estimate."""
-        estimate = Estimate(
-            turns=Range(min=40, max=60),
-            cost_usd=Range(min=9, max=16),
-            cost_kind=CostKind.ESTIMATED,
-            duration_s=Range(min=1800, max=3600),
-        )
-        errors = []
-        budget = (run_input.get("limits") or {}).get("budget_usd")
+        """Resolve and check a run input like `estimate_run` (docs/08 §5.4, simulated).
+
+        `run_input`: `project`, `skill` (None: without skill), `name`, `task_md`, `params`,
+        `agents` (overrides per agent: `model`, `web`, `read_dirs`), `limits` (`wall_time_s`,
+        `turns_per_agent`, `budget_usd`), `decider`. Errors carry the path of their field.
+        """
+        assert self.state.workfolder_settings is not None
+        settings = self.state.workfolder_settings
+        errors: list[FieldIssue] = []
+        warnings: list[str] = []
+        project_name = str(run_input.get("project") or "")
+        skill_name = run_input.get("skill") or None
+        params = dict(run_input.get("params") or {})
+        if not project_name:
+            errors.append(FieldIssue(path="project", field="project", message="Wähle ein Projekt."))
+        else:
+            project = next((p for p in self.state.projects if p.name == project_name), None)
+            if project is None:
+                errors.append(
+                    FieldIssue(
+                        path="project",
+                        field="project",
+                        message=f"Projekt „{project_name}“ gibt es nicht. Wähle ein anderes.",
+                    )
+                )
+            elif not project.setup_ok:
+                warnings.append(
+                    f"{project_name} ist unvollständig eingerichtet. Der Run startet trotzdem, "
+                    "Claude Code arbeitet dort erst nach „Reparieren“ mit."
+                )
+        skill = None
+        if skill_name:
+            skill = next((s for s in self.state.skills if s.name == skill_name), None)
+            if skill is None or skill.kind is not SkillKind.GROUP:
+                errors.append(
+                    FieldIssue(
+                        path="skill",
+                        field="skill",
+                        message=f"„{skill_name}“ ist kein startbarer Group-Skill.",
+                    )
+                )
+                skill = None
+            elif not skill.valid:
+                issue = skill.issues[0] if skill.issues else None
+                where = f"{issue.file}, Zeile {issue.line}: " if issue and issue.line else ""
+                errors.append(
+                    FieldIssue(
+                        path="skill",
+                        field="skill",
+                        message=f"Skill {skill_name} ist ungültig: {where}"
+                        f"{issue.message if issue else 'Prüfung fehlgeschlagen.'}",
+                        action=Action(label="Skill öffnen", url=f"/skills/{skill_name}"),
+                    )
+                )
+        for p in skill.params if skill else []:
+            value = params.get(p.name, p.default)
+            if p.type not in ("int", "float") or not isinstance(value, int | float):
+                continue
+            if (p.min is not None and value < p.min) or (p.max is not None and value > p.max):
+                errors.append(
+                    FieldIssue(
+                        path=f"params.{p.name}",
+                        field=p.name,
+                        message=f"Erlaubt sind {_num(p.min)}–{_num(p.max)}.",
+                    )
+                )
+        if not str(run_input.get("task_md") or "").strip():
+            errors.append(
+                FieldIssue(
+                    path="task_md",
+                    field="task_md",
+                    message="Die Aufgabe fehlt. Schreib, woran die Agenten arbeiten sollen.",
+                )
+            )
+        agents = self._resolve_agents(skill_name, params, run_input.get("agents") or {})
+        channels = self._tr(_resolve_channels(skill_name, agents))
+        agents = self._tr(agents)
+        profiles = {p.name: p for p in self.state.profiles}
+        for agent in agents:
+            profile = profiles.get(agent.profile)
+            if profile is None:
+                errors.append(
+                    FieldIssue(
+                        path=f"agents.{agent.id}.profile",
+                        field=agent.id,
+                        message=f"Für {agent.id} fehlt ein Auth-Profil ({agent.profile}). Lege "
+                        "es unter Auth-Profile an.",
+                        action=Action(label="Auth-Profile", url="/profile"),
+                    )
+                )
+            elif profile.last_test and not profile.last_test.ok:
+                errors.append(
+                    FieldIssue(
+                        path=f"agents.{agent.id}.profile",
+                        field=agent.id,
+                        message=f"Profil „{profile.name}“ von {agent.id} funktioniert nicht.",
+                        action=Action(label="Profil öffnen", url=f"/profile/{profile.name}"),
+                    )
+                )
+        estimate = _estimate(skill_name, params, agents)
+        limits_in = run_input.get("limits") or {}
+        budget = limits_in.get("budget_usd", settings.limits.budget_usd)
         if isinstance(budget, int | float) and budget < estimate.cost_usd.max:
+            cost_param = _COST_PARAM.get(skill_name or "")
+            hint = (
+                f"nimm weniger {_param_label(skill_name, cost_param)}"
+                if cost_param
+                else "nimm weniger Agenten"
+            )
             errors.append(
                 FieldIssue(
                     path="limits.budget_usd",
                     field="budget_usd",
-                    message="Zu knapp: Die Schätzung liegt bei ≈ 9–16 $. Setze mindestens 16 $ "
-                    "oder nimm weniger Turns pro Idee.",
+                    message=f"Zu knapp: Die Schätzung liegt bei ≈ {_num(estimate.cost_usd.min)}–"
+                    f"{_num(estimate.cost_usd.max)} $. Setze mindestens "
+                    f"{_num(estimate.cost_usd.max)} $ oder {hint}.",
                 )
             )
-        if not run_input.get("project"):
-            errors.append(FieldIssue(path="project", message="Wähle ein Projekt."))
+        capacity = []
+        for name in dict.fromkeys(a.profile for a in agents):
+            profile = profiles.get(name)
+            if profile is None:
+                continue
+            needed = sum(1 for a in agents if a.profile == name)
+            free = max(0, profile.concurrency.limit - profile.concurrency.in_use)
+            capacity.append(
+                CapacityInfo(
+                    profile=name, free=free, needed=needed, limit=profile.concurrency.limit
+                )
+            )
+            if needed > free:
+                warnings.append(
+                    f"{name}: {free} von {profile.concurrency.limit} Plätzen frei, der Run "
+                    f"braucht {needed}. Er wartet in der Warteschlange, bis Plätze frei werden."
+                )
+        deviations = self._deviations(agents, limits_in, run_input.get("decider"))
         return ResolveResult(
-            resolved_run_yaml="version: 1\n",
+            resolved_run_yaml=_run_yaml(run_input, skill, agents, settings),
+            agents=agents,
+            channels=channels,
             errors=errors,
+            warnings=warnings,
             estimate=estimate,
-            capacity=[CapacityInfo(profile="max-privat", free=1, needed=3, limit=4)],
+            capacity=capacity,
+            deviations=deviations,
         )
+
+    def _resolve_agents(
+        self, skill: str | None, params: dict[str, Any], overrides: dict[str, Any]
+    ) -> list[RunStartAgent]:
+        """Agents of a skill with the standard profiles, then the overrides of the form."""
+        assert self.state.workfolder_settings is not None
+        defaults = self.state.workfolder_settings.defaults
+        specs: list[tuple[str, str, str]] = []
+        if skill == "exploration":
+            ideas = [i for i in params.get("ideas") or [] if str(i).strip()]
+            for n in range(1, max(1, len(ideas) or 3) + 1):
+                specs.append(
+                    (
+                        f"explorer-{n}" if n < 3 else "explorer-gpt" if n == 3 else f"explorer-{n}",
+                        "Explorer",
+                        "gpt-5.5" if n == 3 else "claude-opus-5-5",
+                    )
+                )
+            specs += [
+                ("critic", "Kritiker", "claude-sonnet-5-5"),
+                ("ranker", "Ranker", "claude-sonnet-5-5"),
+            ]
+        elif skill == "proof":
+            specs = [
+                ("strategist", "Stratege", "claude-opus-5-5"),
+                ("prover", "Beweiser", "claude-opus-5-5"),
+                ("rater-1", "Rater", "claude-sonnet-5-5"),
+                ("rater-2", "Rater", "gpt-5.5"),
+            ]
+        elif skill == "proof-review":
+            specs = [("author", "Autor", "claude-opus-5-5")]
+            for n in range(1, int(params.get("judges") or 3) + 1):
+                specs.append(
+                    (f"judge-{n}", "Judge", "gpt-5.5" if n % 2 == 0 else "claude-opus-5-5")
+                )
+            if params.get("verdict") == "meta_judge":
+                specs.append(("meta-judge", "Meta-Judge", "claude-opus-5-5"))
+        elif skill == "roundtable":
+            for n in range(1, int(params.get("members") or 3) + 1):
+                specs.append(
+                    (f"member-{n}", "Mitglied", "gpt-5.5" if n % 3 == 0 else "claude-opus-5-5")
+                )
+        else:
+            specs = [("solver", "Löser", "claude-opus-5-5")]
+        agents = []
+        for agent_id, role, model in specs:
+            change = overrides.get(self._tr(agent_id)) or overrides.get(agent_id) or {}
+            model = str(change.get("model") or model)
+            provider = _provider_for(model)
+            profile = (defaults.get(provider) or ProviderDefaultsInfo()).auth or ""
+            agents.append(
+                RunStartAgent(
+                    id=agent_id,
+                    role_label=role,
+                    provider=provider,
+                    vendor=_vendor(provider),
+                    model=model,
+                    model_label=_model_label(model),
+                    profile=str(change.get("profile") or profile),
+                    tools=ToolAccess(shell=True, web=bool(change.get("web", False))),
+                    read_dirs=list(change.get("read_dirs") or []),
+                    workspace_mode=WorkspaceMode.EMPTY
+                    if agent_id == "ranker"
+                    else WorkspaceMode.COPY,
+                )
+            )
+        return agents
+
+    def _deviations(
+        self, agents: list[RunStartAgent], limits: dict[str, Any], decider: Any
+    ) -> list[Deviation]:
+        """Differences from your standards (docs/07 §5, docs/08 §5.0 `deviations`)."""
+        assert self.state.workfolder_settings is not None
+        settings = self.state.workfolder_settings
+        out: list[Deviation] = []
+        web = [a.id for a in agents if a.tools.web]
+        if web:
+            out.append(
+                Deviation(
+                    path=f"agents.{_id_group(web)}.tools.web",
+                    label="Web-Zugriff an",
+                    value_text=f"für {', '.join(web)}",
+                    default_text="aus",
+                    default=False,
+                    value=True,
+                    sensitive=True,
+                )
+            )
+        folders: dict[str, list[RunStartAgent]] = {}
+        for a in agents:
+            for folder in a.read_dirs:
+                folders.setdefault(folder, []).append(a)
+        for folder, readers in folders.items():
+            who = (
+                "alle Agenten" if len(readers) == len(agents) else ", ".join(a.id for a in readers)
+            )
+            out.append(
+                Deviation(
+                    path="defaults.read_dirs",
+                    label="Zusätzlicher Lese-Ordner",
+                    value_text=f"{folder} für {who}",
+                    default_text="keiner",
+                    default=[],
+                    value=[folder],
+                    sensitive=True,
+                    providers=_shares(readers),
+                )
+            )
+        std = settings.limits
+        for key, label in (
+            ("wall_time_s", "Laufzeit"),
+            ("turns_per_agent", "Turns pro Agent"),
+            ("budget_usd", "Budget"),
+        ):
+            value = limits.get(key)
+            default = getattr(std, key)
+            if isinstance(value, int | float) and default is not None and value > default:
+                out.append(
+                    Deviation(
+                        path=f"limits.{key}",
+                        label=f"{label} {_limit_text(key, value)}",
+                        value_text="",
+                        default_text=_limit_text(key, default),
+                        default=default,
+                        value=value,
+                        sensitive=False,
+                    )
+                )
+        if decider and str(decider) != settings.approvals.decider.value:
+            weaker = str(decider) == Decider.GATEKEEPER.value
+            out.append(
+                Deviation(
+                    path="decider",
+                    label="Entscheider für Berechtigungsanfragen",
+                    value_text=_DECIDER_TEXT.get(str(decider), str(decider)),
+                    default_text=_DECIDER_TEXT[settings.approvals.decider.value],
+                    default=settings.approvals.decider.value,
+                    value=str(decider),
+                    sensitive=weaker,
+                )
+            )
+        standard = {p: d.auth for p, d in settings.defaults.items()}
+        other = [
+            a for a in agents if standard.get(a.provider) and a.profile != standard[a.provider]
+        ]
+        if other:
+            out.append(
+                Deviation(
+                    path="agents.profile",
+                    label="Anderes Auth-Profil",
+                    value_text=", ".join(f"{a.id}: {a.profile}" for a in other),
+                    default_text=", ".join(sorted({standard[a.provider] or "" for a in other})),
+                    sensitive=True,
+                )
+            )
+        return out
 
     async def start_run(self, run_input: dict[str, Any]) -> StartRunResponse:
         """Create a queued run from the input (simulated preparation follows)."""
@@ -4793,9 +6257,16 @@ class MockApi:
             raise ApiException.of(
                 ErrorCode.CONFIG_INVALID, resolved.errors[0].message, issues=resolved.errors
             )
+        assert self.state.workfolder_settings is not None
+        std = self.state.workfolder_settings.limits
         now = self.now()
         project = str(run_input["project"])
-        skill = run_input.get("skill")
+        skill = run_input.get("skill") or None
+        topology = (
+            next((s.topology for s in self.state.skills if s.name == skill), None)
+            or TopologyKind.SOLO
+        )
+        limits = run_input.get("limits") or {}
         rid = (
             datetime.fromtimestamp(now).strftime("%Y%m%d-%H%M")
             + f"_{project}_{skill or 'custom'}_"
@@ -4806,13 +6277,19 @@ class MockApi:
             name=str(run_input.get("name") or f"{skill or 'Run'} in {project}"),
             project=project,
             skill=skill,
-            topology=TopologyKind.EXPLORATION,
+            topology=topology,
             status=RunStatus.QUEUED,
             starter=Starter.GUI,
             created_at=now,
             status_since=now,
             size=SizeInfo(actual_bytes=0, logical_bytes=0),
+            wall_time_s=int(limits.get("wall_time_s") or std.wall_time_s or 7200),
+            budget_usd=float(limits.get("budget_usd") or std.budget_usd or 20),
+            turns_per_agent=int(limits.get("turns_per_agent") or std.turns_per_agent or 40),
+            decider=Decider(run_input.get("decider") or Decider.GATEKEEPER_THEN_USER),
+            task_md=str(run_input.get("task_md") or ""),
             cost_rate=0.001,
+            token_rate=40.0,
         )
         self.state.runs[rid] = run
         self.state.pending_transitions += [
@@ -4872,11 +6349,11 @@ class MockApi:
             modified_at=self.state.mandate_modified,
             checked=MandateChecks(
                 domains=["pypi.org", "files.pythonhosted.org", "arxiv.org"],
-                read_dirs=["~/Documents/Mathe-Literatur"],
+                read_dirs=self._tr(["~/Documents/Mathe-Literatur"]),
                 packages=["sympy", "numpy", "scipy", "networkx", "python-flint", "mpmath"],
             ),
             running_runs=running,
-            example=_MANDATE_TEXT,
+            example=self._tr(_MANDATE_TEXT),
         )
 
     async def update_mandate(self, name: str, update: MandateUpdate) -> MandateInfo:
@@ -5125,14 +6602,7 @@ class MockApi:
         skill = await self.get_skill(name)
         if path not in skill.files:
             raise _not_found("Datei", f"{name}/{path}")
-        template = _SKILL_FILE_TEXT.get(
-            path, "# Rolle\n\nDu arbeitest in der Research-Group und gibst Ergebnisse ab.\n"
-        )
-        content = template.format(
-            name=name,
-            description=skill.description,
-            topology=skill.topology.value if skill.topology else "solo",
-        )
+        content = self._tr(_skill_file_text(skill, path))
         language = "yaml" if path.endswith(".yaml") else "markdown"
         return SkillFile(
             skill=name, path=path, content=content, language=language, size=len(content.encode())
@@ -5187,4 +6657,301 @@ class MockApi:
                 ),
             ],
             projects=[p.name for p in self.state.projects],
+        )
+
+
+# --------------------------------------------------------------------------------------------
+# Forced page states for reviews and the UX acceptance test (W1-08, docs/08 §5 „Zustände“)
+# --------------------------------------------------------------------------------------------
+
+
+class PageState(StrEnum):
+    """States a page can be forced into with `?zustand=…` (mock only)."""
+
+    EMPTY = "leer"
+    LOADING = "laedt"
+    ERROR = "fehler"
+
+
+FORCED_LOADING_S = 600.0
+"""How long content requests take in the forced state „lädt“ (a page stays in it)."""
+
+_FRAME_METHODS = {"now", "subscribe", "get_counts", "get_workfolder"}
+_SETTINGS_ERRORS = {"get_workfolder_settings", "get_mandate"}
+_INDEX_ERROR = (
+    "Run-Ordner nicht lesbar: meta.json fehlt in 20261012-0915_collatz_custom_77aa.",
+    "Vermutlich wurde der Ordner außerhalb von arr verändert. Der Index lässt sich aus den "
+    "Run-Ordnern neu aufbauen.",
+    "Index neu aufbauen",
+)
+_ERRORS = {
+    "get_usage": (
+        "Usage-Index nicht lesbar.",
+        "Er lässt sich aus den Run-Ordnern neu aufbauen.",
+        "Neu aufbauen aus den Run-Ordnern",
+    ),
+    "get_workfolder_settings": (
+        "arr.yaml, Zeile 14: Einrückung passt nicht zu „limits“.",
+        "Die Datei wurde außerhalb von arr geändert. Öffne sie oder stell den Standard wieder her.",
+        "Datei öffnen",
+    ),
+    "get_mandate": (
+        "mandates/standard.md ist nicht lesbar.",
+        "Die Datei fehlt oder ist leer. Stell den Standard wieder her.",
+        "Standard wiederherstellen",
+    ),
+}
+
+
+class ForcedStateApi:
+    """`ApiClient` view of a `MockApi` in a forced page state (`MockApi.forced`).
+
+    - leer: no runs, projects, skills, profiles, approvals, warnings or usage; counters 0
+    - laedt: content requests take `FORCED_LOADING_S` (frame counters stay real)
+    - fehler: content requests fail as the service would (docs/08 §8.4); data errors that
+      pages show themselves (invalid skill, failed profile tests, missing project folder,
+      a run whose size cannot be measured, check errors in „Neuer Run“) come as data
+    """
+
+    def __init__(self, api: "MockApi", state: PageState, page: str = "") -> None:
+        self._api = api
+        self.state = state
+        self.page = page
+
+    @property
+    def base(self) -> "MockApi":
+        """The mock without the forced state (for the mock-only controls of the frame)."""
+        return self._api
+
+    def __getattr__(self, name: str) -> Any:
+        target = getattr(self._api, name)
+        if name in _FRAME_METHODS or not callable(target) or name.startswith("_"):
+            return target
+        if self.state is PageState.LOADING and asyncio.iscoroutinefunction(target):
+
+            async def slow(*args: Any, **kwargs: Any) -> Any:
+                await asyncio.sleep(FORCED_LOADING_S)
+                return await target(*args, **kwargs)
+
+            return slow
+        if self.state is PageState.ERROR and name in _ERRORS:
+            if name in _SETTINGS_ERRORS and self.page != "einstellungen":
+                return target  # a broken arr.yaml is the error state of the settings only
+            return self._fail(*_ERRORS[name])
+        return target
+
+    def _fail(self, message: str, detail: str, label: str) -> Callable[..., Any]:
+        async def fail(*_args: Any, **_kwargs: Any) -> Any:
+            raise ApiException.of(
+                ErrorCode.UNAVAILABLE, message, detail=detail, action=Action(label=label, url="")
+            )
+
+        return fail
+
+    # --- leer ---------------------------------------------------------------------------------
+
+    def subscribe(self, run_id: str | None = None, agents: set[str] | None = None) -> Subscription:
+        if self.state is PageState.EMPTY:
+            return EventHub().add(run_id, agents)  # nothing is ever published
+        return self._api.subscribe(run_id, agents)
+
+    async def get_counts(self) -> GlobalCounts:
+        if self.state is PageState.EMPTY:
+            return GlobalCounts(waiting=0, active=0, warnings=0)
+        return await self._api.get_counts()
+
+    async def get_workfolder(self) -> WorkfolderInfo:
+        wf = await self._api.get_workfolder()
+        if self.state is PageState.EMPTY:
+            return wf.model_copy(update={"projects_count": 0, "runs_count": 0})
+        return wf
+
+    async def list_warnings(self) -> list[WarningInfo]:
+        if self.state is PageState.EMPTY:
+            return []
+        return await self.__getattr__("list_warnings")()
+
+    async def list_approvals(self, *args: Any, **kwargs: Any) -> list[ApprovalItem]:
+        if self.state is PageState.EMPTY:
+            return []
+        return await self.__getattr__("list_approvals")(*args, **kwargs)
+
+    async def list_runs(self, *args: Any, **kwargs: Any) -> RunsPage:
+        if self.state is PageState.EMPTY:
+            return RunsPage(
+                items=[],
+                counts=RunCounts(all=0, active=0, waiting=0, done=0, error=0, archived=0),
+                total=0,
+            )
+        if self.state is PageState.ERROR and self.page not in ("projekte", "speicher"):
+            # the error states of Projekte and Speicher are one folder; the runs stay readable
+            raise self._index_error()
+        return await self.__getattr__("list_runs")(*args, **kwargs)
+
+    async def list_projects(self) -> list[ProjectInfo]:
+        if self.state is PageState.EMPTY:
+            return []
+        projects = await self.__getattr__("list_projects")()
+        if self.state is PageState.ERROR and projects:
+            first = projects[0]
+            missing = ProjectCheck(
+                key="folder",
+                ok=False,
+                severity=Severity.ERROR,
+                message=f"{first.name} fehlt unter {first.path.rsplit('/', 1)[0]}. "
+                f"{first.runs.total} Runs bleiben lesbar.",
+                detail="Wurde der Ordner verschoben oder umbenannt?",
+                action=Action(label="Ordner suchen", url=f"/projekte/{first.name}"),
+            )
+            projects[0] = first.model_copy(
+                update={"setup_ok": False, "checks": [missing, *first.checks]}
+            )
+        return projects
+
+    async def get_project(self, name: str) -> ProjectInfo:
+        if self.state is PageState.EMPTY:
+            raise _not_found("Projekt", name)
+        if self.state is PageState.ERROR:
+            for project in await self.list_projects():
+                if project.name == name:
+                    return project
+        return await self.__getattr__("get_project")(name)
+
+    async def list_skills(self, kind: SkillKind | None = None) -> list[SkillInfo]:
+        if self.state is PageState.EMPTY:
+            return []
+        skills = await self.__getattr__("list_skills")(kind)
+        return [self._broken(s) for s in skills] if self.state is PageState.ERROR else skills
+
+    async def get_skill(self, name: str) -> SkillInfo:
+        if self.state is PageState.EMPTY:
+            raise _not_found("Skill", name)
+        skill = await self.__getattr__("get_skill")(name)
+        return self._broken(skill) if self.state is PageState.ERROR else skill
+
+    def _broken(self, skill: SkillInfo) -> SkillInfo:
+        if skill.name != "exploration":
+            return skill
+        issue = SkillIssue(
+            file="group.yaml",
+            line=31,
+            message="Rolle roles/critic.md nicht gefunden. Lege sie an oder entferne den "
+            "Agenten critic.",
+        )
+        return skill.model_copy(update={"valid": False, "issues": [issue]})
+
+    async def list_profiles(self) -> list[ProfileInfo]:
+        if self.state is PageState.EMPTY:
+            return []
+        profiles = await self.__getattr__("list_profiles")()
+        if self.state is not PageState.ERROR:
+            return profiles
+        failures = {
+            AuthKind.CLAUDE_OAUTH: (
+                "Die Claude-Anmeldung wurde abgebrochen. Versuche es erneut oder nimm einen "
+                "Claude-API-Key.",
+                "Erneut anmelden",
+            ),
+            AuthKind.CODEX_CHATGPT: (
+                "Die ChatGPT-Anmeldung ist abgelaufen. Melde dich neu an.",
+                "Neu anmelden",
+            ),
+        }
+        out = []
+        for profile in profiles:
+            if profile.kind in failures and profile.last_test is not None:
+                message, label = failures[profile.kind]
+                test = profile.last_test.model_copy(
+                    update={
+                        "ok": False,
+                        "message": message,
+                        "action": Action(label=label, url=f"/profile/{profile.name}"),
+                    }
+                )
+                profile = profile.model_copy(update={"last_test": test})
+            out.append(profile)
+        return out
+
+    async def get_usage(self, *args: Any, **kwargs: Any) -> UsageReport:
+        if self.state is PageState.EMPTY:
+            report = await self._api.get_usage(*args, **kwargs)
+            return report.model_copy(
+                update={
+                    "rows": [],
+                    "totals": UsageRow(key="total", label="Gesamt"),
+                    "billed_usd": None,
+                    "estimated_usd": None,
+                    "cache_read_ratio": None,
+                    "ratelimits": [],
+                }
+            )
+        return await self.__getattr__("get_usage")(*args, **kwargs)
+
+    async def get_storage(self) -> StorageReport:
+        if self.state is PageState.EMPTY:
+            report = await self._api.get_storage()
+            return report.model_copy(
+                update={
+                    "runs_actual": 0,
+                    "runs_logical": 0,
+                    "by_part": StorageParts(),
+                    "by_project": [],
+                    "suggestion": None,
+                    "runs": [],
+                }
+            )
+        report = await self.__getattr__("get_storage")()
+        if self.state is PageState.ERROR and report.runs:
+            # one run folder is not readable: 0 B with the reason (W3-01: a field of its own)
+            last = report.runs[-1].model_copy(
+                update={
+                    "actual": 0,
+                    "logical": 0,
+                    "by_part": StorageParts(),
+                    "slimmable": False,
+                    "archivable": False,
+                    "protected_reason": "Ordner nicht lesbar",
+                }
+            )
+            report = report.model_copy(update={"runs": [*report.runs[:-1], last]})
+        return report
+
+    async def get_setup_state(self) -> SetupState:
+        state = await self.__getattr__("get_setup_state")()
+        if self.state is PageState.EMPTY:
+            return state.model_copy(update={"workfolder": None, "profiles": [], "projects": []})
+        return state
+
+    async def resolve_run(self, run_input: dict[str, Any]) -> ResolveResult:
+        result = await self.__getattr__("resolve_run")(run_input)
+        if self.state is PageState.ERROR and run_input.get("skill") == "exploration":
+            issue = FieldIssue(
+                path="skill",
+                field="skill",
+                message="Rolle für critic nicht gefunden: skills/exploration/roles/critic.md. "
+                "Lege die Datei an oder wähle eine vorhandene Rolle (explorer, ranker).",
+                action=Action(label="Skill öffnen", url="/skills/exploration"),
+            )
+            return result.model_copy(update={"errors": [issue, *result.errors]})
+        return result
+
+    async def start_login(self, name: str) -> LoginStart:
+        return await self.__getattr__("start_login")(name)
+
+    async def get_login_status(self, name: str) -> LoginStatus:
+        if self.state is PageState.ERROR:
+            await self._api.cancel_login(name)
+            return LoginStatus(
+                profile=name,
+                state=LoginState.FAILED,
+                message="Die Claude-Anmeldung wurde abgebrochen. Versuche es erneut oder nimm "
+                "einen Claude-API-Key.",
+                action=Action(label="Erneut anmelden", url=f"/profile/{name}"),
+            )
+        return await self.__getattr__("get_login_status")(name)
+
+    def _index_error(self) -> ApiException:
+        message, detail, label = _INDEX_ERROR
+        return ApiException.of(
+            ErrorCode.UNAVAILABLE, message, detail=detail, action=Action(label=label, url="")
         )

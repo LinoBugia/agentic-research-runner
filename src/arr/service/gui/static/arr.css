@@ -126,7 +126,11 @@ small, .small { font-size: 12px; }
 .ds-switch select { font-size: 12px; padding: 3px 6px; }
 .conn-ok { color: var(--ok); }
 .main { grid-area: main; min-width: 0; }
-.page { padding: var(--s5); max-width: 1440px; width: 100%; }
+.page { padding: var(--s5); max-width: 1440px; width: 100%; margin-inline: auto; }
+/* Wide windows: the content column stands in the middle; crumbs and chips sit on its edges
+   (100% = width of the grid column). The run detail (control room) keeps the full width. */
+.topbar { padding-inline: max(var(--s5), calc((100% - 1440px) / 2 + var(--s5))); }
+.app:has(.rd-page) .topbar { padding-inline: var(--s5); }
 .page-head { display: flex; align-items: center; gap: var(--s3); margin-bottom: var(--s4); flex-wrap: wrap; }
 .page-head .actions { margin-left: auto; display: flex; gap: var(--s2); align-items: center; }
 
@@ -326,7 +330,8 @@ dialog.dlg .db ul { padding-left: 20px; }
 dialog.dlg .df { padding: var(--s3) var(--s5) var(--s4); display: flex; justify-content: flex-end; gap: var(--s2); flex-wrap: wrap; }
 
 /* ---------- K12 Toast ---------- */
-.toasts { position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 40; align-items: flex-end; }
+.toasts { position: fixed; right: max(20px, calc((100vw - var(--nav-w) - 1440px) / 2 + 20px)); bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 40; align-items: flex-end; }
+.app:has(.rd-page) .toasts { right: 20px; }
 .toast { display: inline-flex; gap: var(--s3); align-items: center; background: var(--text); color: var(--surface); border-radius: var(--radius); padding: 8px 12px; font-size: 13px; box-shadow: 0 6px 18px rgba(0, 0, 0, .2); max-width: 520px; }
 .toast a { color: var(--surface); font-weight: 600; }
 .toast.err { background: var(--err); color: var(--danger-solid-text); }

@@ -52,7 +52,7 @@ async def test_mock_delivers_valid_objects_for_every_endpoint(dataset: Dataset) 
     ]:
         _roundtrip(model)
     page = await api.list_runs(limit=1000)
-    assert page.total == len(page.items) == (31 if dataset is Dataset.SCENARIO else 200)
+    assert page.total == len(page.items) == (200 if dataset is Dataset.LOAD else 31)
     _roundtrip(page)
     # run detail objects (docs/08 §6.9) for the hand-made runs and a sample of the others
     special = [r for r in page.items if r.active or r.pinned][:12]

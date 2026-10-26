@@ -11,10 +11,19 @@ from typing import Any
 
 from nicegui import ui
 
+from arr.permissions.types import ApprovalStatus
 from arr.service.api_client import ApiClient
-from arr.service.api_models import GlobalCounts, LiveEvent, WorkfolderInfo
+from arr.service.api_models import (
+    ApprovalEvent,
+    GlobalCounts,
+    LiveEvent,
+    RunFilter,
+    RunStatusEvent,
+    WorkfolderInfo,
+)
 from arr.service.gui import format as fmt
 from arr.service.gui.components.base import esc, icon, raw, text
+from arr.service.gui.components.notification import approval_notification, run_notification
 from arr.service.gui.components.toast import Toasts
 
 NAV = [
@@ -31,6 +40,8 @@ NAV = [
 ]
 
 EventHandler = Callable[[LiveEvent], Any]
+RESET_DATASET = "neu-starten"
+"""Value of the entry „↺ … neu starten“ in the data set switch of the mock."""
 
 
 def tab_title(title: str, waiting: int) -> str:
@@ -152,6 +163,8 @@ class Frame:
         workfolder = await self.api.get_workfolder()
         self._render_counts()
         self._render_foot(workfolder)
+        if hasattr(self.api, "datasets"):
+            await self._notification_switch()
         subscription = self.api.subscribe()
         ui.context.client.on_delete(subscription.close)
 
@@ -160,6 +173,7 @@ class Frame:
                 if event.type == "counts.changed":
                     self.counts = event.counts  # type: ignore[union-attr]
                     self._render_counts()
+                self._notify(event)
                 for handler in list(self._handlers):
                     result = handler(event)
                     if hasattr(result, "__await__"):
@@ -167,6 +181,55 @@ class Frame:
 
         ui.timer(0.25, pump)
         return self
+
+    def _notify(self, event: LiveEvent) -> None:
+        """Simulated macOS notification for a new approval or an ended run (§4.2, W1-08).
+
+        The Freigaben page announces new cards itself, so it gets none for approvals."""
+        created = isinstance(event, ApprovalEvent) and event.type == "approval.created"
+        if created and self.active != "freigaben":
+            message, link = approval_notification(event.item, self.api.now())  # type: ignore[union-attr]
+            self.toasts.show(message, link, sticky=True)
+        elif isinstance(event, RunStatusEvent) and event.previous is not None:
+            if event.previous.is_active and event.run.status.is_final:
+                note = run_notification(event.run)
+                if note is not None:
+                    self.toasts.show(note[0], note[1], sticky=True)
+
+    async def _notification_switch(self) -> None:
+        """Mock only: show a simulated notification for an open item or a finished run, so the
+        UX acceptance test can start a task from a notification (docs/08 §9.2)."""
+        api = getattr(self.api, "base", self.api)  # a forced page state does not apply here
+        items = await api.list_approvals(status=[ApprovalStatus.OPEN])
+        runs = await api.list_runs(status=RunFilter.DONE, limit=1)
+        options: dict[str, tuple[str, tuple[str, str]]] = {}
+        now = self.api.now()
+        for item in items:
+            options[item.id] = approval_notification(item, now)
+        for run in runs.items:
+            note = run_notification(run)
+            if note is not None:
+                options[run.id] = note
+        if not options:
+            return
+        with self.nav_foot, ui.element("div").classes("ds-switch"):
+            raw('<label class="faint" for="note-select">Mitteilung simulieren</label>', tag="span")
+            select = ui.element("select").props('id="note-select"').mark("notify")
+            with select:
+                text("option", "– wählen –").props('value=""')
+                for key, (message, _link) in options.items():
+                    text("option", message.removeprefix("arr · ")[:60]).props(f'value="{esc(key)}"')
+
+            def show(event: Any) -> None:
+                choice = options.get(str(event.args))
+                if choice is not None:
+                    self.toasts.show(choice[0], choice[1], sticky=True)
+
+            select.on(
+                "change",
+                show,
+                js_handler="(e) => { emit(e.target.value); e.target.value = ''; }",
+            )
 
     def on_event(self, handler: EventHandler) -> None:
         """Call `handler` for every event of the global stream (after the counters update)."""
@@ -205,18 +268,24 @@ class Frame:
             )
 
     def _dataset_switch(self, api: Any) -> None:
-        """Mock only: switch between the data sets of docs/08 §9.2 (`api.datasets()`)."""
+        """Mock only: switch between the data sets of docs/08 §9.2 (`api.datasets()`); the last
+        entry loads the current one afresh (before each pass of a usability test)."""
         with ui.element("div").classes("ds-switch"):
             raw('<label class="faint" for="ds-select">Beispieldaten</label>', tag="span")
             select = ui.element("select").props('id="ds-select"').mark("dataset")
+            current = ""
             with select:
                 for value, label in api.datasets():
+                    if value == api.dataset:
+                        current = label
                     text("option", label).props(
                         f'value="{esc(value)}"' + (" selected" if value == api.dataset else "")
                     )
+                text("option", f"↺ {current} neu starten").props(f'value="{RESET_DATASET}"')
 
             def switch(event: Any) -> None:
-                api.switch_dataset(str(event.args))
+                value = str(event.args)
+                api.switch_dataset(api.dataset if value == RESET_DATASET else value)
                 ui.navigate.reload()
 
             select.on("change", switch, js_handler="(e) => emit(e.target.value)")

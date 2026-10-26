@@ -32,6 +32,7 @@ from arr.service.gui.components.badge import badge_html
 from arr.service.gui.components.banner import banner, empty_state
 from arr.service.gui.components.base import button, esc, raw
 from arr.service.gui.components.dialog import ConfirmDialog
+from arr.service.gui.components.page_state import forced_state, state_api
 from arr.service.gui.layout import Frame
 from arr.service.gui.texts import (
     APPROVAL_FILTERS,
@@ -413,8 +414,8 @@ class FreigabenPage:
 def register() -> None:
     """Register `/freigaben` and `/freigaben/{approval_id}`."""
 
-    async def build(approval_id: str | None, art: str, ansicht: str) -> None:
-        api = get_api()
+    async def build(approval_id: str | None, art: str, ansicht: str, zustand: str = "") -> None:
+        api = state_api(get_api(), zustand)
         focus_card, focus = approval_id, None
         if approval_id:
             try:
@@ -427,14 +428,16 @@ def register() -> None:
             api, active="freigaben", title="Freigaben", focus_card=focus_card, focus=focus
         )
         await frame.start()
+        if forced_state(frame, zustand, "freigaben", title="Freigaben", path="/freigaben"):
+            return
         page = FreigabenPage(
             frame, art=art, history=ansicht == "verlauf" and not approval_id, deep_link=approval_id
         )
         await page.build()
 
     @ui.page("/freigaben")
-    async def freigaben(art: str = "alle", ansicht: str = "offen") -> None:
-        await build(None, art, ansicht)
+    async def freigaben(art: str = "alle", ansicht: str = "offen", zustand: str = "") -> None:
+        await build(None, art, ansicht, zustand)
 
     @ui.page("/freigaben/{approval_id}")
     async def freigabe(approval_id: str, art: str = "alle") -> None:

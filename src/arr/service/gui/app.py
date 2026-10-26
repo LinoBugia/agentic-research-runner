@@ -34,9 +34,30 @@ def setup(api: ApiClient) -> None:
         '<meta name="color-scheme" content="light dark">',
         shared=True,
     )
-    from arr.service.gui.pages import freigaben, placeholders, run_detail, runs
+    from arr.service.gui.pages import (
+        einrichtung,
+        einstellungen,
+        freigaben,
+        neuer_run,
+        profile,
+        projekte,
+        run_detail,
+        runs,
+        skills,
+        speicher,
+        start,
+        usage,
+    )
 
+    start.register()
+    neuer_run.register()
+    projekte.register()
+    skills.register()
+    profile.register()
+    usage.register()
+    speicher.register()
+    einstellungen.register()
     freigaben.register()
     runs.register()
     run_detail.register()
-    placeholders.register()
+    einrichtung.register()

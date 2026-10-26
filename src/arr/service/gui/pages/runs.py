@@ -25,6 +25,7 @@ from arr.service.gui.app import get_api
 from arr.service.gui.components.badge import run_badges_html
 from arr.service.gui.components.banner import empty_state_html
 from arr.service.gui.components.base import button, esc, raw
+from arr.service.gui.components.page_state import forced_state, state_api
 from arr.service.gui.components.table import Column, Group, Row, table_html
 from arr.service.gui.layout import Frame
 from arr.service.gui.texts import (
@@ -320,11 +321,18 @@ def register() -> None:
 
     @ui.page("/runs")
     async def runs(
-        status: str = "alle", projekt: str = "", von: str = "", suche: str = "", n: int = PAGE_SIZE
+        status: str = "alle",
+        projekt: str = "",
+        von: str = "",
+        suche: str = "",
+        n: int = PAGE_SIZE,
+        zustand: str = "",
     ) -> None:
-        api = get_api()
+        api = state_api(get_api(), zustand)
         frame = Frame(api, active="runs", title="Runs")
         await frame.start()
+        if forced_state(frame, zustand, "runs", title="Runs", path="/runs"):
+            return
         view = RunsPageView(
             frame, status=status, project=projekt, starter=von, query=suche, count=n
         )
