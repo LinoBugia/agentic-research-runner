@@ -7,6 +7,7 @@ receive content (E19). The card is a `data-primary-scope` for ⌘↩; its headin
 target of deep links; grant buttons ignore Space/Enter (arr.js).
 """
 
+import math
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -598,22 +599,39 @@ class ApprovalCard:
                     set_disabled(b, b is getattr(self, "decide_button", None) and not self.option)
 
 
+COMPACT_LINE_CHARS = 32
+"""Characters of a command per line in the compact card (300 px column, 12 px monospace)."""
+COMPACT_MAX_LINES = 12
+"""Longer commands are not decided in the compact card, only on the Freigaben page (W1-07.1)."""
+
+
+def compact_lines(command: str) -> int:
+    """Lines a command takes in the compact card when it wraps."""
+    return sum(max(1, math.ceil(len(line) / COMPACT_LINE_CHARS)) for line in command.split("\n"))
+
+
 def compact_card(
     item: ApprovalItem,
     *,
     now: float,
     on_decide: Callable[[ApprovalItem, DecisionRequest], Awaitable[Any]] | None = None,
+    prefix: str = "",
 ) -> ui.element:
     """Compact card for the run detail overview (K5 „kompakt“, W1-07).
 
     Permissions show command, agent's reason, „Warum bei dir“, risk as word and deadline, with
     „Erlauben (einmalig)“; run starts and escalations are never decided here, only linked.
+    With `prefix` the card gets the DOM id `<prefix><approval id>` and its heading
+    `<prefix><approval id>-ch`, so the same request can be shown twice on one page.
     """
+    heading = f"{prefix}{item.id}-ch"
     element = (
         ui.element("article")
         .classes("appr compact")
-        .props(f'aria-labelledby="{item.id}-ch" data-primary-scope')
+        .props(f'aria-labelledby="{heading}" data-primary-scope')
     )
+    if prefix:
+        element.props(f'id="{prefix}{item.id}"')
     with element:
         head = [badge_html(_WAIT, word=APPROVAL_TYPE[item.type])]
         if item.type is ApprovalType.PERMISSION:
@@ -624,16 +642,28 @@ def compact_card(
         else:
             head.append("<span>Run pausiert</span>")
         raw("".join(head), classes="ah")
-        raw(f'<h3 id="{item.id}-ch">{esc(item.title)}</h3>')
+        raw(f'<h3 id="{heading}">{esc(item.title)}</h3>')
         details = f"/freigaben/{item.id}"
         if item.type is ApprovalType.PERMISSION:
             why = item.escalated_by.note if item.escalated_by else "Du entscheidest jede Anfrage."
+            what = item.command or item.path or item.url or ""
             raw(
-                f'<span class="cmd" style="font-size:12px">{esc(item.command or item.path or "")}'
-                f'</span><div style="margin-top:6px"><b>Begründung:</b> „{esc(item.reason or "")}“'
-                f'</div><div style="margin-top:4px"><b>Warum bei dir:</b> {esc(why)}</div>',
+                f'<span class="cmd" style="font-size:12px">{esc(what)}</span>'
+                f'<div class="reason" style="margin-top:6px" title="{esc(item.reason or "")}">'
+                f"<b>Begründung:</b> „{esc(item.reason or '')}“</div>"
+                f'<div style="margin-top:4px"><b>Warum bei dir:</b> {esc(why)}</div>',
                 classes="ab small",
             )
+            if compact_lines(what) > COMPACT_MAX_LINES:
+                # too long to be read whole in the narrow column: decide on the Freigaben page
+                raw(
+                    '<span class="small muted">Zu lang für die kompakte Karte. Entscheide auf der '
+                    "Freigaben-Seite.</span>"
+                    f'<div class="decide"><a class="btn btn-sm primary" href="{esc(details)}">'
+                    "Details</a></div>",
+                    classes="af",
+                ).mark(f"{prefix}too-long-{item.id}")
+                return element
 
             async def decide(action: DecisionAction) -> None:
                 if on_decide is not None:

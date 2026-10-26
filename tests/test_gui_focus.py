@@ -67,10 +67,11 @@ def load_url(tmp_path_factory: pytest.TempPathFactory, browser) -> Iterator[str]
         yield url
 
 
-def _server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+def _server(
+    tmp_path_factory: pytest.TempPathFactory, code: str = "from arr.cli import app; app()"
+) -> Iterator[str]:
     port = _free_port()
     home = tmp_path_factory.mktemp("arr-home")
-    code = "from arr.cli import app; app()"
     proc = subprocess.Popen(
         [sys.executable, "-c", code, "gui", "--mock", "--no-browser", "--port", str(port)],
         # without PYTEST_* variables, otherwise NiceGUI starts in its own test mode
@@ -467,4 +468,99 @@ def test_card_with_buttons_out_of_view_is_not_armed(browser, base_url) -> None: 
         "['apr_0042', 'apr_0040'].map(id => document.getElementById(id).classList.contains('tall'))"
     )
     assert tall == [False, False]
+    page.close()
+
+
+# --- W1-07.1: the whole command must have been seen; leaving the view starts again -----------
+
+LONG_COMMAND = "wget " + " ".join(
+    f"https://primes.utm.edu/lists/small/millions/primes{i}.zip" for i in range(1, 81)
+)
+_LONG_SERVER = f"""
+import arr.service.mock_api as m
+_load = m._load_approvals
+def _long(base, runs):
+    items = _load(base, runs)
+    items["apr_1202"] = items["apr_1202"].model_copy(update={{"command": {LONG_COMMAND!r}}})
+    return items
+m._load_approvals = _long
+from arr.cli import app; app()
+"""
+
+
+@pytest.fixture(scope="module")
+def long_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    """Load data set where apr_1202 has a command of about 80 URLs (taller than the window)."""
+    yield from _server(tmp_path_factory, _LONG_SERVER)
+
+
+def _armed(page, approval_id: str) -> bool:  # noqa: ANN001
+    return page.evaluate(f"!!document.getElementById('{approval_id}')._arrArmed")
+
+
+def test_commands_wrap_on_the_freigaben_page(browser, long_url) -> None:  # noqa: ANN001
+    """Point 1: long command and long path at 1280 × 680 wrap; no sideways scrolling."""
+    _reset(browser, long_url, "last")
+    page = _page(browser, (1280, 680))
+    page.goto(f"{long_url}/freigaben")
+    page.wait_for_selector("#apr_1203 .cmd")
+    for approval_id in ("apr_1202", "apr_1203"):
+        cmd = page.evaluate(
+            f"(() => {{ const c = document.querySelector('#{approval_id} .cmd'); return "
+            "{sw: c.scrollWidth, cw: c.clientWidth, text: c.textContent}; })()"
+        )
+        assert cmd["sw"] <= cmd["cw"], (approval_id, cmd)
+    assert cmd["text"] == "cat ~/Documents/Goldbach-Daten/stichprobe.csv"
+    widths = page.evaluate(
+        "[document.documentElement.scrollWidth, document.documentElement.clientWidth]"
+    )
+    assert widths[0] <= widths[1]
+    page.close()
+
+
+def test_command_end_must_have_been_seen(browser, long_url) -> None:  # noqa: ANN001
+    """Point 1: a card taller than the window becomes armed only after the end of its command
+    was in view (above the sticky decision row) – not necessarily together with the head."""
+    _reset(browser, long_url, "last")
+    page = _page(browser, (1280, 680))
+    page.goto(f"{long_url}/freigaben/apr_1202")
+    page.wait_for_function("document.activeElement.id === 'apr_1202-h'", timeout=5000)
+    page.wait_for_timeout(ARM_WAIT_MS + 300)
+    assert page.evaluate("document.getElementById('apr_1202').classList.contains('tall')")
+    assert not _armed(page, "apr_1202"), "armed although the end of the command was hidden"
+    page.keyboard.press("Meta+Enter")
+    page.wait_for_timeout(500)
+    assert page.locator("#apr_1202.decided").count() == 0
+    # read down to the end of the command, then back to the head
+    page.evaluate(
+        "(() => { const c = document.querySelector('#apr_1202 .cmd').getBoundingClientRect(); "
+        "const a = document.querySelector('#apr_1202 .af').getBoundingClientRect(); "
+        "window.scrollBy(0, c.bottom - a.top + 20); })()"
+    )
+    page.wait_for_timeout(400)
+    page.evaluate("document.getElementById('apr_1202').scrollIntoView({block: 'start'})")
+    page.wait_for_timeout(ARM_WAIT_MS + 300)
+    assert _armed(page, "apr_1202")
+    page.locator("#apr_1202 [data-grant]").click()
+    _decided(page, "apr_1202")
+    page.close()
+
+
+def test_leaving_the_view_starts_the_wait_again(browser, load_url) -> None:  # noqa: ANN001
+    """Point 2: an armed card scrolled out of view must be seen for 1.5 s again."""
+    _reset(browser, load_url, "last")
+    page = _page(browser)
+    page.goto(f"{load_url}/freigaben/apr_1201")
+    page.wait_for_function("document.activeElement.id === 'apr_1201-h'", timeout=5000)
+    page.wait_for_timeout(ARM_WAIT_MS)
+    assert _armed(page, "apr_1201")
+    page.evaluate("window.scrollBy(0, 3000)")
+    page.wait_for_timeout(400)
+    page.evaluate("document.getElementById('apr_1201').scrollIntoView({block: 'start'})")
+    page.locator("#apr_1201 [data-grant]").click()  # at once: locked
+    page.wait_for_timeout(300)
+    assert page.locator("#apr_1201.decided").count() == 0 and _card_open(page, "apr_1201")
+    page.wait_for_timeout(ARM_WAIT_MS)
+    page.locator("#apr_1201 [data-grant]").click()
+    _decided(page, "apr_1201")
     page.close()

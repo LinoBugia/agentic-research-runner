@@ -155,18 +155,33 @@
   // ---- arming: granting only on a card that was seen (G2, K5, W1-06.1 H1, W1-06.2 N1/N2) ---
   // Granting (Cmd+Enter or a click on a [data-grant] button) works only once the card has been
   // seen for ARM_MS without a break: its head (type, risk, deadline, title) and its row of
-  // decision buttons both lie in the visible area below the top bar (cards taller than that
-  // area keep the button row at the bottom edge, see .tall). Once armed, a card stays
-  // armed until the next decision, page load or deep link disarms all cards. Cmd+Enter also
-  // needs a fresh key press (no auto-repeat). Dialogs accept granting ARM_MS after they opened.
+  // decision buttons lie in the visible area below the top bar and inside the visible part of
+  // every scrolling column around the card (run detail, W1-07; cards taller than that area keep
+  // the button row at the bottom edge, see .tall), and every command (.cmd) has been in view
+  // from its start to its end at least once (W1-07.1; not necessarily together with the head).
+  // Leaving the visible area starts the ARM_MS again, also for a card that was armed
+  // (W1-07.1). Every decision, page load and deep link disarms all cards and forgets what was
+  // seen. Cmd+Enter also needs a fresh key press (no auto-repeat). Dialogs accept granting
+  // ARM_MS after they opened.
   const ARM_MS = 1500;
   function inView(r, top, bottom) {
     return r.height > 0 && r.top >= top - 1 && r.bottom <= bottom + 1;
   }
-  function seen(card) {
+  function band(card) {
+    // visible band: below the top bar, inside the window and every scrolling column
     const bar = document.querySelector(".topbar");
-    const top = bar ? bar.getBoundingClientRect().bottom : 0;
-    const bottom = window.innerHeight;
+    let top = bar ? bar.getBoundingClientRect().bottom : 0;
+    let bottom = window.innerHeight;
+    for (let p = card.parentElement; p && p !== document.body; p = p.parentElement) {
+      if (/(auto|scroll|hidden)/.test(getComputedStyle(p).overflowY)) {
+        const r = p.getBoundingClientRect();
+        top = Math.max(top, r.top);
+        bottom = Math.min(bottom, r.bottom);
+      }
+    }
+    return [top, bottom];
+  }
+  function seen(card, top, bottom) {
     const head = card.querySelector(".ah") || card;
     const title = card.querySelector("h3") || head;
     const buttons = card.querySelector(".af") || card;
@@ -176,6 +191,19 @@
       inView(buttons.getBoundingClientRect(), top, bottom)
     );
   }
+  function noteCommands(card, top, bottom) {
+    // a sticky button row (tall card) covers the lower edge of the visible band
+    const buttons = card.querySelector(".af");
+    const limit = card.classList.contains("tall") && buttons ? Math.min(bottom, buttons.getBoundingClientRect().top) : bottom;
+    let all = true;
+    card.querySelectorAll(".cmd").forEach((cmd) => {
+      const r = cmd.getBoundingClientRect();
+      if (r.height > 0 && r.top >= top - 1 && r.top < limit) cmd._arrStart = true;
+      if (r.height > 0 && r.bottom <= limit + 1 && r.bottom > top) cmd._arrEnd = true;
+      all = all && cmd._arrStart && cmd._arrEnd;
+    });
+    return all;
+  }
   function trackVisibility() {
     const now = performance.now();
     const bar = document.querySelector(".topbar");
@@ -184,8 +212,15 @@
       // Only a card taller than the visible area keeps its decision row at the window's
       // bottom edge (CSS .tall); otherwise head and buttons could never be in view together.
       card.classList.toggle("tall", card.offsetHeight > room - 8);
+      const [top, bottom] = band(card);
+      const commands = noteCommands(card, top, bottom);
+      if (!seen(card, top, bottom)) {
+        card._arrSince = null; // out of view: an armed card has to be seen again
+        card._arrArmed = false;
+        return;
+      }
       if (card._arrArmed) return;
-      if (!seen(card)) card._arrSince = null;
+      if (!commands) card._arrSince = null;
       else if (card._arrSince == null) card._arrSince = now;
       else if (now - card._arrSince >= ARM_MS) card._arrArmed = true;
     });
@@ -195,6 +230,7 @@
     document.querySelectorAll("[data-primary-scope]").forEach((card) => {
       card._arrSince = null;
       card._arrArmed = false;
+      card.querySelectorAll(".cmd").forEach((cmd) => (cmd._arrStart = cmd._arrEnd = false));
     });
   };
   arr.isArmed = function (scope) {

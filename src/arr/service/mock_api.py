@@ -202,6 +202,15 @@ __all__ = [
 ]
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8765"
+
+PAUSE_TURNS_END_S = 8.0
+"""After „Pausieren“ the running turns of the agents end after this many seconds."""
+
+RUN_DETAIL_STREAM_RATE = 1.0
+"""Speed of the simulated live stream of running runs (transcripts, messages, turns).
+
+1.0 gives about one new transcript entry every 3 s and a channel message every 12 s per run;
+browser tests and the load measurement of W1-07 raise it (`MockApi.stream_rate`)."""
 """Service URL of the mock when `arr gui` does not pass its own (docs/08 §4.3)."""
 
 GB = 1_000_000_000
@@ -307,6 +316,14 @@ class _Transcript:
             return self.gen(seq)
         return None
 
+    def replace(self, ev: TranscriptEvent) -> None:
+        """Store a changed entry under its `seq` (e.g. a tool call that finished)."""
+        base = max([self.total_generated - 1, *self.fixed], default=-1) + 1
+        if ev.seq >= base and 0 <= ev.seq - base < len(self.extra):
+            self.extra[ev.seq - base] = ev
+        else:
+            self.fixed[ev.seq] = ev
+
 
 @dataclass
 class _Run:
@@ -357,6 +374,9 @@ class _Run:
     file_changes: list[AgentChanges] = field(default_factory=list)
     handoff_extra: str = ""
     detail_built: bool = False
+    running_tools: dict[str, int] = field(default_factory=dict)  # agent → seq (live stream)
+    turns_end_at: float | None = None  # paused: running turns end at this time
+    paused_workers: list[str] = field(default_factory=list)  # back to work on resume
 
 
 @dataclass
@@ -3229,6 +3249,7 @@ class MockApi:
         self.base_url = base_url.rstrip("/")
         self.hub = EventHub()
         self._task: asyncio.Task[None] | None = None
+        self.stream_rate = RUN_DETAIL_STREAM_RATE
         self.dataset = dataset
         self._load(dataset)
 
@@ -3444,6 +3465,11 @@ class MockApi:
                 run.ended_at = now
             self._publish_run(run, prev)
             changed_counts = True
+        # paused runs: the running turns end after a moment
+        for run in st.runs.values():
+            if run.status is RunStatus.PAUSED and run.turns_end_at and run.turns_end_at <= now:
+                run.turns_end_at = None
+                self._workers_pause(run, now)
         # usage and activity of running runs
         for run in st.runs.values():
             if run.status is not RunStatus.RUNNING or dt == 0:
@@ -3465,54 +3491,175 @@ class MockApi:
                 )
             )
             if run.detail_built:
-                self._simulate_run_activity(run, now)
+                self._simulate_run_activity(run, now, dt)
         if changed_counts:
             self._publish_counts()
 
-    def _simulate_run_activity(self, run: _Run, now: float) -> None:
+    # --- live stream of the run detail (W1-07) ----------------------------------------------
+
+    _SIM_TOOLS = [
+        ("Bash", "python check.py --k 18", "k=18: 262144 Restklassen geprüft\nLaufzeit 2,4 s"),
+        ("Bash", "sage teil3.sage", "Fall geprüft: 4096 von 4096\nkein Gegenbeispiel"),
+        ("Read", "notes/ideen.md", "# Ideen\n1. Restklassen modulo 64\n2. Paritätsvektoren"),
+        (
+            "Bash",
+            "python stoppzeiten.py --bis 10**9",
+            "Stoppzeiten bis 10^9 berechnet\nMittelwert 6,95 · ln n\nLaufzeit 41,2 s",
+        ),
+        ("Edit", "tex/entwurf.tex", "3 Zeilen geändert"),
+    ]
+    _SIM_TEXTS = [
+        "Die Rechnung bestätigt $T^4(n) < n$ für alle $n ≡ 3 \\pmod{16}$ bis $2^{20}$.",
+        "Als Nächstes prüfe ich die Restklasse $27 \\bmod 32$ getrennt.",
+        "Die Abweichung fällt ungefähr wie $1 / \\log n$, das passt zur Heuristik.",
+        "Ich schreibe das Zwischenergebnis in den Kanal.",
+    ]
+    _SIM_THOUGHTS = [
+        "Ich vergleiche die beiden Rechnungen, bevor ich etwas behaupte.",
+        "Der Fall $k = 1$ braucht eine eigene Abschätzung.",
+        "Lieber erst die kleinen Fälle per Hand prüfen, dann die Schranke.",
+    ]
+    _SIM_KINDS = [
+        MessageKind.NOTE,
+        MessageKind.CLAIM,
+        MessageKind.ANSWER,
+        MessageKind.IDEA,
+        MessageKind.QUESTION,
+        MessageKind.OBJECTION,
+    ]
+
+    def _sim_chance(self, per_second: float, dt: float) -> bool:
+        """True with the probability of an event that happens `per_second` times a second."""
+        return self.state.sim_rng.random() < min(1.0, per_second * self.stream_rate * dt)
+
+    def _sim_append(self, run: _Run, agent: AgentState, ev: TranscriptEvent) -> None:
+        transcript = run.transcripts.setdefault(agent.id, _Transcript())
+        transcript.extra.append(ev)
+        self._publish(
+            AgentTranscriptEvent(seq=0, ts=ev.ts, run_id=run.id, agent_id=agent.id, event=ev)
+        )
+
+    def _sim_activity(self, run: _Run, agent: AgentState, act: Activity, now: float) -> None:
+        run.agents[agent.id] = agent.model_copy(update={"activity": act})
+        self._publish(
+            AgentActivityEvent(seq=0, ts=now, run_id=run.id, agent_id=agent.id, activity=act)
+        )
+
+    def _simulate_run_activity(self, run: _Run, now: float, dt: float = 1.0) -> None:
+        """Agents of a running run work: tool calls start and finish, text, thinking, turns,
+        channel messages (docs/08 §6.6). The pace follows `stream_rate`."""
         rng = self.state.sim_rng
         working = [a for a in run.agents.values() if a.state is AgentDisplayState.WORKING]
-        if not working:
-            return
-        if rng.random() < 0.35:
-            agent = rng.choice(working)
-            arg = rng.choice(
-                [
-                    "python check.py --k 18",
-                    "sage teil3.sage",
-                    "notes/ideen.md",
-                    "python stoppzeiten.py --bis 10**9",
-                ]
+        # running tool calls finish
+        for agent_id, seq in list(run.running_tools.items()):
+            transcript = run.transcripts.get(agent_id)
+            ev = transcript.event(seq) if transcript else None
+            agent = run.agents.get(agent_id)
+            if ev is None or ev.tool is None or agent is None:
+                run.running_tools.pop(agent_id, None)
+                continue
+            if not self._sim_chance(0.3, dt):
+                continue
+            run.running_tools.pop(agent_id)
+            output = next((o for n, a, o in self._SIM_TOOLS if a == ev.tool.input_summary), "ok")
+            done = ev.model_copy(
+                update={
+                    "tool": ev.tool.model_copy(
+                        update={
+                            "status": ToolStatus.OK,
+                            "duration_ms": int(max(0.1, now - ev.ts) * 1000),
+                            "output_excerpt": output,
+                            "output_lines": output.count("\n") + 1,
+                        }
+                    )
+                }
             )
-            act = Activity(kind=ActivityKind.TOOL, label="Bash", arg=arg, since=now, running=True)
-            run.agents[agent.id] = agent.model_copy(update={"activity": act})
+            transcript.replace(done)  # type: ignore[union-attr]
             self._publish(
-                AgentActivityEvent(seq=0, ts=now, run_id=run.id, agent_id=agent.id, activity=act)
+                AgentTranscriptEvent(seq=0, ts=now, run_id=run.id, agent_id=agent_id, event=done)
             )
-            transcript = run.transcripts.get(agent.id)
-            if transcript is not None:
-                ev = _tool_event(
-                    transcript.total, now, agent.turn or 1, "Bash", arg, ToolStatus.RUNNING
+            if agent.state is AgentDisplayState.WORKING:
+                self._sim_activity(
+                    run, agent, Activity(kind=ActivityKind.TEXT, label="schreibt", since=now), now
                 )
-                transcript.extra.append(ev)
-                self._publish(
-                    AgentTranscriptEvent(seq=0, ts=now, run_id=run.id, agent_id=agent.id, event=ev)
+        # new entries of a working agent without a running tool call
+        idle_workers = [a for a in working if a.id not in run.running_tools]
+        if idle_workers and self._sim_chance(0.35, dt):
+            agent = run.agents[rng.choice(idle_workers).id]
+            transcript = run.transcripts.setdefault(agent.id, _Transcript())
+            seq, turn = transcript.total, agent.turn or 1
+            roll = rng.random()
+            if roll < 0.04:
+                # the agent ends its turn and starts the next one
+                turn += 1
+                self._sim_append(
+                    run,
+                    agent,
+                    _ev(seq, now, turn - 1, TranscriptKind.TURN_END, status="ok", cost_usd=0.11),
                 )
-        if rng.random() < 0.08:
+                self._sim_append(
+                    run,
+                    agent,
+                    _ev(
+                        seq + 1,
+                        now,
+                        turn,
+                        TranscriptKind.TURN_START,
+                        prompt=f"Turn {turn}. Posteingang: 1 neue Nachricht.",
+                        stage=None,
+                    ),
+                )
+                agent = agent.model_copy(update={"turn": turn})
+                run.agents[agent.id] = agent
+                run.max_turns_used = max(run.max_turns_used, turn)
+                self._publish(AgentStateEvent(seq=0, ts=now, run_id=run.id, agent=agent))
+            elif roll < 0.6:
+                name, arg, _out = rng.choice(self._SIM_TOOLS)
+                self._sim_append(
+                    run, agent, _tool_event(seq, now, turn, name, arg, ToolStatus.RUNNING)
+                )
+                run.running_tools[agent.id] = seq
+                act = Activity(kind=ActivityKind.TOOL, label=name, arg=arg, since=now, running=True)
+                self._sim_activity(run, agent, act, now)
+            elif roll < 0.85:
+                text = rng.choice(self._SIM_TEXTS)
+                self._sim_append(run, agent, _ev(seq, now, turn, TranscriptKind.TEXT, text=text))
+            else:
+                text = rng.choice(self._SIM_THOUGHTS)
+                self._sim_append(
+                    run, agent, _ev(seq, now, turn, TranscriptKind.THINKING, text=text)
+                )
+                act = Activity(kind=ActivityKind.THINKING, label="denkt nach", since=now)
+                self._sim_activity(run, agent, act, now)
+        # channel messages
+        if working and self._sim_chance(0.08, dt):
             open_channels = [c for c in run.channels.values() if c.info.open]
             if open_channels:
                 ch = rng.choice(open_channels)
-                sender = rng.choice(working).id
-                if sender in [m.agent for m in ch.info.members]:
+                members = [m.agent for m in ch.info.members]
+                senders = [a.id for a in working if a.id in members]
+                if senders:
+                    sender = rng.choice(senders)
+                    kind = rng.choice(self._SIM_KINDS)
+                    others = [m for m in members if m != sender]
+                    to = [rng.choice(others)] if kind is MessageKind.QUESTION and others else []
                     msg = Message(
                         id=ch.count + 1,
                         ts=now,
                         channel=ch.info.name,
                         sender=sender,
-                        kind=MessageKind.NOTE,
+                        kind=kind,
                         body=rng.choice(_MATH_SNIPPETS),
+                        to=to,
+                        open=bool(to),
                     )
                     ch.extra.append(msg)
+                    ch.info = ch.info.model_copy(
+                        update={
+                            "open_questions": ch.info.open_questions + int(msg.open),
+                            "unread_for_user": ch.info.unread_for_user + 1,
+                        }
+                    )
                     self._publish(ChannelMessageEvent(seq=0, ts=now, run_id=run.id, message=msg))
 
     def simulate_new_approval(self, run_id: str | None = None) -> ApprovalItem:
@@ -3583,6 +3730,8 @@ class MockApi:
         if not run.detail_built:
             _DETAIL_BUILDERS.get(run_id, _build_generic_detail)(run)
             run.detail_built = True
+            if run_id not in _DETAIL_BUILDERS:
+                self._agents_follow_approvals(run)
         return run
 
     def _open_items(self, run_id: str | None = None) -> list[ApprovalItem]:
@@ -3715,6 +3864,136 @@ class MockApi:
             }
         )
         self._publish(AgentStateEvent(seq=0, ts=now, run_id=run.id, agent=run.agents[agent.id]))
+        # the waiting tool call in the transcript runs now, or ends as denied (live stream)
+        transcript = run.transcripts.get(agent.id)
+        if transcript is None:
+            return
+        for seq in range(transcript.total - 1, max(-1, transcript.total - 400), -1):
+            ev = transcript.event(seq)
+            if ev is None or ev.tool is None or ev.tool.approval_id != item.id:
+                continue
+            tool = ev.tool.model_copy(
+                update={"status": ToolStatus.RUNNING}
+                if allowed
+                else {
+                    "status": ToolStatus.ERROR,
+                    "output_excerpt": "Nicht erlaubt: Die Freigabe wurde abgelehnt.",
+                    "output_lines": 1,
+                }
+            )
+            changed = ev.model_copy(update={"tool": tool})
+            transcript.replace(changed)
+            if allowed:
+                run.running_tools[agent.id] = seq
+            self._publish(
+                AgentTranscriptEvent(seq=0, ts=now, run_id=run.id, agent_id=agent.id, event=changed)
+            )
+            break
+
+    def _workers_pause(self, run: _Run, now: float) -> None:
+        """A paused run: working agents finish their turn and wait (docs/08 §6.7)."""
+        if not run.detail_built:
+            return
+        for agent in list(run.agents.values()):
+            if agent.state is not AgentDisplayState.WORKING:
+                continue
+            run.paused_workers.append(agent.id)
+            run.running_tools.pop(agent.id, None)
+            idle = agent.model_copy(
+                update={
+                    "state": AgentDisplayState.IDLE,
+                    "state_since": now,
+                    "activity": Activity(
+                        kind=ActivityKind.WAIT_MESSAGES, label="Run pausiert, Turn beendet"
+                    ),
+                }
+            )
+            run.agents[agent.id] = idle
+            self._publish(AgentStateEvent(seq=0, ts=now, run_id=run.id, agent=idle))
+
+    def _workers_resume(self, run: _Run, now: float) -> None:
+        """After „Fortsetzen“ the agents stopped by the pause work again."""
+        for agent_id in run.paused_workers:
+            agent = run.agents.get(agent_id)
+            if agent is None or agent.state is not AgentDisplayState.IDLE:
+                continue
+            busy = agent.model_copy(
+                update={
+                    "state": AgentDisplayState.WORKING,
+                    "state_since": now,
+                    "activity": Activity(
+                        kind=ActivityKind.TEXT, label="arbeitet weiter", since=now
+                    ),
+                }
+            )
+            run.agents[agent_id] = busy
+            self._publish(AgentStateEvent(seq=0, ts=now, run_id=run.id, agent=busy))
+        run.paused_workers = []
+
+    def _agents_follow_approvals(self, run: _Run) -> None:
+        """Agents with an open permission request wait for you (keeps generic runs consistent)."""
+        for item in self._open_items(run.id):
+            if item.type is not ApprovalType.PERMISSION or item.agent is None:
+                continue
+            blocked = BlockedBy(
+                kind=BlockedKind.APPROVAL,
+                approval_id=item.id,
+                summary=item.title,
+                deadline=item.deadline,
+            )
+            act = Activity(
+                kind=ActivityKind.WAIT_APPROVAL,
+                label=item.tool or "Anfrage",
+                arg=item.command or item.path or item.url,
+                since=item.created_at,
+            )
+            agent = run.agents.get(item.agent.id)
+            if agent is None:
+                agent = _agent(
+                    run.id,
+                    item.agent.id,
+                    item.agent.role_label,
+                    item.agent.model,
+                    AgentDisplayState.WAITING_USER,
+                    act,
+                    blocked_by=blocked,
+                    since=item.created_at,
+                    turn=4,
+                    channels=list(run.channels),
+                )
+                run.transcripts[agent.id] = _Transcript()
+                start = _ev(
+                    0,
+                    item.created_at - 90,
+                    4,
+                    TranscriptKind.TURN_START,
+                    prompt="Turn 4. Arbeite an deiner Idee weiter.",
+                    stage=None,
+                )
+                run.transcripts[agent.id].extra.append(start)
+            elif agent.blocked_by is None:
+                agent = agent.model_copy(
+                    update={
+                        "state": AgentDisplayState.WAITING_USER,
+                        "blocked_by": blocked,
+                        "activity": act,
+                        "state_since": item.created_at,
+                    }
+                )
+            run.agents[agent.id] = agent
+            # the request is the tool call the agent waits on (transcript and card agree)
+            transcript = run.transcripts.setdefault(agent.id, _Transcript())
+            transcript.extra.append(
+                _tool_event(
+                    transcript.total,
+                    item.created_at,
+                    agent.turn or 1,
+                    item.tool or "Bash",
+                    item.command or item.path or item.url or "",
+                    ToolStatus.WAITING_APPROVAL,
+                    approval_id=item.id,
+                )
+            )
 
     # --- ApiClient: workfolder, counts, warnings ----------------------------------------------
 
@@ -4099,9 +4378,12 @@ class MockApi:
             run.status = RunStatus.PAUSED
             run.status_since = now
             run.elapsed_frozen = self._limits(run).elapsed_s
+            run.turns_end_at = now + PAUSE_TURNS_END_S
             message = f"Pausiert: {run.name}"
         elif action is RunAction.RESUME:
             run.status = RunStatus.RUNNING
+            run.turns_end_at = None
+            self._workers_resume(run, now)
             if run.elapsed_frozen is not None:
                 run.started_at = now - run.elapsed_frozen
                 run.elapsed_frozen = None

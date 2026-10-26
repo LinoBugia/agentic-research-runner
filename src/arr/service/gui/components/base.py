@@ -97,8 +97,9 @@ def link_html(label: str, href: str, *, classes: str = "") -> str:
 
 
 # --- Markdown with formulas ---------------------------------------------------------------------
-# W1-06 renders `$…$` as readable inline text (Unicode for common commands, italic serif).
-# Typeset formulas (KaTeX or similar, G7) are decided in W1-07.
+# `$…$` and `$$…$$` become a span with readable Unicode text (W1-06) that carries the LaTeX
+# source in `data-tex`; pages that load static/math.js typeset it with KaTeX as MathML (G7,
+# W1-07). Without JavaScript or KaTeX the Unicode text stays.
 
 _MATH_RE = re.compile(r"\$\$(.+?)\$\$|\$(.+?)\$", re.S)
 _TEX = {
@@ -135,8 +136,13 @@ def markdown_html(source: str) -> str:
     spans: list[str] = []
 
     def keep(match: re.Match[str]) -> str:
+        display = match.group(1) is not None
         tex = match.group(1) or match.group(2) or ""
-        spans.append(f'<span class="math" title="{esc(tex)}">{esc(_tex_to_text(tex))}</span>')
+        cls = "math math-display" if display else "math"
+        spans.append(
+            f'<span class="{cls}" title="{esc(tex)}" data-tex="{esc(tex)}">'
+            f"{esc(_tex_to_text(tex))}</span>"
+        )
         return f"ARRMATH{len(spans) - 1}END"
 
     marked = _MATH_RE.sub(keep, source)

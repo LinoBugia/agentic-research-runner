@@ -211,7 +211,8 @@ textarea { font-family: var(--font); line-height: 1.45; resize: vertical; width:
 .kv { display: grid; grid-template-columns: 160px minmax(0, 1fr); gap: 6px var(--s3); margin: 0; }
 .kv dt { color: var(--text-2); font-size: 13px; }
 .kv dd { margin: 0; min-width: 0; }
-.cmd { display: block; font-family: var(--mono); font-size: 13px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; overflow-x: auto; white-space: pre; }
+/* commands wrap instead of scrolling sideways: what you grant is always seen whole (G2, W1-07.1) */
+.cmd { display: block; font-family: var(--mono); font-size: 13px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .quote { border-left: 3px solid var(--border-strong); padding: 2px 0 2px var(--s3); color: var(--text); }
 .copy { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 12px; color: var(--text-2); text-decoration: none; border: 1px solid var(--border); border-radius: 4px; padding: 0 6px; background: var(--surface-2); cursor: pointer; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .copy::after { content: "⧉"; font-family: var(--font); color: var(--text-3); }
