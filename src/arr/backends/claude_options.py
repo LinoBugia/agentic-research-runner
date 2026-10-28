@@ -116,6 +116,17 @@ def remove_tmp_link(link: Path) -> None:
         link.unlink(missing_ok=True)
 
 
+def cache_env(run_tmp: Path) -> dict[str, str]:
+    """Caches of pip, matplotlib and XDG tools in Run-tmp: `~` is not writable in the sandbox
+    (W1-05 §7.2), and without this pip warns and works without a cache."""
+    cache = run_tmp / "cache"
+    return {
+        "XDG_CACHE_HOME": str(cache),
+        "PIP_CACHE_DIR": str(cache / "pip"),
+        "MPLCONFIGDIR": str(cache / "matplotlib"),
+    }
+
+
 def room_server(agent: PreparedAgent) -> dict[str, Any]:
     """stdio config of the room server for this agent (docs/01 §5)."""
     return {
@@ -153,6 +164,7 @@ def build_options(
     perms = claude_options(profile)
     plugin = agent.plugin_dir
     process_env = {**env, **perms.env, "PATH": agent_path(agent)}
+    process_env.update(cache_env(Path(perms.env["TMPDIR"])))
     if tmpdir is not None:
         process_env["TMPDIR"] = process_env["CLAUDE_CODE_TMPDIR"] = str(tmpdir)
     return ClaudeAgentOptions(

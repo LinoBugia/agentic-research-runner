@@ -8,7 +8,8 @@ One `ClaudeSDKClient` (one CLI process) per agent. The options come from
 - `can_use_tool` → `ApprovalInbox.handle`: the grey zone (network per host, reading outside
   the allowlist with the file tools, writing outside) goes to the PolicyEngine and, on `ask`,
   into the inbox; the agent waits, the others keep working.
-- `PostToolUse` hook: only `additionalContext` for chat hints (`deliver_hint`).
+- `PostToolUse`/`PostToolUseFailure` hooks: only `additionalContext` for chat hints
+  (`deliver_hint`).
 
 Project context (E10): `context.md` of the agent goes in front of the first prompt and again
 after every compaction, because `setting_sources=[]` loads no `CLAUDE.md` (S1 §3.3).
@@ -191,6 +192,7 @@ class ClaudeBackend:
             hooks={
                 "PreToolUse": [HookMatcher(matcher=None, hooks=[self._pre_tool_use])],
                 "PostToolUse": [HookMatcher(matcher=None, hooks=[self._post_tool_use])],
+                "PostToolUseFailure": [HookMatcher(matcher=None, hooks=[self._post_tool_use])],
             },
             max_budget_usd=self.limits.budget_usd if self.limits else None,
             tmpdir=self._tmp_link,
@@ -375,7 +377,11 @@ class ClaudeBackend:
     async def _post_tool_use(
         self, hook_input: Any, tool_use_id: str | None, context: HookContext
     ) -> dict[str, Any]:
-        """Attach pending chat hints to this tool result (docs/06 §4)."""
+        """Attach pending chat hints to this tool result (docs/06 §4).
+
+        Also registered for `PostToolUseFailure`, so a failed call (exit code ≠ 0, a refusal)
+        carries the hint too; `PostToolUse` fires only for successful calls (W2-01 live test).
+        """
         if not self._hints:
             return {}
         hints, self._hints = self._hints, []
@@ -388,7 +394,9 @@ class ClaudeBackend:
             )
             if not waiter.done():
                 waiter.set_result(True)
-        return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}
+        event_name = hook_input.get("hook_event_name") or "PostToolUse"
+        output = {"hookEventName": event_name, "additionalContext": text}
+        return {"hookSpecificOutput": output}
 
     def _on_stderr(self, line: str) -> None:
         log.debug("claude-cli %s: %s", self.agent.id, line.rstrip())
