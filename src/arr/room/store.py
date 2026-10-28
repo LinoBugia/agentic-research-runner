@@ -35,13 +35,11 @@ from typing import Any, Literal
 from arr.errors import ArrError
 from arr.models import (
     RESERVED_SENDERS,
-    AgentConfig,
     AgentStatus,
     ChannelMode,
     GroupChatConfig,
     ResolvedRun,
     Rubric,
-    WorkspaceMode,
 )
 from arr.resolve import load_yaml_model
 from arr.room.types import (
@@ -63,6 +61,7 @@ from arr.room.types import (
     VoteChoice,
     VoteRule,
 )
+from arr.runs.prepare import load_agent_file
 
 log = logging.getLogger(__name__)
 
@@ -970,13 +969,17 @@ class RoomStore:
 
 
 def agent_work_dir(run_dir: Path, agent_id: str) -> Path:
-    """Working folder of an agent: `shared/<name>/` or `agents/<id>/work/` (docs/02 §3.1)."""
-    agent_json = Path(run_dir) / "agents" / agent_id / "agent.json"
-    if agent_json.is_file():
-        config = AgentConfig.model_validate_json(agent_json.read_text(encoding="utf-8"))
-        if config.workspace.mode is WorkspaceMode.SHARED and config.workspace.name:
-            return Path(run_dir) / "shared" / config.workspace.name
-    return Path(run_dir) / "agents" / agent_id / "work"
+    """Working folder of an agent: `work_dir` of its `agent.json` (`AgentFile`, docs/02 §4).
+
+    That is `shared/<name>/` or `agents/<id>/work/`; without `agent.json` the latter.
+    """
+    run_dir = Path(run_dir)
+    if (run_dir / "agents" / agent_id / "agent.json").is_file():
+        work_dir = run_dir / load_agent_file(run_dir, agent_id).work_dir
+        if not work_dir.resolve().is_relative_to(run_dir.resolve()):
+            raise ArrError(f"Der Arbeitsordner von „{agent_id}“ liegt außerhalb des Runs.")
+        return work_dir
+    return run_dir / "agents" / agent_id / "work"
 
 
 class AgentRoom:
