@@ -503,12 +503,14 @@ def test_mark_interrupted_runs(workfolder: Path) -> None:
     before = {p.name: load_run_meta(p).status for p in runs.iterdir() if p.name != "kaputt"}
     changed = mark_interrupted_runs(workfolder)
     after = {p.name: load_run_meta(p) for p in runs.iterdir() if p.name != "kaputt"}
-    expected = [r for r, s in before.items() if s in ("running", "paused", "finalizing")]
-    assert sorted(changed) == sorted(expected) and len(changed) == 3
+    active = ("preparing", "running", "paused", "finalizing")
+    expected = [r for r, s in before.items() if s in active]
+    assert sorted(changed) == sorted(expected) and len(changed) == 4
     assert all(after[r].status is RunStatus.INTERRUPTED for r in changed)
     for run_id in changed:
         folder = runs / run_id
         assert log_entries(folder, "status")[-1]["data"]["previous"] in (
+            "preparing",
             "running",
             "paused",
             "finalizing",
@@ -717,3 +719,97 @@ async def test_parallel_turns_of_one_agent_run_one_after_the_other(workfolder: P
     assert await manager.run() is RunStatus.DONE
     first, second = intervals(manager.run_dir, "a")
     assert not overlap(first, second)
+
+
+# --------------------------------------------------------------------------------------------
+# W2-03.1: stop in finalizing (G1), crash in preparing (G3), parallel interrupt (G4)
+# --------------------------------------------------------------------------------------------
+
+
+async def test_w2_03_1_stop_during_finalizing_keeps_done(workfolder: Path) -> None:
+    """G1: a stop that comes while the finalizer runs is ignored; the run stays `done`."""
+    seen: list[RunStatus] = []
+
+    async def topology(ctx: RunContext) -> None:
+        await ctx.turn("solo", "los")
+
+    async def finalizer(prepared: PreparedRun) -> None:
+        seen.append(load_run_meta(prepared.run_dir).status)
+        manager.stop()
+        await asyncio.sleep(0.05)  # room for a stop task, as on the old code
+
+    manager = make_manager(workfolder, topology, {"solo": turns([say("x")])}, finalizer=finalizer)
+    assert await manager.run() is RunStatus.DONE
+    assert seen == [RunStatus.FINALIZING]
+    assert statuses(manager.run_dir)[-2:] == ["finalizing", "done"]
+    assert log_entries(manager.run_dir, "stop") == []
+    manager.stop()  # after the end: ignored as well
+    assert load_run_meta(manager.run_dir).status is RunStatus.DONE
+
+
+def test_w2_03_1_crash_in_preparing_becomes_interrupted(workfolder: Path) -> None:
+    """G3: a run left in `preparing` (arr went down while preparing) becomes `interrupted`."""
+    folder = workfolder / "runs" / "20261028-1200_demo_custom_beef"
+    folder.mkdir(parents=True)
+    meta = {
+        "run_id": folder.name,
+        "status": "preparing",
+        "starter": "cli",
+        "project": "demo",
+        "created": 1.0,
+        "arr_version": "0",
+    }
+    (folder / "meta.json").write_text(json.dumps(meta))
+    assert mark_interrupted_runs(workfolder) == [folder.name]
+    assert load_run_meta(folder).status is RunStatus.INTERRUPTED
+    assert log_entries(folder, "status")[-1]["data"] == {
+        "status": "interrupted",
+        "previous": "preparing",
+    }
+
+
+async def test_w2_03_1_interrupts_run_in_parallel_after_cancelling_approvals(
+    workfolder: Path,
+) -> None:
+    """G4: three agents whose `interrupt()` takes 1 s each stop in well under 2 s."""
+    pending_at_interrupt: list[int] = []
+
+    async def topology(ctx: RunContext) -> None:
+        await ctx.turns([("a", "x"), ("b", "x"), ("c", "x")])
+
+    scripts = {name: turns([say("beginne"), wait(30)]) for name in ("a", "b", "c")}
+    manager = make_manager(workfolder, topology, scripts)
+    original = manager.backend_factory
+
+    def factory(prepared: Any) -> Any:
+        backend = original(prepared)
+        interrupt = backend.interrupt
+
+        async def slow_interrupt() -> None:
+            if not backend._running:
+                return  # no-op when idle (contract), e.g. from close()
+            assert manager.inbox is not None
+            pending_at_interrupt.append(len(manager.inbox.pending()))
+            await asyncio.sleep(1.0)
+            await interrupt()
+
+        backend.interrupt = slow_interrupt
+        return backend
+
+    manager.backend_factory = factory
+    running = asyncio.create_task(manager.run())
+    await eventually(
+        lambda: manager.orchestrator is not None and len(manager.orchestrator._active) == 3
+    )
+    assert manager.orchestrator is not None
+    waiting = asyncio.create_task(
+        manager.orchestrator.inbox.handle(network_request(manager.prepared.run_id, "a"))
+    )
+    await eventually(lambda: len(manager.inbox.pending()) == 1)
+    started = time.monotonic()
+    manager.stop()
+    assert await running is RunStatus.STOPPED
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.8, f"stop took {elapsed:.2f} s, interrupts ran one after the other"
+    assert pending_at_interrupt == [0, 0, 0], "approvals are cancelled before interrupt()"
+    assert (await waiting).action is DecisionAction.DENY

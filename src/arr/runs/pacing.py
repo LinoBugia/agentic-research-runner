@@ -21,7 +21,6 @@ import contextlib
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from arr.backends.base import TurnOutcome
@@ -29,15 +28,13 @@ from arr.errors import ArrError
 from arr.models import AgentStatus, ChannelMode, GroupChatConfig, RoundOrder, WakeOn
 from arr.room.store import ORCHESTRATOR, USER
 from arr.room.types import DeliveryStatus, Inbox, Message, MessageKind
-from arr.runs.context import TurnJob
+from arr.runs.context import DiscussionEnd, DiscussionOutcome, TurnJob
 
 if TYPE_CHECKING:
     from arr.runs.orchestrator import Orchestrator
 
 __all__ = [
     "DEFAULT_ROUNDS",
-    "DiscussionEnd",
-    "DiscussionOutcome",
     "HintGate",
     "PacingSettings",
     "PingPongTracker",
@@ -241,29 +238,6 @@ class PingPongTracker:
 # --------------------------------------------------------------------------------------------
 # Discussion phases (docs/06 §5.1, §5.2)
 # --------------------------------------------------------------------------------------------
-
-
-class DiscussionEnd(StrEnum):
-    """Why a discussion phase ended (logged as `discussion_end` in `orchestrator.jsonl`)."""
-
-    ROUNDS = "rounds"  # rounds: N rounds played
-    ALL_PASSED = "all_passed"  # rounds: nobody posted anything but `pass` in a round
-    ALL_DONE = "all_done"  # all members reported `done`
-    QUIET = "quiet"  # event: `quiet_after_s` without messages and nobody working
-    STOPPED = "stopped"  # user stop
-    LIMIT = "limit"  # a run limit was reached
-
-
-@dataclass(slots=True)
-class DiscussionOutcome:
-    """Result of `Orchestrator.discuss`: why it ended, rounds, wake-ups and all turns."""
-
-    channel: str
-    mode: ChannelMode
-    ended_by: DiscussionEnd
-    rounds: int = 0
-    wakeups: dict[str, int] = field(default_factory=dict)
-    outcomes: list[TurnOutcome] = field(default_factory=list)
 
 
 _ROUND_PROMPT = (

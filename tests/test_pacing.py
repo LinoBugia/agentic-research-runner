@@ -24,11 +24,9 @@ from run_kit import (
 
 from arr.models import AgentStatus, RunStatus
 from arr.room.types import DeliveryStatus, Inbox, Message, MessageKind, MessageVia
-from arr.runs.context import RunContext
+from arr.runs.context import DiscussionEnd, DiscussionOutcome, RunContext
 from arr.runs.orchestrator import Orchestrator
 from arr.runs.pacing import (
-    DiscussionEnd,
-    DiscussionOutcome,
     HintGate,
     PacingSettings,
     PingPongTracker,
@@ -225,7 +223,7 @@ async def run_discussion(
     results: list[DiscussionOutcome] = []
 
     async def topology(ctx: RunContext) -> None:
-        results.append(await orch(ctx).discuss("main", **discuss))
+        results.append(await ctx.discuss("main", **discuss))
 
     members = list(scripts)
     manager = make_manager(
@@ -278,6 +276,38 @@ async def test_rounds_end_when_all_are_done(workfolder: Path) -> None:
     scripts = {"a": turns([done()]), "b": turns([post("main", "fertig"), done()])}
     _, outcome = await run_discussion(workfolder, scripts, {"mode": "rounds"}, rounds=4)
     assert (outcome.ended_by, outcome.rounds) == (DiscussionEnd.ALL_DONE, 1)
+
+
+async def test_w2_03_1_topology_discusses_through_the_run_context_contract(
+    workfolder: Path,
+) -> None:
+    """W2-03.1 B1: `discuss` is part of `RunContext`; a topology needs nothing else."""
+    assert "discuss" in RunContext.__abstractmethods__
+
+    class WithoutDiscuss(RunContext):  # an implementation must provide `discuss`
+        locals().update({name: None for name in RunContext.__abstractmethods__ - {"discuss"}})
+
+    with pytest.raises(TypeError, match="discuss"):
+        WithoutDiscuss()  # type: ignore[abstract]
+
+    found: list[DiscussionOutcome] = []
+
+    async def topology(ctx: RunContext) -> None:  # uses the contract only, no isinstance
+        found.append(await ctx.discuss("main", "Tauscht euch aus.", stage="austausch", rounds=2))
+
+    scripts = {
+        "a": turns([post("main", "a1")], [post("main", "a2")]),
+        "b": turns([post("main", "b1")], [post("main", "b2")]),
+    }
+    manager = make_manager(
+        workfolder, topology, scripts, groupchats=[channel("main", ["a", "b"], mode="rounds")]
+    )
+    assert await manager.run() is RunStatus.DONE
+    [outcome] = found
+    assert (outcome.channel, outcome.ended_by, outcome.rounds) == ("main", DiscussionEnd.ROUNDS, 2)
+    assert len(outcome.outcomes) == 4
+    checkpoint = log_entries(manager.run_dir, "checkpoint")[-1]["data"]
+    assert checkpoint == {"stage": "austausch", "channel": "main", "phase": "discussion"}
 
 
 # --------------------------------------------------------------------------------------------
@@ -383,7 +413,7 @@ async def test_event_discussion_ends_on_stop(workfolder: Path) -> None:
     results: list[DiscussionOutcome] = []
 
     async def topology(ctx: RunContext) -> None:
-        results.append(await orch(ctx).discuss("main", "Los."))
+        results.append(await ctx.discuss("main", "Los."))
 
     scripts = {"a": turns([wait(30)]), "b": turns([wait(30)])}
     manager = make_manager(
@@ -530,7 +560,7 @@ async def test_user_messages_wake_or_hint_and_record_the_delivery(workfolder: Pa
     results: list[DiscussionOutcome] = []
 
     async def topology(ctx: RunContext) -> None:
-        results.append(await orch(ctx).discuss("main", "Los.", kickoff=True))
+        results.append(await ctx.discuss("main", "Los.", kickoff=True))
 
     scripts = {"a": turns([wait(0.5)], [done()]), "b": turns([done()])}
     manager = make_manager(

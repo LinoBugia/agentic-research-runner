@@ -82,8 +82,13 @@ BackendFactory = Callable[[PreparedAgent], AgentBackend]
 Finalizer = Callable[[PreparedRun], Awaitable[None]]
 """Runs in `finalizing`, also after stop, limit or error (W2-04)."""
 
-INTERRUPTIBLE_STATUSES = frozenset({RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.FINALIZING})
-"""Statuses that become `interrupted` after a crash (docs/01 §7)."""
+INTERRUPTIBLE_STATUSES = frozenset(
+    {RunStatus.PREPARING, RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.FINALIZING}
+)
+"""Statuses that become `interrupted` after a crash (docs/01 §7, W2-03.1 G3)."""
+
+STOPPABLE_STATUSES = frozenset({RunStatus.PREPARING, RunStatus.RUNNING, RunStatus.PAUSED})
+"""Statuses in which `RunManager.stop` acts; in `finalizing` and after it is ignored."""
 
 STOP_GRACE_S = 10.0
 """How long a stopped topology may take to return before it is cancelled."""
@@ -122,7 +127,9 @@ def set_run_status(run_dir: str | Path, status: RunStatus, *, now: float | None 
 
 
 def mark_interrupted_runs(workfolder: str | Path) -> list[str]:
-    """Set runs left `running`, `paused` or `finalizing` (arr went down) to `interrupted`.
+    """Set runs left `preparing`, `running`, `paused` or `finalizing` to `interrupted`.
+
+    These runs were active when arr went down; a crash during the preparation also counts.
 
     Called when arr starts, before any run of this process. Logs stay as they are and remain
     readable; returns the IDs of the runs that were changed.
@@ -291,8 +298,13 @@ class RunManager:
     def stop(self) -> None:
         """Stop the run: approvals cancelled, turns interrupted, then the finalizer (A2).
 
-        Before the agents run, the topology is skipped. Safe to call more than once.
+        Acts before the start and in `preparing`, `running` and `paused`; before the agents
+        run, the topology is skipped. In `finalizing` and after it, `stop` is ignored: the
+        finalizer runs anyway and a regularly ended run stays `done`. Safe to call more than
+        once.
         """
+        if self._status is not None and self._status not in STOPPABLE_STATUSES:
+            return
         orch = self.orchestrator
         if orch is None or self._status is None or self._status is RunStatus.PREPARING:
             self._stop_early = True

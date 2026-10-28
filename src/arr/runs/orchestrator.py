@@ -44,10 +44,9 @@ from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.types import ApprovalType, EscalationOption
 from arr.room.store import ORCHESTRATOR, USER, AgentRoom, RoomStore
 from arr.room.types import DeliveryStatus, Message, MessageKind, Rating, Result
-from arr.runs.context import AgentHandle, RunContext, TurnJob
+from arr.runs.context import AgentHandle, DiscussionOutcome, RunContext, TurnJob
 from arr.runs.eventlog import EventLogger
 from arr.runs.pacing import (
-    DiscussionOutcome,
     HintGate,
     PacingSettings,
     compose_hint,
@@ -718,22 +717,7 @@ class Orchestrator(RunContext):
         context: Mapping[str, Any] | None = None,
         kickoff: bool = True,
     ) -> DiscussionOutcome:
-        """Run a discussion phase in `channel` with the channel's pacing and wait for its end.
-
-        - With `stage`, the phase starts with `checkpoint(stage, channel=…, phase=
-          "discussion")`, which opens channels with that `open_from`. The channel must be open.
-        - `rounds` mode: per round all members that are not `done` get a turn (parallel or
-          in order), prompt „Runde r von N …“ plus `prompt`. Ends after `rounds` rounds
-          (default 3), when nobody posted anything but `pass` in a round, or on stop.
-        - `event` mode: with `kickoff`, all members that are not `done` get `prompt` at once.
-          Then idle members are woken on `wake_on` events after `debounce_s`, at most
-          `max_wakeups_per_agent` times per channel; own messages and messages of the
-          orchestrator never wake; the ping-pong guard stops waking two agents that talk in
-          circles. Ends when nobody works, no wake-up is due and either all members are `done`
-          or nothing happened for `quiet_after_s` (messages and turn ends count).
-        - Wake-up turns get `stage` and `context` like the kick-off turns. Hints mid-turn and
-          the inbox work in and outside of discussions.
-        """
+        """Discussion phase as specified in `RunContext.discuss`; logs its start and end."""
         try:
             config = self.config.channel(channel)
         except KeyError:
@@ -891,7 +875,9 @@ class Orchestrator(RunContext):
         self._halt_task = asyncio.get_running_loop().create_task(self._halt(info))
 
     async def halt(self, reason: StopReason, limit: LimitKind | None = None, **info: Any) -> None:
-        """Stop the run: cancel open approvals, then interrupt running turns (docs/01 §6).
+        """Stop the run: cancel open approvals, then interrupt all running turns at once.
+
+        See docs/01 §6. Each `interrupt()` has its own deadline of `INTERRUPT_TIMEOUT_S`.
 
         After that `stop_requested` is true and every further turn returns at once (status
         `interrupted` or `limit`). Pause waiters, profile waiters and discussions are released.
@@ -916,11 +902,17 @@ class Orchestrator(RunContext):
             gate.kick()
         for listener in list(self._listeners):
             listener.kick()
-        for agent_id, active in list(self._active.items()):
-            try:
-                await asyncio.wait_for(active.backend.interrupt(), INTERRUPT_TIMEOUT_S)
-            except Exception:
-                logger.exception("interrupt() von %s fehlgeschlagen", agent_id)
+        # All at once, each with its own deadline: the stop must not grow with the agents.
+        await asyncio.gather(
+            *(self._interrupt(agent_id, a.backend) for agent_id, a in self._active.items())
+        )
+
+    @staticmethod
+    async def _interrupt(agent_id: str, backend: AgentBackend) -> None:
+        try:
+            await asyncio.wait_for(backend.interrupt(), INTERRUPT_TIMEOUT_S)
+        except Exception:
+            logger.exception("interrupt() von %s fehlgeschlagen", agent_id)
 
     def pause(self, reason: str = "user") -> None:
         """Let new turns wait (running turns go on); `reason` `user` or `escalation`."""
