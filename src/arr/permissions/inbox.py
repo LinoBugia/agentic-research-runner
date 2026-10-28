@@ -18,7 +18,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import timedelta
 from typing import Any, Protocol
 
@@ -42,6 +42,7 @@ from arr.permissions.types import (
     DecisionAction,
     DecisionScope,
     EscalatedBy,
+    EscalationOption,
     PermissionRequest,
     RequestCategory,
     RiskLevel,
@@ -52,6 +53,7 @@ __all__ = [
     "ApprovalInbox",
     "DeciderUnavailable",
     "TerminalDecider",
+    "format_escalation",
     "format_item",
     "item_id_prefix",
 ]
@@ -89,10 +91,11 @@ class ApprovalDecider(Protocol):
 
 
 class ApprovalInbox:
-    """Queue of open permission requests of one run (docs/07 §3 ③, §6).
+    """Queue of open permission requests and escalations of one run (docs/07 §3 ③, §6).
 
     `handle` is the single entry point for the adapters: it asks the PolicyEngine and, on
-    `ask`, opens an item and waits for a decision or the timeout. `resolve` is where the
+    `ask`, opens an item and waits for a decision or the timeout. `ask_escalation` is the
+    entry point of `RunContext.escalate` (W2-03). `resolve` is where the
     terminal, the GUI or the gatekeeper put their decision; it may be called from another
     thread (GUI). `escalate` records who passed an item on to the user. Final decisions with
     scope agent/run/always are passed to `PolicyEngine.remember`; new „Immer“ rules go to
@@ -122,7 +125,7 @@ class ApprovalInbox:
         self.on_note = on_note
         self._lock = threading.RLock()
         self._items: dict[str, ApprovalItem] = {}
-        self._waiters: dict[str, asyncio.Future[Decision]] = {}
+        self._waiters: dict[str, asyncio.Future[Decision | None]] = {}
         self._counters: dict[str, int] = {}
 
     # -- queries ------------------------------------------------------------------------
@@ -160,17 +163,61 @@ class ApprovalInbox:
         Never raises because of the decider; a cancelled wait marks the item obsolete.
         """
         loop = asyncio.get_running_loop()
-        waiter: asyncio.Future[Decision] = loop.create_future()
+        waiter: asyncio.Future[Decision | None] = loop.create_future()
         with self._lock:
             item = self._open(assessment)
             self._waiters[item.id] = waiter
         task = asyncio.create_task(self._run_decider(item)) if self.decider else None
         try:
-            return await asyncio.wait_for(asyncio.shield(waiter), self.timeout)
+            decision = await asyncio.wait_for(asyncio.shield(waiter), self.timeout)
+            assert decision is not None  # only escalations are released without a decision
+            return decision
         except TimeoutError:
             return self._expire(item.id)
         except asyncio.CancelledError:
             self.cancel(item.id, "Die wartende Anfrage wurde abgebrochen.")
+            raise
+        finally:
+            with self._lock:
+                self._waiters.pop(item.id, None)
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    async def ask_escalation(
+        self,
+        run_id: str,
+        stage: str,
+        summary: str,
+        options: Sequence[EscalationOption],
+    ) -> Decision | None:
+        """Open an escalation of a topology and wait for the user's choice (docs/07 §6).
+
+        Escalations have no deadline. Only a decision `action: option` by `user` with scope
+        `once` ends the wait (E15, enforced in `resolve`). Returns None when the item was
+        cancelled, e.g. because the run was stopped. The decider (if any) is asked as for
+        permission requests.
+        """
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[Decision | None] = loop.create_future()
+        with self._lock:
+            item = ApprovalItem(
+                id=self._next_id(run_id),
+                type=ApprovalType.ESCALATION,
+                run_id=run_id,
+                stage=stage,
+                summary=summary,
+                options=list(dict.fromkeys(options)),
+            )
+            self._items[item.id] = item
+            self._waiters[item.id] = waiter
+            self._write(LogEvent.OPEN, item, note=f"Eskalation in Stufe „{stage}“: {summary}")
+        task = asyncio.create_task(self._run_decider(item)) if self.decider else None
+        try:
+            return await asyncio.shield(waiter)
+        except asyncio.CancelledError:
+            self.cancel(item.id, "Die wartende Eskalation wurde abgebrochen.")
             raise
         finally:
             with self._lock:
@@ -186,7 +233,8 @@ class ApprovalInbox:
         Only `allow` and `deny` fit a permission request; `always` only by the user (both
         enforced by the types). Raises `ArrError` if the item is not open any more. If the
         request contains a secret, an „Immer“ decision is kept with scope `run` (no rule in
-        `arr.yaml`) and the user gets a hint.
+        `arr.yaml`) and the user gets a hint. An escalation takes only one of its options,
+        chosen by `user` with scope `once` (E15); anything else raises `ArrError`.
         """
         with self._lock:
             item = self.get(item_id)
@@ -195,6 +243,11 @@ class ApprovalInbox:
                     f"Die Freigabe „{item_id}“ ist nicht mehr offen ({item.status}). "
                     "Eine Entscheidung ist nicht mehr nötig."
                 )
+            if item.type is ApprovalType.ESCALATION:
+                item = self._decide_escalation(item, decision)
+                self._write(LogEvent.DECIDED, item)
+                self._wake(item.id, decision)
+                return item
             if decision.action not in (DecisionAction.ALLOW, DecisionAction.DENY):
                 raise ArrError("Eine Berechtigungsanfrage lässt sich nur erlauben oder ablehnen.")
             if decision.risk is None:
@@ -211,6 +264,18 @@ class ApprovalInbox:
         self._wake(item.id, decision)
         return item
 
+    def _decide_escalation(self, item: ApprovalItem, decision: Decision) -> ApprovalItem:
+        """Check a choice for an escalation (E15: user, once, an offered option) and store it."""
+        if decision.decided_by is not DecidedBy.USER or decision.scope is not DecisionScope.ONCE:
+            raise ArrError(
+                "Eskalationen entscheidest in v1 nur du selbst, und zwar einmalig (E15). "
+                "Die Entscheidung wurde nicht übernommen."
+            )
+        if decision.action is not DecisionAction.OPTION or decision.option not in item.options:
+            offered = ", ".join(o.value for o in item.options)
+            raise ArrError(f"Wähle eine der angebotenen Optionen: {offered}.")
+        return self._update(item, ApprovalStatus.DECIDED, decision)
+
     def escalate(self, item_id: str, escalated_by: EscalatedBy) -> ApprovalItem:
         """Record who passed an open item on to the user, and why (docs/08 §5.0, W4-04)."""
         with self._lock:
@@ -222,10 +287,18 @@ class ApprovalInbox:
         return item
 
     def cancel(self, item_id: str, note: str = "Der Run wurde gestoppt.") -> ApprovalItem:
-        """Mark an open item obsolete and release the agent with a `deny` (stop, docs/07 §7)."""
+        """Mark an open item obsolete and release the agent with a `deny` (stop, docs/07 §7).
+
+        An escalation becomes obsolete without a decision; its waiter gets None.
+        """
         with self._lock:
             item = self.get(item_id)
             if item.status is not ApprovalStatus.OPEN:
+                return item
+            if item.type is ApprovalType.ESCALATION:
+                item = self._update(item, ApprovalStatus.OBSOLETE, None)
+                self._write(LogEvent.OBSOLETE, item, note=note)
+                self._wake(item.id, None)
                 return item
             decision = Decision(
                 action=DecisionAction.DENY,
@@ -358,7 +431,7 @@ class ApprovalInbox:
         self._items[item.id] = updated
         return updated
 
-    def _wake(self, item_id: str, decision: Decision) -> None:
+    def _wake(self, item_id: str, decision: Decision | None) -> None:
         with self._lock:
             waiter = self._waiters.get(item_id)
         if waiter is None:
@@ -432,6 +505,39 @@ _CHOICES = (
     "  nein    – ablehnen"
 )
 _RULE = "─" * 72
+
+
+_ESCALATION_ANSWERS = {
+    "nochmal": EscalationOption.RETRY,
+    "weiter": EscalationOption.CONTINUE,
+    "beenden": EscalationOption.END,
+}
+_ESCALATION_WORDS = {
+    EscalationOption.RETRY: "noch ein Versuch",
+    EscalationOption.CONTINUE: "trotzdem weiter",
+    EscalationOption.END: "Run beenden",
+}
+
+
+def _escalation_choices(item: ApprovalItem) -> str:
+    lines = ["Antworte mit einem ganzen Wort und Enter:"]
+    lines += [
+        f"  {word:<8}– {_ESCALATION_WORDS[option]}"
+        for word, option in _ESCALATION_ANSWERS.items()
+        if option in item.options
+    ]
+    return "\n".join(lines)
+
+
+def format_escalation(item: ApprovalItem) -> str:
+    """German text of an escalation of a topology for the terminal (docs/03 §4.4)."""
+    lines = [_RULE, f"Eskalation {item.id} · der Run ist pausiert", f"Run:    {item.run_id}"]
+    if item.stage:
+        lines.append(f"Stufe:  {item.stage}")
+    if item.summary:
+        lines.append(f"Stand:  {item.summary}")
+    lines += ["", _escalation_choices(item)]
+    return redact("\n".join(lines))
 
 
 def format_item(item: ApprovalItem) -> str:
@@ -517,6 +623,9 @@ class TerminalDecider:
             if item.deadline is not None and item.deadline <= time.time():
                 return None
             try:
+                if item.type is ApprovalType.ESCALATION:
+                    self._write(format_escalation(item))
+                    return await self._ask_escalation(item)
                 self._write(format_item(item))
                 return await self._ask(item)
             except asyncio.CancelledError:
@@ -525,6 +634,25 @@ class TerminalDecider:
                     "Eine Eingabe dazu wird verworfen."
                 )
                 raise
+
+    async def _ask_escalation(self, item: ApprovalItem) -> Decision:
+        words = {
+            word: option for word, option in _ESCALATION_ANSWERS.items() if option in item.options
+        }
+        while True:
+            line = await self._read("Deine Wahl: ")
+            if line is None:
+                raise DeciderUnavailable(_CLOSED)
+            option = words.get(line.strip().casefold())
+            if option is None:
+                self._write(f"„{line.strip()}“ verstehe ich nicht.\n{_escalation_choices(item)}")
+                continue
+            return Decision(
+                action=DecisionAction.OPTION,
+                option=option,
+                decided_by=DecidedBy.USER,
+                reason=f"Im Terminal gewählt: {_ESCALATION_WORDS[option]}.",
+            )
 
     async def _ask(self, item: ApprovalItem) -> Decision:
         while True:

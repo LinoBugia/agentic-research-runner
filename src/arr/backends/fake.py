@@ -25,6 +25,15 @@ Script format (YAML)::
           - {do: delay, seconds: 0.5}      # interruptible wait
           - {do: hang, seconds: 2}         # wait that ignores interrupt()
           - {do: end, status: limit, message: "Budget erreicht"}   # end the turn now
+    by_stage:                   # optional: turns for `run_turn(stage=…)`, e.g. wake-up turns
+      discussion:
+        repeat_last: true       # any number of turns in this stage
+        turns:
+          - steps: [{do: room, action: post_message, args: {channel: main, body: "…"}}]
+
+A turn with a stage listed in `by_stage` plays the next entry of that stage; all other turns
+play the next entry of `turns`. So `turns` stays in order even when wake-up turns of a
+variable number come in between.
 
 String values of room `args` that consist of exactly `${name.path}` are replaced by a value
 saved earlier with `save_as` (dotted path; list items by index).
@@ -227,13 +236,25 @@ class TurnScript(StrictModel):
     steps: list[Step] = Field(default_factory=list)
 
 
+class StageScript(StrictModel):
+    """Turns of one stage in `by_stage`; `repeat_last` plays the last one again when used up."""
+
+    repeat_last: bool = False
+    turns: list[TurnScript] = Field(default_factory=list)
+
+
 class FakeScript(StrictModel):
-    """Behavior of a FakeBackend agent: entry n of `turns` is played for turn n."""
+    """Behavior of a FakeBackend agent.
+
+    Turns with a stage from `by_stage` play the entries of that stage in order; every other
+    turn plays the next entry of `turns` (the n-th such turn plays entry n).
+    """
 
     version: Literal[1] = 1
     cost_kind: CostKind | None = CostKind.ESTIMATED
     repeat_last: bool = False
     turns: list[TurnScript] = Field(default_factory=list)
+    by_stage: dict[str, StageScript] = Field(default_factory=dict)
 
 
 def load_script(source: "str | Path | Mapping[str, Any] | FakeScript") -> FakeScript:
@@ -338,6 +359,7 @@ class FakeBackend:
         self.room = room
         self._session = f"fake-{config.id}"
         self._turn = 0
+        self._played: dict[str | None, int] = {}  # turns played per `by_stage` key / `turns`
         self._started = False
         self._closed = False
         self._current: tuple[object, weakref.ref[Any]] | None = None
@@ -418,7 +440,7 @@ class FakeBackend:
                 state, EventKind.TURN_START, TurnStartData(prompt=prompt, stage=stage)
             )
             try:
-                async for event in self._play(state):
+                async for event in self._play(state, stage):
                     yield event
             except Exception as exc:  # script or room bug: report it, keep the turn contract
                 state.status = TurnStatus.ERROR
@@ -441,8 +463,8 @@ class FakeBackend:
         if self._current is not None and self._current[0] is token:
             self._current = None
 
-    async def _play(self, state: _TurnState) -> AsyncIterator[AgentEvent]:
-        for step in self._turn_script(state.n).steps:
+    async def _play(self, state: _TurnState, stage: str | None) -> AsyncIterator[AgentEvent]:
+        for step in self._turn_script(stage).steps:
             for event in self._take_hints(state):
                 yield event
             if self._interrupted.is_set():
@@ -452,14 +474,22 @@ class FakeBackend:
             if state.status is not TurnStatus.OK or state.ended:
                 return
 
-    def _turn_script(self, n: int) -> TurnScript:
-        turns = self.script.turns
+    def _turn_script(self, stage: str | None) -> TurnScript:
+        """Pick the script of the next turn (by `stage` if listed in `by_stage`) or raise."""
+        key = stage if stage is not None and stage in self.script.by_stage else None
+        n = self._played.get(key, 0) + 1
+        self._played[key] = n
+        if key is None:
+            turns, repeat, where = self.script.turns, self.script.repeat_last, ""
+        else:
+            entry = self.script.by_stage[key]
+            turns, repeat, where = entry.turns, entry.repeat_last, f" in Stufe „{key}“"
         if n <= len(turns):
             return turns[n - 1]
-        if self.script.repeat_last and turns:
+        if repeat and turns:
             return turns[-1]
         raise FakeScriptError(
-            f"Das Skript für „{self.config.id}“ hat keinen Eintrag für Turn {n} "
+            f"Das Skript für „{self.config.id}“ hat keinen Eintrag für Turn {n}{where} "
             f"(es hat {len(turns)}). Ergänze einen Turn oder setze repeat_last: true."
         )
 

@@ -133,7 +133,7 @@ async def test_all_agent_tools_over_mcp_with_footer(store: RoomStore) -> None:
         assert f"get_attachment({claim_id}, 'lemma.md')" in read
         attachment = await critic.ok("get_attachment", msg_id=claim_id, name="lemma.md")
         assert attachment.endswith("# Lemma A")
-        assert f"groupchats/attachments/{claim_id}/lemma.md" in attachment
+        assert f"groupchats/attachments/main/{claim_id}/lemma.md" in attachment
 
         thread = await critic.ok("read_messages", thread=claim_id)
         assert thread.count("[#") == 2
@@ -233,7 +233,7 @@ async def test_user_message_is_shown_to_agent(store: RoomStore) -> None:
     store.post("main", "Bitte kürzer", sender="user", via=MessageVia.GUI, to=["critic"])
     async with Client(build_server(store.for_agent("critic"))) as client:
         text = await Agent(client).ok("read_messages", channel="main")
-    assert "[#5 user · note · an critic · #main]\nBitte kürzer" in text
+    assert "[#5 user · note · an critic · #main] (★ vom User, hat Vorrang)\nBitte kürzer" in text
 
 
 def test_main_needs_environment(
@@ -293,3 +293,19 @@ def test_invalid_log_level_falls_back_to_info(
     with pytest.raises(SystemExit):
         room_server.main()
     assert restore_root_logger.level == logging.DEBUG
+
+
+def test_user_messages_are_marked_in_tool_output() -> None:
+    """docs/06 §10: messages of `user` stand out in `inbox()` and `read_messages` (W2-03)."""
+    from arr.room.types import Message, MessageKind
+
+    user = Message(id=7, ts=0, channel="main", sender="user", body="Bitte n ≤ 100.")
+    question = user.model_copy(
+        update={"id": 8, "kind": MessageKind.QUESTION, "to": ["e1"], "open": True}
+    )
+    agent = user.model_copy(update={"id": 9, "sender": "critic"})
+    assert room_server.render_message(user).startswith(
+        "[#7 user · note · #main] (★ vom User, hat Vorrang)\n"
+    )
+    assert "(★ vom User, hat Vorrang, offene Frage)" in room_server.render_message(question)
+    assert "★" not in room_server.render_message(agent)

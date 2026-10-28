@@ -972,6 +972,70 @@ def test_fixed_run_id(workfolder: Path, settings: WorkfolderSettings) -> None:
         prepare(workfolder, settings, run_id="../evil")
 
 
+def reserve(workfolder: Path, run_id: str, status: RunStatus) -> Path:
+    """A reserved run folder as W4-01 keeps it before preparing: `meta.json` plus a note."""
+    folder = workfolder / "runs" / run_id
+    folder.mkdir(parents=True)
+    meta = {
+        "run_id": run_id,
+        "status": status.value,
+        "starter": "user_agent",
+        "project": "collatz",
+        "created": 1761390000.0,
+        "arr_version": __version__,
+    }
+    (folder / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    (folder / "approval.txt").write_text("vom User freigegeben", encoding="utf-8")
+    return folder
+
+
+@pytest.mark.parametrize("status", [RunStatus.AWAITING_APPROVAL, RunStatus.QUEUED])
+def test_reserved_run_folder_is_taken_over(
+    workfolder: Path, settings: WorkfolderSettings, status: RunStatus
+) -> None:
+    fixed = "20261025-1200_collatz_exploration_abcd"
+    folder = reserve(workfolder, fixed, status)
+    result = prepare(workfolder, settings, run_id=fixed)
+    assert result.run_dir == folder
+    meta = load_run_meta(folder)
+    assert meta.status is RunStatus.PREPARING
+    assert (meta.starter, meta.created) == (Starter.USER_AGENT, 1761390000.0)
+    assert result.meta == meta
+    assert (folder / "approval.txt").read_text() == "vom User freigegeben"
+    assert (folder / "agents" / "explorer-1" / "agent.json").is_file()
+
+
+def test_failed_preparation_of_reserved_folder_keeps_meta_json(
+    workfolder: Path, settings: WorkfolderSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixed = "20261025-1200_collatz_exploration_abcd"
+    folder = reserve(workfolder, fixed, RunStatus.QUEUED)
+    before = (folder / "meta.json").read_bytes()
+
+    def broken(src: str, dst: str) -> None:
+        raise OSError(errno.EACCES, "Keine Berechtigung", src)
+
+    monkeypatch.setattr(prepare_module, "_clonefile", broken)
+    with pytest.raises(PermissionError):
+        prepare(workfolder, settings, run_id=fixed)
+    assert sorted(p.name for p in folder.iterdir()) == ["approval.txt", "meta.json"]
+    assert (folder / "meta.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("status", [RunStatus.RUNNING, RunStatus.DONE, None])
+def test_other_existing_folders_are_refused(
+    workfolder: Path, settings: WorkfolderSettings, status: RunStatus | None
+) -> None:
+    fixed = "20261025-1200_collatz_exploration_abcd"
+    if status is None:
+        (workfolder / "runs" / fixed).mkdir(parents=True)
+    else:
+        reserve(workfolder, fixed, status)
+    with pytest.raises(ArrError, match="existiert schon"):
+        prepare(workfolder, settings, run_id=fixed)
+    assert not (workfolder / "runs" / fixed / "base").exists()
+
+
 def test_two_runs_in_the_same_minute_get_different_folders(
     workfolder: Path, settings: WorkfolderSettings
 ) -> None:

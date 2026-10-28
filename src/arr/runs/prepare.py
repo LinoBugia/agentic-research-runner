@@ -74,6 +74,7 @@ __all__ = [
     "ExcludeSet",
     "PreparedAgent",
     "PreparedRun",
+    "RESERVED_STATUSES",
     "RunMeta",
     "copy_tree",
     "load_agent_file",
@@ -812,9 +813,22 @@ def _sdk_versions() -> dict[str, str]:
     return versions
 
 
+RESERVED_STATUSES = frozenset({RunStatus.AWAITING_APPROVAL, RunStatus.QUEUED})
+"""Statuses of a reserved run folder that `prepare_run(run_id=…)` takes over (docs/02 §7)."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Reserved:
+    """A run folder that existed before `prepare_run`: its `meta.json` and its entries."""
+
+    meta: RunMeta
+    meta_bytes: bytes
+    entries: frozenset[str]
+
+
 def _reserve_run_dir(
     runs_dir: Path, make_id: Callable[[], str], fixed_id: str | None
-) -> tuple[str, Path]:
+) -> tuple[str, Path, _Reserved | None]:
     runs_dir.mkdir(parents=True, exist_ok=True)
     if fixed_id is not None:
         if not _RUN_ID_RE.fullmatch(fixed_id):
@@ -825,11 +839,8 @@ def _reserve_run_dir(
         try:
             folder.mkdir()
         except FileExistsError:
-            raise ArrError(
-                f"Der Run-Ordner „{fixed_id}“ existiert schon ({folder}). "
-                "arr überschreibt keinen Run."
-            ) from None
-        return fixed_id, folder
+            return fixed_id, folder, _take_over(folder)
+        return fixed_id, folder, None
     for _ in range(50):
         run_id = make_id()
         folder = runs_dir / run_id
@@ -837,8 +848,36 @@ def _reserve_run_dir(
             folder.mkdir()
         except FileExistsError:
             continue
-        return run_id, folder
+        return run_id, folder, None
     raise ArrError("Es konnte keine freie Run-ID gefunden werden. Versuche es noch einmal.")
+
+
+def _take_over(folder: Path) -> _Reserved:
+    """Accept an existing folder only if it is a reserved run (`awaiting_approval`, `queued`)."""
+    meta_path = folder / "meta.json"
+    try:
+        raw = meta_path.read_bytes() if folder.is_dir() and not folder.is_symlink() else None
+        meta = RunMeta.model_validate_json(raw) if raw is not None else None
+    except (OSError, ValueError):
+        meta = raw = None
+    if meta is None or raw is None or meta.status not in RESERVED_STATUSES:
+        raise ArrError(
+            f"Der Run-Ordner „{folder.name}“ existiert schon ({folder}). "
+            "arr überschreibt keinen Run."
+        )
+    return _Reserved(meta, raw, frozenset(p.name for p in folder.iterdir()))
+
+
+def _undo_take_over(run_dir: Path, reserved: _Reserved) -> None:
+    """Remove what `prepare_run` added to a reserved folder and restore its `meta.json`."""
+    for path in run_dir.iterdir():
+        if path.name in reserved.entries:
+            continue
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    (run_dir / "meta.json").write_bytes(reserved.meta_bytes)
 
 
 def _rel(run_dir: Path, path: Path) -> str:
@@ -878,7 +917,13 @@ def prepare_run(
 
     All configuration problems (unknown project, role or skill, bad profile …) are collected and
     raised as one `ConfigError` before anything is created. `run_id` reserves a fixed ID
-    (docs/02 §7); it must not exist yet. If something fails later, the new folder is removed.
+    (docs/02 §7). If something fails later, the new folder is removed.
+
+    Reserved folders (W2-03): if the folder of `run_id` already exists with a `meta.json` in
+    status `awaiting_approval` or `queued`, the run is prepared in that folder; `created` and
+    `starter` are kept from the reserved `meta.json`. If preparing fails, only what
+    `prepare_run` added is removed and the reserved `meta.json` is restored; the folder and
+    its earlier entries stay. Any other existing folder is refused.
     """
     root = Path(workfolder).expanduser().absolute()
     settings = settings or load_workfolder_settings(root)
@@ -894,9 +939,12 @@ def prepare_run(
     )
 
     moment = now or datetime.now()
-    run_id, run_dir = _reserve_run_dir(
+    run_id, run_dir, reserved = _reserve_run_dir(
         root / "runs", lambda: new_run_id(resolved.project, resolved.skill, now=moment), run_id
     )
+    if reserved is not None:
+        starter = reserved.meta.starter
+        moment = datetime.fromtimestamp(reserved.meta.created)
     try:
         return _build_run(
             root,
@@ -912,7 +960,10 @@ def prepare_run(
             moment,
         )
     except BaseException:
-        shutil.rmtree(run_dir, ignore_errors=True)
+        if reserved is None:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        else:
+            _undo_take_over(run_dir, reserved)
         raise
 
 
@@ -948,7 +999,7 @@ def _build_run(
     (run_dir / "run.yaml").write_text(dump_yaml_model(stored), encoding="utf-8")
     (run_dir / "task.md").write_text(plan.task_text, encoding="utf-8")
     for sub in ("output/results", "groupchats/attachments"):
-        (run_dir / sub).mkdir(parents=True)
+        (run_dir / sub).mkdir(parents=True, exist_ok=True)
 
     # Project snapshot and skills
     base_dir = run_dir / "base"

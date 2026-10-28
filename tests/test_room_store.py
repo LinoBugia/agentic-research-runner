@@ -376,10 +376,10 @@ def test_attachments_are_copied_and_readable_by_members(store: RoomStore) -> Non
     e1 = room(store, "explorer-1")
     msg = e1.post_message("main", "siehe Anhang", kind="claim", refs=["notes/lemma.md", "check.py"])
     assert [(a.name, a.size, a.path) for a in msg.refs] == [
-        ("lemma.md", 9, f"groupchats/attachments/{msg.id}/lemma.md"),
-        ("check.py", 8, f"groupchats/attachments/{msg.id}/check.py"),
+        ("lemma.md", 9, f"groupchats/attachments/main/{msg.id}/lemma.md"),
+        ("check.py", 8, f"groupchats/attachments/main/{msg.id}/check.py"),
     ]
-    target = store.run_dir / "groupchats" / "attachments" / str(msg.id) / "lemma.md"
+    target = store.run_dir / "groupchats" / "attachments" / "main" / str(msg.id) / "lemma.md"
     assert target.read_text() == "# Lemma A"
     path = room(store, "critic").get_attachment(msg.id, "lemma.md")
     assert path == target and path.read_text() == "# Lemma A"
@@ -783,7 +783,7 @@ def test_export_markdown_and_jsonl(store: RoomStore) -> None:
     assert "Zweck: Ansätze austauschen" in md
     assert f"### #{claim.id} · " in md and " · explorer-1 · claim" in md
     assert f"*an: explorer-1 · Antwort auf #{claim.id} · offene Frage*" in md
-    assert f"- Anhang: [lemma.md](../groupchats/attachments/{claim.id}/lemma.md)" in md
+    assert f"- Anhang: [lemma.md](../groupchats/attachments/main/{claim.id}/lemma.md)" in md
     assert "über gui · Zustellung: pending" in md
 
 
@@ -1008,3 +1008,24 @@ def test_score_must_not_be_bool(store: RoomStore) -> None:
         with pytest.raises(RoomError, match="muss eine Zahl sein"):
             judge.submit_rating(result.id, 5, "x", {"Tiefe": value})
     assert store.ratings() == []
+
+
+def test_attachments_are_stored_per_channel(store: RoomStore) -> None:
+    """W2-03: `attachments/<kanal>/<msg-id>/`, so read access can follow membership (E19)."""
+    write(store, "explorer-1", "a.md", "A")
+    e1 = room(store, "explorer-1")
+    main = e1.post_message("main", "eins", refs=["a.md"])
+    side = e1.post_message("side", "zwei", refs=["a.md"])
+    assert main.refs[0].path == f"groupchats/attachments/main/{main.id}/a.md"
+    assert side.refs[0].path == f"groupchats/attachments/side/{side.id}/a.md"
+    assert sorted(p.name for p in store.attachments_dir.iterdir()) == ["main", "side"]
+
+
+def test_messages_after_reads_all_channels_in_order(store: RoomStore) -> None:
+    first = store.messages_after(0)
+    e1 = room(store, "explorer-1")
+    one = e1.post_message("main", "eins")
+    two = e1.post_message("side", "zwei")
+    newer = store.messages_after(first[-1].id)
+    assert [(m.id, m.channel) for m in newer] == [(one.id, "main"), (two.id, "side")]
+    assert store.messages_after(two.id) == []

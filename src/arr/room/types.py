@@ -67,7 +67,7 @@ class VoteRule(StrEnum):
 
 
 class Attachment(Record):
-    """File attached to a message, stored in `groupchats/attachments/<msg-id>/` (docs/06 §3).
+    """File attached to a message, in `groupchats/attachments/<kanal>/<msg-id>/` (docs/06 §3).
 
     `path` is relative to the run folder.
     """

@@ -1,0 +1,945 @@
+"""Orchestrator: the `RunContext` implementation that drives the agents of a running run.
+
+The RunManager (`arr.runs.manager`) builds one `Orchestrator` per run after preparing it and
+hands it to the topology (`async def run(ctx: RunContext) -> None`, E8). The orchestrator
+
+- runs turns: inbox in the prompt, assignment for `get_assignment()`, every event into the
+  agent's EventLogger, always leaving the turn with `contextlib.aclosing(...)`;
+- enforces the limits (turns per agent, budget; wall time via `halt` from the manager), the
+  concurrency per auth profile (`ProfileGate`) and the reaction to `rate_limit` events;
+- pauses between turns, stops (`halt`): open approvals are cancelled, running turns
+  interrupted;
+- watches the room: hints mid-turn, `blocked` while an approval waits, delivery state of
+  `user` messages, and the discussion phases of `arr.runs.pacing` (`discuss`);
+- writes `orchestrator.jsonl`.
+
+See docs/01-architektur.md §6, docs/02-workfolder-und-runs.md §4, §7, docs/06-gruppenchats.md.
+"""
+
+import asyncio
+import contextlib
+import json
+import logging
+import threading
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, Protocol
+
+from arr.backends.base import (
+    AgentBackend,
+    AgentEvent,
+    ErrorData,
+    EventKind,
+    TurnEndData,
+    TurnOutcome,
+    TurnStatus,
+    Usage,
+)
+from arr.errors import ArrError
+from arr.models import AgentStatus, ResolvedRun, Rubric
+from arr.permissions.inbox import ApprovalInbox
+from arr.permissions.types import ApprovalType, EscalationOption
+from arr.room.store import ORCHESTRATOR, USER, AgentRoom, RoomStore
+from arr.room.types import DeliveryStatus, Message, MessageKind, Rating, Result
+from arr.runs.context import AgentHandle, RunContext, TurnJob
+from arr.runs.eventlog import EventLogger
+from arr.runs.pacing import (
+    DiscussionOutcome,
+    HintGate,
+    PacingSettings,
+    compose_hint,
+    render_turn_prompt,
+    run_discussion,
+)
+from arr.runs.prepare import PreparedRun
+
+__all__ = [
+    "PLAN_STAGE",
+    "LimitKind",
+    "Orchestrator",
+    "OrchestratorLog",
+    "ProfileGate",
+    "StopReason",
+]
+
+logger = logging.getLogger(__name__)
+
+ORCHESTRATOR_LOG = "orchestrator.jsonl"
+PLAN_STAGE = "plan"
+"""Checkpoint with all planned stages, written at start (`stages=[…]`)."""
+
+RATE_LIMIT_BACKOFF_S = 60.0
+"""Pause of a profile after a rate limit without `resets_at`."""
+
+INTERRUPT_TIMEOUT_S = 5.0
+
+
+class StopReason(StrEnum):
+    """Why a run stops before its topology is finished."""
+
+    USER = "user"
+    LIMIT = "limit"
+
+
+class LimitKind(StrEnum):
+    """Run limits (docs/01 §6, `Limits`)."""
+
+    WALL_TIME = "wall_time"
+    TURNS_PER_AGENT = "turns_per_agent"
+    BUDGET_USD = "budget_usd"
+
+
+_LIMIT_TEXT = {
+    LimitKind.WALL_TIME: "Die Gesamtlaufzeit des Runs ist erreicht.",
+    LimitKind.TURNS_PER_AGENT: "Die Zahl der Turns pro Agent ist erreicht.",
+    LimitKind.BUDGET_USD: "Das Budget des Runs ist erreicht.",
+}
+
+
+class OrchestratorLog:
+    """Append-only `orchestrator.jsonl`: one line `{"ts", "kind", "data"}` per entry.
+
+    Kinds written by the orchestrator and the RunManager: `status`, `checkpoint`, `turn`,
+    `turn_end`, `limit`, `stop`, `pause`, `resume`, `rate_limit`, `hint`, `wake`,
+    `wake_skipped`, `ping_pong`, `channel_open`, `discussion_start`, `discussion_end`,
+    `escalation`, `escalation_decided`, `error`; `prepare_run` writes `warning`.
+    """
+
+    def __init__(self, run_dir: Path) -> None:
+        self.path = Path(run_dir) / ORCHESTRATOR_LOG
+        self._lock = threading.Lock()
+
+    def write(self, kind: str, **data: Any) -> dict[str, Any]:
+        """Append one entry and flush; returns it."""
+        entry = {"ts": time.time(), "kind": kind, "data": data}
+        line = json.dumps(entry, ensure_ascii=False, default=str)
+        with self._lock, self.path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+            handle.flush()
+        return entry
+
+    def entries(self) -> list[dict[str, Any]]:
+        """All entries (empty if the file does not exist)."""
+        if not self.path.exists():
+            return []
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        return [json.loads(line) for line in lines if line.strip()]
+
+
+class ProfileGate:
+    """Concurrency of one auth profile plus the reaction to its rate limits (docs/01 §4.1).
+
+    `limit` is the number of turns that may run at once (`concurrency` in `arr.yaml`, None =
+    unlimited). A `rate_limit` event with status `allowed_warning` throttles the profile to
+    one turn at a time, any other non-`allowed` status pauses it; both until `resets_at`
+    (Unix time) or `RATE_LIMIT_BACKOFF_S`. Running turns are not touched.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        limit: int | None,
+        *,
+        clock: Callable[[], float] = time.time,
+        backoff_s: float = RATE_LIMIT_BACKOFF_S,
+    ) -> None:
+        self.name = name
+        self.limit = limit
+        self.active = 0
+        self.paused_until = 0.0
+        self.throttled_until = 0.0
+        self._clock = clock
+        self._backoff_s = backoff_s
+        self._waiters: list[asyncio.Future[None]] = []
+
+    def _capacity(self, now: float) -> int | None:
+        return 1 if now < self.throttled_until else self.limit
+
+    async def acquire(self, abort: Callable[[], bool]) -> bool:
+        """Wait for a free slot; False (without a slot) as soon as `abort()` is true."""
+        loop = asyncio.get_running_loop()
+        while True:
+            if abort():
+                return False
+            now = self._clock()
+            deadlines = []
+            if now < self.paused_until:
+                deadlines.append(self.paused_until)
+            else:
+                capacity = self._capacity(now)
+                if capacity is None or self.active < capacity:
+                    self.active += 1
+                    return True
+                if now < self.throttled_until:
+                    deadlines.append(self.throttled_until)
+            waiter = loop.create_future()
+            self._waiters.append(waiter)
+            timeout = max(0.0, min(deadlines) - now) if deadlines else None
+            try:
+                await asyncio.wait_for(waiter, timeout)
+            except TimeoutError:
+                pass
+            finally:
+                with contextlib.suppress(ValueError):
+                    self._waiters.remove(waiter)
+
+    def release(self) -> None:
+        """Give a slot back."""
+        self.active -= 1
+        self.kick()
+
+    def kick(self) -> None:
+        """Let all waiters check again (slot freed, stop)."""
+        waiters, self._waiters = self._waiters, []
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    def report(self, data: Mapping[str, Any]) -> tuple[str, float] | None:
+        """React to `rate_limit` data; returns `("throttle" | "pause", until)` or None."""
+        status = str(data.get("status") or "")
+        if status in ("", "allowed"):
+            return None
+        now = self._clock()
+        resets_at = data.get("resets_at")
+        if isinstance(resets_at, int | float) and resets_at > now:
+            until = float(resets_at)
+        else:
+            until = now + self._backoff_s
+        if status == "allowed_warning":
+            self.throttled_until = max(self.throttled_until, until)
+            return "throttle", self.throttled_until
+        self.paused_until = max(self.paused_until, until)
+        return "pause", self.paused_until
+
+
+class _Listener(Protocol):
+    def on_message(self, msg: Message) -> None: ...
+    def on_turn_end(self, agent_id: str, undelivered: Sequence[Message]) -> None: ...
+    def kick(self) -> None: ...
+
+
+@dataclass(slots=True)
+class _ActiveTurn:
+    backend: AgentBackend
+    gate: HintGate
+    tool_calls: int = 0
+    pending: list[Message] = field(default_factory=list)
+    blocked: bool = False
+    retry_at_calls: int = 0
+
+
+@dataclass(slots=True)
+class _TurnRecord:
+    """What the orchestrator collects from the events of one turn."""
+
+    number: int | None = None
+    status: TurnStatus | None = None
+    text: str | None = None
+    error: str | None = None
+    usage: Usage = field(default_factory=Usage)
+    session: str | None = None
+    num_turns: int | None = None
+
+
+class Orchestrator(RunContext):
+    """`RunContext` of one running run (W2-03); built and driven by the RunManager.
+
+    Besides the `RunContext` API, topologies can use `discuss` for a discussion phase in a
+    channel (docs/06 §5). The RunManager uses `watch`, `halt`, `pause`/`resume` and
+    `halted`. All public methods run on the event loop of the run.
+    """
+
+    def __init__(
+        self,
+        prepared: PreparedRun,
+        *,
+        room: RoomStore,
+        backends: Mapping[str, AgentBackend],
+        loggers: Mapping[str, EventLogger],
+        inbox: ApprovalInbox,
+        concurrency: Mapping[str, int] | None = None,
+        stages: Sequence[str] = (),
+        pacing: PacingSettings | None = None,
+        log: OrchestratorLog | None = None,
+        on_pause: Callable[[bool], None] | None = None,
+    ) -> None:
+        self.prepared = prepared
+        self.room = room
+        self.backends = dict(backends)
+        self.loggers = dict(loggers)
+        self.inbox = inbox
+        self.pacing = pacing or PacingSettings()
+        self.log = log or OrchestratorLog(prepared.run_dir)
+        self.plan = list(stages)
+        self.stage: str | None = None
+        self.halted = asyncio.Event()
+        self.cost_usd = 0.0
+        self._on_pause = on_pause
+        self._handles = {a.id: AgentHandle(a) for a in prepared.resolved.agents}
+        self._locks = {agent_id: asyncio.Lock() for agent_id in self._handles}
+        concurrency = concurrency or {}
+        self._gates = {
+            a.auth: ProfileGate(a.auth, concurrency.get(a.auth)) for a in prepared.resolved.agents
+        }
+        rubric = prepared.resolved.rubric or Rubric()
+        self._views: dict[str, AgentRoom] = {
+            agent_id: room.for_agent(agent_id, agent.work_dir, rubric=rubric)
+            for agent_id, agent in prepared.agents.items()
+        }
+        self._waiting = {c.name for c in prepared.resolved.groupchats if c.open_from}
+        self._active: dict[str, _ActiveTurn] = {}
+        self._listeners: list[_Listener] = []
+        self._senders: dict[int, str] = {}
+        self._wakeups: dict[tuple[str, str], int] = {}
+        self._pause_reasons: set[str] = set()
+        self._runnable = asyncio.Event()
+        self._runnable.set()
+        self._stop_reason: StopReason | None = None
+        self._limit: LimitKind | None = None
+        self._halt_task: asyncio.Task[None] | None = None
+        self._last_seen = 0
+        for msg in room.messages_after(0):
+            self._senders[msg.id] = msg.sender
+            self._last_seen = msg.id
+
+    # ----------------------------------------------------------------------------------------
+    # RunContext: properties
+    # ----------------------------------------------------------------------------------------
+
+    @property
+    def run_id(self) -> str:
+        """ID of the run."""
+        return self.prepared.run_id
+
+    @property
+    def config(self) -> ResolvedRun:
+        """Resolved configuration of the run (as in `run.yaml`)."""
+        return self.prepared.resolved
+
+    @property
+    def params(self) -> Mapping[str, Any]:
+        """Final parameters (`config.topology.params`)."""
+        return self.prepared.resolved.params
+
+    @property
+    def agents(self) -> Mapping[str, AgentHandle]:
+        """Agents by ID in configuration order; `turns_used` and `status` are kept current."""
+        return self._handles
+
+    @property
+    def stop_requested(self) -> bool:
+        """True after `halt`: a user stop or a reached run limit."""
+        return self._stop_reason is not None
+
+    @property
+    def stop_reason(self) -> StopReason | None:
+        """Why the run stops, None while it runs normally."""
+        return self._stop_reason
+
+    @property
+    def limit_reached(self) -> LimitKind | None:
+        """The limit that stopped the run, if any."""
+        return self._limit
+
+    @property
+    def paused(self) -> bool:
+        """True while new turns wait (user pause or escalation)."""
+        return bool(self._pause_reasons) and not self.stop_requested
+
+    # ----------------------------------------------------------------------------------------
+    # RunContext: turns
+    # ----------------------------------------------------------------------------------------
+
+    def _handle(self, agent_id: str) -> AgentHandle:
+        try:
+            return self._handles[agent_id]
+        except KeyError:
+            known = ", ".join(self._handles)
+            raise ArrError(
+                f"Den Agenten „{agent_id}“ gibt es in diesem Run nicht ({known})."
+            ) from None
+
+    async def turn(
+        self,
+        agent_id: str,
+        prompt: str,
+        *,
+        stage: str | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> TurnOutcome:
+        """Give one agent a turn and wait for it (docs/01 §6).
+
+        - Turns of one agent run one after the other; a turn starts only while the run is not
+          paused and a slot of the agent's auth profile is free (`concurrency`, rate limits).
+        - The prompt gets the agent's inbox in front (`pacing.render_turn_prompt`); `prompt`,
+          `stage` and `context` are stored as the assignment (`get_assignment()`).
+          `context["attempt"]` becomes the `attempt` of results submitted in this turn.
+        - A `stage` opens channels whose `open_from` is reached (like `checkpoint`).
+        - The outcome holds status, last text, usage, the results submitted in the turn and
+          the session. Status `limit`: a run limit stopped or prevented the turn;
+          `interrupted`: the user stopped the run. In both cases `stop_requested` is true and
+          further turns return at once without running. Errors of the backend come back as
+          status `error`, they are not raised.
+        """
+        handle = self._handle(agent_id)
+        if stage is not None:
+            self._reach_stage(stage)
+        async with self._locks[agent_id]:
+            await self._runnable.wait()
+            if (refused := self._refuse(handle)) is not None:
+                return refused
+            gate = self._gates[handle.config.auth]
+            if not await gate.acquire(lambda: self.stop_requested):
+                return self._not_run(handle)
+            try:
+                await self._runnable.wait()
+                if (refused := self._refuse(handle)) is not None:
+                    return refused
+                return await self._run_turn(handle, gate, prompt, stage, context)
+            finally:
+                gate.release()
+
+    async def turns(
+        self, jobs: Sequence[TurnJob | tuple[str, str]], *, stage: str | None = None
+    ) -> list[TurnOutcome]:
+        """Run several turns at once (each as `turn`); outcomes in the order of `jobs`.
+
+        Limits, concurrency and pause apply per turn; two jobs of one agent run in sequence.
+        """
+        normalized = [job if isinstance(job, TurnJob) else TurnJob(*job) for job in jobs]
+        async with asyncio.TaskGroup() as tg:
+            tasks = [
+                tg.create_task(self.turn(j.agent_id, j.prompt, stage=stage, context=j.context))
+                for j in normalized
+            ]
+        return [task.result() for task in tasks]
+
+    def _not_run(self, handle: AgentHandle) -> TurnOutcome:
+        if self._limit is not None:
+            status, error = TurnStatus.LIMIT, _LIMIT_TEXT[self._limit]
+        else:
+            status, error = TurnStatus.INTERRUPTED, "Der Run wurde gestoppt."
+        return TurnOutcome(
+            agent_id=handle.id, turn=handle.turns_used + 1, status=status, error=error
+        )
+
+    def _refuse(self, handle: AgentHandle) -> TurnOutcome | None:
+        """An outcome without running if the run stops or a limit forbids the turn."""
+        if not self.stop_requested:
+            limits = self.config.limits
+            if limits.turns_per_agent is not None and handle.turns_used >= limits.turns_per_agent:
+                self._start_halt(StopReason.LIMIT, LimitKind.TURNS_PER_AGENT, agent=handle.id)
+            elif limits.budget_usd is not None and self.cost_usd >= limits.budget_usd:
+                self._start_halt(StopReason.LIMIT, LimitKind.BUDGET_USD, cost_usd=self.cost_usd)
+        return self._not_run(handle) if self.stop_requested else None
+
+    async def _run_turn(
+        self,
+        handle: AgentHandle,
+        gate: ProfileGate,
+        prompt: str,
+        stage: str | None,
+        context: Mapping[str, Any] | None,
+    ) -> TurnOutcome:
+        agent_id = handle.id
+        backend = self.backends[agent_id]
+        events_log = self.loggers[agent_id]
+        handle.turns_used += 1
+        number = handle.turns_used
+        full_prompt = self._prompt_with_inbox(agent_id, prompt)
+        self.room.add_assignment(agent_id, number, prompt, stage=stage, context=context)
+        before = max((r.id for r in self.room.results(agent=agent_id)), default=0)
+        self._set_status(handle, AgentStatus.WORKING)
+        active = _ActiveTurn(
+            backend,
+            HintGate(self.pacing.hint_interval_s, self.pacing.hint_tool_calls),
+        )
+        self._active[agent_id] = active
+        self.log.write("turn", agent=agent_id, turn=number, stage=stage)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        record = _TurnRecord()
+        try:
+            async with contextlib.aclosing(backend.run_turn(full_prompt, stage=stage)) as events:
+                async for event in events:
+                    events_log.log(event)
+                    await self._on_event(handle, gate, active, record, event)
+        except asyncio.CancelledError:
+            if record.status is None:
+                self._close_log(agent_id, record, TurnStatus.INTERRUPTED, "Turn abgebrochen.")
+            raise
+        except Exception as exc:
+            logger.exception("Turn von %s fehlgeschlagen", agent_id)
+            record.error = f"{type(exc).__name__}: {exc}"
+            self._close_log(agent_id, record, TurnStatus.ERROR, record.error)
+        finally:
+            self._active.pop(agent_id, None)
+            self._finish_status(handle)
+            self._write_session(agent_id, backend)
+            for listener in list(self._listeners):
+                listener.on_turn_end(agent_id, active.pending)
+        if record.status is None:
+            message = "Der Turn endete ohne Abschluss (turn_end fehlt)."
+            record.error = record.error or message
+            self._close_log(agent_id, record, TurnStatus.ERROR, message)
+        status = record.status or TurnStatus.ERROR
+        if status is TurnStatus.INTERRUPTED and self._limit is not None:
+            status = TurnStatus.LIMIT
+        results = [r for r in self.room.results(agent=agent_id) if r.id > before]
+        self.log.write(
+            "turn_end",
+            agent=agent_id,
+            turn=number,
+            status=status.value,
+            cost_usd=record.usage.cost_usd,
+            results=[r.id for r in results],
+        )
+        return TurnOutcome(
+            agent_id=agent_id,
+            turn=number,
+            status=status,
+            text=record.text,
+            usage=record.usage,
+            results=results,
+            session=record.session,
+            num_turns=record.num_turns,
+            duration_s=loop.time() - started,
+            error=record.error,
+        )
+
+    async def _on_event(
+        self,
+        handle: AgentHandle,
+        gate: ProfileGate,
+        active: _ActiveTurn,
+        record: _TurnRecord,
+        event: AgentEvent,
+    ) -> None:
+        record.number = event.turn
+        data = event.data
+        match event.kind:
+            case EventKind.TOOL_CALL:
+                active.tool_calls += 1
+            case EventKind.TEXT:
+                record.text = str(data.get("text", ""))
+            case EventKind.ERROR:
+                record.error = str(data.get("message", ""))
+            case EventKind.RATE_LIMIT:
+                reaction = gate.report(data)
+                if reaction is not None:
+                    self.log.write(
+                        "rate_limit",
+                        profile=gate.name,
+                        agent=handle.id,
+                        status=data.get("status"),
+                        action=reaction[0],
+                        until=reaction[1],
+                    )
+            case EventKind.TURN_END:
+                record.status = TurnStatus(str(data.get("status", TurnStatus.ERROR)))
+                tokens = {k: v for k, v in dict(data.get("usage") or {}).items() if k != "model"}
+                record.usage = Usage(
+                    **tokens, cost_usd=data.get("cost_usd"), cost_kind=data.get("cost_kind")
+                )
+                record.session = data.get("session")
+                record.num_turns = data.get("num_turns")
+                self.cost_usd += record.usage.cost_usd or 0.0
+                budget = self.config.limits.budget_usd
+                if budget is not None and self.cost_usd >= budget:
+                    await self.halt(StopReason.LIMIT, LimitKind.BUDGET_USD, cost_usd=self.cost_usd)
+
+    def _close_log(
+        self, agent_id: str, record: _TurnRecord, status: TurnStatus, message: str
+    ) -> None:
+        """Log `error` + `turn_end` for a turn the backend did not close (docs/02 §6)."""
+        record.status = status
+        if record.number is None:
+            return  # the turn never started: nothing to close in the transcript
+        events_log = self.loggers[agent_id]
+        for kind, data in (
+            (EventKind.ERROR, ErrorData(message=message, type="orchestrator", recoverable=False)),
+            (
+                EventKind.TURN_END,
+                TurnEndData(
+                    status=status.value,
+                    usage=Usage().tokens(),
+                    cost_usd=None,
+                    cost_kind=None,
+                    session=None,
+                    num_turns=None,
+                ),
+            ),
+        ):
+            events_log.log(AgentEvent(self.run_id, agent_id, record.number, kind, dict(data)))
+
+    def _prompt_with_inbox(self, agent_id: str, prompt: str) -> str:
+        view = self._views[agent_id]
+        channels = [c for c in self.config.groupchats if agent_id in c.members]
+        if not channels:
+            return prompt
+        inbox = view.inbox()
+        user_messages = []
+        for channel in channels:
+            if channel.name in self._waiting:
+                continue
+            cursor = self.room.cursor(agent_id, channel.name)
+            user_messages += [
+                m for m in self.room.messages(channel.name, after_id=cursor) if m.sender == USER
+            ]
+        return render_turn_prompt(agent_id, prompt, inbox, user_messages)
+
+    def _set_status(self, handle: AgentHandle, status: AgentStatus) -> None:
+        handle.status = status
+        self.room.set_agent_status(handle.id, status)
+
+    def _finish_status(self, handle: AgentHandle) -> None:
+        """After a turn: `done` if the agent reported it, else `idle`."""
+        states = {s.agent: s.status for s in self.room.agent_states()}
+        if states.get(handle.id) is AgentStatus.DONE:
+            handle.status = AgentStatus.DONE
+        else:
+            self._set_status(handle, AgentStatus.IDLE)
+
+    def _write_session(self, agent_id: str, backend: AgentBackend) -> None:
+        try:
+            ref = backend.session_ref()
+        except Exception:
+            logger.exception("session_ref von %s fehlgeschlagen", agent_id)
+            return
+        if ref:
+            path = self.prepared.agents[agent_id].agent_dir / "session.json"
+            path.write_text(json.dumps(ref, indent=2) + "\n", encoding="utf-8")
+
+    # ----------------------------------------------------------------------------------------
+    # RunContext: chat, results, checkpoints, escalation
+    # ----------------------------------------------------------------------------------------
+
+    async def post(
+        self,
+        channel: str,
+        body: str,
+        kind: MessageKind = MessageKind.NOTE,
+        *,
+        to: Sequence[str] = (),
+        reply_to: int | None = None,
+    ) -> int:
+        """Post as `orchestrator` (also into waiting or closed channels); returns the ID.
+
+        Messages of the orchestrator never wake agents; with `to` the addressees get a hint
+        while they work, otherwise they see the message in their next inbox.
+        """
+        return self.room.post(channel, body, kind=kind, to=list(to), reply_to=reply_to).id
+
+    def results(
+        self,
+        *,
+        agent: str | None = None,
+        stage: str | None = None,
+        kind: str | None = None,
+        attempt: int | None = None,
+    ) -> list[Result]:
+        """Submitted results matching all given filters, oldest first."""
+        return [
+            r
+            for r in self.room.results(stage=stage, agent=agent)
+            if (kind is None or r.kind == kind) and (attempt is None or r.attempt == attempt)
+        ]
+
+    def ratings(self, result_id: int) -> list[Rating]:
+        """Ratings of one result, oldest first."""
+        return self.room.ratings(result_id=result_id)
+
+    async def checkpoint(self, stage: str, **info: Any) -> None:
+        """Record a stage in `orchestrator.jsonl` (`{"kind": "checkpoint", "data": {stage, …}}`).
+
+        `plan` with `stages=[…]` replaces the planned stages (the RunManager writes it at
+        start). Any other stage becomes the current stage and opens every channel whose
+        `open_from` is this stage or, in plan order, an earlier one. `info` must be JSON data.
+        """
+        self.log.write("checkpoint", stage=stage, **info)
+        if stage == PLAN_STAGE:
+            stages = info.get("stages")
+            if isinstance(stages, list | tuple):
+                self.plan = [str(s) for s in stages]
+            return
+        self._reach_stage(stage)
+
+    def _reach_stage(self, stage: str) -> None:
+        self.stage = stage
+        for name in sorted(self._waiting):
+            open_from = self.config.channel(name).open_from
+            if open_from == stage or (
+                open_from in self.plan
+                and stage in self.plan
+                and self.plan.index(stage) >= self.plan.index(open_from)
+            ):
+                self.room.open_channel(name)
+                self._waiting.discard(name)
+                self.log.write("channel_open", channel=name, stage=stage)
+
+    async def escalate(
+        self, stage: str, summary: str, options: Sequence[EscalationOption]
+    ) -> EscalationOption:
+        """Pause the run, ask the user in the approval inbox and wait (docs/07 §6).
+
+        New turns wait meanwhile; running turns go on. Only the user can decide, once (E15).
+        Afterwards the run continues (unless the user paused it as well). After a stop, or
+        when the escalation becomes obsolete, the answer is `end`.
+        """
+        if self.stop_requested:
+            return EscalationOption.END
+        choices = [EscalationOption(o).value for o in options]
+        self.log.write("escalation", stage=stage, summary=summary, options=choices)
+        self.pause("escalation")
+        try:
+            decision = await self.inbox.ask_escalation(self.run_id, stage, summary, options)
+        finally:
+            self.resume("escalation")
+        option = decision.option if decision is not None and decision.option else None
+        chosen = option or EscalationOption.END
+        self.log.write("escalation_decided", stage=stage, option=chosen.value, by_user=bool(option))
+        return chosen
+
+    # ----------------------------------------------------------------------------------------
+    # Discussion phases (docs/06 §5)
+    # ----------------------------------------------------------------------------------------
+
+    async def discuss(
+        self,
+        channel: str,
+        prompt: str | None = None,
+        *,
+        stage: str | None = None,
+        rounds: int | None = None,
+        context: Mapping[str, Any] | None = None,
+        kickoff: bool = True,
+    ) -> DiscussionOutcome:
+        """Run a discussion phase in `channel` with the channel's pacing and wait for its end.
+
+        - With `stage`, the phase starts with `checkpoint(stage, channel=…, phase=
+          "discussion")`, which opens channels with that `open_from`. The channel must be open.
+        - `rounds` mode: per round all members that are not `done` get a turn (parallel or
+          in order), prompt „Runde r von N …“ plus `prompt`. Ends after `rounds` rounds
+          (default 3), when nobody posted anything but `pass` in a round, or on stop.
+        - `event` mode: with `kickoff`, all members that are not `done` get `prompt` at once.
+          Then idle members are woken on `wake_on` events after `debounce_s`, at most
+          `max_wakeups_per_agent` times per channel; own messages and messages of the
+          orchestrator never wake; the ping-pong guard stops waking two agents that talk in
+          circles. Ends when nobody works, no wake-up is due and either all members are `done`
+          or nothing happened for `quiet_after_s` (messages and turn ends count).
+        - Wake-up turns get `stage` and `context` like the kick-off turns. Hints mid-turn and
+          the inbox work in and outside of discussions.
+        """
+        try:
+            config = self.config.channel(channel)
+        except KeyError:
+            raise ArrError(f"Den Kanal „{channel}“ gibt es in diesem Run nicht.") from None
+        if stage is not None:
+            await self.checkpoint(stage, channel=channel, phase="discussion")
+        if channel in self._waiting:
+            raise ArrError(
+                f"Der Kanal #{channel} ist noch geschlossen. Er öffnet ab Stufe "
+                f"„{config.open_from}“."
+            )
+        self.log.write("discussion_start", channel=channel, mode=config.mode.value, stage=stage)
+        outcome = await run_discussion(
+            self, channel, prompt, stage=stage, rounds=rounds, context=context, kickoff=kickoff
+        )
+        self.log.write(
+            "discussion_end",
+            channel=channel,
+            ended_by=outcome.ended_by.value,
+            rounds=outcome.rounds,
+            wakeups=outcome.wakeups,
+            turns=len(outcome.outcomes),
+        )
+        return outcome
+
+    # helpers for arr.runs.pacing
+
+    def agent_status(self, agent_id: str) -> AgentStatus:
+        """Current status of an agent (`done` once it reported so at the end of a turn)."""
+        return self._handles[agent_id].status
+
+    def is_busy(self, agent_id: str) -> bool:
+        """True while the agent has a turn running or waiting to start."""
+        return self._locks[agent_id].locked()
+
+    def last_message_id(self) -> int:
+        """Highest message ID in the room right now."""
+        newer = self.room.messages_after(self._last_seen)
+        return newer[-1].id if newer else self._last_seen
+
+    def sender_of(self, msg_id: int) -> str | None:
+        """Sender of a message (real ID), None if unknown."""
+        if msg_id not in self._senders:
+            with contextlib.suppress(ArrError):
+                self._senders[msg_id] = self.room.message(msg_id).sender
+        return self._senders.get(msg_id)
+
+    def wakeups(self, channel: str, agent_id: str) -> int:
+        """Automatic wake-ups of an agent in a channel so far."""
+        return self._wakeups.get((channel, agent_id), 0)
+
+    def count_wakeup(self, channel: str, agent_id: str) -> int:
+        """Count a wake-up (also in `room.sqlite agent_state.wakeups`); returns the new count."""
+        count = self._wakeups[(channel, agent_id)] = self.wakeups(channel, agent_id) + 1
+        self.room.add_wakeup(agent_id)
+        return count
+
+    def mark_delivered(self, msg_ids: Sequence[int], status: DeliveryStatus) -> None:
+        """Set the delivery state of the `user` messages among `msg_ids` (docs/08 §5.0)."""
+        for msg_id in msg_ids:
+            if self.sender_of(msg_id) == USER:
+                self.room.set_delivery(msg_id, status)
+
+    def listen(self, listener: _Listener) -> None:
+        """Register a discussion for new messages, turn ends and stops."""
+        self._listeners.append(listener)
+
+    def unlisten(self, listener: _Listener) -> None:
+        """Remove a registered discussion."""
+        with contextlib.suppress(ValueError):
+            self._listeners.remove(listener)
+
+    # ----------------------------------------------------------------------------------------
+    # Watching the room: hints, blocked agents, delivery state
+    # ----------------------------------------------------------------------------------------
+
+    async def watch(self) -> None:
+        """Poll the room until cancelled (the RunManager runs this as a task)."""
+        while True:
+            try:
+                self.poll()
+                await self.deliver_hints()
+            except Exception:
+                logger.exception("Beobachten des Gruppenchats fehlgeschlagen")
+            await asyncio.sleep(self.pacing.poll_interval_s)
+
+    def _recipients(self, msg: Message) -> list[str]:
+        if msg.channel in self._waiting:
+            return []
+        if msg.sender == ORCHESTRATOR:
+            return list(msg.to)
+        members = self.config.channel(msg.channel).members
+        return [m for m in members if m != msg.sender]
+
+    def poll(self) -> None:
+        """Take new messages: queue hints, tell discussions, set `user` delivery states."""
+        for msg in self.room.messages_after(self._last_seen):
+            self._last_seen = msg.id
+            self._senders[msg.id] = msg.sender
+            for agent_id in self._recipients(msg):
+                if agent_id in self._active:
+                    self._active[agent_id].pending.append(msg)
+            if msg.sender == USER:
+                self.room.set_delivery(msg.id, DeliveryStatus.NEXT_INBOX)
+            for listener in list(self._listeners):
+                listener.on_message(msg)
+        self._sync_blocked()
+
+    def _sync_blocked(self) -> None:
+        """`blocked` while a permission request of the agent waits (docs/06 §5.2)."""
+        waiting = {
+            item.agent_id for item in self.inbox.pending() if item.type is ApprovalType.PERMISSION
+        }
+        for agent_id, active in list(self._active.items()):
+            blocked = agent_id in waiting
+            if blocked != active.blocked:
+                active.blocked = blocked
+                status = AgentStatus.BLOCKED if blocked else AgentStatus.WORKING
+                self._set_status(self._handles[agent_id], status)
+
+    async def deliver_hints(self) -> None:
+        """Deliver queued hints to working agents within the `HintGate` (docs/06 §4)."""
+        for agent_id, active in list(self._active.items()):
+            if not active.pending or active.blocked or active.tool_calls < active.retry_at_calls:
+                continue
+            if not active.gate.allows(active.tool_calls):
+                continue
+            messages = list(active.pending)
+            text = compose_hint(agent_id, messages)
+            try:
+                delivered = await active.backend.deliver_hint(text)
+            except Exception:
+                logger.exception("Hinweis an %s fehlgeschlagen", agent_id)
+                delivered = False
+            if self._active.get(agent_id) is not active:
+                continue  # the turn ended meanwhile; the messages are in the next inbox
+            if not delivered:
+                active.retry_at_calls = active.tool_calls + 1
+                continue
+            active.gate.delivered(active.tool_calls)
+            del active.pending[: len(messages)]
+            ids = [m.id for m in messages]
+            self.log.write("hint", agent=agent_id, text=text, messages=ids)
+            self.mark_delivered(ids, DeliveryStatus.HINT_MID_TURN)
+
+    # ----------------------------------------------------------------------------------------
+    # Stop, limits, pause
+    # ----------------------------------------------------------------------------------------
+
+    def _start_halt(self, reason: StopReason, limit: LimitKind | None = None, **info: Any) -> None:
+        """Like `halt`, for sync code: the stop counts at once, the rest runs as a task."""
+        if self._stop_reason is not None:
+            return
+        self._stop_reason, self._limit = reason, limit
+        self._halt_task = asyncio.get_running_loop().create_task(self._halt(info))
+
+    async def halt(self, reason: StopReason, limit: LimitKind | None = None, **info: Any) -> None:
+        """Stop the run: cancel open approvals, then interrupt running turns (docs/01 §6).
+
+        After that `stop_requested` is true and every further turn returns at once (status
+        `interrupted` or `limit`). Pause waiters, profile waiters and discussions are released.
+        Safe to call more than once; only the first call counts.
+        """
+        if self._stop_reason is not None:
+            return
+        self._stop_reason, self._limit = reason, limit
+        await self._halt(info)
+
+    async def _halt(self, info: Mapping[str, Any]) -> None:
+        if self._limit is not None:
+            self.log.write("limit", limit=self._limit.value, **info)
+            note = _LIMIT_TEXT[self._limit]
+        else:
+            self.log.write("stop", reason=StopReason.USER.value, **info)
+            note = "Der Run wurde gestoppt."
+        self.inbox.cancel_all(note)  # before interrupt(): Codex ignores it while a handler waits
+        self._runnable.set()
+        self.halted.set()
+        for gate in self._gates.values():
+            gate.kick()
+        for listener in list(self._listeners):
+            listener.kick()
+        for agent_id, active in list(self._active.items()):
+            try:
+                await asyncio.wait_for(active.backend.interrupt(), INTERRUPT_TIMEOUT_S)
+            except Exception:
+                logger.exception("interrupt() von %s fehlgeschlagen", agent_id)
+
+    def pause(self, reason: str = "user") -> None:
+        """Let new turns wait (running turns go on); `reason` `user` or `escalation`."""
+        if self.stop_requested or reason in self._pause_reasons:
+            return
+        self._pause_reasons.add(reason)
+        self.log.write("pause", reason=reason)
+        if len(self._pause_reasons) == 1:
+            self._runnable.clear()
+            if self._on_pause is not None:
+                self._on_pause(True)
+
+    def resume(self, reason: str = "user") -> None:
+        """Lift a pause of this `reason`; the run goes on when no pause is left."""
+        if reason not in self._pause_reasons:
+            return
+        self._pause_reasons.discard(reason)
+        self.log.write("resume", reason=reason)
+        if not self._pause_reasons:
+            self._runnable.set()
+            if self._on_pause is not None and not self.stop_requested:
+                self._on_pause(False)
