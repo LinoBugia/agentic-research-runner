@@ -286,17 +286,71 @@ def test_run_detail_keeps_the_full_width(browser, base_url) -> None:  # noqa: AN
 
 
 def test_fresh_new_run_form_shows_no_red_field(browser, base_url) -> None:  # noqa: ANN001
-    """M2: nothing is red before you touch it; leaving the empty task shows its error."""
+    """M2 and W1-08.2 N2: nothing is red before you touch it. The deep link focuses the task;
+    moving on from there (Tab or a click elsewhere) is no touch. Your own focus is."""
     page = _page(browser)
     page.goto(base_url + "/neuer-run?skill=exploration&projekt=collatz")
     page.wait_for_selector("text=Noch offen (1)")
     assert page.locator(".field.invalid, [aria-invalid]").count() == 0
     page.wait_for_function("document.activeElement.tagName === 'TEXTAREA'", timeout=5000)
-    page.keyboard.press("Tab")  # the deep link focuses the task; leave it empty
+    page.keyboard.press("Tab")  # leave the focus the page put there
+    page.click("#inhalt h1")
+    page.wait_for_timeout(900)
+    assert page.locator(".field.invalid").count() == 0
+    assert page.locator("text=Noch offen (1)").count() == 1
+    page.click("[id='f-task_md'] textarea")  # now you focus it yourself and leave it empty
+    page.click("#inhalt h1")
     page.wait_for_selector("[id='f-task_md'].invalid", timeout=3000)
     page.wait_for_selector("text=1 Problem")
     page.fill("[id='f-task_md'] textarea", "# Aufgabe\n\nZwei Ideen prüfen.")
     page.wait_for_selector("[id='f-task_md']:not(.invalid)", timeout=3000)
+    page.close()
+
+
+def test_deep_link_focus_then_click_elsewhere_is_no_touch(browser, base_url) -> None:  # noqa: ANN001
+    """W1-08.2 N2: open „Neuer Run aus Skill“, click somewhere else: „Aufgabe“ stays neutral."""
+    page = _page(browser, (1280, 680))
+    page.goto(base_url + "/neuer-run?skill=proof-review&projekt=collatz")
+    page.wait_for_function("document.activeElement.tagName === 'TEXTAREA'", timeout=5000)
+    page.click("[id='f-name'] input")
+    page.wait_for_timeout(900)
+    assert page.locator("[id='f-task_md'].invalid").count() == 0
+    page.close()
+
+
+THEME_PAGES = ["/freigaben", "/runs", EXPLORE, "/", "/einrichtung"]
+
+
+def test_chosen_appearance_holds_on_every_page(browser, base_url) -> None:  # noqa: ANN001
+    """W1-08.2 U1: „dunkel“ from the settings holds on every page and after reloading, set
+    before the first paint; „wie macOS“ removes it again; `?theme=` wins."""
+    page = _page(browser)
+    page.goto(base_url + "/einstellungen#darstellung")
+    try:
+        page.click("label:has(input[name='appearance'][value='dark'])")
+        page.wait_for_function("document.documentElement.dataset.theme === 'dark'")
+        page.wait_for_timeout(500)  # saved
+        for path in THEME_PAGES:
+            page.goto(base_url + path)
+            assert page.evaluate("document.documentElement.getAttribute('data-theme')") == "dark"
+            # set by an inline script in <head>, before the body is painted: no light flash
+            inline = page.evaluate(
+                "[...document.head.querySelectorAll('script:not([src])')]"
+                ".some((s) => s.textContent.includes(\"'data-theme', 'dark'\"))"
+            )
+            assert inline, path
+        page.reload()
+        assert page.evaluate("document.documentElement.getAttribute('data-theme')") == "dark"
+        page.goto(base_url + "/runs?theme=light")
+        page.wait_for_function("document.documentElement.dataset.theme === 'light'")
+    finally:
+        page.goto(base_url + "/einstellungen#darstellung")
+        page.click("label:has(input[name='appearance'][value='system'])")
+        page.wait_for_function("!document.documentElement.hasAttribute('data-theme')")
+        page.wait_for_timeout(500)
+    for path in THEME_PAGES:
+        page.goto(base_url + path)
+        assert page.evaluate("document.documentElement.getAttribute('data-theme')") is None
     page.close()
 
 

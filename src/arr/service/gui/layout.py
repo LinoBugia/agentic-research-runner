@@ -14,6 +14,8 @@ from nicegui import ui
 from arr.permissions.types import ApprovalStatus
 from arr.service.api_client import ApiClient
 from arr.service.api_models import (
+    ApiException,
+    Appearance,
     ApprovalEvent,
     GlobalCounts,
     LiveEvent,
@@ -42,6 +44,26 @@ NAV = [
 EventHandler = Callable[[LiveEvent], Any]
 RESET_DATASET = "neu-starten"
 """Value of the entry „↺ … neu starten“ in the data set switch of the mock."""
+
+
+THEMES = {Appearance.LIGHT: "light", Appearance.DARK: "dark"}
+"""`data-theme` of the chosen appearance; „wie macOS“ sets none and follows the system."""
+
+
+async def apply_appearance(api: ApiClient) -> None:
+    """Set the appearance from the app settings while the page is built, so every page has it
+    from the first frame on (no light flash). `?theme=` of the URL wins (tests, arr.js)."""
+    api = getattr(api, "base", api)  # a forced page state does not apply here
+    try:
+        settings = await api.get_app_settings()
+    except ApiException:
+        return
+    theme = THEMES.get(settings.appearance)
+    if theme:
+        ui.add_head_html(
+            "<script>if (!new URLSearchParams(location.search).get('theme')) "
+            f"document.documentElement.setAttribute('data-theme', '{theme}');</script>"
+        )
 
 
 def tab_title(title: str, waiting: int) -> str:
@@ -158,7 +180,8 @@ class Frame:
         self.active = active
 
     async def start(self) -> "Frame":
-        """Load counters and workfolder, then follow the global live stream."""
+        """Load appearance, counters and workfolder, then follow the global live stream."""
+        await apply_appearance(self.api)
         self.counts = await self.api.get_counts()
         workfolder = await self.api.get_workfolder()
         self._render_counts()

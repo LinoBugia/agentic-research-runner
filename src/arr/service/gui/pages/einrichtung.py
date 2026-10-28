@@ -33,6 +33,7 @@ from arr.service.gui.components.copy_field import copy_html
 from arr.service.gui.components.form import Field, radio
 from arr.service.gui.components.page_state import state_api, use_screen_assets
 from arr.service.gui.components.toast import Toasts
+from arr.service.gui.layout import apply_appearance
 
 STEPS = ["Workfolder", "Zugänge", "Python-Umgebung", "Projekt", "Los geht's"]
 EXAMPLE = "collatz"
@@ -597,6 +598,7 @@ def register() -> None:
     async def einrichtung(schritt: int = 0, zustand: str = "") -> None:
         api = state_api(get_api(), zustand if zustand in ("leer",) else "")
         use_screen_assets()
+        await apply_appearance(api)  # the assistant has no frame (U1: every page)
         ui.page_title("Einrichtung – arr")
         step = schritt or (2 if zustand in ("laedt", "fehler") else 1)
         page = EinrichtungPage(api, step=step, zustand=zustand)

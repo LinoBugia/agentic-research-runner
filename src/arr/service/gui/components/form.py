@@ -3,8 +3,10 @@
 Label, optional mark, native input, help text, change mark „● geändert (Standard 6) ·
 zurücksetzen“, error text, locked state with a reason. Help and error are linked with
 `aria-describedby`. Values reach Python as strings on every input (pages debounce their
-checks, §5.4 „entprellt 500 ms“) and on leaving the field. A field counts as `touched` once it
-was left (K7 „Prüfung beim Verlassen“); pages show its error from then on.
+checks, §5.4 „entprellt 500 ms“) and on leaving the field. A field counts as `touched` once
+you left it (K7 „Prüfung beim Verlassen“); pages show its error from then on. A field the
+page focused by itself (deep link, marked `data-auto-focus`) is not touched by leaving it,
+only after you typed in it or put the focus there yourself.
 """
 
 import itertools
@@ -42,6 +44,24 @@ def _on_value(element: ui.element, handler: ChangeHandler, *, checkbox: bool = F
         element.on(kind, handle, js_handler=js)
 
 
+# blur: tell Python whether the focus had been set by the page and was never taken by you
+_BLUR_JS = (
+    "(e) => { const auto = e.target.dataset.autoFocus === '1'; "
+    "delete e.target.dataset.autoFocus; emit(auto); }"
+)
+
+
+def auto_focus_js(selector: str) -> str:
+    """JavaScript that focuses a field for you (deep link) without making it `touched`; a
+    click into it counts as your own focus."""
+    return (
+        f"arr.whenEl({selector!r}, (el) => {{ el.scrollIntoView({{block: 'center'}}); "
+        "el.dataset.autoFocus = '1'; "
+        "el.addEventListener('pointerdown', () => delete el.dataset.autoFocus, {once: true}); "
+        "el.focus({preventScroll: true}); })"
+    )
+
+
 class Field:
     """One labelled form field; `value` is always the current text of the input."""
 
@@ -69,6 +89,7 @@ class Field:
         self.name = name
         self.value = value
         self.touched = False
+        self._typed = False
         self.default = default
         self.default_text = default_text or default
         self.default_word = default_word
@@ -112,7 +133,7 @@ class Field:
             if locked:
                 self.input.props('disabled aria-disabled="true"')
             _on_value(self.input, self._changed)
-            self.input.on("blur", self._left)
+            self.input.on("blur", self._left, js_handler=_BLUR_JS)
             self.error = raw("", tag="span", classes="error").props(
                 f'id="{error_id}" aria-live="polite"'
             )
@@ -123,14 +144,17 @@ class Field:
 
     def _changed(self, value: str) -> Any:
         self.value = value
+        self._typed = True
         self._render_mark()
         if self._on_change is not None:
             return self._on_change(value)
         return None
 
-    def _left(self) -> Any:
+    def _left(self, event: Any) -> Any:
         if self.touched:
             return None
+        if event.args is True and not self._typed:
+            return None  # the page put the focus here and you only moved on (W1-08.2 N2)
         self.touched = True
         if self._on_leave is not None:
             return self._on_leave()
