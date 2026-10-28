@@ -39,7 +39,7 @@ from arr.service.gui import format as fmt
 from arr.service.gui.app import get_api
 from arr.service.gui.components.banner import empty_state_html
 from arr.service.gui.components.base import button, esc, icon, markdown_html, raw, set_disabled
-from arr.service.gui.components.form import Field, checkbox, radio
+from arr.service.gui.components.form import Field, auto_focus_js, checkbox, radio
 from arr.service.gui.components.page_state import (
     clean_href,
     load_into,
@@ -1506,7 +1506,4 @@ def register() -> None:
         await page.build()
         if skill and not (von or wie):
             # §4.3: the first empty field, scrolled into view (the task; name is optional)
-            frame.js(
-                "arr.whenEl('#f-task_md textarea', (el) => { el.scrollIntoView({block: 'center'});"
-                " el.focus({preventScroll: true}); })"
-            )
+            frame.js(auto_focus_js("#f-task_md textarea"))
