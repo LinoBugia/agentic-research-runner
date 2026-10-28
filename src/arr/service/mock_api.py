@@ -3932,6 +3932,9 @@ _ABN_PATTERNS = [
     (r"Mathe-Literatur", "Fachliteratur"),
     (r"oeis\.org", "primes.utm.edu"),
     (r"explorer", "scout"),
+    # plurals first, else „den Scoutn“, „Mehrere Scout“
+    (r"Explorern", "Scouts"),
+    (r"\b([Dd]ie|[Mm]ehrere|[Aa]lle) Explorer(?![\w-])", r"\1 Scouts"),
     (r"Explorer", "Scout"),
     (r"critic", "skeptic"),
     (r"Kritiker", "Skeptiker"),
