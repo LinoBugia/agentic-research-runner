@@ -521,12 +521,19 @@ class RunPaths:
 
     @property
     def attachments_dir(self) -> Path:
-        """Chat attachments, readable for all agents (docs/07 §3 ②)."""
+        """Chat attachments, `<kanal>/<msg-id>/` below (docs/06 §6)."""
         return self.run_dir / "groupchats" / "attachments"
+
+    def channel_attachments_dir(self, channel: str) -> Path:
+        """Attachments of one channel; readable for its members only (W2-01)."""
+        return self.attachments_dir / channel
 
     @property
     def skills_dir(self) -> Path:
-        """Snapshot of the skills used by the run (docs/02 §4); read-only for agents."""
+        """Snapshot of the skills used by the run (docs/02 §4); not readable for agents.
+
+        Agents see only their own skills: Claude in its plugin, Codex in `work/.agents/skills`.
+        """
         return self.run_dir / "skills"
 
     def plugin_dir(self, agent: AgentConfig) -> Path:
@@ -678,9 +685,10 @@ def profile_for(
     """Build the sandbox and read profile of an agent (docs/07 §3 ①, E19, docs/01 §4.1).
 
     Write roots: the work folder, Run-tmp and, with `run_venv: overlay`, the run venv.
-    Read allowlist: write roots, `output/`, chat attachments, `read_dirs`, the Python
-    environment (base venv, its installation prefix, `extra_path`), the run's `skills/`, the
-    agent's Claude plugin and paths of always-allow read rules. Read blocks: `~`, `/Volumes`
+    Read allowlist: write roots, `output/`, the attachments of the agent's own channels,
+    `read_dirs`, the Python environment (base venv, its installation prefix, `extra_path`),
+    the agent's Claude plugin and paths of always-allow read rules. The run's `skills/`
+    snapshot is not on the list (W2-01). Read blocks: `~`, `/Volumes`
     and the workfolder (other projects, other agents). `tools.web` switches the web tools
     on; always-allow host rules become allowed domains of the Claude sandbox.
     """
@@ -700,8 +708,9 @@ def profile_for(
     write_roots = [work_dir, tmp_dir] + ([norm(paths.venv_dir)] if run_venv else [])
 
     read_allow = list(write_roots)
-    read_allow += [norm(paths.output_dir), norm(paths.attachments_dir)]
-    read_allow += [norm(paths.skills_dir), norm(paths.plugin_dir(agent))]
+    read_allow.append(norm(paths.output_dir))
+    read_allow += [norm(paths.channel_attachments_dir(c)) for c in agent.channels]
+    read_allow.append(norm(paths.plugin_dir(agent)))
     for entry in agent.read_dirs:
         if entry.startswith("run:"):
             read_allow.append(norm(run_dir / entry.removeprefix("run:")))

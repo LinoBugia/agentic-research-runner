@@ -60,6 +60,7 @@ class Env:
             "model": "claude-sonnet-5-5",
             "auth": "max-privat",
             "read_dirs": ["~/Literatur", "run:shared/other", "projects/collatz"],
+            "channels": ["main"],
         }
         data.update(fields)
         return AgentConfig.model_validate(data)
@@ -95,7 +96,7 @@ def env(tmp_path: Path, arr_home: Path) -> Env:
         run / "shared" / "beweis",
         run / "shared" / "other",
         run / "output",
-        run / "groupchats" / "attachments" / "17",
+        run / "groupchats" / "attachments" / "main" / "17",
         run / "tmp",
         run / ".venv",
         arr_home,
@@ -148,7 +149,7 @@ def test_row_read_in_work_dir_run_and_read_dirs_is_allowed(env: Env) -> None:
         read(env.work / "notes.md"),
         read("notes.md"),
         read(env.run / "output" / "summary.md"),
-        read(env.run / "groupchats" / "attachments" / "17" / "plot.png"),
+        read(env.run / "groupchats" / "attachments" / "main" / "17" / "plot.png"),
         read("~/Literatur/paper.pdf"),
         read(env.run / "shared" / "other" / "lemma.tex"),
         read(env.workfolder / "projects" / "collatz", tool="Grep"),
@@ -1127,30 +1128,26 @@ def test_b1_normal_work_stays_allowed(env: Env, command: str) -> None:
 
 
 def test_b2_skills_and_plugin_are_readable_not_writable(env: Env) -> None:
-    skill = env.run / "skills" / "proof"
-    (skill / "scripts").mkdir(parents=True)
-    (skill / "SKILL.md").write_text("# proof\n")
-    (skill / "scripts" / "check.py").write_text("print('ok')\n")
+    # W2-01: the run's skills/ snapshot is not readable; Claude reads its plugin, Codex its
+    # copy in work/.agents/skills (prepare_run copies, it does not link).
     plugin = env.run / "agents" / "explorer-1" / "plugin" / "skills" / "proof"
     plugin.mkdir(parents=True)
-    (env.work / ".agents" / "skills").mkdir(parents=True)
-    (env.work / ".agents" / "skills" / "proof").symlink_to(skill)
+    (plugin / "SKILL.md").write_text("# proof\n")
+    copy = env.work / ".agents" / "skills" / "proof"
+    (copy / "scripts").mkdir(parents=True)
+    (copy / "scripts" / "check.py").write_text("print('ok')\n")
     profile = env.profile()
     engine = PolicyEngine([profile])
     claude, codex = claude_options(profile), codex_options(profile)
     linked = ".agents/skills/proof"
-    assert engine.evaluate(read(f"{linked}/SKILL.md")).action is ALLOW
     assert engine.evaluate(bash(f"python3 {linked}/scripts/check.py")).action is ALLOW
-    assert engine.evaluate(bash(f"cat {linked}/SKILL.md")).action is ALLOW
     assert engine.evaluate(read(plugin / "SKILL.md")).action is ALLOW
-    for path in (skill / "scripts" / "check.py", plugin / "SKILL.md"):
-        assert claude_sandbox_reads(claude, str(path))
-        assert not claude_sandbox_writes(claude, str(path))
-        assert codex_access(codex, str(path)) == "read"
-        assert claude_rule(claude.allowed_tools, "Read", str(path))
-        assert claude_rule(claude.disallowed_tools, "Edit", str(path))
-    assert engine.evaluate(write(f"{linked}/SKILL.md")).action is DENY
-    assert engine.evaluate(bash(f"echo x > {linked}/SKILL.md")).action is DENY
+    assert claude_sandbox_reads(claude, str(plugin / "SKILL.md"))
+    assert not claude_sandbox_writes(claude, str(plugin / "SKILL.md"))
+    assert codex_access(codex, str(plugin / "SKILL.md")) == "read"
+    assert claude_rule(claude.allowed_tools, "Read", str(plugin / "SKILL.md"))
+    assert claude_rule(claude.disallowed_tools, "Edit", str(plugin / "SKILL.md"))
+    assert engine.evaluate(write(plugin / "SKILL.md")).action is DENY
 
 
 # B2 / 4: no secret in always rules
@@ -1556,3 +1553,48 @@ def test_w201_n10_further_forms_are_denied(env: Env, command: str) -> None:
 def test_w201_n10_bare_data_programs_stay_exempt(env: Env, command: str) -> None:
     decision = env.engine().evaluate(bash(command))
     assert decision.action is ALLOW, (command, decision.reason)
+
+
+# --------------------------------------------------------------------------------------------
+# W2-01 / A3: no run skills snapshot, attachments of own channels only
+# --------------------------------------------------------------------------------------------
+
+
+def test_w201_run_skills_snapshot_is_not_readable(env: Env) -> None:
+    snapshot = env.run / "skills" / "proof" / "SKILL.md"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text("# proof\n")
+    for provider in ("claude", "codex"):
+        profile = env.profile(env.agent(provider=provider))
+        engine = PolicyEngine([profile])
+        assert not profile.can_read(snapshot)
+        assert engine.evaluate(read(snapshot, provider=provider)).action is ASK
+        assert engine.evaluate(bash(f"cat {snapshot}", provider=provider)).action is DENY
+        if provider == "claude":
+            options = claude_options(profile)
+            assert not claude_rule(options.allowed_tools, "Read", str(snapshot))
+            assert str(env.run / "skills") not in options.sandbox["filesystem"]["allowRead"]
+        else:
+            assert codex_access(codex_options(profile), str(snapshot)) == "deny"
+
+
+def test_w201_attachments_only_of_own_channels(env: Env) -> None:
+    attachments = env.run / "groupchats" / "attachments"
+    own = attachments / "beweis" / "17" / "lemma.pdf"
+    foreign = attachments / "kritik" / "18" / "notiz.md"
+    profile = env.profile(env.agent(channels=["main", "beweis"]))
+    engine = PolicyEngine([profile])
+    claude, codex = claude_options(profile), codex_options(profile)
+    allow_read = claude.sandbox["filesystem"]["allowRead"]
+    assert str(attachments / "main") in allow_read and str(attachments / "beweis") in allow_read
+    assert str(attachments) not in allow_read
+    assert profile.can_read(own) and not profile.can_read(foreign)
+    assert engine.evaluate(read(own)).action is ALLOW
+    assert engine.evaluate(bash(f"cat {own}")).action is ALLOW
+    assert engine.evaluate(read(foreign)).action is ASK
+    assert engine.evaluate(bash(f"cat {foreign}")).action is DENY
+    assert claude_rule(claude.allowed_tools, "Read", str(own))
+    assert not claude_rule(claude.allowed_tools, "Read", str(foreign))
+    assert codex_access(codex, str(own)) == "read" and codex_access(codex, str(foreign)) == "deny"
+    none = env.profile(env.agent(channels=[]))
+    assert not none.can_read(own)
