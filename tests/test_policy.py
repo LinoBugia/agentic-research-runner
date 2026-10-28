@@ -1398,7 +1398,7 @@ def test_w1052_b1_download_into_a_shell_stays_high_risk(
         "head -n 5 security.md && wc -l profiles.txt",
         "ls profiles && touch port.txt",
         "printf '%s\\n' halt reboot",
-        "python3 analyze.py --keyword sudo",
+        "python3 analyze.py",
         "git status; grep -n push notes.md",
         "less security.md",
     ],
@@ -1494,3 +1494,65 @@ def test_w1052_b3_no_reason_starts_with_whitespace(env: Env) -> None:
 def test_w1052_b3_more_histories_are_sensitive(env: Env, path: str) -> None:
     decision = env.engine().evaluate(read(path))
     assert decision.action is DENY and "geschützt" in decision.reason
+
+
+# --------------------------------------------------------------------------------------------
+# W2-01 / N10: the data exemption holds only for bare names the command cannot replace
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "./cat sudo ls",
+        "./grep git push",
+        "/tmp/cat sudo ls",
+        "../../../.venv/bin/cat sudo ls",
+        "PATH=.:$PATH cat sudo ls",
+        "export PATH=.:$PATH; cat sudo ls",
+        "echo sudo ls > a && chmod +x a && ./a",
+        "python3 x.py sudo ls",
+    ],
+)
+def test_w201_n10_review_forms_are_denied(env: Env, command: str) -> None:
+    for provider in ("claude", "codex"):
+        engine = env.engine(env.profile(env.agent(provider=provider)))
+        request = bash(command, provider=provider)
+        assert engine.evaluate(request).action is DENY, (command, provider)
+        assert engine.hard_deny(request) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "PATH=. bash -c 'cat sudo ls'",
+        "path=(. $path); cat sudo ls",
+        "env PATH=. cat sudo ls",
+        "PATH+=:.; grep git push",
+        "eval 'export PATH=.'; cat sudo ls",
+        "printf x > ../../../.venv/bin/cat; chmod +x ../../../.venv/bin/cat; cat sudo ls",
+        "ln -s /bin/bash ../../../.venv/bin/grep; grep -c 'sudo ls'",
+        "cp /bin/sh cat; chmod +x cat; ./cat -c 'git push'",
+        "alias cat=bash; cat -c 'sudo ls'",
+        "hash -p /bin/bash cat; cat -c 'sudo ls'",
+        "python3 -u x.py git push",
+    ],
+)
+def test_w201_n10_further_forms_are_denied(env: Env, command: str) -> None:
+    assert env.engine().evaluate(bash(command)).action is DENY, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat sudo",
+        "grep -rn sudo notes.md",
+        "python3 analyze.py",
+        "echo x > out.txt; cat out.txt",
+        "echo 'print(1)' > solve.py && python3 solve.py",
+        "ls profiles && touch port.txt",
+    ],
+)
+def test_w201_n10_bare_data_programs_stay_exempt(env: Env, command: str) -> None:
+    decision = env.engine().evaluate(bash(command))
+    assert decision.action is ALLOW, (command, decision.reason)

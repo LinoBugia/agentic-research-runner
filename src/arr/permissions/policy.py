@@ -952,7 +952,10 @@ None of them runs a command given as an argument, so words in their arguments ar
 checked by the fail-closed net (W1-05.2). `rg`, `man` and `python <file>` count as well,
 unless an option makes them run something (see `_DATA_UNSAFE_OPTIONS`, `_python_runs_file`).
 Everything else (`-c`, `eval`, `exec`, `xargs`, `find -exec`, `env`, interpreters with
-`-c`/`-e`, unknown programs) stays under the net.
+`-c`/`-e`, unknown programs) stays under the net. The exemption holds only for bare program
+names and only while the command cannot have replaced the program (W2-01, N10): not for
+`./cat` or `/tmp/cat`, not after a `PATH` change, `alias` or `hash`, and not when the
+command writes or `chmod`s a file named like one of the programs it calls.
 """
 
 _DATA_UNSAFE_OPTIONS: Mapping[str, tuple[str, ...]] = {
@@ -961,6 +964,12 @@ _DATA_UNSAFE_OPTIONS: Mapping[str, tuple[str, ...]] = {
 }
 
 _PYTHON_FLAGS = frozenset({"-u", "-B", "-O", "-OO", "-E", "-s", "-S", "-I", "-q", "-b", "-bb"})
+
+_PATH_ASSIGN_RE = re.compile(r"^(?:PATH|path)\+?=")
+"""`PATH=…`, `PATH+=…` and zsh's tied `path=(…)`, also after `export`, `env`, `declare`."""
+
+_REWIRING_PROGRAMS = frozenset({"alias", "hash", "enable"})
+"""Builtins that change which program a bare name runs."""
 
 _FEEDABLE = _SHELLS | frozenset({"eval", "source", ".", "python", "perl", "ruby", "node", "php"})
 """Programs that run what they read: a download piped into one of them is high risk."""
@@ -995,6 +1004,8 @@ class CommandInfo:
     feeds_stdin: bool = False
     script_file: bool = False
     strict: int = 0
+    rewires: bool = False
+    made_executable: list[str] = field(default_factory=list)
 
     def ban(self, reason: str, category: RequestCategory | None = None) -> None:
         if reason not in self.forbidden:
@@ -1011,6 +1022,8 @@ class CommandInfo:
         self.user_install = self.user_install or other.user_install
         self.programs += other.programs
         self.program_hits |= other.program_hits
+        self.rewires = self.rewires or other.rewires
+        self.made_executable += other.made_executable
 
 
 def _tokens(command: str) -> tuple[list[str], bool]:
@@ -1182,11 +1195,12 @@ def _shell_script(args: list[str]) -> tuple[str | None, bool]:
 
 
 def _python_runs_file(args: list[str]) -> bool:
-    """`python [flags] <file> …`: runs a file; `-c`, `-m`, `-` or stdin do not count."""
-    for arg in args:
+    """`python [flags] <file>`: runs a file; `-c`, `-m`, `-`, stdin or further arguments
+    (the script may run its `argv`, W2-01 N10) do not count."""
+    for index, arg in enumerate(args):
         if arg in _PYTHON_FLAGS:
             continue
-        return not arg.startswith("-")
+        return not arg.startswith("-") and index == len(args) - 1
     return False
 
 
@@ -1225,6 +1239,8 @@ def _downloads(text: str) -> bool:
 
 def _classify_argv(argv: list[str], info: CommandInfo, depth: int) -> None:
     """Classify one simple command into `info` (a fresh info per segment)."""
+    if any(_PATH_ASSIGN_RE.match(token) for token in argv):
+        info.rewires = True
     argv = _unwrap(_take_redirections(argv, info), info, depth)
     if not argv:
         return
@@ -1240,7 +1256,11 @@ def _classify_argv(argv: list[str], info: CommandInfo, depth: int) -> None:
         info.program_hits.add(name)
         info.ban(_forbidden_call(name), _BAN_CATEGORIES[FORBIDDEN_PROGRAMS[name]])
         return
-    if _data_only(name, args):
+    if name in _REWIRING_PROGRAMS:
+        info.rewires = True
+    elif name == "chmod":
+        info.made_executable += [a for a in args[1:] if not a.startswith(("-", "+"))]
+    if "/" not in argv[0] and _data_only(name, args):
         info.safe_args += args
     for command in _option_commands(name, args):
         # `man -P …`, `rg --pre …`: the option value is a command of its own.
@@ -1441,7 +1461,27 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
     return "\n".join(kept), docs
 
 
+def _replaces_programs(info: CommandInfo) -> bool:
+    """Whether a bare program name may run something else (W2-01, N10).
+
+    True after a `PATH` change, `alias`/`hash`, or when the command writes or `chmod`s a file
+    named like a program it calls (`> .venv/bin/cat; cat …`, `> a && chmod +x a && ./a`).
+    """
+    made = {_program(path) for path in (*info.writes, *info.made_executable)}
+    return info.rewires or bool(made & set(info.programs))
+
+
 def _classify(command: str, info: CommandInfo, depth: int) -> None:
+    trial = CommandInfo(strict=info.strict)
+    _classify_once(command, trial, depth, rewired=False)
+    if _replaces_programs(trial):
+        # No data exemption, and quoted text counts as a possible command (`alias cat=bash`).
+        trial = CommandInfo(strict=info.strict + 1)
+        _classify_once(command, trial, depth, rewired=True)
+    info.merge(trial)
+
+
+def _classify_once(command: str, info: CommandInfo, depth: int, *, rewired: bool) -> None:
     if depth > _MAX_DEPTH:
         info.ban(_R_TOO_DEEP + _ALTERNATIVE)
         return
@@ -1495,7 +1535,7 @@ def _classify(command: str, info: CommandInfo, depth: int) -> None:
         or "<<<" in tokens
     )
     _net(tokens if strict else _without(tokens, exempt), info)
-    if feeds_stdin or "<<<" in tokens:
+    if feeds_stdin or rewired or "<<<" in tokens:
         # `echo 'sudo ls' | sh`, `sh <<< '…'`: any quoted text may become a script.
         info.strict += 1
         for token in tokens:
