@@ -180,16 +180,21 @@ def invalid_fields(user: User) -> list[str]:
 
 
 async def test_fresh_new_run_form_has_no_red_field(api: MockApi) -> None:
-    """M2: fresh form neutral („Noch offen“), the error shows once the field was left."""
+    """M2: fresh form neutral („Noch offen“), the error shows once you left the field; a focus
+    set by the page counts only after you typed (W1-08.2 N2)."""
     async with gui_user(api) as user:
         await user.open("/neuer-run?skill=exploration&projekt=collatz")
         html = await see(user, "Noch offen (1)")
         assert "Die Aufgabe fehlt." in html and "1 Problem" not in html
         assert invalid_fields(user) == []
+        # W1-08.2 N2: the deep link put the focus there, you moved on without typing
+        user.find(marker="field-task_md").trigger("blur", True)
+        await asyncio.sleep(0.3)
+        assert invalid_fields(user) == [] and "Noch offen (1)" in page_html(user)
         user.find(marker="field-task_md").trigger("input", "# Aufgabe\n\n")
         await asyncio.sleep(0.7)
         assert invalid_fields(user) == []  # typing alone does not make it red
-        user.find(marker="field-task_md").trigger("blur")
+        user.find(marker="field-task_md").trigger("blur", True)  # typed, then left: touched
         await see(user, "1 Problem")
         assert invalid_fields(user) == ["f-task_md"]
         user.find(marker="field-task_md").trigger("input", "# Aufgabe\n\nZwei Ideen prüfen.")
@@ -605,9 +610,8 @@ FORBIDDEN = re.compile(
 )
 
 
-async def test_acceptance_data_set_has_its_own_names_and_contents() -> None:
-    """docs/08 §9.2 Nr. 3: same structure as the scenario, other names and contents."""
-    api = MockApi(Dataset.ACCEPTANCE)
+async def acceptance_texts(api: MockApi) -> list[str]:
+    """All texts the acceptance data set shows: lists, details, live stream, skill files."""
     texts = [
         (await api.get_workfolder()).model_dump_json(),
         *(w.model_dump_json() for w in await api.list_warnings()),
@@ -641,6 +645,17 @@ async def test_acceptance_data_set_has_its_own_names_and_contents() -> None:
     texts.append(api.simulate_new_approval().model_dump_json())
     for agent in await api.list_agents(ABN_EXPLORE):
         texts.append((await api.get_transcript(ABN_EXPLORE, agent.id)).model_dump_json())
+    for skill in await api.list_skills():
+        texts.append((await api.get_skill(skill.name)).model_dump_json())
+        for path in skill.files:
+            texts.append((await api.get_skill_file(skill.name, path)).model_dump_json())
+    return texts
+
+
+async def test_acceptance_data_set_has_its_own_names_and_contents() -> None:
+    """docs/08 §9.2 Nr. 3: same structure as the scenario, other names and contents."""
+    api = MockApi(Dataset.ACCEPTANCE)
+    texts = await acceptance_texts(api)
     leftovers = {m.group(0) for text in texts for m in FORBIDDEN.finditer(text)}
     assert not leftovers
     # the contents of docs/08 §9.2
@@ -669,6 +684,14 @@ async def test_acceptance_data_set_has_its_own_names_and_contents() -> None:
     assert storage.suggestion and fmt.size(storage.suggestion.freed_bytes) == "11,2 GB"
     agents = {a.id for a in await api.list_agents(ABN_EXPLORE)}
     assert agents == {"scout-1", "scout-2", "scout-gpt", "skeptic", "ranker"}
+
+
+async def test_acceptance_plurals_of_scout_are_german() -> None:
+    """N1: „Explorern“ becomes „Scouts“, not „Scoutn“; plural „die Scouts“, not „die Scout“."""
+    texts = "\n".join(await acceptance_texts(MockApi(Dataset.ACCEPTANCE)))
+    assert not re.findall(r"\w*scoutn\b", texts, flags=re.I)
+    assert not re.findall(r"\b(?:die|mehrere|alle) Scout(?![\w-])", texts, flags=re.I)
+    assert "Austausch zwischen den Scouts" in texts
 
 
 async def test_forced_states_of_the_mock() -> None:
