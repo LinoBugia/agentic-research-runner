@@ -8,7 +8,7 @@
 ## Befehle
 
 ```bash
-uv sync                      # Umgebung inkl. dev-Gruppe; Spikes: uv sync --group spikes
+uv sync                      # Umgebung inkl. dev-Gruppe
 uv run pytest                # Tests (ohne live)
 uv run ruff check            # Linter
 uv run ruff format           # Formatieren (CI prüft mit --check)
@@ -33,4 +33,4 @@ Vor jedem Commit: `uv run pytest && uv run ruff check && uv run ruff format --ch
 - `src/arr/templates/` – Vorlagen für Workfolder, Projekte, Vollmachten, Start-Skills (Paketdaten, gelesen über `importlib.resources`)
 - `tests/` – pytest, `asyncio_mode = "auto"`
 - `spikes/` – Wegwerf-Code, siehe [spikes/README.md](spikes/README.md); wird nie von `arr` importiert
-- Laufzeit-Abhängigkeiten bewusst klein halten. Agent-SDKs liegen vorerst nur in der Gruppe `spikes`; `mcp` und NiceGUI sind Laufzeit-Abhängigkeiten.
+- Laufzeit-Abhängigkeiten bewusst klein halten. Seit Welle 2 sind `claude-agent-sdk`, `openai-codex` (exakt gepinnt, Änderung nur über den Lead) und `keyring` Laufzeit-Abhängigkeiten, neben `mcp` und NiceGUI. Neue Abhängigkeiten nur nach Rücksprache mit dem Lead (gemeinsame `uv.lock`).
