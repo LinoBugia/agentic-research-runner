@@ -276,6 +276,11 @@ def _message(error: Mapping[str, Any]) -> str:
         return f"Falscher Typ: erwartet eine ganze Zahl, gefunden {_describe(value)}."
     if kind in ("float_type", "float_parsing", "finite_number"):
         return f"Falscher Typ: erwartet eine Zahl, gefunden {_describe(value)}."
+    if kind in ("time_delta_type", "time_delta_parsing"):
+        return (
+            f"Ungültige Dauer {_describe(value)}. Schreibe sie z. B. als „2h“, „90m“, „1h30m“ "
+            "oder „45s“ oder als Zahl in Sekunden."
+        )
     if kind in ("bool_type", "bool_parsing"):
         return f"Falscher Typ: erwartet true oder false, gefunden {_describe(value)}."
     if kind in ("string_type", "string_sub_type"):
@@ -621,6 +626,26 @@ class _Disabled:
         return any(fnmatchcase(candidate, pattern) for candidate in candidates)
 
 
+def _count_param(spec: AgentSpec) -> str | None:
+    """Name of the parameter in `count: "{{ params.<name> }}"`, else None."""
+    if not isinstance(spec.count, str):
+        return None
+    match = PLACEHOLDER_RE.fullmatch(spec.count.strip())
+    return _param_name(match.group(1)) if match else None
+
+
+def _count_issue(issue: ConfigIssue, name: str, value: Any) -> ConfigIssue:
+    """A `count` error caused by a parameter names the parameter (W1-01.1 review N2)."""
+    if not issue.path.endswith(".count"):
+        return issue
+    return ConfigIssue(
+        issue.path,
+        f"Parameter „{name}“ = {_describe(value)} wird als „count“ benutzt und muss eine ganze "
+        f"Zahl von 0 bis {MAX_COUNT} sein. Ändere den Wert von „{name}“.",
+        issue.line,
+    )
+
+
 def _resolve_agents(
     specs: Sequence[AgentSpec],
     source: str,
@@ -640,10 +665,16 @@ def _resolve_agents(
         data = _substitute(_dump(original), params, loc, issues)
         if len(issues) > before:
             continue
+        count_param = _count_param(original)
+        if count_param and isinstance(data.get("count"), float) and data["count"].is_integer():
+            data["count"] = int(data["count"])  # `judges: 2.0` is 2 replicas
         try:
             spec = AgentSpec.model_validate(data)
         except ValidationError as exc:
-            issues += validation_issues(exc, prefix=loc)
+            found = validation_issues(exc, prefix=loc)
+            if count_param:
+                found = [_count_issue(i, count_param, data.get("count")) for i in found]
+            issues += found
             continue
         when_issue = _check_when(spec, params, loc)
         if when_issue:
@@ -861,6 +892,9 @@ def _resolve_stages(
         except ValidationError as exc:
             issues += validation_issues(exc, prefix=loc)
             continue
+        if stage.agent in active:
+            resolved.append(stage)
+            continue
         if stage.agent in disabled:
             issues.append(
                 ConfigIssue(
@@ -869,8 +903,7 @@ def _resolve_stages(
                     "„count“ ausgeschaltet ist. Passe die Bedingung an oder entferne die Stufe.",
                 )
             )
-            continue
-        if stage.agent not in active:
+        else:
             issues.append(
                 ConfigIssue(
                     format_loc((*loc, "agent")),
@@ -878,8 +911,6 @@ def _resolve_stages(
                     f"Vorhanden: {', '.join(active)}.",
                 )
             )
-            continue
-        resolved.append(stage)
     if issues:
         raise ConfigError(issues, source=source)
     return resolved

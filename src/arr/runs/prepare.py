@@ -192,7 +192,11 @@ class PreparedAgent:
 
 @dataclass(frozen=True, slots=True)
 class PreparedRun:
-    """Result of `prepare_run`."""
+    """Result of `prepare_run`.
+
+    `resolved` is the configuration of `run.yaml` with `task_file="task.md"`, but unlike the
+    file on disk (`task: null`) it carries the text of `task.md` in `task` for the topologies.
+    """
 
     run_id: str
     run_dir: Path
@@ -1096,7 +1100,7 @@ def _build_run(
         run_id=run_id,
         run_dir=run_dir,
         meta=meta,
-        resolved=stored,
+        resolved=stored.model_copy(update={"task": plan.task_text}),
         agents=agents,
         warnings=log.warnings,
     )
