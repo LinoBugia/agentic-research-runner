@@ -43,7 +43,7 @@ from arr.room.store import RESULTS_DIR, ROOM_DIR, RoomStore
 from arr.room.types import Rating, Result
 from arr.runs.eventlog import write_transcript_md
 from arr.runs.orchestrator import ORCHESTRATOR_LOG, OrchestratorLog
-from arr.runs.prepare import PreparedRun, RunMeta, load_run_meta
+from arr.runs.prepare import AgentFile, PreparedRun, RunMeta, load_run_meta
 from arr.usage import RunUsage, UsageTotal, compute_run_usage, write_usage_json
 
 __all__ = ["DiffResult", "changes_diff", "finalize_run"]
@@ -56,8 +56,10 @@ SUMMARY_FILE = "output/summary.md"
 RESULTS_JSON = "output/results.json"
 RATINGS_JSON = "output/ratings.json"
 SUMMARY_KIND = "summary"
-MAX_DIFF_BYTES = 2 * 1024 * 1024
-"""Files larger than this are listed as changed without a line diff."""
+MAX_DIFF_BYTES = 256 * 1024
+"""Files larger than this are listed as changed without a line diff (difflib is slow)."""
+MAX_DIFF_LINES = 10_000
+"""Files with more lines than this (on either side) get no line diff either."""
 _SNIFF_BYTES = 8192
 
 _STATUS_TEXT = {
@@ -175,9 +177,12 @@ class DiffResult:
 
 @dataclass(frozen=True, slots=True)
 class _Entry:
-    kind: str  # "file" | "link"
+    kind: str  # "file" | "link" | "unreadable_dir" | "unreadable"
     path: Path
     target: str | None = None
+
+
+_UNREADABLE = ("unreadable_dir", "unreadable")
 
 
 def _excluded(rel: str, exclude: Sequence[str]) -> bool:
@@ -185,24 +190,35 @@ def _excluded(rel: str, exclude: Sequence[str]) -> bool:
 
 
 def _scan(root: Path | None, exclude: Sequence[str]) -> dict[str, _Entry]:
-    """Files and symlinks below `root` by POSIX path, without following any link."""
+    """Files and symlinks below `root` by POSIX path, without following any link.
+
+    A folder or entry that cannot be read is recorded as `unreadable_dir` / `unreadable`
+    (the root as `.`) instead of raising.
+    """
     found: dict[str, _Entry] = {}
     if root is None or not root.is_dir() or root.is_symlink():
         return found
 
     def walk(folder: Path, rel: str) -> None:
-        with os.scandir(folder) as scan:
-            entries = sorted(scan, key=lambda e: e.name)
+        try:
+            with os.scandir(folder) as scan:
+                entries = sorted(scan, key=lambda e: e.name)
+        except OSError:
+            found[rel or "."] = _Entry("unreadable_dir", folder)
+            return
         for entry in entries:
             rel_path = f"{rel}/{entry.name}" if rel else entry.name
             if _excluded(rel_path, exclude):
                 continue
-            if entry.is_symlink():
-                found[rel_path] = _Entry("link", Path(entry.path), os.readlink(entry.path))
-            elif entry.is_dir(follow_symlinks=False):
-                walk(Path(entry.path), rel_path)
-            elif entry.is_file(follow_symlinks=False):
-                found[rel_path] = _Entry("file", Path(entry.path))
+            try:
+                if entry.is_symlink():
+                    found[rel_path] = _Entry("link", Path(entry.path), os.readlink(entry.path))
+                elif entry.is_dir(follow_symlinks=False):
+                    walk(Path(entry.path), rel_path)
+                elif entry.is_file(follow_symlinks=False):
+                    found[rel_path] = _Entry("file", Path(entry.path))
+            except OSError:
+                found[rel_path] = _Entry("unreadable", Path(entry.path))
 
     walk(root, "")
     return found
@@ -237,6 +253,13 @@ def _lines(text: str) -> list[str]:
 
 def _file_diff(rel: str, old: _Entry | None, new: _Entry | None) -> str:
     """Diff of one regular file; `None` side = file did not exist."""
+    try:
+        return _readable_file_diff(rel, old, new)
+    except OSError:
+        return f"Datei nicht lesbar: {rel}\n"
+
+
+def _readable_file_diff(rel: str, old: _Entry | None, new: _Entry | None) -> str:
     old_data, old_size = _read(old.path) if old else (b"", 0)
     new_data, new_size = _read(new.path) if new else (b"", 0)
     if (
@@ -255,6 +278,8 @@ def _file_diff(rel: str, old: _Entry | None, new: _Entry | None) -> str:
     if old_text is None or new_text is None:
         return f"Binärdatei {what}: {rel}\n"
     old_lines, new_lines = _lines(old_text), _lines(new_text)
+    if max(len(old_lines), len(new_lines)) > MAX_DIFF_LINES:
+        return f"Datei {what} (zu groß für einen Zeilen-Diff): {rel}\n"
     diff = "".join(
         difflib.unified_diff(
             old_lines,
@@ -288,8 +313,17 @@ def changes_diff(base: Path | None, work: Path, exclude: Sequence[str] = ()) -> 
     new = _scan(work, exclude)
     parts: list[str] = []
     hints: list[str] = []
+    unreadable = sorted(
+        rel for side in (old, new) for rel, e in side.items() if e.kind == "unreadable_dir"
+    )
     for rel in sorted(old.keys() | new.keys()):
+        if any(rel != d and (d == "." or rel.startswith(d + "/")) for d in unreadable):
+            continue  # inside a folder one side cannot read: no false "new"/"deleted"
         a, b = old.get(rel), new.get(rel)
+        if (a and a.kind in _UNREADABLE) or (b and b.kind in _UNREADABLE):
+            what = "Ordner" if "unreadable_dir" in (a and a.kind, b and b.kind) else "Datei"
+            parts.append(f"{what} nicht lesbar: {rel}\n")
+            continue
         if a and a.kind == "link" and b is None and not os.path.exists(a.path):
             hints.append(
                 f"Der Symlink „{rel}“ zeigt in base/ auf eine durch „copy_exclude“ ausgeschlossene "
@@ -394,12 +428,23 @@ class _Finalizer:
         for agent in self.prepared.agents.values():
             work = agent.work_dir
             if work not in cache:
-                empty = agent.file.config.workspace.mode is WorkspaceMode.EMPTY
-                base = None if empty else self.run_dir / "base"
-                cache[work] = changes_diff(base, work, agent.file.generated_paths)
-                self.hints += cache[work].hints
+                cache[work] = self._diff_of(agent.file, work)
             if agent.agent_dir.is_dir():
                 _write_text(agent.agent_dir / DIFF_FILE, cache[work].text)
+
+    def _diff_of(self, file: AgentFile, work: Path) -> DiffResult:
+        """The diff of one working folder; an error stays with this folder."""
+        empty = file.config.workspace.mode is WorkspaceMode.EMPTY
+        base = None if empty else self.run_dir / "base"
+        try:
+            result = changes_diff(base, work, file.generated_paths)
+        except Exception as exc:
+            logger.exception("changes.diff für %s fehlgeschlagen", file.work_dir)
+            self.failures.append(f"changes.diff für {file.work_dir}: {type(exc).__name__}")
+            self._log_failure(f"changes.diff für {file.work_dir}", exc)
+            return DiffResult(f"Änderungen nicht ermittelbar ({type(exc).__name__}).\n")
+        self.hints += result.hints
+        return result
 
     def _results(self) -> None:
         by_result: dict[int, list[Rating]] = {}
@@ -577,12 +622,16 @@ class _Finalizer:
         return lines
 
     def _hints(self, entries: Sequence[Mapping[str, Any]]) -> list[str]:
-        prepare = [
+        logged = [
             str(e["data"].get("message"))
             for e in entries
-            if e["kind"] == "warning" and e["data"].get("message")
+            if e["data"].get("message")
+            and (
+                e["kind"] == "warning"
+                or (e["kind"] == "error" and e["data"].get("where") == "topology")
+            )
         ]
-        hints = [*dict.fromkeys([*prepare, *self.hints])]
+        hints = [*dict.fromkeys([*logged, *self.hints])]
         failures = [f"Schritt des Finalizers gescheitert: {f}" for f in self.failures]
         if not hints and not failures:
             return []
@@ -591,13 +640,17 @@ class _Finalizer:
 
 def _usage_line(label: str, total: UsageTotal) -> str:
     usage = total.usage
-    parts = [f"{total.turns} Turns", f"{usage.input or 0} Tokens ein", f"{usage.output or 0} aus"]
+    parts = [
+        _count(total.turns, "Turn", "Turns"),
+        f"{usage.input or 0} Tokens ein",
+        f"{usage.output or 0} aus",
+    ]
     if total.cost_billed_usd:
         parts.append(f"{_number(total.cost_billed_usd)} $ abgerechnet")
     if total.cost_estimated_usd:
         parts.append(f"≈ {_number(total.cost_estimated_usd)} $ rechnerisch")
     if total.cost_unknown_turns:
-        parts.append(f"{total.cost_unknown_turns} Turns ohne Kosten")
+        parts.append(_count(total.cost_unknown_turns, "Turn", "Turns") + " ohne Kosten")
     return f"- {label}: " + ", ".join(parts)
 
 
@@ -633,7 +686,9 @@ def _status_and_reason(
 ) -> tuple[RunStatus, str]:
     """Final status as the RunManager will set it, and the reason in German."""
     errors = [
-        e["data"] for e in entries if e["kind"] == "error" and e["data"].get("where") != "finalizer"
+        e["data"]
+        for e in entries
+        if e["kind"] == "error" and e["data"].get("where") not in ("finalizer", "topology")
     ]
     stops = [e["data"] for e in entries if e["kind"] == "stop"]
     limits = [e["data"] for e in entries if e["kind"] == "limit"]

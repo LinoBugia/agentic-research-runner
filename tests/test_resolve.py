@@ -660,5 +660,8 @@ def test_w2_04_timeout_null_has_a_german_message(settings: WorkfolderSettings) -
     with pytest.raises(ConfigError) as info:
         resolve_run(run, None, settings)
     assert info.value.path == "approvals.timeout"
-    assert info.value.issue_message.startswith("Ungültige Dauer leer.")
+    assert info.value.issue_message == (
+        "Die Dauer fehlt. Gib sie z. B. als „2h“, „90m“, „1h30m“ oder „45s“ an oder als Zahl "
+        "in Sekunden."
+    )
     assert "valid" not in info.value.issue_message

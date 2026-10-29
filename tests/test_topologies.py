@@ -415,7 +415,7 @@ async def test_waterfall_context_package_ratings_and_rework(workfolder: Path) ->
     manager = waterfall(workfolder, scripts, recorder=recorder)
     assert await run(manager) is RunStatus.DONE
 
-    plan = checkpoints(manager, "plan")[-1]
+    [plan] = checkpoints(manager, "plan")  # W2-04.1 B4: only the RunManager writes it
     assert plan["stages"] == ["skizze", "beweis"]
     first, second = recorder.of("p", "skizze")
     assert first.context == {

@@ -1,17 +1,19 @@
 """Topology `waterfall`: staged work with ratings and rework.
 
-For each stage of `stages`, in order (the checkpoint `plan` lists their names):
+For each stage of `stages`, in order (the RunManager writes the checkpoint `plan` with their
+names from `run.yaml`):
 
 - **Attempt:** the stage's agent gets a short prompt and the context package (`context`):
   `task`, `stage`, `attempt`, `produces`, the accepted results of earlier stages (`accepted`:
   ID, stage, title, path relative to the run folder, the body only if there is no file) and,
   on rework, the ratings of the last attempt (`rework`: result, score, per rater the score,
   the scores per criterion and the comment). `context.attempt` becomes the `attempt` of the
-  results. Without a result (also after a turn with status `error`) the topology asks once
-  more; then the attempt fails without rating.
+  results. Without a result the topology asks once more; then the attempt fails without
+  rating. A result submitted in a turn with status `error` does not count.
 - **Ratings:** all `raters` except the author rate in parallel (`ctx.turns`); missing ones
   are asked once more. The score is the mean of the ratings that exist; without any rating
-  the attempt fails.
+  the attempt fails. Unlike a result, a rating counts even if its turn ended with `error`:
+  it is stored validly in the room.
 - **Decision:** score ≥ `pass_score` (`params.pass_score`, else `rubric.pass_score`) → the
   result is accepted. Otherwise the same agent reworks it, up to `max_rework` times. When all
   `1 + max_rework` attempts failed, `on_fail` decides: `continue` accepts the attempt with the
@@ -184,10 +186,8 @@ class _Waterfall:
             raise _Stopped
 
     async def run(self) -> None:
-        stages = self.ctx.config.stages
-        await self.ctx.checkpoint(PLAN, stages=[s.name for s in stages])
         try:
-            for stage in stages:
+            for stage in self.ctx.config.stages:
                 if not await self._stage(stage):
                     return
         except _Stopped:

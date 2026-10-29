@@ -4,6 +4,7 @@ RunManager, robustness after stop, limit, error and a half finished setup, idemp
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -326,6 +327,30 @@ async def test_finalizer_after_a_limit(workfolder: Path) -> None:
     assert "- **Grund:** Limit: Die Zahl der Turns pro Agent ist erreicht." in text
 
 
+async def test_status_after_a_limit_and_a_topology_that_does_not_stop(workfolder: Path) -> None:
+    """W2-04.1 B3: the `error` with `where: topology` does not make summary.md say `failed`."""
+
+    async def stubborn(ctx: RunContext) -> None:
+        await ctx.turn("a", "Los.")
+        await asyncio.sleep(30)  # ignores the stop
+
+    manager = make_manager(
+        workfolder,
+        stubborn,
+        {"a": turns([say("ok")])},
+        run_extra={"task": TASK, "limits": {"wall_time": 0.3}},
+        finalizer=finalize_run,
+        stop_grace_s=0.2,
+    )
+    assert await asyncio.wait_for(manager.run(), 10) is RunStatus.DONE
+    [error] = log_entries(manager.run_dir, "error")
+    assert error["data"]["where"] == "topology"
+    text = summary(manager)
+    assert "- **Status:** abgeschlossen (done)" in text
+    assert "- **Grund:** Limit: Die Gesamtlaufzeit des Runs ist erreicht." in text
+    assert f"- {error['data']['message']}" in text, "kept as a hint"
+
+
 async def test_finalizer_after_an_error(workfolder: Path) -> None:
     manager = solo_manager(workfolder, turns(), task=" ")
     assert await asyncio.wait_for(manager.run(), 10) is RunStatus.FAILED
@@ -390,6 +415,7 @@ async def test_a_failing_step_does_not_stop_the_others(
     text = summary(manager)
     assert "- Schritt des Finalizers gescheitert: Transkripte: RuntimeError: kaputt" in text
     assert "- [#1 Ergebnis](results/001-a-note.md)" in text
+    assert "- Gesamt: 1 Turn, 0 Tokens ein, 0 aus, 1 Turn ohne Kosten" in text  # W2-04.1 Punkt 7
     [error] = [e for e in log_entries(run_dir, "error") if e["data"].get("where") == "finalizer"]
     assert error["data"]["step"] == "Transkripte" and error["data"]["message"] == "kaputt"
 
@@ -420,6 +446,37 @@ async def test_summary_lists_a_summarizer_and_a_failed_stage(workfolder: Path) -
     assert await asyncio.wait_for(manager.run(), 10) is RunStatus.DONE
     text = summary(manager)
     assert "## Zusammenfassung von a\n\n**Fazit**\n\nAlles klar." in text
+
+    # W2-04.1 B6: a stage that fails with `on_fail: stop`
+    rate_low = [
+        room("get_assignment", save_as="job"),
+        room("submit_rating", result_id="${job.context.result_id}", score=3, comment="Lücke"),
+    ]
+    failed = make_manager(
+        workfolder,
+        topology_for("waterfall"),
+        {
+            "a": staged(skizze=[[submit("note", "Skizze", body="…")]]),
+            "b": staged(skizze=[rate_low]),
+        },
+        run_extra={
+            "task": TASK,
+            "topology": {"kind": "waterfall", "params": {"max_rework": 0, "on_fail": "stop"}},
+            "stages": [{"name": "skizze", "agent": "a"}, {"name": "beweis", "agent": "b"}],
+            "raters": ["a", "b"],
+            "rubric": {"pass_score": 6},
+        },
+        finalizer=finalize_run,
+    )
+    assert await asyncio.wait_for(failed.run(), 10) is RunStatus.DONE
+    text = summary(failed)
+    assert "- **Status:** abgeschlossen (done)" in text
+    assert "- **Grund:** Die Stufe „skizze“ wurde nicht bestanden (stage_failed)." in text
+    assert "| skizze | 1 | a | #1 | 3 | nicht bestanden |" in text
+    assert (
+        "- **skizze:** nicht bestanden, Run beendet, akzeptiert: keins, Score 3, 1 Versuch" in text
+    )
+    assert "beweis" not in text.split("## Stufen")[1].split("## Ergebnisse")[0]
 
 
 # --------------------------------------------------------------------------------------------
@@ -484,16 +541,111 @@ def test_changes_diff_cases(tmp_path: Path) -> None:
     assert changes_diff(base, base).text == "", "a folder has no changes against itself"
 
 
-def test_changes_diff_large_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(finalize_module, "MAX_DIFF_BYTES", 10)
+def test_changes_diff_large_file(tmp_path: Path) -> None:
+    """W2-04.1 B2: a line diff only up to 256 KB and 10 000 lines per side."""
     base, work = tmp_path / "base", tmp_path / "work"
-    write(base, "gross.txt", "a" * 50)
-    write(work, "gross.txt", "a" * 49 + "b")
-    write(base, "gleich.txt", "c" * 50)
-    write(work, "gleich.txt", "c" * 50)
-    assert changes_diff(base, work).text == (
-        "Datei geändert (zu groß für einen Zeilen-Diff): gross.txt\n"
+    write(base, "gross.txt", "a" * (300 * 1024))
+    write(work, "gross.txt", "a" * (300 * 1024 - 1) + "b")
+    write(base, "gleich.txt", "c" * (300 * 1024))
+    write(work, "gleich.txt", "c" * (300 * 1024))
+    write(base, "zeilen.txt", "x\n" * 10_001)
+    write(work, "zeilen.txt", "x\n" * 10_000 + "y\n")
+    write(base, "grenze.txt", "x\n" * 10_000)
+    write(work, "grenze.txt", "x\n" * 9_999 + "y\n")
+    text = changes_diff(base, work).text
+    assert "Datei geändert (zu groß für einen Zeilen-Diff): gross.txt\n" in text
+    assert "Datei geändert (zu groß für einen Zeilen-Diff): zeilen.txt\n" in text
+    assert "--- a/grenze.txt\n+++ b/grenze.txt\n" in text and "+y\n" in text
+    assert "gleich.txt" not in text
+
+
+def test_changes_diff_of_a_large_scattered_change_is_fast(tmp_path: Path) -> None:
+    """W2-04.1 B2: ~2 MB of text, every 7th line changed: under 1 s (before: minutes)."""
+    base, work = tmp_path / "base", tmp_path / "work"
+    lines = [f"{n},{n * n},{n % 97}\n" for n in range(102_000)]  # 1.98 MB
+    write(base, "daten.csv", "".join(lines))
+    write(work, "daten.csv", "".join(x if n % 7 else "geändert\n" for n, x in enumerate(lines)))
+    assert 1_900_000 < (base / "daten.csv").stat().st_size < 2 * 1024 * 1024  # old limit
+    start = time.monotonic()
+    text = changes_diff(base, work).text
+    assert time.monotonic() - start < 1.0
+    assert text == "Datei geändert (zu groß für einen Zeilen-Diff): daten.csv\n"
+
+
+skip_as_root = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can read files with mode 000"
+)
+
+
+@skip_as_root
+def test_changes_diff_unreadable_file_and_folder(tmp_path: Path) -> None:
+    """W2-04.1 B1: one line per unreadable file or folder instead of an error."""
+    base, work = tmp_path / "base", tmp_path / "work"
+    write(base, "geheim/alt.txt", "alt\n")
+    write(work, "geheim/alt.txt", "alt\n")
+    write(work, "geheim/neu.txt", "neu\n")
+    write(base, "zu.txt", "vorher\n")
+    write(work, "zu.txt", "nachher\n")
+    write(work, "ok.txt", "lesbar\n")
+    (work / "zu.txt").chmod(0)
+    (work / "geheim").chmod(0)
+    try:
+        text = changes_diff(base, work).text
+    finally:
+        (work / "geheim").chmod(0o755)
+        (work / "zu.txt").chmod(0o644)
+    assert "Datei nicht lesbar: zu.txt\n" in text
+    assert "Ordner nicht lesbar: geheim\n" in text
+    assert "alt.txt" not in text, "nothing inside an unreadable folder counts as deleted"
+    assert "--- /dev/null\n+++ b/ok.txt\n" in text
+    assert str(tmp_path) not in text
+
+
+@skip_as_root
+async def test_unreadable_files_cost_no_other_diff(workfolder: Path) -> None:
+    """W2-04.1 B1: an unreadable file of agent a leaves the diffs of a and b intact."""
+    prepared = prepared_only(workfolder)
+    work_a = prepared.agents["a"].work_dir
+    write(work_a, "zu.txt", "x\n")
+    (work_a / "zu.txt").chmod(0)
+    write(prepared.agents["b"].work_dir, "notiz.md", "b\n")
+    try:
+        await finalize_run(prepared)
+    finally:
+        (work_a / "zu.txt").chmod(0o644)
+    run_dir = prepared.run_dir
+    assert (run_dir / "agents/a/changes.diff").read_text("utf-8") == "Datei nicht lesbar: zu.txt\n"
+    assert "+++ b/notiz.md" in (run_dir / "agents/b/changes.diff").read_text("utf-8")
+    assert "Schritt des Finalizers gescheitert" not in (run_dir / "output/summary.md").read_text(
+        "utf-8"
     )
+
+
+async def test_a_failing_working_folder_does_not_stop_the_others(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """W2-04.1 B1: one `try` per working folder in the step `changes.diff`."""
+    prepared = prepared_only(workfolder)
+    write(prepared.agents["b"].work_dir, "notiz.md", "b\n")
+    real = finalize_module.changes_diff
+
+    def flaky(base: Path | None, work: Path, exclude: Any = ()) -> Any:
+        if work == prepared.agents["a"].work_dir:
+            raise RuntimeError(f"kaputt in {work}")
+        return real(base, work, exclude)
+
+    monkeypatch.setattr(finalize_module, "changes_diff", flaky)
+    await finalize_run(prepared)
+    run_dir = prepared.run_dir
+    assert (run_dir / "agents/a/changes.diff").read_text("utf-8") == (
+        "Änderungen nicht ermittelbar (RuntimeError).\n"
+    )
+    assert "+++ b/notiz.md" in (run_dir / "agents/b/changes.diff").read_text("utf-8")
+    summary_text = (run_dir / "output/summary.md").read_text("utf-8")
+    assert "- Schritt des Finalizers gescheitert: changes.diff für agents/a/work: RuntimeError" in (
+        summary_text
+    )
+    assert str(run_dir) not in summary_text
 
 
 async def test_changes_diff_for_shared_empty_and_copy_exclude_links(workfolder: Path) -> None:

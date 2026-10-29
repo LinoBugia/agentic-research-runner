@@ -277,9 +277,12 @@ def _message(error: Mapping[str, Any]) -> str:
     if kind in ("float_type", "float_parsing", "finite_number"):
         return f"Falscher Typ: erwartet eine Zahl, gefunden {_describe(value)}."
     if kind in ("time_delta_type", "time_delta_parsing"):
+        what = (
+            "Die Dauer fehlt." if value is None else f"Die Dauer {_describe(value)} ist ungültig."
+        )
         return (
-            f"Ungültige Dauer {_describe(value)}. Schreibe sie z. B. als „2h“, „90m“, „1h30m“ "
-            "oder „45s“ oder als Zahl in Sekunden."
+            f"{what} Gib sie z. B. als „2h“, „90m“, „1h30m“ oder „45s“ an oder als Zahl in "
+            "Sekunden."
         )
     if kind in ("bool_type", "bool_parsing"):
         return f"Falscher Typ: erwartet true oder false, gefunden {_describe(value)}."
