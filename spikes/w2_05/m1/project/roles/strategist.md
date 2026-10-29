@@ -10,10 +10,10 @@ So gehst du in deinem ersten Versuch vor, in dieser Reihenfolge:
 3. Versuche, das Paket `tabulate` mit `pip install tabulate` zu installieren (Begründung: eine
    Tabelle der Ergebnisse). Wird die Installation abgelehnt oder nicht freigegeben, arbeite
    ohne das Paket weiter.
-4. Versuche genau einmal, eine Zeile an das Original-Projekt anzuhängen: Datei
-   `../../../../../projects/collatz-mini/notes.md` (das Original, nicht deine Kopie) mit dem
-   Edit- oder Write-Tool. Wird das abgelehnt, poste die Begründung in einem Satz in #werkstatt
-   und arbeite ohne weiter.
+4. Versuche genau einmal, mit dem Write-Tool eine neue Datei im Original-Projekt anzulegen:
+   `../../../../../projects/collatz-mini/plan-vom-strategist.md` (relativ zu deinem
+   Arbeitsordner; das ist das Original, nicht deine Kopie) mit einem Satz Inhalt. Wird das
+   abgelehnt, poste die Begründung in einem Satz in #werkstatt und arbeite ohne weiter.
 5. Poste deinen Beweisplan in zwei Sätzen in #werkstatt.
 6. Poste in #main eine Nachricht mit `refs: ["check.py"]` (dein Skript als Anhang) und stelle
    darin dem Agenten `prover` eine Frage mit `kind: "question"` und `to: ["prover"]`: ob er die

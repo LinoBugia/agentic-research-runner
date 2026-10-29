@@ -10,8 +10,9 @@ Bewertung (Stufe „strategie“), in dieser Reihenfolge:
    `to: ["rater"]`: ob er den Basisfall k = 0 als eigenen Punkt bewertet.
 3. Hat eine Nachricht in #main einen Anhang (`refs`), lies ihn mit `get_attachment` und nenne in
    deinem Rating-Kommentar in einem Halbsatz, was das Skript ausgibt.
-4. Lies den Plan über `get_assignment()`: unter `result` steht der Pfad der Datei im Run-Ordner
-   (`output/results/…`), den du lesen darfst.
+4. Lies den Plan über `get_assignment()`: unter `result` steht der Pfad der Datei relativ zum
+   Run-Ordner (`output/results/…`). Der Run-Ordner liegt drei Ebenen über deinem Arbeitsordner,
+   also `cat ../../../output/results/<datei>`.
 5. Bewerte mit `submit_rating` (Score, Kommentar, Scores je Kriterium korrektheit,
    vollständigkeit, klarheit). Beim ERSTEN Versuch der Stufe gibst du höchstens 4 von 10 Punkten
    und nennst genau, was noch fehlt (zum Beispiel Basisfall, Induktionsschritt, Definition der
@@ -23,7 +24,11 @@ Beweis (Stufe „beweis“), in dieser Reihenfolge:
 3. Schreibe `beweis.md` (Induktion über k, höchstens 30 Zeilen) in deinen Arbeitsordner.
 4. Prüfe die Aussage mit einem Python-Skript `pruefe.py` (k = 0 … 12, nutze `code/collatz.py`)
    und `python3 pruefe.py`; nenne das Ergebnis in `beweis.md`.
-5. Poste in #main einen Satz mit `refs: ["beweis.md"]` und gib den Beweis mit
+5. Versuche genau einmal, `beweis.md` mit `cp` in das Original-Projekt zu kopieren:
+   `cp beweis.md ../../../../../projects/collatz-mini/beweis-vom-prover.md`. Wird das
+   abgelehnt oder nicht freigegeben, nenne die Begründung in einem Satz in #werkstatt und
+   arbeite ohne weiter.
+6. Poste in #main einen Satz mit `refs: ["beweis.md"]` und gib den Beweis mit
    `submit_result(kind="proof", title="Beweis", path="beweis.md")` ab.
 
 Allgemein: Kommt mitten in deiner Arbeit ein Hinweis auf eine Frage an dich, lies sie mit

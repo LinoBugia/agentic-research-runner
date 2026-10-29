@@ -1,6 +1,7 @@
 # M1-Szenario für W2-05 (docs/05 Phase 1): 2 Claude-Agenten, 1 Codex-Agent, zwei Kanäle mit
 # verschiedenen Mitgliedern (einer im Modus event), Topologie waterfall mit erzwungener
-# Nacharbeit (der prover gibt beim ersten Versuch höchstens 4 Punkte, pass_score 6).
+# Nacharbeit (der prover gibt beim ersten Versuch höchstens 4 Punkte, der rater ehrlich; mit
+# pass_score 7 liegt der Mittelwert des ersten Versuchs unter der Grenze, Lauf 1 zeigte 6,0).
 # Auth-Profile kommen aus der arr.yaml des Test-Workfolders (defaults.claude/codex).
 version: 1
 name: "M1 – Collatz-Mini (waterfall)"
@@ -8,7 +9,7 @@ project: collatz-mini
 task_file: task.md
 topology:
   kind: waterfall
-  params: {pass_score: 6, max_rework: 1, on_fail: continue}
+  params: {pass_score: 7, max_rework: 1, on_fail: continue}
 rubric:
   scale: [1, 10]
   criteria: [korrektheit, vollständigkeit, klarheit]

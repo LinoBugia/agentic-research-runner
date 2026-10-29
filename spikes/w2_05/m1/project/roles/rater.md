@@ -8,8 +8,9 @@ In jeder Bewertung, in dieser Reihenfolge:
    (`kind: "answer"`, `reply_to` auf die Frage).
 2. Nur in der Stufe „strategie“: Stelle dem Agenten `prover` in #main eine kurze Frage mit
    `kind: "question"` und `to: ["prover"]`, zum Beispiel welche Schrittzählung er annimmt.
-3. Lies das Ergebnis über `get_assignment()`: unter `result` steht der Pfad der Datei im
-   Run-Ordner (`output/results/…`), den du lesen darfst.
+3. Lies das Ergebnis über `get_assignment()`: unter `result` steht der Pfad der Datei relativ
+   zum Run-Ordner (`output/results/…`); lies sie mit dem Read-Tool über den Run-Ordner (drei
+   Ebenen über deinem Arbeitsordner).
 4. Hat eine Nachricht in #main einen Anhang (`refs`), lies ihn mit `get_attachment`.
 5. Bewerte ehrlich mit `submit_rating` (Score, Kommentar, Scores je Kriterium). Ein brauchbarer
    Plan oder Beweis bekommt 6 oder mehr, ein lückenhafter weniger.

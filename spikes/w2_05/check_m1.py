@@ -53,7 +53,16 @@ AGENT_FILES = (
     "session.json",
 )
 ROOM_READS = ("mcp__arr-room__read_messages", "mcp__arr-room__inbox")
-PYTHON_RE = re.compile(r"\bpython3?\b[^\n|&;]*\.py")
+PYTHON_RE = re.compile(r"^\s*python3?\s+\S+\.py\b")
+SHELL_WRAP_RE = re.compile(r"^/bin/\w+\s+-lc\s+['\"](.*)['\"]\s*$", re.DOTALL)
+
+
+def unwrap(command: str) -> str:
+    """`/bin/zsh -lc '<cmd>'` of Codex → `<cmd>`; other commands unchanged."""
+    match = SHELL_WRAP_RE.match(command.strip())
+    return match.group(1) if match else command
+
+
 OUTSIDE_RE = re.compile(r"projects/collatz-mini|\.\./\.\./\.\./\.\./")
 
 
@@ -342,11 +351,12 @@ class M1Folder:
         for agent_id, events in self.transcripts.items():
             results = {e["data"]["id"]: e for e in events if e["kind"] == "tool_result"}
             for e in events:
-                command = (
-                    str((e["data"].get("input") or {}).get("command") or "")
+                raw = (
+                    (e["data"].get("input") or {}).get("command")
                     if e["kind"] == "tool_call"
                     else ""
                 )
+                command = unwrap(str(raw or ""))
                 if not PYTHON_RE.search(command) or "pip" in command:
                     continue
                 result = results.get(e["data"]["id"])
