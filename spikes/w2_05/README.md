@@ -4,7 +4,7 @@
 
 **Dateien**
 
-- `m1/` – das Szenario: `run.yaml`, `task.md`, `project/` (Projekt `collatz-mini` mit den Rollen `roles/*.md`). Ohne persönliche Pfade; die Auth-Profile kommen aus der `arr.yaml` des Test-Workfolders.
+- `m1/` – das Szenario: `run.yaml`, `task.md`, `project/` (Projekt `collatz-mini` mit den Rollen `roles/*.md`). Ohne persönliche Pfade; die Auth-Profile kommen aus der `arr.yaml` des Test-Workfolders. Dazu `wecken.yaml`: eine kleine `roundtable`-Diskussion im Modus `event` (zwei Haiku-Agenten), weil `waterfall` keine Diskussionsphase hat und darum niemanden weckt (Kriterium 6, Teil „Wecken“).
 - `setup_workfolder.py <ziel>` – legt den Test-Workfolder außerhalb des Repos an (`arr init`, `arr.yaml` mit `toolchain.python`, Projekt, Szenario).
 - `check_m1.py <run-ordner>` – prüft maschinell, was sich am Run-Ordner prüfen lässt (Kriterien 1, 2, 5, 6, 7), Tabelle ✅/❌ plus Kennzahlen (Anfragen, Kosten, Dauer).
 - `ask.py <run-ordner> <kanal> <agent> "<frage>"` – stellt während eines Laufs eine Frage als `user` mit `to`, für den Hinweis mitten im Turn bzw. den Posteingang.

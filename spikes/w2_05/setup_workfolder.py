@@ -77,7 +77,7 @@ def main() -> int:
     shutil.copytree(SCENARIO / "project", project)
     scenario = root / "m1"
     scenario.mkdir(exist_ok=True)
-    for name in ("run.yaml", "task.md"):
+    for name in ("run.yaml", "task.md", "wecken.yaml"):
         shutil.copy(SCENARIO / name, scenario / name)
     print(f"Workfolder bereit: {root}")
     print("Start des M1-Laufs:")
