@@ -37,8 +37,8 @@ TURN = "turn-1"
 
 @pytest.fixture(autouse=True)
 def no_user_temp_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`tmp_path` lies in the user's temp folder, which `profile_for` denies (W2-01.1). Its
-    other entries would all become siblings; the tests must not depend on the machine."""
+    """`tmp_path` lies in the user's temp folder, which `profile_for` denies (W2-01.1); the
+    tests must not depend on the machine."""
     monkeypatch.setattr(policy, "user_temp_dirs", lambda: [])
 
 
@@ -377,7 +377,7 @@ async def test_every_turn_restarts_the_app_server_and_resumes(setup) -> None:
     assert all(approvals for _, approvals, _ in kit.starts)
     assert len(kit.codexes) == 2 and all(c.closed for c in kit.codexes)
     assert second[0].turn == 2 and second[1].data["text"] == "zwei"
-    # the permission profile is part of every start (fresh sibling list)
+    # the permission profile is part of every start
     overrides = kit.codexes[1].config.config_overrides
     assert any(o.startswith("permissions.arr.filesystem=") for o in overrides)
 
@@ -735,7 +735,7 @@ async def test_m1_too_many_entries_stop_before_the_app_server(setup, monkeypatch
     await backend.start()
     events = await play(backend)
     assert kinds(events) == ["turn_start", "error", "turn_end"]
-    assert "Archiviere alte Runs" in events[1].data["message"]
+    assert "Lese-Ordner" in events[1].data["message"]
     assert not kit.codexes
 
 

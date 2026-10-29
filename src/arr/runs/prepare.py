@@ -56,6 +56,7 @@ from arr.skills import (
     snapshot_skills,
     write_claude_plugin,
 )
+from arr.venvs import base_venv_dir, run_venv_dir, venv_base_prefix, venv_root
 from arr.workfolder import (
     RESEARCH_AGENT_BLOCK,
     USER_AGENT_BLOCK,
@@ -81,6 +82,7 @@ __all__ = [
     "load_run_meta",
     "new_run_id",
     "prepare_run",
+    "run_venv_location",
 ]
 
 logger = logging.getLogger(__name__)
@@ -109,7 +111,12 @@ _RUN_ID_RE = re.compile(r"^\d{8}-\d{4}_[A-Za-z0-9-]+_[A-Za-z0-9-]+_[0-9a-f]{4}$"
 
 
 class RunMeta(Record):
-    """Content of `meta.json` (docs/02 §4). The RunManager (W2-03) updates status and times."""
+    """Content of `meta.json` (docs/02 §4). The RunManager (W2-03) updates status and times.
+
+    `run_venv` is the absolute folder of the run venv outside `~` (`RunPaths.venv_dir`,
+    W3-00), None with `run_venv: off` and in runs before W3-00 (`<run>/.venv`). Read it with
+    `run_venv_location`.
+    """
 
     run_id: str
     status: RunStatus = RunStatus.PREPARING
@@ -122,6 +129,7 @@ class RunMeta(Record):
     ended: float | None = None
     arr_version: str
     sdk_versions: dict[str, str] = {}
+    run_venv: str | None = None
 
 
 class AgentFile(Record):
@@ -209,6 +217,23 @@ class PreparedRun:
 def load_run_meta(run_dir: str | Path) -> RunMeta:
     """Read `<run_dir>/meta.json`."""
     return RunMeta.model_validate_json((Path(run_dir) / "meta.json").read_text("utf-8"))
+
+
+def run_venv_location(run_dir: str | Path) -> Path | None:
+    """Folder of a run's venv: from `meta.json`, else `<run>/.venv` of a run before W3-00.
+
+    None if the run has no venv (`run_venv: off`, not created yet or removed) or its
+    `meta.json` is not readable.
+    """
+    folder = Path(run_dir)
+    try:
+        recorded = load_run_meta(folder).run_venv
+    except (OSError, ValueError):
+        recorded = None
+    if recorded:
+        return Path(recorded)
+    legacy = folder / ".venv"
+    return legacy if legacy.is_dir() and not legacy.is_symlink() else None
 
 
 def load_agent_file(run_dir: str | Path, agent_id: str) -> AgentFile:
@@ -809,6 +834,92 @@ def _toolchain(
     return prepend, base_python
 
 
+def _below(path: Path, home: Path) -> bool:
+    key, home_key = str(path), str(home)
+    if sys.platform == "darwin":  # case-insensitive file system
+        key, home_key = key.casefold(), home_key.casefold()
+    return key == home_key or key.startswith(home_key.rstrip("/") + "/")
+
+
+def _shown(path: Path, home: Path) -> str:
+    return "~" + str(path)[len(str(home)) :] if _below(path, home) else str(path)
+
+
+def _check_codex_toolchain(
+    root: Path, resolved: ResolvedRun, settings: WorkfolderSettings, *, home: Path | None = None
+) -> None:
+    """Refuse a toolchain below `~` for runs with a Codex agent (W3-00, variant 2).
+
+    The Codex profile denies `~` as a whole, so neither Python nor a program below `~`
+    starts there. Checked (symlinks resolved): `toolchain.python` (venv or interpreter), the
+    Python installation it is built on and its interpreter, every `toolchain.extra_path`
+    entry and, with `run_venv: overlay`, the folder of the run venvs. Runs with Claude
+    agents only are not affected: Claude's sandbox keeps the toolchain readable.
+    """
+    codex = [a.id for a in resolved.agents if a.provider is Provider.CODEX]
+    if not codex:
+        return
+    home = Path(os.path.realpath(home or Path.home()))
+    toolchain = settings.toolchain
+    names = ", ".join(f"„{a}“" for a in codex)
+    way = (
+        f"Lege die Basis-venv außerhalb von ~ unter {base_venv_dir('<name>').parent}/ an, mit "
+        "einem Python, das nicht von uv verwaltet wird (z. B. python.org-Python unter "
+        "/Library/Frameworks), und trage sie als „toolchain.python“ in arr.yaml ein."
+    )
+
+    def absolute(raw: str) -> Path:
+        path = Path(raw).expanduser()
+        return path if path.is_absolute() else root / path
+
+    issues: list[ConfigIssue] = []
+
+    def check(where: str, label: str, path: Path, hint: str) -> None:
+        real = Path(os.path.realpath(path))
+        if _below(real, home):
+            shown = _shown(path, home)
+            if real != path.absolute():
+                shown += f" (= {_shown(real, home)})"
+            issues.append(
+                ConfigIssue(
+                    where,
+                    f"{label} {shown} liegt unter deinem Benutzerordner (~). Die Codex-Sandbox "
+                    f"sperrt ~ ganz, deshalb startet sie dort für {names} nicht. {hint}",
+                )
+            )
+
+    if toolchain.python:
+        python = absolute(toolchain.python)
+        venv = python.parent.parent if python.is_file() else python
+        check("toolchain.python", "Die Python-Umgebung", python, way)
+        if not issues:
+            base = venv_base_prefix(venv)
+            if base is not None:
+                check("toolchain.python", "Das Python der Basis-venv", base, way)
+            for name in ("python3", "python"):
+                interpreter = venv / "bin" / name
+                if not issues and interpreter.exists():
+                    check("toolchain.python", "Das Python der Basis-venv", interpreter, way)
+                    break
+    for index, entry in enumerate(toolchain.extra_path):
+        check(
+            f"toolchain.extra_path[{index}]",
+            "Der Ordner",
+            absolute(entry),
+            "Nimm den Ordner aus „toolchain.extra_path“ oder installiere das Programm "
+            "außerhalb von ~ (z. B. mit Homebrew).",
+        )
+    if toolchain.run_venv is RunVenvMode.OVERLAY:
+        check(
+            "toolchain.run_venv",
+            "Der Ordner der venvs",
+            venv_root(),
+            "Setze ARR_VENV_ROOT auf einen Ordner außerhalb von ~ oder entferne die Variable.",
+        )
+    if issues:
+        raise ConfigError(issues, source="arr.yaml")
+
+
 def _sdk_versions() -> dict[str, str]:
     versions = {}
     for package in _SDK_PACKAGES:
@@ -917,7 +1028,11 @@ def prepare_run(
       installed for research agents (E11).
     - Each working copy gets the processed project context as `CLAUDE.md` (if the project has
       one) and `AGENTS.md`, and each agent a `context.md` (E10, see `AgentFile`).
-    - `meta.json` gets the status `preparing`. Starting the agents is up to the RunManager.
+    - `meta.json` gets the status `preparing` and the folder of the run venv
+      (`RunPaths.venv_dir`, outside `~`); creating it and starting the agents is up to the
+      RunManager.
+    - A run with a Codex agent whose toolchain lies below `~` is refused with `ConfigError`
+      before anything is created (W3-00, `_check_codex_toolchain`).
 
     All configuration problems (unknown project, role or skill, bad profile …) are collected and
     raised as one `ConfigError` before anything is created. `run_id` reserves a fixed ID
@@ -941,6 +1056,7 @@ def prepare_run(
     plan = _make_plan(
         root, project, resolved, catalog, task_base, profiles, allow_external_task_file
     )
+    _check_codex_toolchain(root, resolved, settings)
 
     moment = now or datetime.now()
     run_id, run_dir, reserved = _reserve_run_dir(
@@ -994,6 +1110,11 @@ def _build_run(
         created=moment.timestamp(),
         arr_version=__version__,
         sdk_versions=_sdk_versions(),
+        run_venv=(
+            str(run_venv_dir(run_id))
+            if settings.toolchain.run_venv is RunVenvMode.OVERLAY
+            else None
+        ),
     )
     (run_dir / "meta.json").write_text(meta.model_dump_json(indent=2) + "\n", encoding="utf-8")
     (run_dir / "run.input.yaml").write_text(

@@ -173,7 +173,12 @@ def test_a5_options_follow_the_architecture(setup: Setup) -> None:
     assert env["PIP_CACHE_DIR"] == str(profile.tmp_dir / "cache" / "pip")
     assert env["MPLCONFIGDIR"].startswith(str(profile.tmp_dir))
     path = env["PATH"].split(os.pathsep)
-    assert path[0] == str(setup.run.run_dir / ".venv" / "bin")
+    venv = RunPaths(setup.run.run_dir.parent.parent, setup.run.run_dir).venv_dir
+    assert path[0] == str(venv / "bin")  # from RunPaths, outside the run folder (W3-00)
+    assert not path[0].startswith(str(setup.run.run_dir))
+    real = os.path.realpath(venv)  # PATH, add_dirs and the sandbox name the same run venv
+    assert real in options.add_dirs and real in options.sandbox["filesystem"]["allowWrite"]
+    assert real in options.sandbox["filesystem"]["allowRead"]
     assert path[1 : 1 + len(agent.file.path_prepend)] == agent.file.path_prepend
 
 

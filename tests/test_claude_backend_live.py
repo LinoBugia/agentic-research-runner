@@ -13,8 +13,6 @@ import asyncio
 import json
 import os
 import re
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +34,7 @@ from arr.permissions.types import ApprovalItem, DecidedBy, Decision, DecisionAct
 from arr.resolve import resolve_run
 from arr.room.store import RoomStore
 from arr.runs.eventlog import EventLogger
+from arr.runs.manager import create_run_venv
 from arr.runs.prepare import PreparedRun, prepare_run
 from arr.workfolder import init_workfolder
 
@@ -79,7 +78,7 @@ def make_run(root: Path) -> PreparedRun:
     )
     resolved = resolve_run(run_input, None, settings)
     run = prepare_run(wf, run_input, resolved, settings)
-    subprocess.run([sys.executable, "-m", "venv", str(run.run_dir / ".venv")], check=True)
+    create_run_venv(RunPaths(wf, run.run_dir, settings.toolchain), None)  # outside ~ (W3-00)
     store = RoomStore.create(run.run_dir)
     store.setup_channels([GroupChatConfig(**gc.model_dump()) for gc in resolved.groupchats])
     return run

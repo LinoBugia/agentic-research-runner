@@ -9,10 +9,12 @@ scan after the finalizer and records the result as `secret_scan` in `orchestrato
 `arr runs scan <id>` repeats it.
 
 The profile values are searched as bytes (UTF-8, also UTF-16) in **every** regular file, binary
-files, `tmp/home/`, `tmp/cache/` and `.venv/` included: these are the places agents can write to
-besides their work folder (W2-05.1 M2). The patterns are searched line by line in text files
-(no NUL byte in the first 8 KB) outside `.venv/`, where installed software would give false
-alarms. Only regular files are opened: symlinks are never followed, and a FIFO, socket or
+files, `tmp/home/`, `tmp/cache/` and the run venv included: these are the places agents can
+write to besides their work folder (W2-05.1 M2). The run venv lies outside the run folder
+since W3-00 (`meta.json`, `run_venv_location`); its files are named `run-venv/…`. Runs before
+W3-00 have it as `.venv/` inside the run folder. The patterns are searched line by line in text
+files (no NUL byte in the first 8 KB) outside the run venv, where installed software would give
+false alarms. Only regular files are opened: symlinks are never followed, and a FIFO, socket or
 device an agent could leave behind would block `open()` forever (W2-05.2 N1).
 """
 
@@ -35,9 +37,11 @@ from arr.permissions.policy import (
     _URL_CREDS_RE,
 )
 from arr.runs.orchestrator import OrchestratorLog
+from arr.runs.prepare import run_venv_location
 
 __all__ = [
     "PATTERN_SKIP",
+    "RUN_VENV_LABEL",
     "SCAN_KIND",
     "Finding",
     "ScanReport",
@@ -50,10 +54,13 @@ __all__ = [
 SCAN_KIND = "secret_scan"
 """Kind of the entry in `orchestrator.jsonl` (`data`: `ScanReport.to_data()`)."""
 
-PATTERN_SKIP = (".venv/",)
-"""Folders (POSIX paths relative to the run) whose files get no pattern scan: installed
-software (pip's own `KEY=…` lines, `https://user:pw@` examples). Profile values are searched
-there too."""
+RUN_VENV_LABEL = "run-venv"
+"""Prefix of the run venv's files in a report when it lies outside the run folder (W3-00)."""
+
+PATTERN_SKIP = (".venv/", RUN_VENV_LABEL + "/")
+"""Folders (POSIX paths as reported) whose files get no pattern scan: installed software
+(pip's own `KEY=…` lines, `https://user:pw@` examples). Profile values are searched there
+too. `.venv/` is the run venv of runs before W3-00."""
 
 MIN_SECRET_LENGTH = 8
 """Shorter profile secrets are not searched for (too many chance hits)."""
@@ -222,21 +229,18 @@ def _pattern_hits(handle: Any) -> list[tuple[int, str]]:
     return hits
 
 
-def scan_run_dir(
-    run_dir: str | Path,
-    secrets: Mapping[str, str] | None = None,
-    *,
-    pattern_skip: Sequence[str] = PATTERN_SKIP,
-) -> ScanReport:
-    """Scan every regular file below `run_dir`: the profile values everywhere, the patterns in
-    text files outside `pattern_skip` (see the module docstring)."""
-    root = Path(run_dir)
-    values = [(k, v) for k, v in (secrets or {}).items() if len(v) >= MIN_SECRET_LENGTH]
-    needles = _needles(values)
-    report = ScanReport(secrets=len(values))
+def _scan_tree(
+    report: ScanReport,
+    root: Path,
+    shown_as: str,
+    needles: Sequence[tuple[str, bytes]],
+    pattern_skip: Sequence[str],
+) -> None:
+    """Scan every regular file below `root`; files are reported as `<shown_as>/<path>`."""
     for folder, dirs, files in os.walk(root):
         rel_folder = Path(folder).relative_to(root).as_posix()
-        prefix = "" if rel_folder == "." else rel_folder + "/"
+        prefix = shown_as + "/" if shown_as else ""
+        prefix += "" if rel_folder == "." else rel_folder + "/"
         dirs.sort()
         for name in sorted(files):
             path = Path(folder) / name
@@ -254,6 +258,40 @@ def scan_run_dir(
                 report.skipped.append(rel)
                 continue
             report.findings += [Finding(rel, number, kind) for number, kind in sorted(found)]
+
+
+def _outside_venv(run_dir: Path) -> Path | None:
+    """The run venv if it is a real folder outside the run folder (not a symlink)."""
+    venv = run_venv_location(run_dir)
+    if venv is None:
+        return None
+    try:
+        if not stat.S_ISDIR(os.lstat(venv).st_mode):
+            return None
+    except OSError:
+        return None
+    if Path(os.path.realpath(venv)).is_relative_to(os.path.realpath(run_dir)):
+        return None  # `<run>/.venv` of a run before W3-00: part of the walk anyway
+    return venv
+
+
+def scan_run_dir(
+    run_dir: str | Path,
+    secrets: Mapping[str, str] | None = None,
+    *,
+    pattern_skip: Sequence[str] = PATTERN_SKIP,
+) -> ScanReport:
+    """Scan every regular file below `run_dir` and in the run venv (`run-venv/…`): the profile
+    values everywhere, the patterns in text files outside `pattern_skip` (see the module
+    docstring)."""
+    root = Path(run_dir)
+    values = [(k, v) for k, v in (secrets or {}).items() if len(v) >= MIN_SECRET_LENGTH]
+    needles = _needles(values)
+    report = ScanReport(secrets=len(values))
+    _scan_tree(report, root, "", needles, pattern_skip)
+    venv = _outside_venv(root)
+    if venv is not None:
+        _scan_tree(report, venv, RUN_VENV_LABEL, needles, pattern_skip)
     return report
 
 

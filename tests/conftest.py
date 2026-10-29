@@ -13,6 +13,18 @@ def arr_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+@pytest.fixture(autouse=True)
+def venv_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point ARR_VENV_ROOT at a temporary directory (not created) for every test.
+
+    Run venvs and base venvs live below this root (`arr.venvs`); no test may touch
+    `/Users/Shared` or `/var/tmp`.
+    """
+    root = tmp_path / "venv-root"
+    monkeypatch.setenv("ARR_VENV_ROOT", str(root))
+    return root
+
+
 @pytest.fixture
 def restore_root_logger() -> Iterator[logging.Logger]:
     """Give a test the root logger and restore its handlers and level afterwards.

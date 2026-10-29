@@ -59,6 +59,7 @@ from arr.permissions.types import (
     RiskLevel,
 )
 from arr.settings import app_dir
+from arr.venvs import run_venv_dir, venv_base_prefix
 
 __all__ = [
     "AlwaysRule",
@@ -513,9 +514,10 @@ class PermissionRules(StrictModel):
 class RunPaths:
     """Folders of one run that the profile needs (docs/02 §1, §4).
 
-    Run-tmp is `<run>/tmp`, the run venv `<run>/.venv`, the Claude plugin of an agent
-    `agents/<id>/plugin` (Codex skills live in `work/.agents/skills`). Relative read folders
-    are resolved against the workfolder.
+    Run-tmp is `<run>/tmp`, the run venv `<venv root>/runs/<run-id>/` outside `~`
+    (`arr.venvs`, W3-00), the Claude plugin of an agent `agents/<id>/plugin` (Codex skills
+    live in `work/.agents/skills`). Relative read folders are resolved against the
+    workfolder.
     """
 
     workfolder: Path
@@ -529,8 +531,13 @@ class RunPaths:
 
     @property
     def venv_dir(self) -> Path:
-        """Run venv over the base venv (docs/07 §2)."""
-        return self.run_dir / ".venv"
+        """Run venv over the base venv (docs/07 §2): `<venv root>/runs/<run-id>/`.
+
+        Outside `~`, so Python starts behind the Codex profile that denies `~` (W3-00). The
+        run ID is the name of the run folder. Runs before W3-00 had `<run>/.venv`; see
+        `arr.runs.prepare.run_venv_location` for reading such runs.
+        """
+        return run_venv_dir(self.run_dir.name)
 
     @property
     def output_dir(self) -> Path:
@@ -666,19 +673,6 @@ class SandboxProfile:
         return tuple(p for p in self.read_allow if self._within_any(p, self.write_roots) < 0)
 
 
-def _venv_base(venv: Path) -> Path | None:
-    """Prefix of the Python installation a venv is built on (`home` in `pyvenv.cfg`)."""
-    try:
-        text = (venv / "pyvenv.cfg").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    for line in text.splitlines():
-        name, _, value = line.partition("=")
-        if name.strip() == "home" and value.strip():
-            return Path(value.strip()).parent
-    return None
-
-
 def _existing_matches(home: Path, patterns: Iterable[str]) -> list[Path]:
     """Existing folders below `home` that match the patterns (for the backend options)."""
     found = []
@@ -739,7 +733,7 @@ def profile_for(
     if paths.toolchain.python:
         venv = norm(paths.toolchain.python)
         read_allow.append(venv)
-        base = _venv_base(venv)
+        base = venv_base_prefix(venv)
         if base is not None:
             read_allow.append(norm(base))
     read_allow += [norm(p) for p in paths.toolchain.extra_path]

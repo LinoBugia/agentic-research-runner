@@ -35,6 +35,7 @@ from arr.runs.prepare import (
     load_run_meta,
     new_run_id,
     prepare_run,
+    run_venv_location,
 )
 from arr.workfolder import init_workfolder, load_project_settings
 
@@ -1305,3 +1306,173 @@ def test_role_file_linked_inside_the_skill_is_fine(
     result = prepare(workfolder, settings, alias)
     assert "Ranker" in (result.agents["ranker"].agent_dir / "role.md").read_text("utf-8")
     assert not (result.agents["ranker"].agent_dir / "role.md").is_symlink()
+
+
+# --------------------------------------------------------------------------------------------
+# W3-00: run venv outside the run folder, Codex toolchain outside ~
+# --------------------------------------------------------------------------------------------
+
+
+def test_w3_00_meta_json_names_the_run_venv(run: PreparedRun, venv_root: Path) -> None:
+    meta = load_run_meta(run.run_dir)
+    assert meta.run_venv == str(venv_root / "runs" / run.run_id)
+    assert run_venv_location(run.run_dir) == venv_root / "runs" / run.run_id
+    assert not (run.run_dir / ".venv").exists()
+
+
+def test_w3_00_no_run_venv_recorded_without_overlay(
+    workfolder: Path, settings: WorkfolderSettings
+) -> None:
+    off = settings.model_copy(
+        update={"toolchain": settings.toolchain.model_copy(update={"run_venv": "off"})}
+    )
+    result = prepare(workfolder, off)
+    assert load_run_meta(result.run_dir).run_venv is None
+    assert run_venv_location(result.run_dir) is None
+
+
+def test_w3_00_old_runs_with_dot_venv_stay_readable(tmp_path: Path) -> None:
+    """Runs before W3-00 have no `run_venv` in `meta.json` and the venv in `<run>/.venv`."""
+    old = tmp_path / "20261028-0900_demo_custom_ab12"
+    (old / ".venv" / "bin").mkdir(parents=True)
+    (old / "meta.json").write_text(
+        json.dumps(
+            {
+                "run_id": old.name,
+                "status": "done",
+                "starter": "cli",
+                "project": "demo",
+                "created": 1.0,
+                "arr_version": "0.1.0",
+            }
+        )
+    )
+    assert load_run_meta(old).run_venv is None
+    assert run_venv_location(old) == old / ".venv"
+    shutil.rmtree(old / ".venv")
+    assert run_venv_location(old) is None
+    assert run_venv_location(tmp_path / "missing") is None
+
+
+@pytest.fixture
+def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = Path(os.path.realpath(tmp_path)) / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+def with_toolchain(settings: WorkfolderSettings, **toolchain: Any) -> WorkfolderSettings:
+    return settings.model_copy(
+        update={"toolchain": settings.toolchain.model_copy(update=toolchain)}
+    )
+
+
+def assert_refused(workfolder: Path, settings: WorkfolderSettings, field: str, shown: str) -> None:
+    with pytest.raises(ConfigError) as info:
+        prepare(workfolder, settings)
+    issue = info.value.issues[0]
+    assert issue.path == field
+    assert shown in issue.message and "„explorer-gpt“" in issue.message
+    assert (
+        "/venvs/" in issue.message
+        or "ARR_VENV_ROOT" in issue.message
+        or "Homebrew" in (issue.message)
+    )
+    assert not list((workfolder / "runs").iterdir()), "refused before anything is created"
+
+
+def test_w3_00_codex_with_base_venv_below_home_is_refused(
+    workfolder: Path, settings: WorkfolderSettings, fake_home: Path, venv_root: Path
+) -> None:
+    venv = fake_home / ".venvs" / "mathe"
+    (venv / "bin").mkdir(parents=True)
+    tc = with_toolchain(settings, python="~/.venvs/mathe")
+    assert_refused(workfolder, tc, "toolchain.python", "~/.venvs/mathe")
+    with pytest.raises(ConfigError) as info:
+        prepare(workfolder, tc)
+    message = info.value.issues[0].message
+    assert f"{venv_root / 'venvs'}/" in message and "nicht von uv verwaltet" in message
+
+
+def test_w3_00_codex_with_interpreter_below_home_is_refused(
+    workfolder: Path, settings: WorkfolderSettings, fake_home: Path
+) -> None:
+    venv = fake_home / ".venvs" / "mathe"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python3").write_text("#!/bin/sh\n")
+    tc = with_toolchain(settings, python=str(venv / "bin" / "python3"))
+    assert_refused(workfolder, tc, "toolchain.python", "~/.venvs/mathe/bin/python3")
+
+
+def test_w3_00_codex_with_a_link_into_home_is_refused(
+    workfolder: Path, settings: WorkfolderSettings, fake_home: Path, tmp_path: Path
+) -> None:
+    (fake_home / "venv" / "bin").mkdir(parents=True)
+    link = tmp_path / "link-venv"
+    link.symlink_to(fake_home / "venv")
+    tc = with_toolchain(settings, python=str(link))
+    assert_refused(workfolder, tc, "toolchain.python", "(= ~/venv)")
+
+
+def test_w3_00_codex_with_a_uv_managed_python_is_refused(
+    workfolder: Path, settings: WorkfolderSettings, fake_home: Path
+) -> None:
+    """The venv lies outside `~`, but the Python it is built on below it."""
+    venv = Path(str(settings.toolchain.python))
+    managed = fake_home / ".local" / "share" / "uv" / "python" / "cpython-3.12" / "bin"
+    managed.mkdir(parents=True)
+    (managed / "python3.12").write_text("#!/bin/sh\n")
+    (venv / "pyvenv.cfg").write_text(f"home = {managed}\n")
+    (venv / "bin" / "python3").symlink_to(managed / "python3.12")
+    tc = with_toolchain(settings)
+    assert_refused(workfolder, tc, "toolchain.python", "~/.local/share/uv/python/cpython-3.12")
+
+
+def test_w3_00_codex_with_an_interpreter_link_into_home_is_refused(
+    workfolder: Path, settings: WorkfolderSettings, fake_home: Path
+) -> None:
+    venv = Path(str(settings.toolchain.python))
+    (fake_home / "py").write_text("#!/bin/sh\n")
+    (venv / "bin" / "python3").symlink_to(fake_home / "py")
+    assert_refused(workfolder, with_toolchain(settings), "toolchain.python", "(= ~/py)")
+
+
+def test_w3_00_codex_with_extra_path_below_home_is_refused(
+    workfolder: Path, settings: WorkfolderSettings, fake_home: Path
+) -> None:
+    (fake_home / ".local" / "bin").mkdir(parents=True)
+    tc = with_toolchain(settings, extra_path=["/Library/TeX/texbin", "~/.local/bin"])
+    assert_refused(workfolder, tc, "toolchain.extra_path[1]", "~/.local/bin")
+
+
+def test_w3_00_codex_with_venv_root_below_home_is_refused(
+    workfolder: Path, settings: WorkfolderSettings, fake_home: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("ARR_VENV_ROOT", str(fake_home / "venvs"))
+    assert_refused(workfolder, settings, "toolchain.run_venv", "~/venvs")
+    off = with_toolchain(settings, run_venv="off")
+    assert prepare(workfolder, off).run_dir.is_dir()  # without a run venv it does not matter
+
+
+def test_w3_00_claude_only_run_keeps_a_toolchain_below_home(
+    workfolder: Path, settings: WorkfolderSettings, fake_home: Path
+) -> None:
+    venv = fake_home / ".venvs" / "mathe"
+    (venv / "bin").mkdir(parents=True)
+    (fake_home / ".local" / "bin").mkdir(parents=True)
+    tc = with_toolchain(settings, python="~/.venvs/mathe", extra_path=["~/.local/bin"])
+
+    def claude_only(data: dict[str, Any]) -> None:
+        data["agents"] = [a for a in data["agents"] if a.get("provider") != "codex"]
+        data["groupchats"][0]["members"] = ["explorer-*"]
+
+    result = prepare(workfolder, tc, claude_only)
+    assert result.agents["explorer-1"].file.base_python == str(venv)
+
+
+def test_w3_00_codex_with_toolchain_outside_home_is_fine(
+    workfolder: Path, settings: WorkfolderSettings, fake_home: Path
+) -> None:
+    result = prepare(workfolder, settings)  # `settings` lies in tmp_path, outside the fake ~
+    assert "explorer-gpt" in result.agents

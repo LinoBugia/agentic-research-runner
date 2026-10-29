@@ -23,7 +23,7 @@ from claude_agent_sdk.types import CanUseTool, SystemPromptPreset
 
 from arr.errors import ArrError
 from arr.models import Effort, RunVenvMode
-from arr.permissions.policy import ROOM_TOOL_PREFIX, SandboxProfile, claude_options
+from arr.permissions.policy import ROOM_TOOL_PREFIX, RunPaths, SandboxProfile, claude_options
 from arr.room.server import AGENT_ID_ENV, RUN_DIR_ENV
 from arr.runs.prepare import PreparedAgent
 
@@ -80,15 +80,16 @@ def system_prompt(agent: PreparedAgent) -> SystemPromptPreset:
     }
 
 
-def agent_path(agent: PreparedAgent, base_path: str | None = None) -> str:
+def agent_path(agent: PreparedAgent, venv_dir: Path, base_path: str | None = None) -> str:
     """`PATH` of the agent: run venv `bin/`, then `path_prepend`, then the inherited `PATH`.
 
-    The run venv comes first so `pip install` lands there and never in the base venv
-    (docs/07 §2); the RunManager creates it before the agents start.
+    The run venv (`RunPaths.venv_dir`, outside `~`) comes first so `pip install` lands there
+    and never in the base venv (docs/07 §2); the RunManager creates it before the agents
+    start.
     """
     parts: list[str] = []
     if agent.file.run_venv is RunVenvMode.OVERLAY:
-        parts.append(str(agent.run_dir / ".venv" / "bin"))
+        parts.append(str(venv_dir / "bin"))
     parts += agent.file.path_prepend
     inherited = os.environ.get("PATH", os.defpath) if base_path is None else base_path
     parts += [p for p in inherited.split(os.pathsep) if p]
@@ -192,7 +193,8 @@ def build_options(
     config = agent.file.config
     perms = claude_options(profile)
     plugin = agent.plugin_dir
-    process_env = {**env, **perms.env, "PATH": agent_path(agent)}
+    venv_dir = RunPaths(profile.workfolder, agent.run_dir).venv_dir
+    process_env = {**env, **perms.env, "PATH": agent_path(agent, venv_dir)}
     process_env.update(cache_env(Path(perms.env["TMPDIR"])))
     if tmpdir is not None:
         process_env["TMPDIR"] = process_env["CLAUDE_CODE_TMPDIR"] = str(tmpdir)

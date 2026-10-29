@@ -27,6 +27,7 @@ from run_kit import (
 from arr.backends.base import TurnStatus
 from arr.errors import ArrError, ConfigError
 from arr.models import RunStatus, Toolchain
+from arr.permissions.policy import RunPaths
 from arr.permissions.types import (
     ApprovalStatus,
     ApprovalType,
@@ -178,13 +179,13 @@ async def test_finalizer_error_fails_the_run(workfolder: Path) -> None:
 
 
 async def test_run_venv_is_created_for_overlay(
-    workfolder: Path, monkeypatch: pytest.MonkeyPatch
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, venv_root: Path
 ) -> None:
     calls: list[tuple[Path, str | None, bool]] = []
 
-    def fake_venv(run_dir: Path, base: str | None, *, with_pip: bool = True) -> Path:
-        calls.append((run_dir, base, with_pip))
-        return run_dir / ".venv"
+    def fake_venv(paths: RunPaths, base: str | None, *, with_pip: bool = True) -> Path:
+        calls.append((paths.venv_dir, base, with_pip))
+        return paths.venv_dir
 
     monkeypatch.setattr(manager_module, "create_run_venv", fake_venv)
     settings = make_settings().model_copy(update={"toolchain": Toolchain(run_venv="overlay")})
@@ -194,7 +195,8 @@ async def test_run_venv_is_created_for_overlay(
 
     manager = make_manager(workfolder, topology, {"solo": turns()}, settings=settings)
     assert await manager.run() is RunStatus.DONE
-    assert calls == [(manager.run_dir, None, True)]
+    assert calls == [(venv_root / "runs" / manager.run_dir.name, None, True)]
+    assert load_run_meta(manager.run_dir).run_venv == str(calls[0][0])  # W3-00: in meta.json
     assert (manager.run_dir / "tmp").is_dir()
 
 
@@ -207,9 +209,11 @@ def test_create_run_venv_sees_the_base_venv(tmp_path: Path) -> None:
     (site / "arr_basemod.py").write_text("WERT = 42\n")
     assert base_interpreter(str(base)) == base / "bin" / "python3"
 
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    venv = create_run_venv(run_dir, str(base), with_pip=False)
+    run_dir = tmp_path / "wf" / "runs" / "run"
+    run_dir.mkdir(parents=True)
+    venv = create_run_venv(RunPaths(tmp_path / "wf", run_dir), str(base), with_pip=False)
+    assert venv == tmp_path / "venv-root" / "runs" / "run"  # outside the run folder (W3-00)
+    assert not (run_dir / ".venv").exists()
     python = venv / "bin" / "python"
     probe = "import arr_basemod, sys; print(arr_basemod.WERT, sys.prefix)"
     out = subprocess.run([python, "-c", probe], check=True, capture_output=True, text=True)

@@ -53,6 +53,7 @@ class Env:
     literature: Path
     venv: Path
     run_paths: RunPaths
+    run_venv: Path
 
     def agent(self, agent_id: str = "explorer-1", **fields: Any) -> AgentConfig:
         data: dict[str, Any] = {
@@ -100,7 +101,6 @@ def env(tmp_path: Path, arr_home: Path) -> Env:
         run / "output",
         run / "groupchats" / "attachments" / "main" / "17",
         run / "tmp",
-        run / ".venv",
         arr_home,
     ]
     for directory in dirs:
@@ -113,6 +113,9 @@ def env(tmp_path: Path, arr_home: Path) -> Env:
         "home = /opt/pybase/bin\ninclude-system-site-packages = false\n"
     )
     toolchain = Toolchain(python="~/.venvs/mathe", extra_path=["/Library/TeX/texbin"])
+    run_paths = RunPaths(workfolder, run, toolchain)
+    run_venv = Path(os.path.realpath(run_paths.venv_dir))  # outside ~ (W3-00)
+    run_venv.mkdir(parents=True)
     return Env(
         home=home,
         workfolder=workfolder,
@@ -120,7 +123,8 @@ def env(tmp_path: Path, arr_home: Path) -> Env:
         work=run / "agents" / "explorer-1" / "work",
         literature=home / "Literatur",
         venv=venv,
-        run_paths=RunPaths(workfolder, run, toolchain),
+        run_paths=run_paths,
+        run_venv=run_venv,
     )
 
 
@@ -168,7 +172,7 @@ def test_row_write_in_work_dir_and_released_run_folders_is_allowed(env: Env) -> 
         write(env.work / "solve.py"),
         write("sub/dir/result.txt", tool="Edit"),
         write(env.run / "tmp" / "x.bin"),
-        write(env.run / ".venv" / "lib" / "site.py", tool="fileChange"),
+        write(env.run_venv / "lib" / "site.py", tool="fileChange"),
     ]:
         assert engine.evaluate(request).action is ALLOW, request.paths
 
@@ -299,7 +303,7 @@ def test_install_outside_run_venv_is_denied(env: Env) -> None:
     assert engine.evaluate(bash("uv tool install ruff")).action is DENY
     no_venv = RunPaths(env.workfolder, env.run, Toolchain(run_venv="off"))
     profile = profile_for(env.agent(), no_venv, home=env.home)
-    assert env.run / ".venv" not in profile.write_roots
+    assert env.run_venv not in profile.write_roots
     decision = PolicyEngine([profile]).evaluate(bash("pip install sympy"))
     assert decision.action is DENY
     assert "Run-venv" in decision.reason
@@ -596,7 +600,7 @@ def test_l10_toolchain(views: Views, env: Env) -> None:
     assert "/opt/pybase" in views.claude.sandbox["filesystem"]["allowRead"]
     texbin = normalize_path("/Library/TeX/texbin", base=env.home, home=env.home)
     assert str(texbin) in views.claude.sandbox["filesystem"]["allowRead"]
-    run_venv = env.run / ".venv" / "lib" / "x.py"
+    run_venv = env.run_venv / "lib" / "x.py"
     assert views.shell_reads(run_venv) and claude_sandbox_writes(views.claude, str(run_venv))
     assert views.engine.evaluate(bash("python3 -c 'import sympy'")).action is ALLOW
 
@@ -613,7 +617,7 @@ def test_l11_system_paths(views: Views) -> None:
 def test_claude_translation_is_complete(views: Views, env: Env) -> None:
     claude = views.claude
     assert claude.cwd == str(env.work)
-    assert claude.add_dirs == [str(env.run / "tmp"), str(env.run / ".venv")]
+    assert claude.add_dirs == [str(env.run / "tmp"), str(env.run_venv)]
     assert claude.permission_mode == "acceptEdits"
     assert claude.env == {"TMPDIR": str(env.run / "tmp")}
     assert claude.allowed_tools[0] == "mcp__arr-room__*"
@@ -634,7 +638,7 @@ def test_claude_translation_is_complete(views: Views, env: Env) -> None:
     assert sandbox["failIfUnavailable"] is True
     assert sandbox["network"] == {"allowedDomains": []}
     fs = sandbox["filesystem"]
-    assert fs["allowWrite"] == [str(env.work), str(env.run / "tmp"), str(env.run / ".venv")]
+    assert fs["allowWrite"] == [str(env.work), str(env.run / "tmp"), str(env.run_venv)]
     assert {str(env.home), "/Volumes", str(env.workfolder)} <= set(fs["denyRead"])
     assert str(env.home / ".ssh") in fs["denyRead"]
     assert str(env.literature) in fs["allowRead"]
@@ -646,7 +650,7 @@ def test_codex_translation_is_complete(views: Views, env: Env) -> None:
     assert codex.sandbox == "workspace_write"
     assert codex.approvals_reviewer == "user"
     assert codex.sandbox_workspace_write == {
-        "writable_roots": [str(env.run / "tmp"), str(env.run / ".venv")],
+        "writable_roots": [str(env.run / "tmp"), str(env.run_venv)],
         "network_access": False,
         "exclude_slash_tmp": True,
         "exclude_tmpdir_env_var": True,
@@ -1681,3 +1685,25 @@ def test_w2012_write_to_dev_stderr_with_tmp_as_process_temp(
     assert normalize_path("/tmp", base=env.home, home=env.home) not in profile.read_deny
     decision = env.engine(profile).evaluate(bash("echo hi > /dev/stderr"))
     assert decision.action is ALLOW, decision.reason
+
+
+# --------------------------------------------------------------------------------------------
+# W3-00: the run venv lives outside ~ and outside the run folder
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_w3_00_run_venv_is_a_write_root_outside_home(env: Env, provider: str) -> None:
+    profile = env.profile(env.agent(provider=provider))
+    assert env.run_venv in profile.write_roots and env.run_venv in profile.read_allow
+    assert env.run / ".venv" not in profile.write_roots
+    assert not env.run_venv.is_relative_to(env.home)
+    assert env.run_venv.name == env.run.name  # <venv root>/runs/<run-id>
+    assert profile.can_write(env.run_venv / "lib" / "x.py")
+    assert not profile.can_write(env.run / ".venv" / "lib" / "x.py")
+
+
+def test_w3_00_shadowing_a_program_in_the_run_venv_is_denied(env: Env) -> None:
+    cat = env.run_venv / "bin" / "cat"
+    command = f"printf x > {cat}; chmod +x {cat}; cat sudo ls"
+    assert env.engine().evaluate(bash(command)).action is DENY
