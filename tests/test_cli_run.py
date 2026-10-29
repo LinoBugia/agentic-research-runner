@@ -25,7 +25,7 @@ from typer.testing import CliRunner
 from arr.cli import app
 from arr.models import RunStatus
 from arr.runs import launch as launch_module
-from arr.runs.launch import plan_launch, run_launch
+from arr.runs.launch import STOP_REQUEST, plan_launch, run_launch
 
 runner = CliRunner()
 
@@ -97,8 +97,15 @@ def m1_scripts() -> dict[str, Any]:
 
 
 @pytest.fixture
-def m1(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Workfolder with the M1 run.yaml; the launcher builds FakeBackends."""
+def m1(
+    tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch, restore_root_logger: Any
+) -> Path:
+    """Workfolder with the M1 run.yaml; the launcher builds FakeBackends.
+
+    `arr run` calls `setup_logging()`, which binds a handler to the `CliRunner` stream of that
+    call; `restore_root_logger` drops it afterwards, so later log calls never hit a closed
+    stream (the „Logging error“ lines in CI, W2-05.3).
+    """
     wf = make_workfolder(tmp_path)
     (wf / "arr.yaml").write_text("version: 1\ntoolchain: {run_venv: off}\n", encoding="utf-8")
     (wf / "run.yaml").write_text(M1_RUN_YAML, encoding="utf-8")
@@ -270,7 +277,14 @@ async def test_runs_stop_from_a_second_process_ends_a_running_run(m1: Path) -> N
     assert stop.exit_code == 0, stop.output
     assert f"Stopp angefordert für {run_dir.name}" in stop.output
     again = await asyncio.to_thread(runner.invoke, app, ["runs", "stop", run_dir.name])
-    assert "schon eine Stopp-Anforderung" in again.output or "läuft nicht" in again.output
+    # The running process may already have consumed the first request while the run is still
+    # being stopped (seen in CI, W2-05.3): then the second call puts a new one, which the
+    # process consumes as well; or the run is already in `finalizing` or over.
+    assert (
+        "schon eine Stopp-Anforderung" in again.output
+        or f"Stopp angefordert für {run_dir.name}" in again.output
+        or "läuft nicht" in again.output
+    ), again.output
 
     result = await asyncio.wait_for(running, 10)
     assert result.status is RunStatus.STOPPED
@@ -280,4 +294,5 @@ async def test_runs_stop_from_a_second_process_ends_a_running_run(m1: Path) -> N
     assert "Grund:     Der User hat den Run gestoppt." in status.output
     assert "  a: 1 Turn, zuletzt unterbrochen" in status.output
     assert "Stopp angefordert" not in status.output
+    assert not (run_dir / STOP_REQUEST).exists(), "no request stays behind (W2-05.3)"
     assert json.loads((run_dir / "meta.json").read_text())["status"] == "stopped"
