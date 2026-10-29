@@ -3,6 +3,7 @@ translators for Claude and Codex, always rules, scopes, revocation and approvals
 
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,7 @@ class Env:
             "model": "claude-sonnet-5-5",
             "auth": "max-privat",
             "read_dirs": ["~/Literatur", "run:shared/other", "projects/collatz"],
+            "channels": ["main"],
         }
         data.update(fields)
         return AgentConfig.model_validate(data)
@@ -95,7 +97,7 @@ def env(tmp_path: Path, arr_home: Path) -> Env:
         run / "shared" / "beweis",
         run / "shared" / "other",
         run / "output",
-        run / "groupchats" / "attachments" / "17",
+        run / "groupchats" / "attachments" / "main" / "17",
         run / "tmp",
         run / ".venv",
         arr_home,
@@ -148,7 +150,7 @@ def test_row_read_in_work_dir_run_and_read_dirs_is_allowed(env: Env) -> None:
         read(env.work / "notes.md"),
         read("notes.md"),
         read(env.run / "output" / "summary.md"),
-        read(env.run / "groupchats" / "attachments" / "17" / "plot.png"),
+        read(env.run / "groupchats" / "attachments" / "main" / "17" / "plot.png"),
         read("~/Literatur/paper.pdf"),
         read(env.run / "shared" / "other" / "lemma.tex"),
         read(env.workfolder / "projects" / "collatz", tool="Grep"),
@@ -1127,30 +1129,26 @@ def test_b1_normal_work_stays_allowed(env: Env, command: str) -> None:
 
 
 def test_b2_skills_and_plugin_are_readable_not_writable(env: Env) -> None:
-    skill = env.run / "skills" / "proof"
-    (skill / "scripts").mkdir(parents=True)
-    (skill / "SKILL.md").write_text("# proof\n")
-    (skill / "scripts" / "check.py").write_text("print('ok')\n")
+    # W2-01: the run's skills/ snapshot is not readable; Claude reads its plugin, Codex its
+    # copy in work/.agents/skills (prepare_run copies, it does not link).
     plugin = env.run / "agents" / "explorer-1" / "plugin" / "skills" / "proof"
     plugin.mkdir(parents=True)
-    (env.work / ".agents" / "skills").mkdir(parents=True)
-    (env.work / ".agents" / "skills" / "proof").symlink_to(skill)
+    (plugin / "SKILL.md").write_text("# proof\n")
+    copy = env.work / ".agents" / "skills" / "proof"
+    (copy / "scripts").mkdir(parents=True)
+    (copy / "scripts" / "check.py").write_text("print('ok')\n")
     profile = env.profile()
     engine = PolicyEngine([profile])
     claude, codex = claude_options(profile), codex_options(profile)
     linked = ".agents/skills/proof"
-    assert engine.evaluate(read(f"{linked}/SKILL.md")).action is ALLOW
     assert engine.evaluate(bash(f"python3 {linked}/scripts/check.py")).action is ALLOW
-    assert engine.evaluate(bash(f"cat {linked}/SKILL.md")).action is ALLOW
     assert engine.evaluate(read(plugin / "SKILL.md")).action is ALLOW
-    for path in (skill / "scripts" / "check.py", plugin / "SKILL.md"):
-        assert claude_sandbox_reads(claude, str(path))
-        assert not claude_sandbox_writes(claude, str(path))
-        assert codex_access(codex, str(path)) == "read"
-        assert claude_rule(claude.allowed_tools, "Read", str(path))
-        assert claude_rule(claude.disallowed_tools, "Edit", str(path))
-    assert engine.evaluate(write(f"{linked}/SKILL.md")).action is DENY
-    assert engine.evaluate(bash(f"echo x > {linked}/SKILL.md")).action is DENY
+    assert claude_sandbox_reads(claude, str(plugin / "SKILL.md"))
+    assert not claude_sandbox_writes(claude, str(plugin / "SKILL.md"))
+    assert codex_access(codex, str(plugin / "SKILL.md")) == "read"
+    assert claude_rule(claude.allowed_tools, "Read", str(plugin / "SKILL.md"))
+    assert claude_rule(claude.disallowed_tools, "Edit", str(plugin / "SKILL.md"))
+    assert engine.evaluate(write(plugin / "SKILL.md")).action is DENY
 
 
 # B2 / 4: no secret in always rules
@@ -1398,7 +1396,7 @@ def test_w1052_b1_download_into_a_shell_stays_high_risk(
         "head -n 5 security.md && wc -l profiles.txt",
         "ls profiles && touch port.txt",
         "printf '%s\\n' halt reboot",
-        "python3 analyze.py --keyword sudo",
+        "python3 analyze.py",
         "git status; grep -n push notes.md",
         "less security.md",
     ],
@@ -1494,3 +1492,153 @@ def test_w1052_b3_no_reason_starts_with_whitespace(env: Env) -> None:
 def test_w1052_b3_more_histories_are_sensitive(env: Env, path: str) -> None:
     decision = env.engine().evaluate(read(path))
     assert decision.action is DENY and "geschützt" in decision.reason
+
+
+# --------------------------------------------------------------------------------------------
+# W2-01 / N10: the data exemption holds only for bare names the command cannot replace
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "./cat sudo ls",
+        "./grep git push",
+        "/tmp/cat sudo ls",
+        "../../../.venv/bin/cat sudo ls",
+        "PATH=.:$PATH cat sudo ls",
+        "export PATH=.:$PATH; cat sudo ls",
+        "echo sudo ls > a && chmod +x a && ./a",
+        "python3 x.py sudo ls",
+    ],
+)
+def test_w201_n10_review_forms_are_denied(env: Env, command: str) -> None:
+    for provider in ("claude", "codex"):
+        engine = env.engine(env.profile(env.agent(provider=provider)))
+        request = bash(command, provider=provider)
+        assert engine.evaluate(request).action is DENY, (command, provider)
+        assert engine.hard_deny(request) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "PATH=. bash -c 'cat sudo ls'",
+        "path=(. $path); cat sudo ls",
+        "env PATH=. cat sudo ls",
+        "PATH+=:.; grep git push",
+        "eval 'export PATH=.'; cat sudo ls",
+        "printf x > ../../../.venv/bin/cat; chmod +x ../../../.venv/bin/cat; cat sudo ls",
+        "ln -s /bin/bash ../../../.venv/bin/grep; grep -c 'sudo ls'",
+        "cp /bin/sh cat; chmod +x cat; ./cat -c 'git push'",
+        "alias cat=bash; cat -c 'sudo ls'",
+        "hash -p /bin/bash cat; cat -c 'sudo ls'",
+        "python3 -u x.py git push",
+    ],
+)
+def test_w201_n10_further_forms_are_denied(env: Env, command: str) -> None:
+    assert env.engine().evaluate(bash(command)).action is DENY, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat sudo",
+        "grep -rn sudo notes.md",
+        "python3 analyze.py",
+        "echo x > out.txt; cat out.txt",
+        "echo 'print(1)' > solve.py && python3 solve.py",
+        "ls profiles && touch port.txt",
+    ],
+)
+def test_w201_n10_bare_data_programs_stay_exempt(env: Env, command: str) -> None:
+    decision = env.engine().evaluate(bash(command))
+    assert decision.action is ALLOW, (command, decision.reason)
+
+
+# --------------------------------------------------------------------------------------------
+# W2-01 / A3: no run skills snapshot, attachments of own channels only
+# --------------------------------------------------------------------------------------------
+
+
+def test_w201_run_skills_snapshot_is_not_readable(env: Env) -> None:
+    snapshot = env.run / "skills" / "proof" / "SKILL.md"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text("# proof\n")
+    for provider in ("claude", "codex"):
+        profile = env.profile(env.agent(provider=provider))
+        engine = PolicyEngine([profile])
+        assert not profile.can_read(snapshot)
+        assert engine.evaluate(read(snapshot, provider=provider)).action is ASK
+        assert engine.evaluate(bash(f"cat {snapshot}", provider=provider)).action is DENY
+        if provider == "claude":
+            options = claude_options(profile)
+            assert not claude_rule(options.allowed_tools, "Read", str(snapshot))
+            assert str(env.run / "skills") not in options.sandbox["filesystem"]["allowRead"]
+        else:
+            assert codex_access(codex_options(profile), str(snapshot)) == "deny"
+
+
+def test_w201_attachments_only_of_own_channels(env: Env) -> None:
+    attachments = env.run / "groupchats" / "attachments"
+    own = attachments / "beweis" / "17" / "lemma.pdf"
+    foreign = attachments / "kritik" / "18" / "notiz.md"
+    profile = env.profile(env.agent(channels=["main", "beweis"]))
+    engine = PolicyEngine([profile])
+    claude, codex = claude_options(profile), codex_options(profile)
+    allow_read = claude.sandbox["filesystem"]["allowRead"]
+    assert str(attachments / "main") in allow_read and str(attachments / "beweis") in allow_read
+    assert str(attachments) not in allow_read
+    assert profile.can_read(own) and not profile.can_read(foreign)
+    assert engine.evaluate(read(own)).action is ALLOW
+    assert engine.evaluate(bash(f"cat {own}")).action is ALLOW
+    assert engine.evaluate(read(foreign)).action is ASK
+    assert engine.evaluate(bash(f"cat {foreign}")).action is DENY
+    assert claude_rule(claude.allowed_tools, "Read", str(own))
+    assert not claude_rule(claude.allowed_tools, "Read", str(foreign))
+    assert codex_access(codex, str(own)) == "read" and codex_access(codex, str(foreign)) == "deny"
+    none = env.profile(env.agent(channels=[]))
+    assert not none.can_read(own)
+
+
+# --------------------------------------------------------------------------------------------
+# W2-01.1 / B4: the user's temp folders are not readable
+# --------------------------------------------------------------------------------------------
+
+
+def test_w2011_user_temp_dirs_are_blocked_by_default(env: Env) -> None:
+    claude_tmp = normalize_path(f"/tmp/claude-{os.getuid()}", base=env.home, home=env.home)
+    process_tmp = normalize_path(tempfile.gettempdir(), base=env.home, home=env.home)
+    for provider in ("claude", "codex"):
+        profile = env.profile(env.agent(provider=provider))
+        assert claude_tmp in profile.read_deny and process_tmp in profile.read_deny
+        assert not profile.can_read(claude_tmp / "scratchpad" / "notes.md")
+        assert profile.can_read(env.work / "a.py") and profile.can_read(env.run / "tmp" / "x")
+        if provider == "claude":
+            deny_read = claude_options(profile).sandbox["filesystem"]["denyRead"]
+            assert str(claude_tmp) in deny_read and str(process_tmp) in deny_read
+        else:
+            assert codex_access(codex_options(profile), str(claude_tmp / "x")) == "deny"
+
+
+def test_w2011_temp_dirs_deny_reading_but_keep_run_tmp(env: Env, tmp_path: Path) -> None:
+    claude_tmp = Path(os.path.realpath(tmp_path)) / "sys" / "claude-501"
+    process_tmp = Path(os.path.realpath(tmp_path)) / "sys" / "T"
+    secret = claude_tmp / "scratchpad" / "copy.txt"
+    other = process_tmp / "pytest-of-user" / "data.txt"
+    profile = env.profile(temp_dirs=[claude_tmp, process_tmp])
+    engine = PolicyEngine([profile])
+    for path in (secret, other):
+        assert not profile.can_read(path)
+        assert engine.evaluate(read(path)).action is ASK
+        assert engine.evaluate(bash(f"cat {path}")).action is DENY
+    run_tmp = env.run / "tmp" / "cache" / "pip"
+    assert profile.can_read(run_tmp) and profile.can_write(run_tmp)
+    assert engine.evaluate(bash(f"python3 -c 1 > {env.run / 'tmp' / 'out.txt'}")).action is ALLOW
+
+
+def test_w2011_temp_dir_below_run_tmp_stays_readable(env: Env) -> None:
+    inside = env.run / "tmp" / "T"
+    profile = env.profile(temp_dirs=[inside])
+    assert inside not in profile.read_deny
+    assert profile.can_read(inside / "x.txt")
