@@ -8,6 +8,7 @@ entries depend on the profile only. The tests of variant 1 (open parents, siblin
 import os
 import re
 import tomllib
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -279,6 +280,34 @@ def test_w3_00_venv_name_that_globs_cannot_express_is_refused(
     with pytest.raises((ArrError, ValueError)):
         _, profile, paths = venv_setup(venv_layout, python=str(odd))
         filesystem_entries(profile, paths, ["main"])
+
+
+@pytest.mark.parametrize(
+    "name", ["mäthe", "w3rev-é1", unicodedata.normalize("NFD", "w3rev-é1"), "mathe✓"]
+)
+def test_w3_00_1_m1_non_ascii_base_venv_name_is_refused(
+    venv_layout: dict[str, Path], name: str
+) -> None:
+    """Seatbelt compares in NFD, `[!é]` acts like `[!e]`: such a name would open `e1`."""
+    base = venv_layout["root"] / "venvs" / name
+    (base / "bin").mkdir(parents=True)
+    _, profile, paths = venv_setup(venv_layout, python=str(base))
+    with pytest.raises(ArrError, match="Nicht-ASCII") as info:
+        filesystem_entries(profile, paths, ["main"])
+    assert "Benenne die venv um" in info.value.message
+
+
+def test_w3_00_1_m1_same_message_for_glob_characters(venv_layout: dict[str, Path]) -> None:
+    from arr.backends.codex_config import _others
+
+    _, profile, _ = venv_setup(venv_layout)
+    folder = venv_layout["root"] / "venvs"
+    messages = []
+    for name in ("mä", "m!a"):
+        with pytest.raises(ArrError) as info:
+            _others(profile, folder, folder / name)
+        messages.append(info.value.message.split("“", 1)[1])
+    assert messages[0].replace("mä", "m!a") == messages[1]
 
 
 FILES_ARR_WRITES = [

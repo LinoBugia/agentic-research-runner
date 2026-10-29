@@ -831,13 +831,23 @@ class ClaudeOptions:
 
 
 def claude_options(profile: SandboxProfile) -> ClaudeOptions:
-    """Translate a profile into Claude options (W2-01 checks that the SDK enforces them)."""
+    """Translate a profile into Claude options (W2-01 checks that the SDK enforces them).
+
+    A `Read(//p/**)` rule lets Read, Grep and Glob through without asking `can_use_tool`.
+    So a read folder that contains a read block (`~`, the workfolder, the venv root …) gets
+    no rule: such reads go to the PolicyEngine, which decides by specificity (W3-00.1 M2).
+    """
     writable = [p for p in profile.write_roots if p != profile.work_dir]
+
+    def covers_a_block(path: Path) -> bool:
+        key = profile.key(path)
+        return any(_key_within(profile.key(d), key) for d in profile.read_deny)
+
     allowed = [f"{ROOM_TOOL_PREFIX}*"]
     allowed += [
         f"Read({_claude_path(p, tree=True)})"
         for p in profile.read_allow
-        if p not in profile.write_roots
+        if p not in profile.write_roots and not covers_a_block(p)
     ]
     if profile.web:
         allowed += ["WebFetch", "WebSearch"]

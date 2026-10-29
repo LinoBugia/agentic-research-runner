@@ -1789,3 +1789,48 @@ def test_w3_00_base_venv_is_read_only_for_both_backends(venv_env, provider: str)
         claude = claude_options(profile)
         assert not claude_sandbox_writes(claude, str(base / "lib" / "x.py"))
         assert claude_rule(claude.disallowed_tools, "Edit", str(base / "lib" / "x.py"))
+
+
+# --------------------------------------------------------------------------------------------
+# W3-00.1 M2: a read folder that contains a read block gets no Read rule
+# --------------------------------------------------------------------------------------------
+
+
+def _m2_views(env: Env, read_dir: Path) -> tuple[SandboxProfile, ClaudeOptions, PolicyEngine]:
+    profile = env.profile(env.agent(read_dirs=[str(read_dir)]))
+    return profile, claude_options(profile), PolicyEngine([profile])
+
+
+@pytest.mark.parametrize("tool", ["Read", "Grep", "Glob"])
+def test_w3_00_1_m2_read_folder_around_the_venv_root(env: Env, venv_root: Path, tool: str) -> None:
+    root = Path(os.path.realpath(venv_root))
+    outer = root.parent  # like /Users/Shared around /Users/Shared/arr-<user>
+    other = root / "runs" / "20261029-1200_other_custom_beef" / "canary.txt"
+    profile, claude, engine = _m2_views(env, outer)
+    assert outer in profile.read_allow
+    assert not any(claude_rule(claude.allowed_tools, "Read", str(p)) for p in (other, outer))
+    assert engine.evaluate(read(other, tool=tool)).action is not ALLOW
+    assert engine.evaluate(read(root / "venvs" / "x" / "c.txt", tool=tool)).action is not ALLOW
+    assert engine.evaluate(read(outer / "paper.md", tool=tool)).action is ALLOW  # still open
+    assert engine.evaluate(read(env.run_venv / "x.py", tool=tool)).action is ALLOW
+    assert not claude_sandbox_reads(claude, str(other))
+    assert claude_sandbox_reads(claude, str(outer / "paper.md"))
+
+
+@pytest.mark.parametrize("tool", ["Read", "Grep", "Glob"])
+def test_w3_00_1_m2_read_folder_around_the_workfolder(env: Env, tool: str) -> None:
+    outer = env.workfolder.parent  # ~/Mathe around ~/Mathe/arr-work (older case, review hint)
+    other_run = env.workfolder / "runs" / "r2" / "agents" / "x" / "work" / "c.txt"
+    other_project = env.workfolder / "projects" / "other" / "canary.txt"
+    profile, claude, engine = _m2_views(env, outer)
+    for path in (other_run, other_project, env.run / "meta.json"):
+        assert not claude_rule(claude.allowed_tools, "Read", str(path)), path
+        assert engine.evaluate(read(path, tool=tool)).action is not ALLOW, path
+        assert not claude_sandbox_reads(claude, str(path)), path
+    assert engine.evaluate(read(outer / "notes.md", tool=tool)).action is ALLOW
+
+
+def test_w3_00_1_m2_plain_read_folders_keep_their_rule(env: Env) -> None:
+    claude = claude_options(env.profile())
+    assert f"Read(/{env.literature}/**)" in claude.allowed_tools
+    assert claude_rule(claude.allowed_tools, "Read", str(env.literature / "paper.pdf"))

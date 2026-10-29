@@ -232,6 +232,68 @@ def claude_offline(lab: Lab, late: dict[str, Path]) -> list[dict]:
         rows.append({"expect": expect, "mode": mode, "case": label, "sandbox": sandbox})
         rows[-1] |= {"file_tool": tools, "as_expected": ok}
         print(f"  Claude {expect} {mode:<9} {label:<38} Sandbox={sandbox} Werkzeug={tools}")
+    return rows + claude_wide_read_dirs(lab, config, rules)
+
+
+def claude_wide_read_dirs(lab: Lab, config, rules) -> list[dict]:
+    """W3-00.1 M2: a read folder that contains a block (`<wurzel>`, the workfolder) gets no
+    `Read(//…/**)` rule, so Read/Grep/Glob go to the PolicyEngine, which decides."""
+    c = lab.canaries
+    wide = [
+        (
+            venv_root().parent,
+            "Lese-Ordner = Elternordner von <wurzel>",
+            [
+                ("❌", "Run-venv des parallelen Runs", c["parallel_venv"]),
+                ("❌", "fremde Basis-venv", c["other_base_venv"]),
+                ("✅", "Lese-Ordner selbst", venv_root().parent / "w3-00-paper.md"),
+            ],
+        ),
+        (
+            lab.workfolder.parent,
+            "Lese-Ordner = Elternordner des Workfolders",
+            [
+                ("❌", "paralleler Run", c["parallel_run"]),
+                ("❌", "anderes Projekt", c["other_project"]),
+                ("✅", "Lese-Ordner selbst", lab.workfolder.parent / "AGENTS.md"),
+            ],
+        ),
+    ]
+    rows = []
+    for folder, title, checks in wide:
+        profile = profile_for(
+            config.model_copy(update={"read_dirs": [str(folder)]}), lab.run_paths, rules
+        )
+        allowed = claude_options(profile).allowed_tools
+        engine = PolicyEngine([profile])
+        for expect, label, path in checks:
+            rule = any(
+                r.startswith("Read(//") and _within(str(path), r[6:-1].removesuffix("/**"))
+                for r in allowed
+            )
+            answers = []
+            for name in ("Read", "Grep", "Glob"):
+                request = PermissionRequest(
+                    run_id="lab",
+                    agent_id="claude-1",
+                    tool=name,
+                    provider="claude",
+                    paths=[str(path)],
+                )
+                answers.append(engine.evaluate(request).action is DecisionAction.ALLOW)
+            ok = (not rule) and all(a == (expect == "✅") for a in answers)
+            label = f"{title}: {label}"
+            rows.append(
+                {
+                    "expect": expect,
+                    "mode": "Read/Grep/Glob",
+                    "case": label,
+                    "read_rule": rule,
+                    "policy_allow": answers,
+                    "as_expected": ok,
+                }
+            )
+            print(f"  Claude {expect} Read-Regel={rule} Policy={answers} {label}")
     return rows
 
 

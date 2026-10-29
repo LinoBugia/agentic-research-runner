@@ -230,10 +230,12 @@ def _others(profile: SandboxProfile, folder: Path, own: Path | None) -> list[str
     if own is None or profile.key(own.parent) != profile.key(folder):
         return [f"{base}/*{{,/**}}"]
     name = own.name
-    if _NAME_FORBIDDEN & set(name):
+    # Seatbelt compares in NFD: `[!é]` acts like `[!e]`, so only ASCII names (W3-00.1 M1).
+    if _NAME_FORBIDDEN & set(name) or not name.isascii():
         raise ArrError(
             f"Der Name „{name}“ in {folder} enthält ein Zeichen, das Codex in einem Muster "
-            "nicht ausschließen kann ([ ] \\ ! ^ { } * ? ,). Benenne die venv um."
+            "nicht ausschließen kann (Umlaute, Akzente und andere Nicht-ASCII-Zeichen sowie "
+            "[ ] \\ ! ^ { } * ? ,). Benenne die venv um, z. B. nur mit a–z, 0–9, - und _."
         )
     globs = [f"{base}/{name[:i]}[!{ch}]*" for i, ch in enumerate(name)]
     globs += [f"{base}/{name[:i]}" for i in range(1, len(name))]
@@ -309,32 +311,37 @@ def filesystem_entries(
             )
     for glob in _venv_globs(profile) + _sensitive_globs(profile):
         result[glob] = "deny"
-    _check_size(len(result), len(toml_value(result).encode("utf-8")))
+    _check_size(len(result), len(toml_value(result).encode("utf-8")), run_paths.run_dir.name)
     return result
 
 
-_TOO_MANY = (
-    "So viele Einträge machen jeden Befehl in der Sandbox sehr langsam oder lassen ihn "
-    "scheitern. Die Liste wächst mit den Lese-Ordnern („read_dirs“), den Kanälen und den "
-    "Freigaberegeln des Agenten: Fasse Lese-Ordner zusammen oder entferne nicht nötige."
-)
+def _too_many(run_id: str) -> str:
+    """Why the list is big and what helps (variant 2: no folder contents, W3-00.1 G1)."""
+    return (
+        "So viele Einträge machen jeden Befehl in der Sandbox sehr langsam oder lassen ihn "
+        "scheitern. Die Liste wächst mit den Lese-Ordnern („read_dirs“), den Kanälen und den "
+        "Freigaberegeln des Agenten und mit der Länge der Run-ID: Jedes Zeichen kostet zwei "
+        f"Einträge, und die Run-ID „{run_id}“ hat {len(run_id)} Zeichen. Fasse Lese-Ordner "
+        "zusammen oder entferne nicht nötige; bei sehr langen Projekt- oder Skill-Namen "
+        "hilft ein kürzerer Name."
+    )
 
 
-def _check_size(count: int, size: int) -> None:
+def _check_size(count: int, size: int, run_id: str) -> None:
     if count >= ENTRIES_MAX:
         raise ArrError(
             f"Die Lese-Sperrliste für Codex hat {count} Einträge (Grenze {ENTRIES_MAX}). "
-            + _TOO_MANY
+            + _too_many(run_id)
         )
     if size >= PROFILE_MAX_BYTES:
         raise ArrError(
             f"Die Lese-Sperrliste für Codex ist {size} Bytes groß (Grenze {PROFILE_MAX_BYTES} "
-            "Bytes). " + _TOO_MANY
+            "Bytes). " + _too_many(run_id)
         )
     if count >= ENTRIES_WARN:
         logger.warning(
             "Lese-Sperrliste für Codex mit %d Einträgen (Warnung ab %d): jeder Befehl wird "
-            "langsamer. Alte Runs archivieren hilft.",
+            "langsamer. Weniger Lese-Ordner oder kürzere Projekt- und Skill-Namen helfen.",
             count,
             ENTRIES_WARN,
         )

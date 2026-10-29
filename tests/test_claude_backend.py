@@ -2,6 +2,7 @@
 from the S1 fixtures (A6), approval path (A7), secrets (A8), project context (A9), hints."""
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -187,15 +188,27 @@ def test_a5_options_follow_the_architecture(setup: Setup) -> None:
 
 def test_w3_00_no_virtual_env_without_run_venv(setup: Setup, monkeypatch) -> None:
     monkeypatch.setenv("VIRTUAL_ENV", "/arr/.venv")
-    agent = setup.agent()
-    file = agent.file.model_copy(update={"run_venv": "off"})
-    from arr.runs.prepare import PreparedAgent
-
-    off = PreparedAgent(file, agent.run_dir)
+    off = dataclasses.replace(setup, toolchain=Toolchain(run_venv="off"))
+    profile = off.profile()
+    assert profile.venv_dir is None
     options = build_options(
-        off, setup.profile(), env=dict(CLAUDE_SWITCHES), can_use_tool=None, hooks=None
+        setup.agent(), profile, env=dict(CLAUDE_SWITCHES), can_use_tool=None, hooks=None
     )
     assert options.env["VIRTUAL_ENV"] == ""
+    assert not any("venv-root" in p for p in options.env["PATH"].split(os.pathsep))
+
+
+def test_w3_00_1_g4_run_venv_comes_from_the_profile(setup: Setup, monkeypatch) -> None:
+    """One source: a changed `ARR_VENV_ROOT` after the profile was built changes nothing."""
+    profile = setup.profile()
+    monkeypatch.setenv("ARR_VENV_ROOT", "/somewhere/else")
+    options = build_options(
+        setup.agent(), profile, env=dict(CLAUDE_SWITCHES), can_use_tool=None, hooks=None
+    )
+    assert profile.venv_dir is not None
+    assert options.env["PATH"].split(os.pathsep)[0] == str(profile.venv_dir / "bin")
+    assert options.env["VIRTUAL_ENV"] == str(profile.venv_dir)
+    assert str(profile.venv_dir) in options.sandbox["filesystem"]["allowWrite"]
 
 
 def test_a5_system_prompt_is_byte_identical_per_role(setup: Setup) -> None:
