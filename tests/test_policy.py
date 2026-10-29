@@ -1607,9 +1607,18 @@ def test_w201_attachments_only_of_own_channels(env: Env) -> None:
 # --------------------------------------------------------------------------------------------
 
 
-def test_w2011_user_temp_dirs_are_blocked_by_default(env: Env) -> None:
+def test_w2011_user_temp_dirs_are_blocked_by_default(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A macOS-like process temp folder; under Linux `gettempdir()` is `/tmp`, which
+    # `user_temp_dirs()` leaves out on purpose (W2-01.2).
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: "/private/var/folders/zz/arr-test/T")
     claude_tmp = normalize_path(f"/tmp/claude-{os.getuid()}", base=env.home, home=env.home)
     process_tmp = normalize_path(tempfile.gettempdir(), base=env.home, home=env.home)
+    assert [normalize_path(p, base=env.home, home=env.home) for p in user_temp_dirs()] == [
+        claude_tmp,
+        process_tmp,
+    ]
     for provider in ("claude", "codex"):
         profile = env.profile(env.agent(provider=provider))
         assert claude_tmp in profile.read_deny and process_tmp in profile.read_deny
