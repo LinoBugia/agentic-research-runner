@@ -46,6 +46,7 @@ from arr.models import AuthKind, AuthProfile, RunVenvMode
 from arr.permissions.policy import RunPaths, SandboxProfile
 from arr.runs.prepare import PreparedAgent
 from arr.settings import app_dir
+from arr.venvs import venv_root
 from arr.workfolder import read_template
 
 __all__ = [
@@ -181,6 +182,7 @@ def _entries(
     attachments = profile.resolve(run_paths.attachments_dir)
     plugin = profile.resolve(run_paths.run_dir / "agents" / profile.agent_id / "plugin")
     hidden = (skills, attachments, plugin)
+    venvs = profile.resolve(venv_root())
 
     entries: dict[str, tuple[Path, str]] = {}
 
@@ -194,7 +196,8 @@ def _entries(
         if not any(_within(profile, path, h) for h in hidden):
             put(path, "read", overwrite=False)
     for path in (*profile.read_deny, *hidden):
-        put(path, "deny")
+        if profile.key(path) != profile.key(venvs):  # `_venv_globs` instead (W3-00)
+            put(path, "deny")
     for channel in channels:
         put(attachments / channel, "read")
     for channel in run_channels:
@@ -209,6 +212,47 @@ def _entries(
     for path in (*profile.sensitive, *hard_deny):
         put(path, "deny")
     return entries
+
+
+_NAME_FORBIDDEN = frozenset("[]\\!^{}*?,")
+
+
+def _others(profile: SandboxProfile, folder: Path, own: Path | None) -> list[str]:
+    """Globs that deny every entry of `folder` except `own` (a direct child) and its tree.
+
+    A name differs from `own` at some position `i` (`own[:i][!own[i]]*`), is a proper
+    prefix of it (`own[:i]`) or is longer (`own?*`); each glob covers the entry and its
+    tree (`{,/**}`, checked offline: a big `{…}` alternation breaks the Seatbelt profile, a
+    small one works). The globs match names that do not exist yet as well: a run venv that
+    appears during a turn is denied. `2 × len(own)` entries, nothing is listed.
+    """
+    base = glob_escape(str(folder))
+    if own is None or profile.key(own.parent) != profile.key(folder):
+        return [f"{base}/*{{,/**}}"]
+    name = own.name
+    if _NAME_FORBIDDEN & set(name):
+        raise ArrError(
+            f"Der Name „{name}“ in {folder} enthält ein Zeichen, das Codex in einem Muster "
+            "nicht ausschließen kann ([ ] \\ ! ^ { } * ? ,). Benenne die venv um."
+        )
+    globs = [f"{base}/{name[:i]}[!{ch}]*" for i, ch in enumerate(name)]
+    globs += [f"{base}/{name[:i]}" for i in range(1, len(name))]
+    globs.append(f"{base}/{name}?*")
+    return [g + "{,/**}" for g in globs]
+
+
+def _venv_globs(profile: SandboxProfile) -> list[str]:
+    """W3-00: other runs' venvs and other base venvs below the venv root stay closed.
+
+    The root and `runs/` cannot be denied themselves: a denied ancestor of the run venv
+    stops Python (`realpath` of `bin/`). So every other name in `runs/` and `venvs/` is
+    denied by glob; their names stay visible (`ls`), only run IDs and venv names.
+    """
+    root = profile.resolve(venv_root())
+    own_run = profile.venv_dir if profile.run_venv else None
+    return _others(profile, root / "runs", own_run) + _others(
+        profile, root / "venvs", profile.base_venv
+    )
 
 
 def _sensitive_globs(profile: SandboxProfile) -> list[str]:
@@ -263,7 +307,7 @@ def filesystem_entries(
                 f"Der Pfad „{text}“ enthält eines der Zeichen * ? [ ] {{ }}. Codex liest ihn als "
                 "Muster und kann ihn dann nicht freigeben. Benenne den Ordner um."
             )
-    for glob in _sensitive_globs(profile):
+    for glob in _venv_globs(profile) + _sensitive_globs(profile):
         result[glob] = "deny"
     _check_size(len(result), len(toml_value(result).encode("utf-8")))
     return result

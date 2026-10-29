@@ -1707,3 +1707,85 @@ def test_w3_00_shadowing_a_program_in_the_run_venv_is_denied(env: Env) -> None:
     cat = env.run_venv / "bin" / "cat"
     command = f"printf x > {cat}; chmod +x {cat}; cat sudo ls"
     assert env.engine().evaluate(bash(command)).action is DENY
+
+
+# --------------------------------------------------------------------------------------------
+# W3-00 §12 / A10: Claude reads below the venv root only its run venv, base venv, toolchain
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def venv_env(env: Env, venv_root: Path) -> tuple[Env, Path, SandboxProfile]:
+    """`env` with the base venv below `<venv root>/venvs/` and a tool folder there."""
+    root = Path(os.path.realpath(venv_root))
+    base = root / "venvs" / "mathe"
+    (base / "lib" / "python3.12" / "site-packages" / "sympy").mkdir(parents=True)
+    (base / "pyvenv.cfg").write_text("home = /opt/pybase/bin\n")
+    tools = root / "venvs" / "tools" / "bin"
+    tools.mkdir(parents=True)
+    toolchain = Toolchain(python=str(base / "bin" / "python"), extra_path=[str(tools)])
+    (base / "bin").mkdir()
+    (base / "bin" / "python").write_text("#!/bin/sh\n")
+    paths = RunPaths(env.workfolder, env.run, toolchain)
+    agent = env.agent(read_dirs=[str(root / "runs"), str(root / "venvs" / "other")])
+    profile = profile_for(agent, paths, home=env.home, case_insensitive=True)
+    return env, root, profile
+
+
+def test_w3_00_a10_profile_denies_the_venv_root(venv_env) -> None:
+    env, root, profile = venv_env
+    assert root in profile.read_deny
+    assert profile.venv_dir == env.run_venv and profile.base_venv == root / "venvs" / "mathe"
+    assert profile.can_read(env.run_venv / "lib" / "x.py")
+    assert profile.can_read(root / "venvs" / "mathe" / "lib" / "python3.12" / "site-packages")
+    assert profile.can_read(root / "venvs" / "tools" / "bin" / "tool")  # extra_path
+    for path in (
+        root / "runs" / "20261029-1200_other_custom_beef" / "c.txt",  # parallel run
+        root / "runs" / (env.run.name + "x") / "c.txt",  # longer ID
+        root / "runs" / env.run.name[:-1] / "c.txt",  # shorter ID
+        root / "venvs" / "other" / "c.txt",  # foreign base venv, although a read folder
+        root / "c.txt",
+    ):
+        assert not profile.can_read(path), path
+    # read folders inside the venv root are dropped (only the three exceptions stay open)
+    assert root / "runs" not in profile.read_allow
+    assert root / "venvs" / "other" not in profile.read_allow
+
+
+def test_w3_00_a10_claude_sandbox_and_file_tools_follow(venv_env) -> None:
+    env, root, profile = venv_env
+    claude = claude_options(profile)
+    fs = claude.sandbox["filesystem"]
+    assert str(root) in fs["denyRead"]
+    open_in_root = sorted(p for p in fs["allowRead"] if p.startswith(str(root)))
+    assert open_in_root == sorted(
+        [str(env.run_venv), str(root / "venvs" / "mathe"), str(root / "venvs" / "tools" / "bin")]
+    )
+    assert fs["allowWrite"] == [str(env.work), str(env.run / "tmp"), str(env.run_venv)]
+    other = root / "runs" / "20261029-1200_other_custom_beef" / "c.txt"
+    assert not claude_sandbox_reads(claude, str(other))
+    assert claude_sandbox_reads(claude, str(env.run_venv / "bin" / "python"))
+    assert not claude_rule(claude.allowed_tools, "Read", str(other))
+    assert str(env.run_venv) in claude.add_dirs  # write roots come as add_dirs, no Read rule
+    engine = PolicyEngine([profile])
+    assert engine.evaluate(read(other)).action is not ALLOW
+    assert engine.evaluate(read(env.run_venv / "x.py")).action is ALLOW
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_w3_00_base_venv_is_read_only_for_both_backends(venv_env, provider: str) -> None:
+    env, root, _ = venv_env
+    base = root / "venvs" / "mathe"
+    paths = RunPaths(env.workfolder, env.run, Toolchain(python=str(base)))
+    profile = profile_for(env.agent(provider=provider), paths, home=env.home)
+    assert not profile.can_write(base / "lib" / "x.py")
+    assert profile.can_read(base / "lib" / "x.py")
+    assert base not in profile.write_roots and base in profile.read_only
+    engine = PolicyEngine([profile])
+    tool = "Write" if provider == "claude" else "fileChange"
+    assert engine.evaluate(write(base / "lib" / "x.py", tool=tool)).action is DENY
+    assert engine.evaluate(write(env.run_venv / "lib" / "x.py", tool=tool)).action is ALLOW
+    if provider == "claude":
+        claude = claude_options(profile)
+        assert not claude_sandbox_writes(claude, str(base / "lib" / "x.py"))
+        assert claude_rule(claude.disallowed_tools, "Edit", str(base / "lib" / "x.py"))

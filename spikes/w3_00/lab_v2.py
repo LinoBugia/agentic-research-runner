@@ -37,7 +37,9 @@ from common import (
 )
 
 from arr.backends.codex_config import PERMISSION_PROFILE, build_launch, codex_home_for, toml_value
-from arr.venvs import venv_root
+from arr.permissions.policy import PermissionRules, PolicyEngine, claude_options, profile_for
+from arr.permissions.types import DecisionAction, PermissionRequest
+from arr.venvs import base_venv_dir, venv_root
 
 SBX = Path(__file__).resolve().parent / "tmp" / "sbx_v2"
 TEX = "\\documentclass{article}\\begin{document}$1+1=2$\\end{document}"
@@ -76,10 +78,14 @@ def late_files(lab: Lab) -> dict[str, Path]:
         "late_in_run": lab.run.run_dir / f"late-{tag}.txt",
         "late_agent": lab.run.run_dir / "agents" / "spawned-1" / "transcript.jsonl",
         "late_venv": venv_root() / "runs" / f"20261029-2359_new_custom_{tag[:4]}" / "c.txt",
+        "late_venv_longer": venv_root() / "runs" / (lab.run.run_id + "x") / "c.txt",
+        "late_venv_shorter": venv_root() / "runs" / lab.run.run_id[:-1] / "c.txt",
+        "late_base_venv": base_venv_dir(f"w3-00-late-{tag}") / "c.txt",
     }
     for path in late.values():
         canary(path)
-    lab.cleanup += [late["late_home"], late["late_venv"].parent]
+    lab.cleanup += [late["late_home"]]
+    lab.cleanup += [late[n].parent for n in late if "venv" in n]
     return late
 
 
@@ -123,10 +129,16 @@ def cases(lab: Lab, late: dict[str, Path], login: Path) -> list[tuple[str, str, 
         ("❌", "meta.json des Runs", f"cat {run / 'meta.json'}"),
         ("❌", "anderes Projekt", f"cat {c['other_project']}"),
         ("❌", "paralleler Run", f"cat {c['parallel_run']}"),
-        ("⚠️", "Run-venv des parallelen Runs", f"cat {c['parallel_venv']}"),
-        ("⚠️", "andere Basis-venv", f"cat {c['other_base_venv']}"),
-        ("⚠️", "Namen in <wurzel>/runs", f"ls {venv_root() / 'runs'} >/dev/null"),
+        ("❌", "Run-venv des parallelen Runs", f"cat {c['parallel_venv']}"),
+        ("❌", "Run-venv des parallelen Runs (ls)", f"ls {c['parallel_venv'].parent} >/dev/null"),
+        ("❌", "fremde Basis-venv", f"cat {c['other_base_venv']}"),
+        ("⚠️", "Namen in <wurzel>/runs (bekannter Rest)", f"ls {venv_root() / 'runs'} >/dev/null"),
         ("❌", "Schreiben in die Basis-venv", f"touch {base}/w3.txt"),
+        (
+            "❌",
+            "Schreiben in die Basis-venv (Python)",
+            f"python3 -c \"open('{base}/lib/w3.txt', 'w').write('x')\"",
+        ),
         ("❌", "Hardlink (ln)", f"ln {c['outside']} hl.txt && cat hl.txt"),
         (
             "❌",
@@ -152,11 +164,69 @@ def cases(lab: Lab, late: dict[str, Path], login: Path) -> list[tuple[str, str, 
         "late_in_run": "neu während des Turns: Datei im Run-Ordner",
         "late_agent": "neu während des Turns: neuer Agent",
         "late_venv": "neu während des Turns: Run-venv in <wurzel>/runs",
+        "late_venv_longer": "neu während des Turns: Run-venv, längere ID",
+        "late_venv_shorter": "neu während des Turns: Run-venv, kürzere ID",
+        "late_base_venv": "neu während des Turns: Basis-venv in <wurzel>/venvs",
     }
-    rows += [
-        ("⚠️" if name == "late_venv" else "❌", labels[name], f"cat {path}")
-        for name, path in late.items()
+    rows += [("❌", labels[name], f"cat {path}") for name, path in late.items()]
+    return rows
+
+
+def _within(path: str, root: str) -> bool:
+    child, parent = path.casefold(), root.casefold().rstrip("/")
+    return child == parent or child.startswith(parent + "/")
+
+
+def claude_offline(lab: Lab, late: dict[str, Path]) -> list[dict]:
+    """Claude without a model: profile, sandbox lists and file-tool rules for the same paths.
+
+    Sandbox semantics as in tests/test_policy.py (S1 §3.4): the narrower entry wins, deny on
+    a tie. File tools: the PolicyEngine's answer for Read/Write.
+    """
+    config = lab.agent.file.config.model_copy(update={"provider": "claude", "id": "claude-1"})
+    rules = PermissionRules(sensitive_paths=[str(lab.root / "readdir" / ".secret")])
+    profile = profile_for(config, lab.run_paths, rules)
+    fs = claude_options(profile).sandbox["filesystem"]
+    engine = PolicyEngine([profile])
+
+    def reads(path: Path) -> bool:
+        text = str(path)
+        allow = max((len(r) for r in fs["allowRead"] if _within(text, r)), default=-1)
+        deny = max((len(r) for r in fs["denyRead"] if _within(text, r)), default=-1)
+        return deny < 0 or allow > deny
+
+    def writes(path: Path) -> bool:
+        return any(_within(str(path), r) for r in fs["allowWrite"])
+
+    def tool(name: str, path: Path) -> bool:
+        request = PermissionRequest(
+            run_id="lab", agent_id="claude-1", tool=name, provider="claude", paths=[str(path)]
+        )
+        return engine.evaluate(request).action is DecisionAction.ALLOW
+
+    c = lab.canaries
+    venv = lab.run_paths.venv_dir
+    base = Path(str(lab.run_paths.toolchain.python))
+    cases = [
+        ("✅", "lesen", "Run-venv", venv / "bin" / "python"),
+        ("✅", "schreiben", "Run-venv", venv / "lib" / "w3.txt"),
+        ("✅", "lesen", "Basis-venv (sympy)", next(base.glob("lib/python*/site-packages/sympy"))),
+        ("❌", "schreiben", "Basis-venv", base / "lib" / "w3.txt"),
+        ("❌", "lesen", "Run-venv des parallelen Runs", c["parallel_venv"]),
+        ("❌", "lesen", "fremde Basis-venv", c["other_base_venv"]),
+        ("❌", "lesen", "<wurzel>/runs (Namen)", venv_root() / "runs"),
     ]
+    cases += [("❌", "lesen", f"neu: {n}", path) for n, path in late.items() if "venv" in n]
+    rows = []
+    for expect, mode, label, path in cases:
+        if mode == "lesen":
+            sandbox, tools = reads(path), tool("Read", path)
+        else:
+            sandbox, tools = writes(path), tool("Write", path)
+        ok = (expect == "✅") == sandbox == tools
+        rows.append({"expect": expect, "mode": mode, "case": label, "sandbox": sandbox})
+        rows[-1] |= {"file_tool": tools, "as_expected": ok}
+        print(f"  Claude {expect} {mode:<9} {label:<38} Sandbox={sandbox} Werkzeug={tools}")
     return rows
 
 
@@ -209,10 +279,12 @@ def main() -> None:
             last = " | ".join(text.splitlines()[-2:])[:90]
             mark = "läuft  " if ok else "gesperrt"
             print(f"  {expect} {mark} exit={proc.returncode:<3} {label:<46} {last!r}")
+        claude_rows = claude_offline(lab, late)
+        claude_bad = [r["case"] for r in claude_rows if not r["as_expected"]]
         bad = [r for r in rows if r["expect"] != "⚠️" and (r["expect"] == "✅") != r["ok"]]
         gaps = [r["case"] for r in rows if r["expect"] == "⚠️" and r["ok"]]
         tokens = {n: p.read_text().strip() for n, p in {**lab.canaries, **late}.items()}
-        allowed = {"own_attachment", "parallel_venv", "other_base_venv", "late_venv"}
+        allowed = {"own_attachment"}
         texts = [r["out"] for r in rows]
         leaked = [n for n, t in tokens.items() if n not in allowed and any(t in x for x in texts)]
         v2 = timing(launch.cwd, env)
@@ -226,6 +298,8 @@ def main() -> None:
             "rows": rows,
             "deviations": [r["case"] for r in bad],
             "known_gaps_open": gaps,
+            "claude_offline": claude_rows,
+            "claude_deviations": claude_bad,
             "leaked_canaries": leaked,
             "seconds_per_command": {
                 "variant2": round(v2, 3),
@@ -240,9 +314,9 @@ def main() -> None:
             f"Variante-1-Größe ({entries + 250}) {v1:.2f} s, nur 2 Einträge {bare:.2f} s"
         )
         print(f"Abweichungen: {len(bad)} {[r['case'] for r in bad]}  Kanarien im Text: {leaked}")
-        print(f"Bekannte Lücke (⚠️ offen): {gaps}")
+        print(f"Bekannter Rest (⚠️ offen): {gaps}  Claude offline Abweichungen: {claude_bad}")
         print(f"→ {shown(str(OUT / 'lab_v2.json'))}")
-        sys.exit(1 if bad or leaked else 0)
+        sys.exit(1 if bad or leaked or claude_bad else 0)
     finally:
         remove_cleanup(lab)
 

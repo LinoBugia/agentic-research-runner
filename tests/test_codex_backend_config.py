@@ -127,6 +127,8 @@ def _glob_regex(glob: str) -> re.Pattern[str]:
         elif c == "[":
             end = glob.index("]", i + 2)
             out, i = out + "[" + re.escape(glob[i + 1 : end]).replace("!", "^", 1) + "]", end + 1
+        elif glob.startswith("{,/**}", i):  # the only alternation arr writes (W3-00)
+            out, i = out + "(/.*)?", i + 6
         else:
             out, i = out + re.escape(c), i + 1
     return re.compile(out + "$")
@@ -135,11 +137,11 @@ def _glob_regex(glob: str) -> re.Pattern[str]:
 def codex_access(entries: dict[str, str], path: Path) -> str:
     text = str(path)
     for key, access in entries.items():
-        if any(ch in key for ch in "*?[") and access == "deny" and _glob_regex(key).match(text):
+        if any(ch in key for ch in "*?[{") and access == "deny" and _glob_regex(key).match(text):
             return "deny"
     best, access = "", entries[":root"]
     for key, value in entries.items():
-        if any(ch in key for ch in "*?[") or key == ":root":
+        if any(ch in key for ch in "*?[{") or key == ":root":
             continue
         if (text == key or text.startswith(key.rstrip("/") + "/")) and len(key) > len(best):
             best, access = key, value
@@ -200,23 +202,83 @@ def test_write_roots_and_system(layout: dict[str, Path]) -> None:
     assert codex_access(entries, Path("/Volumes/USB/x")) == "deny"
 
 
-def test_no_ancestor_of_the_run_venv_is_denied(layout: dict[str, Path], venv_root: Path) -> None:
-    """A denied ancestor of the run venv stops Python (`realpath` of `bin/`, W3-00 lab), so
-    the venvs outside `~` stay readable through `:root`; the agent writes only its own."""
+RUN_ID = "20261029-1912_demo_custom_b32e"
+
+
+@pytest.fixture
+def venv_layout(layout: dict[str, Path], venv_root: Path) -> dict[str, Path]:
+    """`layout` with a realistic run ID and a base venv below `<venv root>/venvs/`."""
+    run = layout["run"].parent / RUN_ID
+    layout["run"].rename(run)
     root = Path(os.path.realpath(venv_root))
     base = root / "venvs" / "mathe"
     (base / "bin").mkdir(parents=True)
     (base / "pyvenv.cfg").write_text("home = /opt/pybase/bin\n")
-    _, profile, paths = setup(layout, Toolchain(python=str(base)))
+    return {**layout, "run": run, "work": run / "agents" / "gpt-1" / "work", "root": root}
+
+
+def venv_setup(layout: dict[str, Path], **toolchain: object):
+    toolchain.setdefault("python", str(layout["root"] / "venvs" / "mathe"))
+    return setup(layout, Toolchain.model_validate(toolchain))
+
+
+def test_no_ancestor_of_the_run_venv_is_denied(venv_layout: dict[str, Path]) -> None:
+    """A denied ancestor of the run venv stops Python (`realpath` of `bin/`, W3-00 lab)."""
+    _, profile, paths = venv_setup(venv_layout)
     entries = filesystem_entries(profile, paths, ["main"])
     venv = run_venv(paths)
     for ancestor in venv.parents:
         assert codex_access(entries, ancestor) == "read", ancestor
+    assert str(venv_layout["root"]) not in entries  # the profile denies it; Codex uses globs
     assert codex_access(entries, venv / "lib" / "x.py") == "write"
-    assert codex_access(entries, base / "lib" / "sympy.py") == "read"
+
+
+def test_w3_00_other_venvs_are_denied_by_glob(venv_layout: dict[str, Path]) -> None:
+    root = venv_layout["root"]
+    _, profile, paths = venv_setup(venv_layout)
+    entries = filesystem_entries(profile, paths, ["main"])
+    base = root / "venvs" / "mathe"
+    assert codex_access(entries, base / "lib" / "sympy.py") == "read"  # never write
     assert codex_access(entries, Path("/opt/pybase/lib/libpython.dylib")) == "read"
-    # known gap (report §7): other runs' venvs are readable, but not writable
-    assert codex_access(entries, root / "runs" / "other-run" / "lib" / "x.py") == "read"
+    for name in (
+        "20261029-1912_demo_custom_b33f",  # parallel run
+        "20261029-2359_new_custom_aaaa",  # appears during the turn
+        RUN_ID + "x",  # longer ID
+        RUN_ID[:-1],  # shorter ID
+        "2",
+        "X",
+    ):
+        for path in (root / "runs" / name, root / "runs" / name / "lib" / "c.txt"):
+            assert codex_access(entries, path) == "deny", path
+    for name in ("other", "math", "mathex", "Mathe2"):
+        assert codex_access(entries, root / "venvs" / name / "c.txt") == "deny", name
+    assert codex_access(entries, root / "runs") == "read"  # names stay visible (report §7)
+    globs = [k for k in entries if k.startswith(str(root)) and k.endswith("{,/**}")]
+    assert len(globs) == 2 * len(RUN_ID) + 2 * len("mathe")
+
+
+def test_w3_00_without_run_venv_or_base_venv_everything_is_denied(
+    venv_layout: dict[str, Path], tmp_path: Path
+) -> None:
+    root = venv_layout["root"]
+    elsewhere = tmp_path / "base-elsewhere"
+    elsewhere.mkdir()
+    _, profile, paths = venv_setup(venv_layout, python=str(elsewhere), run_venv="off")
+    entries = filesystem_entries(profile, paths, ["main"])
+    assert entries[glob_escape(str(root / "runs")) + "/*{,/**}"] == "deny"
+    assert entries[glob_escape(str(root / "venvs")) + "/*{,/**}"] == "deny"
+    assert codex_access(entries, root / "runs" / RUN_ID / "bin" / "python") == "deny"
+    assert codex_access(entries, root / "venvs" / "mathe" / "lib") == "deny"
+
+
+def test_w3_00_venv_name_that_globs_cannot_express_is_refused(
+    venv_layout: dict[str, Path],
+) -> None:
+    odd = venv_layout["root"] / "venvs" / "ma[th]e"
+    (odd / "bin").mkdir(parents=True)
+    with pytest.raises((ArrError, ValueError)):
+        _, profile, paths = venv_setup(venv_layout, python=str(odd))
+        filesystem_entries(profile, paths, ["main"])
 
 
 FILES_ARR_WRITES = [
@@ -282,13 +344,19 @@ def test_new_entries_during_a_turn_are_denied(layout: dict[str, Path]) -> None:
     assert filesystem_entries(profile, paths, ["main"]) == entries
 
 
-@pytest.mark.parametrize("where", ["home", "runs"])
+@pytest.mark.parametrize("where", ["home", "runs", "venv-runs", "venv-venvs"])
 def test_entries_do_not_depend_on_what_lies_in_home_or_runs(
-    layout: dict[str, Path], where: str
+    venv_layout: dict[str, Path], where: str
 ) -> None:
-    """A3: the same entries with 5 or 2000 entries in `~` or `runs/`."""
-    folder = layout["home"] if where == "home" else layout["run"].parent
-    _, profile, paths = setup(layout)
+    """A3: the same entries with 5 or 2000 entries in `~`, `runs/` or below the venv root."""
+    folder = {
+        "home": venv_layout["home"],
+        "runs": venv_layout["run"].parent,
+        "venv-runs": venv_layout["root"] / "runs",
+        "venv-venvs": venv_layout["root"] / "venvs",
+    }[where]
+    folder.mkdir(parents=True, exist_ok=True)
+    _, profile, paths = venv_setup(venv_layout)
     for n in range(5):
         (folder / f"20261029-0000_demo_custom_{n:04x}").mkdir()
     few = filesystem_entries(profile, paths, ["main"])
@@ -296,7 +364,7 @@ def test_entries_do_not_depend_on_what_lies_in_home_or_runs(
         (folder / f"20261029-0000_demo_custom_{n:04x}").mkdir()
     many = filesystem_entries(profile, paths, ["main"])
     assert many == few
-    assert len(few) < ENTRIES_WARN // 2
+    assert len(few) < ENTRIES_WARN
 
 
 def test_variant_1_is_gone() -> None:
