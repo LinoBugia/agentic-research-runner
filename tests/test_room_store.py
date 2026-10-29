@@ -10,6 +10,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from run_kit import make_run_input, make_settings, make_workfolder
 
 from arr.errors import ArrError
 from arr.models import (
@@ -21,7 +22,7 @@ from arr.models import (
     ResolvedRun,
     Rubric,
 )
-from arr.resolve import dump_yaml_model
+from arr.resolve import dump_yaml_model, resolve_run
 from arr.room.store import (
     CONVERSATION_RULES,
     AgentRoom,
@@ -38,6 +39,7 @@ from arr.room.types import (
     VoteChoice,
     VoteRule,
 )
+from arr.runs.prepare import AgentFile, prepare_run
 
 AGENTS = ["explorer-1", "explorer-2", "critic", "judge-1", "judge-2", "outsider"]
 
@@ -165,8 +167,45 @@ def test_agent_work_dir_follows_agent_json(run_dir: Path) -> None:
         auth="p",
         workspace={"mode": "shared", "name": "team"},
     )
-    (run_dir / "agents" / "critic" / "agent.json").write_text(config.model_dump_json())
+    file = AgentFile(
+        config=config,
+        work_dir="shared/team",
+        role_file="agents/critic/role.md",
+        context_file="agents/critic/context.md",
+    )
+    (run_dir / "agents" / "critic" / "agent.json").write_text(file.model_dump_json())
     assert agent_work_dir(run_dir, "critic") == run_dir / "shared" / "team"
+    outside = file.model_copy(update={"work_dir": "../elsewhere"})
+    (run_dir / "agents" / "critic" / "agent.json").write_text(outside.model_dump_json())
+    with pytest.raises(ArrError, match="außerhalb des Runs"):
+        agent_work_dir(run_dir, "critic")
+
+
+def test_w2_04_for_agent_works_with_a_run_from_prepare_run(tmp_path: Path) -> None:
+    """W2-04 A9: `agent.json` is an `AgentFile`; the room server's view needs no `work_dir`."""
+    workfolder = make_workfolder(tmp_path)
+    run_input = make_run_input(
+        [
+            {"id": "a"},
+            {"id": "b", "workspace": {"mode": "shared", "name": "team"}},
+            {"id": "c", "workspace": {"mode": "shared", "name": "team"}},
+        ],
+        [{"name": "main", "members": ["a", "b", "c"]}],
+    )
+    settings = make_settings()
+    prepared = prepare_run(workfolder, run_input, resolve_run(run_input, None, settings), settings)
+    store = RoomStore.create(prepared.run_dir)
+    store.setup_channels(prepared.resolved.groupchats, {})
+    for agent_id, agent in prepared.agents.items():
+        view = store.for_agent(agent_id)  # as in room/server.py: no work_dir given
+        assert view.work_dir == agent.work_dir.absolute()
+    assert store.for_agent("b").work_dir == prepared.run_dir / "shared" / "team"
+    assert store.for_agent("a").work_dir == prepared.run_dir / "agents" / "a" / "work"
+    (prepared.run_dir / "shared" / "team" / "beweis.md").write_text("Satz 1 …", "utf-8")
+    message = store.for_agent("c").post_message("main", "Siehe Anhang.", refs=["beweis.md"])
+    assert [ref.name for ref in message.refs] == ["beweis.md"]
+    result = store.for_agent("b").submit_result("proof", "Beweis", path="beweis.md")
+    assert (prepared.run_dir / str(result.path)).read_text("utf-8") == "Satz 1 …"
 
 
 # --------------------------------------------------------------------------------------------

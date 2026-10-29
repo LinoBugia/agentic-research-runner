@@ -204,7 +204,7 @@ def test_run_yaml_and_input_roundtrip(
     run: PreparedRun, workfolder: Path, settings: WorkfolderSettings
 ) -> None:
     stored = load_yaml_model(run.run_dir / "run.yaml", ResolvedRun)
-    assert stored == run.resolved
+    assert stored == run.resolved.model_copy(update={"task": None}), "only the task text differs"
     assert [a.id for a in stored.agents] == ["explorer-1", "explorer-2", "explorer-gpt", "ranker"]
     assert stored.task_file == "task.md"
     assert stored.task is None
@@ -233,6 +233,24 @@ def test_task_md_from_file_and_inline(workfolder: Path, settings: WorkfolderSett
         encoding="utf-8"
     ) == "Zeige, dass 3n+1 terminiert."
     assert result.resolved.task_file == "task.md"
+
+
+def test_w2_04_prepared_resolved_carries_the_task_text(
+    workfolder: Path, settings: WorkfolderSettings
+) -> None:
+    """Lead decision W2-04: `PreparedRun.resolved.task` is the text, `run.yaml` keeps none."""
+
+    def inline(data: dict[str, Any]) -> None:
+        del data["task_file"]
+        data["task"] = "Zeige, dass 3n+1 terminiert."
+
+    for result in (prepare(workfolder, settings), prepare(workfolder, settings, inline)):
+        text = (result.run_dir / "task.md").read_text(encoding="utf-8")
+        assert text and result.resolved.task == text
+        assert result.resolved.task_file == "task.md"
+        stored = YAML(typ="safe").load((result.run_dir / "run.yaml").read_text(encoding="utf-8"))
+        assert stored["task"] is None and stored["task_file"] == "task.md"
+        assert text not in (result.run_dir / "run.yaml").read_text(encoding="utf-8")
 
 
 def test_role_md_is_the_role_file(run: PreparedRun, workfolder: Path) -> None:
