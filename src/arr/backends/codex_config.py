@@ -46,7 +46,7 @@ from arr.models import AuthKind, AuthProfile, RunVenvMode
 from arr.permissions.policy import RunPaths, SandboxProfile
 from arr.runs.prepare import PreparedAgent
 from arr.settings import app_dir
-from arr.venvs import venv_root
+from arr.venvs import glob_safe_name, venv_root
 from arr.workfolder import read_template
 
 __all__ = [
@@ -214,9 +214,6 @@ def _entries(
     return entries
 
 
-_NAME_FORBIDDEN = frozenset("[]\\!^{}*?,")
-
-
 def _others(profile: SandboxProfile, folder: Path, own: Path | None) -> list[str]:
     """Globs that deny every entry of `folder` except `own` (a direct child) and its tree.
 
@@ -230,8 +227,7 @@ def _others(profile: SandboxProfile, folder: Path, own: Path | None) -> list[str
     if own is None or profile.key(own.parent) != profile.key(folder):
         return [f"{base}/*{{,/**}}"]
     name = own.name
-    # Seatbelt compares in NFD: `[!é]` acts like `[!e]`, so only ASCII names (W3-00.1 M1).
-    if _NAME_FORBIDDEN & set(name) or not name.isascii():
+    if not glob_safe_name(name):  # also checked by `prepare_run` (W3-00.2)
         raise ArrError(
             f"Der Name „{name}“ in {folder} enthält ein Zeichen, das Codex in einem Muster "
             "nicht ausschließen kann (Umlaute, Akzente und andere Nicht-ASCII-Zeichen sowie "

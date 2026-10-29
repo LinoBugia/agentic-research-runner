@@ -141,3 +141,12 @@ def test_venv_base_prefix(tmp_path: Path) -> None:
     (tmp_path / "pyvenv.cfg").write_text("home = /Library/Frameworks/P/bin\nversion = 3.12\n")
     assert venv_base_prefix(tmp_path) == Path("/Library/Frameworks/P")
     assert venv_base_prefix(tmp_path / "none") is None
+
+
+def test_w3_00_2_glob_safe_name() -> None:
+    from arr.venvs import glob_safe_name
+
+    for name in ("mathe", "py3.12_x-1", "20261029-1912_demo_custom_b32e"):
+        assert glob_safe_name(name), name
+    for name in ("mäthe", "w3rev-é1", "é", "мат", "ｍａｔｈｅ", "a[b]", "a,b", "a\\b", "a!b"):
+        assert not glob_safe_name(name), name

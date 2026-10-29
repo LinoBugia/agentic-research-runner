@@ -338,6 +338,11 @@ _R_SEARCH_SENSITIVE = (
     "Dieser Ordner enthält geschützte Pfade und darf nicht als Ganzes durchsucht werden. "
     "Suche gezielt in deinem Arbeitsordner oder einem Lese-Ordner."
 )
+_R_SEARCH_BLOCKED = (
+    "Unter diesem Ordner liegen Ordner, die du nicht lesen darfst (z. B. andere Runs, "
+    "Projekte oder Python-Umgebungen), deshalb darf er nicht als Ganzes durchsucht werden. "
+    "Fasse die Suche enger: Suche gezielt in einem Unterordner, den du lesen darfst."
+)
 _R_WRITE_OUTSIDE = (
     "Schreiben außerhalb des Runs ist nicht erlaubt. Lege die Datei in deinem Arbeitsordner "
     "an und hänge sie im Chat an."
@@ -646,6 +651,12 @@ class SandboxProfile:
             ):
                 return True
         return False
+
+    def contains_block(self, path: Path) -> bool:
+        """True if a read block (`read_deny`, e.g. `~`, the workfolder, the venv root) lies
+        strictly below `path`: a search from `path` would walk into it (W3-00.2)."""
+        key = self.key(path)
+        return any(_key_within(self.key(d), key) and self.key(d) != key for d in self.read_deny)
 
     def contains_sensitive(self, path: Path) -> bool:
         """True if a sensitive path lies below `path` (e.g. `~` or `/`)."""
@@ -2184,6 +2195,9 @@ class PolicyEngine:
                 analysis.ban(_R_SENSITIVE, RequestCategory.READ_OUTSIDE)
             elif search and profile.contains_sensitive(path):
                 analysis.ban(_R_SEARCH_SENSITIVE, RequestCategory.READ_OUTSIDE)
+            elif search and profile.contains_block(path):
+                # Grep/Glob/LS in the CLI would walk the blocked folders below (W3-00.2)
+                analysis.ban(_R_SEARCH_BLOCKED, RequestCategory.READ_OUTSIDE)
             elif not profile.can_read(path):
                 analysis.ask(key, RequestCategory.READ_OUTSIDE)
                 analysis.labels[key] = str(path)

@@ -1476,3 +1476,36 @@ def test_w3_00_codex_with_toolchain_outside_home_is_fine(
 ) -> None:
     result = prepare(workfolder, settings)  # `settings` lies in tmp_path, outside the fake ~
     assert "explorer-gpt" in result.agents
+
+
+@pytest.mark.parametrize("name", ["mäthe", "übung", "ma[th]e"])
+def test_w3_00_2_codex_base_venv_name_codex_cannot_exclude_is_refused(
+    workfolder: Path, settings: WorkfolderSettings, venv_root: Path, name: str
+) -> None:
+    """Seatbelt compares in NFD (W3-00.1 M1): refused before the run folder exists, not
+    only at the first Codex turn."""
+    venv = venv_root / "venvs" / name
+    (venv / "bin").mkdir(parents=True)
+    with pytest.raises(ConfigError) as info:
+        prepare(workfolder, with_toolchain(settings, python=str(venv)))
+    issue = info.value.issues[0]
+    assert issue.path == "toolchain.python"
+    assert f"„{name}“" in issue.message and "Benenne die venv um" in issue.message
+    assert "„explorer-gpt“" in issue.message
+    assert not list((workfolder / "runs").iterdir())
+
+
+def test_w3_00_2_ascii_base_venv_name_and_claude_only_runs_pass(
+    workfolder: Path, settings: WorkfolderSettings, venv_root: Path
+) -> None:
+    good = venv_root / "venvs" / "py3.12_mathe-1"
+    (good / "bin").mkdir(parents=True)
+    assert prepare(workfolder, with_toolchain(settings, python=str(good))).run_dir.is_dir()
+    odd = venv_root / "venvs" / "mäthe"
+    (odd / "bin").mkdir(parents=True)
+
+    def claude_only(data: dict[str, Any]) -> None:
+        data["agents"] = [a for a in data["agents"] if a.get("provider") != "codex"]
+        data["groupchats"][0]["members"] = ["explorer-*"]
+
+    assert prepare(workfolder, with_toolchain(settings, python=str(odd)), claude_only)

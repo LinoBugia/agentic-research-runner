@@ -32,6 +32,7 @@ __all__ = [
     "default_venv_root",
     "ensure_run_venvs_dir",
     "ensure_venv_root",
+    "glob_safe_name",
     "run_venv_dir",
     "venv_base_prefix",
     "venv_root",
@@ -67,6 +68,18 @@ def _name(name: str, what: str) -> str:
     if not name or name in (".", "..") or "/" in name or "\0" in name:
         raise ValueError(f"invalid {what}: {name!r}")
     return name
+
+
+_GLOB_UNSAFE = frozenset("[]\\!^{}*?,")
+
+
+def glob_safe_name(name: str) -> bool:
+    """Whether the Codex profile can exclude every other name next to `name` by glob.
+
+    Only ASCII without glob characters: Seatbelt compares in NFD, so `[!é]` acts like
+    `[!e]` (W3-00.1 M1). Run IDs always pass; base venv names are free to choose.
+    """
+    return name.isascii() and not (_GLOB_UNSAFE & set(name))
 
 
 def run_venv_dir(run_id: str) -> Path:

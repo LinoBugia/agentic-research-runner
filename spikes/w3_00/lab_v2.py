@@ -237,7 +237,8 @@ def claude_offline(lab: Lab, late: dict[str, Path]) -> list[dict]:
 
 def claude_wide_read_dirs(lab: Lab, config, rules) -> list[dict]:
     """W3-00.1 M2: a read folder that contains a block (`<wurzel>`, the workfolder) gets no
-    `Read(//…/**)` rule, so Read/Grep/Glob go to the PolicyEngine, which decides."""
+    `Read(//…/**)` rule, so Read/Grep/Glob go to the PolicyEngine, which decides. W3-00.2:
+    Grep/Glob/LS with the read folder itself as search root are refused."""
     c = lab.canaries
     wide = [
         (
@@ -247,6 +248,7 @@ def claude_wide_read_dirs(lab: Lab, config, rules) -> list[dict]:
                 ("❌", "Run-venv des parallelen Runs", c["parallel_venv"]),
                 ("❌", "fremde Basis-venv", c["other_base_venv"]),
                 ("✅", "Lese-Ordner selbst", venv_root().parent / "w3-00-paper.md"),
+                ("❌", "Suche mit dem Lese-Ordner als Wurzel", venv_root().parent),
             ],
         ),
         (
@@ -256,6 +258,7 @@ def claude_wide_read_dirs(lab: Lab, config, rules) -> list[dict]:
                 ("❌", "paralleler Run", c["parallel_run"]),
                 ("❌", "anderes Projekt", c["other_project"]),
                 ("✅", "Lese-Ordner selbst", lab.workfolder.parent / "AGENTS.md"),
+                ("❌", "Suche mit dem Lese-Ordner als Wurzel", lab.workfolder.parent),
             ],
         ),
     ]
@@ -272,7 +275,9 @@ def claude_wide_read_dirs(lab: Lab, config, rules) -> list[dict]:
                 for r in allowed
             )
             answers = []
-            for name in ("Read", "Grep", "Glob"):
+            search_root = "Suche" in label  # W3-00.2: the read folder itself as search root
+            tools = ("Grep", "Glob", "LS") if search_root else ("Read", "Grep", "Glob")
+            for name in tools:
                 request = PermissionRequest(
                     run_id="lab",
                     agent_id="claude-1",
@@ -286,7 +291,7 @@ def claude_wide_read_dirs(lab: Lab, config, rules) -> list[dict]:
             rows.append(
                 {
                     "expect": expect,
-                    "mode": "Read/Grep/Glob",
+                    "mode": "/".join(tools),
                     "case": label,
                     "read_rule": rule,
                     "policy_allow": answers,

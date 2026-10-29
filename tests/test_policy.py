@@ -1834,3 +1834,58 @@ def test_w3_00_1_m2_plain_read_folders_keep_their_rule(env: Env) -> None:
     claude = claude_options(env.profile())
     assert f"Read(/{env.literature}/**)" in claude.allowed_tools
     assert claude_rule(claude.allowed_tools, "Read", str(env.literature / "paper.pdf"))
+
+
+# --------------------------------------------------------------------------------------------
+# W3-00.2: a search whose root contains a read block is refused (rest of M2)
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def shared_root(env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The venv root in its own parent folder, like `/Users/Shared/arr-<user>`."""
+    shared = Path(os.path.realpath(tmp_path)) / "Shared"
+    root = shared / "arr-u"
+    (root / "runs" / env.run.name).mkdir(parents=True)
+    monkeypatch.setenv("ARR_VENV_ROOT", str(root))
+    return root
+
+
+@pytest.mark.parametrize("tool", ["Grep", "Glob", "LS"])
+def test_w3_00_2_search_over_the_venv_root_is_refused(
+    env: Env, shared_root: Path, tool: str
+) -> None:
+    outer = shared_root.parent
+    profile = env.profile(env.agent(read_dirs=[str(outer)]))
+    assert not profile.contains_sensitive(outer) and profile.contains_block(outer)
+    engine = env.engine(profile)
+    decision = engine.evaluate(read(outer, tool=tool))
+    assert decision.action is DENY, decision
+    assert "enger" in decision.reason and "Unterordner" in decision.reason
+    assert engine.evaluate(read(outer / "paper.md")).action is ALLOW  # a single file: as before
+    assert engine.evaluate(read(outer / "docs", tool=tool)).action is ALLOW  # narrower search
+
+
+@pytest.mark.parametrize("tool", ["Grep", "Glob", "LS"])
+def test_w3_00_2_search_over_the_workfolder_is_refused(env: Env, tool: str) -> None:
+    outer = env.workfolder.parent
+    engine = env.engine(env.profile(env.agent(read_dirs=[str(outer)])))
+    assert engine.evaluate(read(outer, tool=tool)).action is DENY
+    assert engine.evaluate(read(outer / "notes.md")).action is ALLOW
+
+
+@pytest.mark.parametrize("tool", ["Grep", "Glob", "LS"])
+def test_w3_00_2_search_without_a_block_below_stays_free(env: Env, tool: str) -> None:
+    engine = env.engine()
+    for path in (env.work, env.work / "sub", env.literature, env.run / "output"):
+        assert engine.evaluate(read(path, tool=tool)).action is ALLOW, path
+
+
+def test_w3_00_2_contains_block_only_strictly_below(env: Env, shared_root: Path) -> None:
+    profile = env.profile()
+    root = shared_root
+    assert profile.contains_block(root.parent)
+    assert profile.contains_block(env.workfolder.parent)
+    assert not profile.contains_block(root)  # the block itself: can_read decides (ask)
+    assert not profile.contains_block(env.work)
+    assert not profile.contains_block(env.literature)

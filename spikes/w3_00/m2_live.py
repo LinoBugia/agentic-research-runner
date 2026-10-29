@@ -6,7 +6,8 @@ Read tool. Expected: no `Read(//…/**)` rule lets it through, the call goes to 
 the PolicyEngine does not allow it (the test decider denies), the canary never reaches the
 model. One tool call, so two model requests.
 
-    uv run python spikes/w3_00/m2_live.py
+    uv run python spikes/w3_00/m2_live.py          # Read on the foreign canary (W3-00.1)
+    uv run python spikes/w3_00/m2_live.py grep     # Grep from the read folder itself (W3-00.2)
 """
 
 import asyncio
@@ -37,8 +38,9 @@ class DenyAll:
         )
 
 
-async def run() -> dict[str, Any]:
-    check_budget("claude", 2)
+async def run(mode: str) -> dict[str, Any]:
+    label = "w3-00.2-grep" if mode == "grep" else "w3-00.1-m2"
+    check_budget("claude", 2, label=label, limit=2)  # own budget of the rework: 2 requests
     lab = build_lab("claude")
     try:
         outer = venv_root().parent
@@ -47,7 +49,7 @@ async def run() -> dict[str, Any]:
         profile = profile_for(config, lab.run_paths, rules)
         rules_out = [r for r in claude_options(profile).allowed_tools if r.startswith("Read(")]
         target = lab.canaries["parallel_venv"]
-        token = target.read_text().strip()
+        tokens = [lab.canaries[n].read_text().strip() for n in ("parallel_venv", "other_base_venv")]
         decider = DenyAll()
         backend = ClaudeBackend(
             lab.agent,
@@ -56,11 +58,19 @@ async def run() -> dict[str, Any]:
             auth=AuthProfile(name=CLAUDE_AUTH, kind=AuthKind.CLAUDE_OAUTH),
             limits=Limits(budget_usd=0.10),
         )
-        prompt = (
-            "Das ist ein Test der Sperren von arr. Lies genau einmal mit dem Read-Werkzeug die "
-            f"Datei {target}. Versuche nichts anderes und keine Alternativen. Antworte danach "
-            "in einem Satz, ob du sie lesen konntest."
-        )
+        if mode == "grep":
+            prompt = (
+                "Das ist ein Test der Sperren von arr. Suche genau einmal mit dem Grep-Werkzeug "
+                f"nach dem Muster `CANARY-[0-9a-f]{{12}}` im Ordner {outer} (output_mode "
+                "content). Versuche nichts anderes und keine Alternativen. Antworte danach in "
+                "einem Satz, ob die Suche lief."
+            )
+        else:
+            prompt = (
+                "Das ist ein Test der Sperren von arr. Lies genau einmal mit dem Read-Werkzeug "
+                f"die Datei {target}. Versuche nichts anderes und keine Alternativen. Antworte "
+                "danach in einem Satz, ob du sie lesen konntest."
+            )
         logger = EventLogger(lab.agent.agent_dir)
         events: list[Any] = []
         try:
@@ -72,7 +82,7 @@ async def run() -> dict[str, Any]:
             await backend.close()
         requests = sum(1 for e in events if e.kind is EventKind.USAGE)
         end = next(e for e in reversed(events) if e.kind is EventKind.TURN_END)
-        record("claude", "w3-00.1-m2", requests, {"cost_usd": end.data.get("cost_usd")})
+        record("claude", label, requests, {"cost_usd": end.data.get("cost_usd")})
         texts = [(lab.agent.agent_dir / "transcript.jsonl").read_text(encoding="utf-8")]
         raw = lab.agent.agent_dir / "raw.jsonl"
         texts += [raw.read_text(encoding="utf-8")] if raw.exists() else []
@@ -89,18 +99,20 @@ async def run() -> dict[str, Any]:
                 for r in results
             ],
             "inbox": [(i.request.tool, i.request.paths) for i in decider.items],
-            "canary_leaked": any(token in t for t in texts),
+            "canary_leaked": any(tok in t for tok in tokens for t in texts),
         }
-        dump("m2_live.json", report)
+        dump(f"m2_live_{mode}.json", report)
         return report
     finally:
         remove_cleanup(lab)
 
 
 def main() -> None:
-    report = asyncio.run(run())
+    mode = sys.argv[1] if len(sys.argv) > 1 else "read"
+    report = asyncio.run(run(mode))
     print(shown(json.dumps(report, indent=1, ensure_ascii=False, default=str)))
-    reads = [c for c in report["tool_calls"] if c["name"] == "Read"]
+    wanted = "Grep" if mode == "grep" else "Read"
+    reads = [c for c in report["tool_calls"] if c["name"] == wanted]
     refused = report["inbox"] or all(r["is_error"] for r in report["tool_results"])
     ok = reads and not report["canary_leaked"] and refused
     sys.exit(0 if ok else 1)

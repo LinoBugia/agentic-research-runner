@@ -223,10 +223,18 @@ def requests_used(kind: str) -> int:
     return sum(int(r.get("requests") or 0) for r in rows if r["kind"] == kind)
 
 
-def check_budget(kind: str, planned: int) -> None:
-    used = requests_used(kind)
-    if used + planned > BUDGET[kind]:
-        sys.exit(f"Budget {kind}: {used} verbraucht + {planned} geplant > {BUDGET[kind]}")
+def check_budget(kind: str, planned: int, *, label: str = "", limit: int = 0) -> None:
+    """W3-00 budget per kind; with `label` and `limit` the own budget of a rework (W3-00.x)."""
+    if label:
+        rows = (
+            [json.loads(x) for x in REQUESTS.read_text().splitlines()] if REQUESTS.exists() else []
+        )
+        used = sum(int(r.get("requests") or 0) for r in rows if r.get("label") == label)
+        cap = limit
+    else:
+        used, cap = requests_used(kind), BUDGET[kind]
+    if used + planned > cap:
+        sys.exit(f"Budget {kind} {label}: {used} verbraucht + {planned} geplant > {cap}")
 
 
 def record(kind: str, label: str, requests: int, extra: dict[str, Any] | None = None) -> None:

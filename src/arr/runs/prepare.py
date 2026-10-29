@@ -56,7 +56,7 @@ from arr.skills import (
     snapshot_skills,
     write_claude_plugin,
 )
-from arr.venvs import base_venv_dir, run_venv_dir, venv_base_prefix, venv_root
+from arr.venvs import base_venv_dir, glob_safe_name, run_venv_dir, venv_base_prefix, venv_root
 from arr.workfolder import (
     RESEARCH_AGENT_BLOCK,
     USER_AGENT_BLOCK,
@@ -892,6 +892,19 @@ def _check_codex_toolchain(
         python = absolute(toolchain.python)
         venv = python.parent.parent if python.is_file() else python
         check("toolchain.python", "Die Python-Umgebung", python, way)
+        real = Path(os.path.realpath(venv))
+        if real.parent == Path(os.path.realpath(venv_root())) / "venvs" and not glob_safe_name(
+            real.name
+        ):
+            issues.append(
+                ConfigIssue(
+                    "toolchain.python",
+                    f"Der Name der Basis-venv „{real.name}“ enthält Umlaute, Akzente oder "
+                    "andere Nicht-ASCII-Zeichen bzw. eines der Zeichen [ ] \\ ! ^ { } * ? ,. "
+                    f"Damit kann die Codex-Sandbox für {names} andere venvs nicht sicher "
+                    "sperren. Benenne die venv um, z. B. nur mit a–z, 0–9, - und _.",
+                )
+            )
         if not issues:
             base = venv_base_prefix(venv)
             if base is not None:
