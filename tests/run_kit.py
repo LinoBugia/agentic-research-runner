@@ -168,3 +168,43 @@ async def eventually(check: Callable[[], bool], within: float = 5.0) -> None:
         if time.monotonic() > end:
             raise AssertionError("Bedingung nicht rechtzeitig erfüllt")
         await asyncio.sleep(0.01)
+
+
+# --------------------------------------------------------------------------------------------
+# W2-05: `arr run` with FakeBackend agents through the launcher's backend builders
+# --------------------------------------------------------------------------------------------
+
+
+def fake_builders(scripts: Mapping[str, Script]) -> dict[Any, Callable[..., FakeBackend]]:
+    """Replacement for `arr.runs.launch.BACKEND_BUILDERS`: a FakeBackend per agent.
+
+    Every call is recorded in the returned mapping under the key `"calls"` as
+    `(provider, agent_id, kwargs)`; `kwargs` holds `run_id`, `inbox`, `auth` and `limits`.
+    """
+    from arr.models import Provider
+
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+    inner = fake_factory(scripts)
+
+    def builder_for(provider: Provider) -> Callable[..., FakeBackend]:
+        def build(prepared: PreparedAgent, **kwargs: Any) -> FakeBackend:
+            calls.append((provider.value, prepared.id, kwargs))
+            backend = inner(prepared)
+            backend.run_id = kwargs.get("run_id", backend.run_id)
+            return backend
+
+        return build
+
+    builders: dict[Any, Any] = {p: builder_for(p) for p in Provider}
+    builders["calls"] = calls
+    return builders
+
+
+def write_profiles(arr_home: Path, profiles: Mapping[str, str]) -> Path:
+    """`profiles.yaml` in the (test) app folder: `name → kind`."""
+    arr_home.mkdir(parents=True, exist_ok=True)
+    lines = ["version: 1", "profiles:"]
+    lines += [f"  - {{name: {name}, kind: {kind}}}" for name, kind in profiles.items()]
+    path = arr_home / "profiles.yaml"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path

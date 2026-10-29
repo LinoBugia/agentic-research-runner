@@ -679,3 +679,18 @@ async def test_changes_diff_for_shared_empty_and_copy_exclude_links(workfolder: 
     text = (run_dir / "output" / "summary.md").read_text("utf-8")
     hint = "- Der Symlink „daten“ zeigt in base/ auf eine durch „copy_exclude“ ausgeschlossene"
     assert text.count(hint) == 1, "one hint, even for three copies of base/"
+
+
+async def test_w2_05_summary_names_turns_that_ended_with_an_error(workfolder: Path) -> None:
+    """A failed Codex login (`login_hint`) and every other turn error reach summary.md."""
+    hint = "Profil „chatgpt-x“ neu anmelden: uv run arr auth codex-login chatgpt-x (401)"
+    script = turns(
+        [say("Ich versuche es."), {"do": "error", "message": hint}],
+        [submit("note", "Zweiter Versuch", body="Jetzt klappt es.")],
+    )
+    manager = solo_manager(workfolder, script)
+    assert await asyncio.wait_for(manager.run(), 10) is RunStatus.DONE
+    text = summary(manager)
+    assert "## Hinweise" in text
+    assert f"- Turn 1 von `a` endete mit Fehler: {hint}" in text
+    assert "Turn 2 von `a`" not in text

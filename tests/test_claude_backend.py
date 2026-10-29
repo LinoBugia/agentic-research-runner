@@ -142,7 +142,7 @@ def test_a5_options_follow_the_architecture(setup: Setup) -> None:
     assert not bare & set(options.disallowed_tools)
     assert options.setting_sources == []
     assert options.strict_mcp_config is True
-    assert options.permission_mode == "acceptEdits"
+    assert options.permission_mode == "default"  # W2-05: explicit, see PERMISSION_MODE
     from arr.permissions.policy import claude_options
 
     perms = claude_options(profile)

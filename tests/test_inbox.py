@@ -62,7 +62,8 @@ class FakeTerminal:
         return "\n".join(self.output + self.prompts)
 
     def decider(self) -> TerminalDecider:
-        return TerminalDecider(read_line=self.read_line, write=self.write)
+        # `is_terminal`: the TTY check applies to an own `read_line` as well (W1-05.1 N4)
+        return TerminalDecider(read_line=self.read_line, write=self.write, is_terminal=lambda: True)
 
 
 @pytest.fixture
@@ -366,7 +367,7 @@ def test_reader_thread_is_daemon(engine: PolicyEngine) -> None:
         threading.Event().wait(0.5)
         return "einmal"
 
-    decider = TerminalDecider(read_line=read_line, write=lambda _: None)
+    decider = TerminalDecider(read_line=read_line, write=lambda _: None, is_terminal=lambda: True)
 
     async def run() -> None:
         item = ApprovalItem(id="apr_0001", type="permission", run_id="r1", request=install())
@@ -433,6 +434,25 @@ async def test_b2_no_terminal_no_approval(
     explicit = TerminalDecider(read_line=lambda _: "einmal", is_terminal=lambda: False)
     inbox = ApprovalInbox(engine, decider=explicit, timeout=5)
     assert (await inbox.handle(install())).action is DENY
+
+
+async def test_w2_05_n4_own_read_line_needs_a_terminal_too(
+    engine: PolicyEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """W1-05.1 review N4: an own `read_line` does not switch the TTY check off."""
+    monkeypatch.setattr(sys, "stdin", io.StringIO("einmal\n"))
+    asked: list[str] = []
+
+    def read_line(prompt: str) -> str:
+        asked.append(prompt)
+        return "einmal"
+
+    decider = TerminalDecider(read_line=read_line, write=lambda _: None)
+    inbox = ApprovalInbox(engine, decider=decider, timeout=5)
+    decision = await inbox.handle(install())
+    assert decision.action is DENY and "kein Terminal" in decision.reason
+    assert asked == [], "nothing was asked through the pipe"
+    assert inbox.items()[0].status is ApprovalStatus.OBSOLETE
 
 
 async def test_b3_escalated_by(engine: PolicyEngine) -> None:

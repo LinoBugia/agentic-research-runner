@@ -433,7 +433,7 @@ def test_h1_no_virtual_env_without_run_venv(layout: dict[str, Path], tmp_path: P
 def test_m1_limits(layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog) -> None:
     from arr.backends import codex_config
 
-    assert (codex_config.ENTRIES_WARN, codex_config.ENTRIES_MAX) == (500, 1000)
+    assert (codex_config.ENTRIES_WARN, codex_config.ENTRIES_MAX) == (250, 500)  # W2-05
     _, profile, paths = setup(layout)
     count = len(filesystem_entries(profile, paths, ["main"]))
     monkeypatch.setattr(codex_config, "ENTRIES_WARN", count)
@@ -442,6 +442,21 @@ def test_m1_limits(layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch, cap
     assert f"{count} Einträgen" in caplog.text
     monkeypatch.setattr(codex_config, "ENTRIES_MAX", count)
     with pytest.raises(ArrError, match="Archiviere alte Runs"):
+        filesystem_entries(profile, paths, ["main"])
+
+
+def test_w2_05_profile_size_limit_gives_the_german_message(
+    layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nachprüfung W2-02.1 N1: a size bound below Seatbelt's 65535 bytes, in German."""
+    from arr.backends import codex_config
+    from arr.backends.codex_config import toml_value
+
+    assert codex_config.PROFILE_MAX_BYTES < codex_config.SEATBELT_MAX_BYTES == 65535
+    _, profile, paths = setup(layout)
+    size = len(toml_value(filesystem_entries(profile, paths, ["main"])).encode("utf-8"))
+    monkeypatch.setattr(codex_config, "PROFILE_MAX_BYTES", size)
+    with pytest.raises(ArrError, match=rf"{size} Bytes groß \(Grenze {size}, die Sandbox"):
         filesystem_entries(profile, paths, ["main"])
 
 

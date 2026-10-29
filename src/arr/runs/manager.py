@@ -10,7 +10,9 @@
 - `running` ⇄ `paused`: the topology runs with the `Orchestrator` as `RunContext`; limits,
   concurrency per auth profile, rate limits, hints and pacing are the orchestrator's job.
   The wall time is watched here.
-- `finalizing`: backends closed, then the finalizer (always, also after stop, limit or error).
+- `finalizing`: set as soon as the topology is over (a stop from then on is ignored, W2-05),
+  then the helper tasks and a running stop are awaited, the backends closed in parallel and
+  the finalizer runs (always, also after stop, limit or error).
 - `done` (also after a limit), `stopped` (user stop) or `failed` (error).
 
 `mark_interrupted_runs` sets runs that were `running`, `paused` or `finalizing` when arr
@@ -357,8 +359,10 @@ class RunManager:
             logger.exception("Run %s fehlgeschlagen", self.prepared.run_id)
             self.error = exc
             self.log.write("error", message=str(exc), type=type(exc).__name__)
-        await self._teardown()
+        # `finalizing` before the teardown: a stop that arrives while the backends close must
+        # not turn a regularly finished run into `stopped` (W2-03.1 G8, W2-05).
         self._set_status(RunStatus.FINALIZING)
+        await self._teardown()
         if self.finalizer is not None:
             try:
                 await self.finalizer(self.prepared)
@@ -491,17 +495,31 @@ class RunManager:
         await self.orchestrator.halt(StopReason.LIMIT, LimitKind.WALL_TIME, seconds=seconds)
 
     async def _teardown(self) -> None:
-        """Stop the helper tasks, close backends (with a timeout) and the loggers."""
+        """Stop the helper tasks, await a running stop, close backends in parallel, loggers.
+
+        A stop (`stop()` → `halt`, or a limit reached in sync code → `_start_halt`) runs as a
+        task; it is awaited here so that `run()` never returns while an `interrupt()` is still
+        on its way (W2-03.1 G9). Each `close()` has its own deadline and they run at once, so
+        the teardown does not grow with the number of agents.
+        """
         for task in self._tasks:
             task.cancel()
         for task in self._tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         self._tasks.clear()
-        for agent_id, backend in self.backends.items():
-            try:
-                await asyncio.wait_for(backend.close(), CLOSE_TIMEOUT_S)
-            except Exception:
-                logger.exception("close() von %s fehlgeschlagen", agent_id)
+        if self._stop_task is not None:
+            with contextlib.suppress(Exception):
+                await self._stop_task
+        if self.orchestrator is not None:
+            await self.orchestrator.wait_halted()
+        await asyncio.gather(*(self._close(a, b) for a, b in self.backends.items()))
         for events_log in self.loggers.values():
             events_log.close()
+
+    @staticmethod
+    async def _close(agent_id: str, backend: AgentBackend) -> None:
+        try:
+            await asyncio.wait_for(backend.close(), CLOSE_TIMEOUT_S)
+        except Exception:
+            logger.exception("close() von %s fehlgeschlagen", agent_id)

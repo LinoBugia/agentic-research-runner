@@ -585,3 +585,44 @@ async def test_user_messages_wake_or_hint_and_record_the_delivery(workfolder: Pa
     woken = prompts(manager.run_dir, "a")[1]
     assert "★ Vom User: [#" in woken and "Bitte melde dich." in woken
     assert results[0].ended_by is DiscussionEnd.ALL_DONE
+
+
+async def test_w2_05_slow_hint_delivery_blocks_neither_the_room_nor_other_agents(
+    workfolder: Path,
+) -> None:
+    """Review W2-01 B1: `deliver_hint` may wait (Claude: until the next tool result). The
+    orchestrator delivers per agent in its own task, so a slow agent delays nobody."""
+
+    async def topology(ctx: RunContext) -> None:
+        await ctx.turns([("a", "arbeite"), ("b", "arbeite"), ("c", "schreibe")])
+
+    scripts = {
+        "a": turns([wait(1.6)]),
+        "b": turns([wait(1.6)]),
+        "c": turns([wait(0.2), post("main", "hallo zusammen"), wait(0.2)]),
+    }
+    manager = make_manager(
+        workfolder, topology, scripts, groupchats=[channel("main", ["a", "b", "c"])]
+    )
+    original = manager.backend_factory
+
+    def factory(prepared: Any) -> Any:
+        backend = original(prepared)
+        if prepared.id == "a":
+            inner = backend.deliver_hint
+
+            async def slow(text: str) -> bool:
+                await asyncio.sleep(1.0)  # like Claude during a long tool call
+                return await inner(text)
+
+            backend.deliver_hint = slow
+        return backend
+
+    manager.backend_factory = factory
+    assert await manager.run() is RunStatus.DONE
+    [message] = [m for m in manager.room.messages("main") if m.sender == "c"]
+    by_agent = {e["data"]["agent"]: e for e in log_entries(manager.run_dir, "hint")}
+    assert set(by_agent) == {"a", "b"}
+    assert by_agent["b"]["ts"] - message.ts < 0.5, "b waited for a's slow delivery"
+    assert by_agent["a"]["ts"] - message.ts >= 1.0
+    assert hints(manager.run_dir, "a") and hints(manager.run_dir, "b")

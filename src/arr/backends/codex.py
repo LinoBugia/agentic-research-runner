@@ -22,6 +22,7 @@ See docs/01-architektur.md §4.2.
 import asyncio
 import contextlib
 import logging
+import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -53,9 +54,31 @@ from arr.permissions.policy import RunPaths
 from arr.resolve import load_yaml_model
 from arr.runs.prepare import RUN_SOURCE, PreparedAgent
 
-__all__ = ["CodexBackend"]
+__all__ = ["CodexBackend", "login_hint"]
 
 logger = logging.getLogger(__name__)
+
+_AUTH_FAILURE_RE = re.compile(
+    r"(?i)unauthori[sz]ed|\b401\b|not logged in|logged out|login required|re-?login|"
+    r"refresh token|token (?:is |has )?(?:expired|invalid)|invalid (?:api key|token)|"
+    r"authentication (?:failed|error|required)|not authenticated"
+)
+
+
+def login_hint(auth: AuthProfile, message: str) -> str:
+    """Put „Profil neu anmelden“ in front of an error that looks like a failed login.
+
+    A Codex turn that fails at the login (expired or revoked ChatGPT login, HTTP 401) then
+    shows in the terminal and in `summary.md` how to log the profile in again (review
+    W2-02 Q13, W2-05). Other messages are returned unchanged.
+    """
+    if not _AUTH_FAILURE_RE.search(message):
+        return message
+    return (
+        f"Profil „{auth.name}“ neu anmelden: uv run arr auth codex-login {auth.name} "
+        f"(Codex meldet: {message})"
+    )
+
 
 CodexFactory = Callable[[Any], Any]
 """Builds an `AsyncCodex` from a `CodexConfig`; tests pass a fake."""
@@ -234,7 +257,7 @@ class CodexBackend:
                     logger.warning("Codex-Turn von %s fehlgeschlagen: %s", self.agent.id, exc)
                     events.status = TurnStatus.ERROR
                     data = ErrorData(
-                        message=str(exc) or type(exc).__name__,
+                        message=login_hint(self.auth, str(exc) or type(exc).__name__),
                         type=type(exc).__name__,
                         recoverable=False,
                     )
@@ -274,6 +297,8 @@ class CodexBackend:
                     continue
                 method, params = entry
                 for kind, data in events.feed(method, params):
+                    if kind is EventKind.ERROR:
+                        data["message"] = login_hint(self.auth, str(data.get("message", "")))
                     yield self._event(kind, data, raw={"method": method, "params": params})
             await pump
         finally:
@@ -290,7 +315,9 @@ class CodexBackend:
             yield event
         if events.status is TurnStatus.ERROR:
             data = ErrorData(
-                message=events.error or "Codex-Fehler", type="turn_failed", recoverable=False
+                message=login_hint(self.auth, events.error or "Codex-Fehler"),
+                type="turn_failed",
+                recoverable=False,
             )
             yield self._event(EventKind.ERROR, dict(data))
 

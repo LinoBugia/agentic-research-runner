@@ -38,15 +38,16 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any
 
+from arr.backends.base import EventKind, TurnStatus
 from arr.models import RunStatus, WorkspaceMode
 from arr.room.store import RESULTS_DIR, ROOM_DIR, RoomStore
 from arr.room.types import Rating, Result
-from arr.runs.eventlog import write_transcript_md
+from arr.runs.eventlog import TRANSCRIPT_FILE, read_events, write_transcript_md
 from arr.runs.orchestrator import ORCHESTRATOR_LOG, OrchestratorLog
 from arr.runs.prepare import AgentFile, PreparedRun, RunMeta, load_run_meta
 from arr.usage import RunUsage, UsageTotal, compute_run_usage, write_usage_json
 
-__all__ = ["DiffResult", "changes_diff", "finalize_run"]
+__all__ = ["DiffResult", "changes_diff", "finalize_run", "last_turn_error"]
 
 logger = logging.getLogger(__name__)
 
@@ -621,6 +622,22 @@ class _Finalizer:
         lines += [_usage_line(f"`{agent}`", total) for agent, total in self.usage.by_agent.items()]
         return lines
 
+    def _turn_errors(self, entries: Sequence[Mapping[str, Any]]) -> list[str]:
+        """Turns that ended with `error`, with the last error message of the transcript.
+
+        Makes a failed Codex login visible („Profil … neu anmelden“, W2-05) and every other
+        turn error, e.g. a CLI that aborted.
+        """
+        lines = []
+        for entry in entries:
+            data = entry["data"]
+            if entry["kind"] != "turn_end" or data.get("status") != TurnStatus.ERROR:
+                continue
+            agent, turn = str(data.get("agent")), data.get("turn")
+            message = last_turn_error(self.run_dir, agent, turn) or "(keine Meldung)"
+            lines.append(f"Turn {turn} von `{agent}` endete mit Fehler: {message}")
+        return lines
+
     def _hints(self, entries: Sequence[Mapping[str, Any]]) -> list[str]:
         logged = [
             str(e["data"].get("message"))
@@ -631,11 +648,21 @@ class _Finalizer:
                 or (e["kind"] == "error" and e["data"].get("where") == "topology")
             )
         ]
-        hints = [*dict.fromkeys([*logged, *self.hints])]
+        hints = [*dict.fromkeys([*logged, *self._turn_errors(entries), *self.hints])]
         failures = [f"Schritt des Finalizers gescheitert: {f}" for f in self.failures]
         if not hints and not failures:
             return []
         return ["", "## Hinweise", "", *(f"- {h}" for h in [*failures, *hints])]
+
+
+def last_turn_error(run_dir: Path, agent: str, turn: Any) -> str | None:
+    """Message of the last `error` event of a turn in the agent's transcript, if any."""
+    path = run_dir / "agents" / agent / TRANSCRIPT_FILE
+    message = None
+    for record in read_events(path):
+        if record.get("turn") == turn and record.get("kind") == EventKind.ERROR:
+            message = str((record.get("data") or {}).get("message") or "") or message
+    return message
 
 
 def _usage_line(label: str, total: UsageTotal) -> str:

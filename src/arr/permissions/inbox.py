@@ -587,13 +587,13 @@ def format_item(item: ApprovalItem) -> str:
 class TerminalDecider:
     """Asks in the terminal whether to allow a request (docs/07 §6: Phase 1 without GUI).
 
-    Asks only with a real terminal: standard input and output must both be a TTY, or a
-    terminal object (`read_line`) is passed explicitly. Otherwise, e.g. with a pipe, it
-    refuses at once (`DeciderUnavailable` → item obsolete), so nobody can approve „through
-    a pipe“ past the user (docs/07 §4 Nr. 3, §6). Answers are whole German words, never a
-    single key or an empty line; „immer“ must be confirmed. Prompts are serialized, so
-    parallel requests are asked one after the other. A line typed for an expired request is
-    discarded, never applied to the next one.
+    Asks only with a real terminal: standard input and output must both be a TTY, also when
+    a terminal object (`read_line`) is passed (W1-05.1 review N4; tests pass `is_terminal`).
+    Otherwise, e.g. with a pipe, it refuses at once (`DeciderUnavailable` → item obsolete),
+    so nobody can approve „through a pipe“ past the user (docs/07 §4 Nr. 3, §6). Answers are
+    whole German words, never a single key or an empty line; „immer“ must be confirmed.
+    Prompts are serialized, so parallel requests are asked one after the other. A line typed
+    for an expired request is discarded, never applied to the next one.
     """
 
     def __init__(
@@ -605,9 +605,7 @@ class TerminalDecider:
     ) -> None:
         self._read_line = read_line or input
         self._write = write or (lambda text: print(text, flush=True))
-        if is_terminal is None:
-            is_terminal = (lambda: True) if read_line is not None else _stdio_is_tty
-        self._is_terminal = is_terminal
+        self._is_terminal = is_terminal or _stdio_is_tty
         self._lock = asyncio.Lock()
         self._pending: asyncio.Future[str | None] | None = None
 
