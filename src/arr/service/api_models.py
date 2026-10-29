@@ -1037,7 +1037,10 @@ class Consequences(ApiModel):
 
 
 class RunStartAgent(ApiModel):
-    """An agent of a requested run (docs/08 §5.0 `agents[]` of `run_start`)."""
+    """An agent of a requested run (docs/08 §5.0 `agents[]` of `run_start`).
+
+    `skills` are the research skills the agent gets (column „Skills“ of „Neuer Run“, W1-08 §4).
+    """
 
     id: str
     role_label: str
@@ -1049,6 +1052,7 @@ class RunStartAgent(ApiModel):
     tools: ToolAccess = Field(default_factory=ToolAccess)
     read_dirs: list[str] = Field(default_factory=list)
     workspace_mode: WorkspaceMode = WorkspaceMode.COPY
+    skills: list[str] = Field(default_factory=list)
 
 
 class RunStartChannel(ApiModel):

@@ -6,6 +6,7 @@ Everything comes from the files of docs/02 §4: `meta.json`, `orchestrator.jsonl
 the run (`run_lock_held`).
 """
 
+import contextlib
 import re
 import time
 from collections.abc import Mapping, Sequence
@@ -30,6 +31,7 @@ __all__ = [
     "RUN_LOCK",
     "STATUS_TEXT",
     "STOP_REQUEST",
+    "RunLock",
     "RunStatusView",
     "TurnCount",
     "describe_checkpoint",
@@ -64,8 +66,10 @@ ACTIVE_STATUSES = frozenset(
 def run_lock_held(run_dir: str | Path) -> bool:
     """True if a process (or another file handle) holds the run's lock right now.
 
-    Tries a non-blocking lock on a fresh handle and releases it at once; a missing lock file
-    counts as not held. Without `fcntl` always False.
+    Probes with a non-blocking *shared* lock on a fresh handle and releases it at once: it
+    fails only while an executing process holds the exclusive lock, and several probes (the
+    service asks often, W3-01) never block each other. A missing lock file counts as not held.
+    Without `fcntl` always False.
     """
     if fcntl is None:
         return False
@@ -75,11 +79,69 @@ def run_lock_held(run_dir: str | Path) -> bool:
         return False
     with handle:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except OSError:
             return True
         fcntl.flock(handle, fcntl.LOCK_UN)
         return False
+
+
+LOCK_RETRIES = 20
+LOCK_RETRY_WAIT_S = 0.05
+"""`RunLock.acquire` tries this often, this far apart, before it gives up: a probe of
+`run_lock_held` holds the file for a moment, and a starting run must not fail on it."""
+
+
+class RunLock:
+    """Owner mark of the run this process executes: `fcntl.flock` on `<run>/run.lock`.
+
+    Taken right after the run folder is reserved (`arr run`: `run_launch`; service: the same
+    path; a `RunManager` with a reserved `run_id` takes it before the folder is prepared) and
+    held until the run is over, the secret scan included. Other processes see it with
+    `run_lock_held`: a second `arr run` leaves the run alone when it marks crashed runs, and
+    `arr runs stop` tells when no process executes a run any more. The lock falls with the
+    process (also after `os._exit` and a crash); the file stays. Without `fcntl` (Windows)
+    nothing is locked.
+    """
+
+    def __init__(self, run_dir: str | Path) -> None:
+        self.path = Path(run_dir) / RUN_LOCK
+        self._handle: Any = None
+
+    @property
+    def held(self) -> bool:
+        return self._handle is not None
+
+    def acquire(self, *, retries: int = LOCK_RETRIES, wait_s: float = LOCK_RETRY_WAIT_S) -> None:
+        """Take the lock; `ArrError` if another process holds it.
+
+        A failed attempt is repeated `retries` times `wait_s` apart, so a brief probe of
+        `run_lock_held` from another process never makes a start fail (W3-01).
+        """
+        if fcntl is None or self._handle is not None:
+            return
+        handle = self.path.open("ab")
+        for attempt in range(retries + 1):
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                if attempt < retries:
+                    time.sleep(wait_s)
+                    continue
+                handle.close()
+                raise ArrError(
+                    f"Den Run {self.path.parent.name} führt schon ein anderer arr-Prozess aus."
+                ) from None
+            self._handle = handle
+            return
+
+    def release(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        with contextlib.suppress(OSError):
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
 
 
 STATUS_TEXT = {

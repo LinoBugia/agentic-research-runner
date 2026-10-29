@@ -12,6 +12,23 @@
   const params = new URLSearchParams(location.search);
   const theme = params.get("theme");
   if (theme === "dark" || theme === "light") root.setAttribute("data-theme", theme);
+  // Appearance from the app settings: the page head sets it; if the page was slow and the
+  // head script is missing (W1-08.2), the frame's data-theme and the browser's memory do it.
+  const isTheme = (t) => t === "dark" || t === "light";
+  try {
+    const remembered = localStorage.getItem("arr-theme");
+    if (!theme && isTheme(remembered) && !root.getAttribute("data-theme")) root.setAttribute("data-theme", remembered);
+  } catch (e) {}
+  arr.applyTheme = function (t) {
+    if (theme) return; // ?theme= of the URL wins
+    if (isTheme(t)) {
+      root.setAttribute("data-theme", t);
+      try { localStorage.setItem("arr-theme", t); } catch (e) {}
+    } else {
+      root.removeAttribute("data-theme");
+      try { localStorage.removeItem("arr-theme"); } catch (e) {}
+    }
+  };
   if ("scrollRestoration" in history) history.scrollRestoration = "manual";
 
   // ---- helpers ------------------------------------------------------------------------------
@@ -134,6 +151,7 @@
   };
 
   whenEl(".app", (app) => {
+    if ("theme" in app.dataset) arr.applyTheme(app.dataset.theme);
     if (app.dataset.now) arr.offset = parseFloat(app.dataset.now) - Date.now() / 1000;
     const hashId = location.hash.slice(1);
     const card = app.dataset.focusCard || params.get("focus") || (hashId.startsWith("apr_") ? hashId : "");

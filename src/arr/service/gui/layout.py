@@ -50,20 +50,26 @@ THEMES = {Appearance.LIGHT: "light", Appearance.DARK: "dark"}
 """`data-theme` of the chosen appearance; „wie macOS“ sets none and follows the system."""
 
 
-async def apply_appearance(api: ApiClient) -> None:
+async def apply_appearance(api: ApiClient) -> str | None:
     """Set the appearance from the app settings while the page is built, so every page has it
-    from the first frame on (no light flash). `?theme=` of the URL wins (tests, arr.js)."""
+    from the first frame on (no light flash). `?theme=` of the URL wins (tests, arr.js).
+
+    Returns the theme (`dark`, `light` or None). The head script is lost when a page takes
+    longer than NiceGUI's response window (W1-08.2), so the frame also puts the theme on its
+    root as `data-theme` and `arr.js` applies it from there (and remembers it in the browser).
+    """
     api = getattr(api, "base", api)  # a forced page state does not apply here
     try:
         settings = await api.get_app_settings()
     except ApiException:
-        return
+        return None
     theme = THEMES.get(settings.appearance)
     if theme:
         ui.add_head_html(
             "<script>if (!new URLSearchParams(location.search).get('theme')) "
             f"document.documentElement.setAttribute('data-theme', '{theme}');</script>"
         )
+    return theme
 
 
 def tab_title(title: str, waiting: int) -> str:
@@ -181,7 +187,8 @@ class Frame:
 
     async def start(self) -> "Frame":
         """Load appearance, counters and workfolder, then follow the global live stream."""
-        await apply_appearance(self.api)
+        theme = await apply_appearance(self.api)
+        self.root.props(f'data-theme="{theme or ""}"')
         self.counts = await self.api.get_counts()
         workfolder = await self.api.get_workfolder()
         self._render_counts()
