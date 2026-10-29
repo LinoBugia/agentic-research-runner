@@ -10,8 +10,12 @@ It runs in the client's reader thread and blocks it while it waits, so:
   (once: grants for the agent or the run are kept by arr's PolicyEngine, not by Codex),
   `deny` → `decline`. Codex has no field for a reason, so the reason goes to `on_denied`,
   which the backend sends into the turn by `steer`.
+- **Fail-closed:** a shell request that is not of kind `command` (e.g. `writeStdin`, input
+  into a running process) or carries neither a command nor a network host cannot be checked
+  and is declined (W2-02.1 M4).
 - **All other requests** are answered explicitly with a refusal, never with the SDK default
-  (which accepts): extra permissions, MCP elicitations, user input, legacy approvals.
+  (which accepts): extra permissions, MCP elicitations, user input, legacy approvals. Each of
+  them is reported to `on_refused` (method, params, answer) for an event with `raw`.
 - **A stop while it waits** (`cancel_waiting`) ends the wait first with a `decline`; only then
   can the client deliver the answer to `turn/interrupt`.
 """
@@ -49,6 +53,10 @@ _REFUSALS: dict[str, dict[str, Any]] = {
 }
 
 _UNCHECKED = "Die Anfrage konnte nicht geprüft werden und gilt als abgelehnt."
+_UNCHECKABLE = (
+    "Die Anfrage lässt sich nicht prüfen (keine vollständige Befehlszeile, z. B. eine Eingabe "
+    "in einen laufenden Prozess). Sie ist abgelehnt. Starte den Befehl neu als ganzen Befehl."
+)
 _STOPPED = "Der Turn wurde gestoppt. Die Anfrage ist damit hinfällig."
 
 
@@ -76,6 +84,7 @@ class ApprovalBridge:
         work_dir: str,
         loop: asyncio.AbstractEventLoop,
         on_denied: Callable[[str], None],
+        on_refused: Callable[[str, dict[str, Any], dict[str, Any]], None] | None = None,
     ) -> None:
         self.inbox = inbox
         self.run_id = run_id
@@ -84,6 +93,7 @@ class ApprovalBridge:
         self.work_dir = work_dir
         self.loop = loop
         self.on_denied = on_denied
+        self.on_refused = on_refused
         self._items: dict[str, dict[str, Any]] = {}
         self._waiting: set[concurrent.futures.Future[Decision]] = set()
         self._lock = threading.Lock()
@@ -108,18 +118,32 @@ class ApprovalBridge:
 
     def _answer(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == COMMAND:
+            if not self._checkable(params):
+                logger.info("Nicht prüfbare Befehlsanfrage von %s abgelehnt", self.agent_id)
+                self.on_denied(_UNCHECKABLE)
+                return refusal(method)
             request = self._command_request(params)
         elif method == FILE_CHANGE:
             request = self._file_request(params)
         else:
             logger.info("Codex-Anfrage %s von %s abgelehnt", method, self.agent_id)
-            return refusal(method)
+            answer = refusal(method)
+            if self.on_refused is not None:
+                self.on_refused(method, params, answer)
+            return answer
         decision = self._decide(request)
         if decision.action is DecisionAction.ALLOW:
             return {"decision": "accept"}
         if decision.reason:
             self.on_denied(decision.reason)
         return {"decision": "decline"}
+
+    @staticmethod
+    def _checkable(params: dict[str, Any]) -> bool:
+        if params.get("kind") not in (None, "command"):
+            return False
+        host = (params.get("networkApprovalContext") or {}).get("host")
+        return bool(str(params.get("command") or "").strip() or host)
 
     def _request(self, **fields: Any) -> PermissionRequest:
         return PermissionRequest(

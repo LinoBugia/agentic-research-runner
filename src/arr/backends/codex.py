@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 from arr.backends.base import (
@@ -46,10 +47,11 @@ from arr.backends.codex_sdk import (
     start_thread,
 )
 from arr.errors import ArrError
-from arr.models import AuthProfile, WorkspaceMode
+from arr.models import AuthProfile, ResolvedRun, WorkspaceMode
 from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.policy import RunPaths
-from arr.runs.prepare import PreparedAgent
+from arr.resolve import load_yaml_model
+from arr.runs.prepare import RUN_SOURCE, PreparedAgent
 
 __all__ = ["CodexBackend"]
 
@@ -59,6 +61,7 @@ CodexFactory = Callable[[Any], Any]
 """Builds an `AsyncCodex` from a `CodexConfig`; tests pass a fake."""
 
 _DENIED = "Abgelehnt: {reason}"
+CLOSED = "Das Codex-Backend ist geschlossen. Es startet keinen Turn mehr."
 _END = object()
 
 
@@ -72,6 +75,14 @@ def _codex_config(launch: CodexLaunch) -> Any:
     from openai_codex import CodexConfig
 
     return CodexConfig(env=launch.env, config_overrides=launch.config_overrides)
+
+
+def _run_channels(run_dir: Path) -> list[str]:
+    """All channels of the run from `run.yaml` (their attachments are denied unless own)."""
+    path = run_dir / RUN_SOURCE
+    if not path.is_file():
+        return []
+    return [chat.name for chat in load_yaml_model(path, ResolvedRun).groupchats]
 
 
 def _payload(note: Any) -> dict[str, Any]:
@@ -116,6 +127,7 @@ class CodexBackend:
         self._queue: asyncio.Queue[Any] | None = None
         self._interrupted = False
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._run_channels: list[str] = []
 
     # -- lifecycle --------------------------------------------------------------------------
 
@@ -130,6 +142,7 @@ class CodexBackend:
             )
         home = self.profile.tmp_dir / "home" / self.agent.id
         home.mkdir(parents=True, exist_ok=True)
+        self._run_channels = _run_channels(self.agent.run_dir)
         self._started = True
 
     async def close(self) -> None:
@@ -175,8 +188,15 @@ class CodexBackend:
     # -- turn -------------------------------------------------------------------------------
 
     def run_turn(self, prompt: str, *, stage: str | None = None) -> AsyncIterator[AgentEvent]:
-        """Run one turn in a fresh app-server; ends with `turn_end` also after errors."""
-        if not self._started or self._closed:
+        """Run one turn in a fresh app-server; ends with `turn_end` also after errors.
+
+        After `close()` no app-server starts: the turn ends at once with `error` and
+        `turn_end`, also for a turn created before `close()` and iterated after it.
+        """
+        if self._closed:
+            self._turn += 1
+            return self._closed_turn(prompt, stage)
+        if not self._started:
             raise RuntimeError("Das Codex-Backend ist nicht gestartet.")
         if self._queue is not None:
             raise RuntimeError("Es läuft schon ein Turn.")
@@ -185,22 +205,40 @@ class CodexBackend:
         self._interrupted = False
         return self._run(prompt, stage)
 
+    async def _closed_turn(self, prompt: str, stage: str | None) -> AsyncIterator[AgentEvent]:
+        events = TurnEvents(model=self.config.model, status=TurnStatus.ERROR)
+        yield self._event(EventKind.TURN_START, dict(TurnStartData(prompt=prompt, stage=stage)))
+        data = ErrorData(message=CLOSED, type="closed", recoverable=False)
+        yield self._event(EventKind.ERROR, dict(data))
+        yield self._turn_end(events)
+
     async def _run(self, prompt: str, stage: str | None) -> AsyncIterator[AgentEvent]:
         events = TurnEvents(model=self.config.model)
         try:
             yield self._event(EventKind.TURN_START, dict(TurnStartData(prompt=prompt, stage=stage)))
+            if self._closed:  # created before close(), iterated after it
+                events.status = TurnStatus.ERROR
+                yield self._event(
+                    EventKind.ERROR,
+                    dict(ErrorData(message=CLOSED, type="closed", recoverable=False)),
+                )
+                yield self._turn_end(events)
+                return
             try:
                 async for event in self._play(self._first_prompt(prompt), events):
                     yield event
             except Exception as exc:  # noqa: BLE001 - every turn ends with turn_end
-                logger.warning("Codex-Turn von %s fehlgeschlagen: %s", self.agent.id, exc)
-                events.status = TurnStatus.ERROR
-                data = ErrorData(
-                    message=str(exc) or type(exc).__name__,
-                    type=type(exc).__name__,
-                    recoverable=False,
-                )
-                yield self._event(EventKind.ERROR, dict(data))
+                if self._interrupted:  # stopped while the app-server started
+                    events.status = TurnStatus.INTERRUPTED
+                else:
+                    logger.warning("Codex-Turn von %s fehlgeschlagen: %s", self.agent.id, exc)
+                    events.status = TurnStatus.ERROR
+                    data = ErrorData(
+                        message=str(exc) or type(exc).__name__,
+                        type=type(exc).__name__,
+                        recoverable=False,
+                    )
+                    yield self._event(EventKind.ERROR, dict(data))
             await self._shutdown()
             yield self._turn_end(events)
         finally:
@@ -221,6 +259,9 @@ class CodexBackend:
         queue = self._queue
         assert queue is not None
         thread = await self._open(queue)
+        if self._interrupted or self._closed:  # stopped while the app-server started
+            events.status = TurnStatus.INTERRUPTED
+            return
         effort = self.config.effort.value if self.config.effort else None
         self._handle = await thread.turn(prompt, effort=effort, summary="detailed")
         if self._interrupted:
@@ -261,6 +302,7 @@ class CodexBackend:
             self.run_paths,
             codex_home=self.codex_home,
             environ=self._environ,
+            run_channels=self._run_channels,
         )
         codex = self._factory(_codex_config(launch))
         self._codex = codex
@@ -275,6 +317,9 @@ class CodexBackend:
                 work_dir=launch.cwd,
                 loop=loop,
                 on_denied=lambda reason: loop.call_soon_threadsafe(self._steer_reason, reason),
+                on_refused=lambda method, params, answer: loop.call_soon_threadsafe(
+                    queue.put_nowait, self._refused_event(method, params, answer)
+                ),
             )
             self._bridge = bridge
             install_approval_handler(codex, bridge)
@@ -303,6 +348,18 @@ class CodexBackend:
         self._thread_id = started.thread.id
         self._rollout = getattr(started.thread, "path", None) or self._rollout
         return thread
+
+    def _refused_event(
+        self, method: str, params: dict[str, Any], answer: dict[str, Any]
+    ) -> AgentEvent:
+        """A server request other than shell/file, refused by the bridge (W2-02 Auftrag §6, G3)."""
+        data = ErrorData(
+            message=f"Codex-Anfrage „{method}“ abgelehnt (in arr nicht vorgesehen).",
+            type="server_request",
+            recoverable=True,
+        )
+        raw = {"request": {"method": method, "params": params}, "answer": answer}
+        return self._event(EventKind.ERROR, dict(data), raw=raw)
 
     async def _pump(self, handle: Any, queue: asyncio.Queue[Any]) -> None:
         try:

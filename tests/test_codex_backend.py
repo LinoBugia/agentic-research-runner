@@ -17,6 +17,7 @@ from arr.backends.codex import CodexBackend
 from arr.backends.codex_approvals import ApprovalBridge
 from arr.errors import ArrError
 from arr.models import AgentConfig, AuthKind, AuthProfile, Provider
+from arr.permissions import policy
 from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.policy import PermissionRules, PolicyEngine, RunPaths, profile_for
 from arr.permissions.types import (
@@ -32,6 +33,13 @@ from arr.runs.prepare import AgentFile, PreparedAgent
 FIXTURES = Path(__file__).parent / "fixtures" / "codex"
 THREAD = "thread-1"
 TURN = "turn-1"
+
+
+@pytest.fixture(autouse=True)
+def no_user_temp_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`tmp_path` lies in the user's temp folder, which `profile_for` denies (W2-01.1). Its
+    other entries would all become siblings; the tests must not depend on the machine."""
+    monkeypatch.setattr(policy, "user_temp_dirs", lambda: [])
 
 
 # -- fake app-server -----------------------------------------------------------------------
@@ -356,13 +364,14 @@ async def test_app_server_error_still_ends_with_turn_end(setup, monkeypatch) -> 
 
 
 async def test_close_is_idempotent(setup) -> None:
-    backend, _, _ = setup([simple_turn()])
+    backend, kit, _ = setup([simple_turn()])
     await backend.start()
     await play(backend)
     await backend.close()
     await backend.close()
-    with pytest.raises(RuntimeError):
-        backend.run_turn("x")
+    events = await play(backend, "x")  # like ClaudeBackend: no new process, error + turn_end
+    assert kinds(events) == ["turn_start", "error", "turn_end"]
+    assert events[-1].data["status"] == "error" and len(kit.codexes) == 1
 
 
 async def test_fallback_without_internals(setup, monkeypatch) -> None:
@@ -569,3 +578,151 @@ async def test_replay_of_read_allowlist_recording(setup) -> None:
     assert limits and limits[0].data["status"] == "allowed"
     usage = events[-1].data["usage"]
     assert usage["input"] > 0 and usage["cache_read"] > 0
+
+
+# -- W2-02.1 ------------------------------------------------------------------------------
+
+
+async def test_g2_turn_created_before_close_starts_nothing(setup) -> None:
+    backend, kit, _ = setup([simple_turn()])
+    await backend.start()
+    turn = backend.run_turn("Los.")
+    await backend.close()
+    events = [event async for event in turn]
+    assert kinds(events) == ["turn_start", "error", "turn_end"]
+    assert not kit.codexes  # no app-server
+
+
+async def test_g2_stop_during_start_is_interrupted(setup, monkeypatch) -> None:
+    backend, kit, _ = setup([simple_turn()])
+    started = asyncio.Event()
+
+    async def slow_start(codex: Any, **kwargs: Any) -> Any:
+        started.set()
+        await asyncio.sleep(0.2)
+        return kit._started(codex)
+
+    monkeypatch.setattr(codex_module, "start_thread", slow_start)
+    await backend.start()
+    turn = asyncio.create_task(play(backend))
+    await started.wait()
+    await backend.interrupt()
+    events = await turn
+    assert kinds(events) == ["turn_start", "turn_end"]
+    assert events[-1].data["status"] == "interrupted"
+    assert not kit.handles  # no turn/start sent
+
+
+async def test_g2_failure_while_stopping_is_interrupted(setup, monkeypatch) -> None:
+    backend, _, _ = setup([simple_turn()])
+    started = asyncio.Event()
+
+    async def broken(codex: Any, **kwargs: Any) -> Any:
+        started.set()
+        await asyncio.sleep(0.2)
+        raise RuntimeError("app-server closed")
+
+    monkeypatch.setattr(codex_module, "start_thread", broken)
+    await backend.start()
+    turn = asyncio.create_task(play(backend))
+    await started.wait()
+    await backend.interrupt()
+    events = await turn
+    assert kinds(events) == ["turn_start", "turn_end"]
+    assert events[-1].data["status"] == "interrupted"
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"kind": "writeStdin", "command": "/bin/zsh -lc 'python3'"},
+        {"kind": "command", "command": None},
+        {"command": "   "},
+        {"kind": "somethingNew", "command": "ls"},
+    ],
+)
+async def test_m4_uncheckable_command_requests_are_declined(setup, params) -> None:
+    script = simple_turn()
+    request = command_request()
+    request["params"] = {"threadId": THREAD, "turnId": TURN, "itemId": "exec-1", **params}
+    script.insert(1, request)
+    backend, kit, inbox = setup([script], decider=Decider(DecisionAction.ALLOW))
+    await backend.start()
+    await play(backend)
+    assert "answer item/commandExecution/requestApproval {'decision': 'decline'}" in kit.log
+    assert not inbox.items()  # never reached the PolicyEngine's allow
+    await asyncio.sleep(0.05)
+    assert any("lässt sich nicht prüfen" in line for line in kit.log if line.startswith("steer"))
+
+
+async def test_m4_network_request_without_command_is_checked(setup) -> None:
+    script = simple_turn()
+    request = command_request()
+    request["params"] = {"threadId": THREAD, "turnId": TURN, "itemId": "exec-1",
+                         "networkApprovalContext": {"host": "pypi.org"}}  # fmt: skip
+    script.insert(1, request)
+    backend, kit, inbox = setup([script], decider=Decider(DecisionAction.DENY))
+    await backend.start()
+    await play(backend)
+    assert inbox.items() and inbox.items()[0].request.hosts == ["pypi.org"]
+
+
+async def test_g3_refused_requests_become_events_with_raw(setup) -> None:
+    script = simple_turn()
+    script.insert(1, {"id": 50, "method": "mcpServer/elicitation/request", "params": {"q": 1}})
+    backend, _, _ = setup([script])
+    await backend.start()
+    events = await play(backend)
+    refused = [e for e in events if e.kind is EventKind.ERROR]
+    assert len(refused) == 1 and refused[0].data["recoverable"] is True
+    assert refused[0].data["type"] == "server_request"
+    assert refused[0].raw == {
+        "request": {"method": "mcpServer/elicitation/request", "params": {"q": 1}},
+        "answer": {"action": "decline", "content": None},
+    }
+    assert events[-1].data["status"] == "ok"
+
+
+async def test_m1_too_many_entries_stop_before_the_app_server(setup, monkeypatch) -> None:
+    from arr.backends import codex_config
+
+    backend, kit, _ = setup([simple_turn()])
+    monkeypatch.setattr(codex_config, "ENTRIES_MAX", 5)
+    await backend.start()
+    events = await play(backend)
+    assert kinds(events) == ["turn_start", "error", "turn_end"]
+    assert "Archiviere alte Runs" in events[1].data["message"]
+    assert not kit.codexes
+
+
+async def test_m3_channels_come_from_run_yaml(tmp_path: Path, monkeypatch) -> None:
+    from run_kit import agent, channel, make_run_input, make_settings, make_workfolder
+
+    from arr.resolve import resolve_run
+    from arr.runs.prepare import prepare_run
+
+    wf = make_workfolder(tmp_path)
+    codex = {"provider": "codex", "model": "gpt-6-luna", "auth": "chatgpt-test"}
+    run_input = make_run_input(
+        [agent("gpt-1", **codex), agent("critic-1")],
+        [channel("main", ["gpt-1", "critic-1"]), channel("secret", ["critic-1"])],
+    )
+    settings = make_settings()
+    run = prepare_run(wf, run_input, resolve_run(run_input, None, settings), settings)
+    prepared = run.agents["gpt-1"]
+    profile = profile_for(prepared.file.config, RunPaths(wf, run.run_dir), PermissionRules())
+    kit = Kit([simple_turn()])
+    monkeypatch.setattr(codex_module, "start_thread", kit.start_thread)
+    monkeypatch.setattr(codex_module, "_codex_config", lambda launch: launch)
+    backend = CodexBackend(
+        prepared,
+        run_id=run.run_id,
+        inbox=ApprovalInbox(PolicyEngine([profile])),
+        auth=make_auth(tmp_path),
+        factory=kit.factory,
+    )
+    await backend.start()
+    await play(backend)
+    fs = kit.codexes[0].config.filesystem
+    secret = run.run_dir / "groupchats" / "attachments" / "secret"
+    assert not secret.exists() and fs[str(profile.resolve(secret))] == "deny"

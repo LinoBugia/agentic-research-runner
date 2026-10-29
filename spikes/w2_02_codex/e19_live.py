@@ -17,9 +17,11 @@ any message from the app-server means the model saw it.
 
 import asyncio
 import json
+import os
 import re
 import secrets
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -118,6 +120,10 @@ def probes(lab: Any) -> list[tuple[str, str, str]]:
         ("F1", f"cat /System/Volumes/Data{c['outside']}", "❌"),
         ("T1", f"echo x > {tmp_probe} && echo WROTE", "❌ write"),
         ("T2", 'echo "$TMPDIR" && echo x > "$TMPDIR/t.txt" && echo ok', "✅ run-tmp"),
+        # W2-02.1: names of the shell's variables only (never values), user temp folders
+        ("E1", "env | cut -d= -f1 | sort | tr '\\n' ' '", "✅ Namen ohne Secrets"),
+        ("T3", f"ls {tempfile.gettempdir()} >/dev/null 2>&1; echo exit=$?", "❌ exit≠0"),
+        ("T4", f"ls /tmp/claude-{os.getuid()} >/dev/null 2>&1; echo exit=$?", "❌ exit≠0"),
     ]
 
 

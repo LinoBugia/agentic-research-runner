@@ -1,6 +1,7 @@
 """Turn a raw recording of `e19_live.py` (or a smoke test) into a sanitized fixture.
 
-Home path → `~`, account and installation data → placeholders. Afterwards the fixture is
+Home path → `~`, the user's temp folders → `<user-tmp>` / `/tmp/claude-<uid>`, account and
+installation data → placeholders. Afterwards the fixture is
 searched for the user name, e-mail addresses and the temp folders; any hit aborts.
 
     uv run python spikes/w2_02_codex/make_fixture.py tmp/out/e19_v1.raw.jsonl read_allowlist
@@ -13,14 +14,18 @@ Lines are `{"source": "stream" | "rollout", "line": …}`.
 
 import getpass
 import json
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from common import FIXTURES
 
 HOME = str(Path.home())
+USER_TMP = [os.path.realpath(tempfile.gettempdir()), tempfile.gettempdir().rstrip("/")]
+CLAUDE_TMP = f"/tmp/claude-{os.getuid()}"
 REDACT = {"email", "accountId", "userId", "installationId", "serverName", "chatgptUserId"}
 EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
@@ -36,7 +41,9 @@ def clean(value: Any) -> Any:
         return [clean(v) for v in value]
     if isinstance(value, str):
         text = value.replace(f"/System/Volumes/Data{HOME}", "/System/Volumes/Data~")
-        return text.replace(HOME, "~")
+        for tmp in USER_TMP:
+            text = text.replace(tmp, "<user-tmp>")
+        return text.replace(CLAUDE_TMP, "/tmp/claude-<uid>").replace(HOME, "~")
     return value
 
 
@@ -68,7 +75,7 @@ def main() -> None:
     out = [json.dumps(clean(line), ensure_ascii=False) for line in lines]
     text = "\n".join(out) + "\n"
     user = getpass.getuser()
-    hits = [w for w in (user, "/private/tmp", "/var/folders") if w in text]
+    hits = [w for w in (user, "/private/tmp", "/var/folders", CLAUDE_TMP) if w in text]
     hits += [m for m in EMAIL.findall(text) if not m.endswith("@example.com")]
     if hits:
         sys.exit(f"Bereinigung unvollständig: {sorted(set(hits))[:5]}")

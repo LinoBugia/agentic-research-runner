@@ -1,6 +1,7 @@
 """E19 live result as a test without a model (W2-02 A1): the recording of the read allowlist
 test (`tests/fixtures/codex/read_allowlist.jsonl`, spike `spikes/w2_02_codex/e19_live.py v1`,
 permission profile from `build_launch`, variant 1) matches the expected table L1-L15.
+Recorded on 29.10. after W2-02.1 (shell environment `core`, user temp folders denied).
 
 Every probe is a shell command tagged `: <case>;`. Its `commandExecution` item carries exit
 code and output. Canaries hold random tokens; only the one of the own channel may appear."""
@@ -30,6 +31,7 @@ WORKS = {
 }
 # cases that must be blocked by the sandbox
 BLOCKED = ["L3", "L5", "L5b", "L6b", "L9w", "L9c", "L13", "L13b", "L13c", "L14", "L15", "F1", "T1"]
+BY_EXIT_CODE = ["L1", "T3", "T4"]  # ~/.ssh, the arr process's temp folder, /tmp/claude-<uid>
 
 
 def _messages() -> list[dict[str, Any]]:
@@ -54,7 +56,7 @@ def probes() -> dict[str, dict[str, Any]]:
 
 
 def test_every_case_was_run(probes: dict[str, dict[str, Any]]) -> None:
-    assert set(WORKS) | set(BLOCKED) | {"L1", "L6"} <= set(probes)
+    assert set(WORKS) | set(BLOCKED) | set(BY_EXIT_CODE) | {"L6", "E1"} <= set(probes)
 
 
 @pytest.mark.parametrize("case", sorted(WORKS))
@@ -71,9 +73,20 @@ def test_blocked_case_is_blocked(probes: dict[str, dict[str, Any]], case: str) -
     assert any(word in item["aggregatedOutput"] for word in DENIED), item["aggregatedOutput"]
 
 
-def test_ssh_blocked_by_exit_code(probes: dict[str, dict[str, Any]]) -> None:
-    """L1: the real `~/.ssh` is probed by exit code only, the content goes to /dev/null."""
-    assert probes["L1"]["aggregatedOutput"].strip() == "exit=1"
+@pytest.mark.parametrize("case", BY_EXIT_CODE)
+def test_blocked_by_exit_code(probes: dict[str, dict[str, Any]], case: str) -> None:
+    """Real folders are probed by exit code only, the content goes to /dev/null."""
+    assert probes[case]["aggregatedOutput"].strip() == "exit=1"
+
+
+def test_shell_environment_has_no_secrets(probes: dict[str, dict[str, Any]]) -> None:
+    """E1 (W2-02.1 H1): the names of the shell's variables, recorded without values."""
+    names = set(probes["E1"]["aggregatedOutput"].split())
+    assert {"HOME", "PATH", "TMPDIR", "VIRTUAL_ENV", "UV_NO_CONFIG"} <= names
+    for name in names:
+        upper = name.upper()
+        assert not any(word in upper for word in ("TOKEN", "SECRET", "KEY")), name
+        assert not upper.startswith(("AWS_", "CLAUDE_CODE_")) and upper != "CODEX_HOME", name
 
 
 def test_home_wide_search_finds_only_the_own_attachment(

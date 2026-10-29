@@ -16,9 +16,18 @@ from arr.backends.codex_config import (
     isolation_overrides,
     toml_value,
 )
+from arr.errors import ArrError
 from arr.models import AgentConfig, Provider, RunVenvMode, Toolchain
+from arr.permissions import policy
 from arr.permissions.policy import PermissionRules, RunPaths, profile_for
 from arr.runs.prepare import AgentFile, PreparedAgent
+
+
+@pytest.fixture(autouse=True)
+def no_user_temp_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`tmp_path` lies in the user's temp folder, which `profile_for` denies (W2-01.1). Its
+    other entries would all become siblings; the tests must not depend on the machine."""
+    monkeypatch.setattr(policy, "user_temp_dirs", lambda: [])
 
 
 def agent_config(**changes: object) -> AgentConfig:
@@ -386,3 +395,118 @@ def test_launch_env_isolates_python(layout: dict[str, Path], tmp_path: Path) -> 
     assert env["VIRTUAL_ENV"] == str(layout["run"] / ".venv")  # not arr's own venv
     assert env["PYTHONPATH"] == "" and env["PYTHONHOME"] == ""
     assert env["UV_NO_CONFIG"] == "1"  # parents on the way may hold a denied pyproject.toml
+
+
+# -- W2-02.1 ------------------------------------------------------------------------------
+
+
+def parsed_overrides(overrides: tuple[str, ...]) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for item in overrides:
+        key, _, value = item.partition("=")
+        out[key] = tomllib.loads(f"v = {value}")["v"]
+    return out
+
+
+def test_h1_shell_inherits_only_core_and_the_agents_variables(
+    layout: dict[str, Path], tmp_path: Path
+) -> None:
+    agent, profile, paths = setup(layout)
+    environ = {"PATH": "/usr/bin", "GITHUB_TOKEN": "x", "CLAUDE_CODE_USER_EMAIL": "x"}
+    launch = build_launch(agent, profile, paths, codex_home=tmp_path / "ch", environ=environ)
+    parsed = parsed_overrides(launch.config_overrides)
+    assert parsed["shell_environment_policy.inherit"] == "core"
+    shell = parsed["shell_environment_policy.set"]
+    assert shell == launch.shell_env
+    assert {"HOME", "PATH", "TMPDIR", "VIRTUAL_ENV", "UV_NO_CONFIG", "MPLCONFIGDIR"} <= set(shell)
+    assert "CODEX_HOME" not in shell and "CODEX_HOME" in launch.env  # only the app-server
+    assert not [n for n in shell if any(w in n for w in ("TOKEN", "SECRET", "KEY", "CLAUDE"))]
+
+
+def test_h1_no_virtual_env_without_run_venv(layout: dict[str, Path], tmp_path: Path) -> None:
+    agent, profile, paths = setup(layout)
+    file = agent.file.model_copy(update={"run_venv": RunVenvMode.OFF})
+    launch = build_launch(PreparedAgent(file, agent.run_dir), profile, paths, codex_home=tmp_path)
+    assert "VIRTUAL_ENV" not in launch.shell_env
+
+
+def test_m1_limits(layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    from arr.backends import codex_config
+
+    assert (codex_config.ENTRIES_WARN, codex_config.ENTRIES_MAX) == (500, 1000)
+    _, profile, paths = setup(layout)
+    count = len(filesystem_entries(profile, paths, ["main"]))
+    monkeypatch.setattr(codex_config, "ENTRIES_WARN", count)
+    caplog.set_level("WARNING")
+    filesystem_entries(profile, paths, ["main"])
+    assert f"{count} Einträgen" in caplog.text
+    monkeypatch.setattr(codex_config, "ENTRIES_MAX", count)
+    with pytest.raises(ArrError, match="Archiviere alte Runs"):
+        filesystem_entries(profile, paths, ["main"])
+
+
+def test_m1_many_old_runs_stop_the_turn(layout: dict[str, Path]) -> None:
+    runs = layout["run"].parent
+    for n in range(1000):
+        (runs / f"20261029-0000_demo_custom_{n:04x}").mkdir()
+    _, profile, paths = setup(layout)
+    with pytest.raises(ArrError, match=r"Lese-Sperrliste für Codex hat 1\d{3} Einträge"):
+        filesystem_entries(profile, paths, ["main"])
+
+
+@pytest.mark.parametrize(
+    "name", ["Rechnung 🧾.pdf", 'zitat "x".txt', "back\\slash", "ctl\x01\x7f\ttab", "äöü ß"]
+)
+def test_m2_odd_names_give_valid_toml(layout: dict[str, Path], name: str) -> None:
+    (layout["home"] / name).write_text("x")
+    _, profile, paths = setup(layout)
+    overrides = isolation_overrides(profile, paths, model="m", channels=["main"])
+    fs = parsed_overrides(overrides)[f"permissions.{PERMISSION_PROFILE}.filesystem"]
+    assert fs == filesystem_entries(profile, paths, ["main"])
+    assert fs[str(layout["home"] / name)] == "deny"
+
+
+def test_m2_undecodable_name_is_refused() -> None:
+    from arr.backends.codex_config import toml_string
+
+    with pytest.raises(ArrError, match="kein gültiges UTF-8"):
+        toml_string("/home/a\udcff.txt")  # what os.listdir gives for the byte 0xff
+    assert tomllib.loads(f"v = {toml_string('🧾')}")["v"] == "🧾"
+
+
+def test_m3_foreign_channels_denied_before_they_exist(layout: dict[str, Path]) -> None:
+    _, profile, paths = setup(layout)
+    att = layout["run"] / "groupchats" / "attachments"
+    entries = filesystem_entries(profile, paths, ["main"], run_channels=["main", "later", "secret"])
+    assert not (att / "later").exists()
+    assert entries[str(att / "later")] == "deny"
+    assert codex_access(entries, att / "later" / "17" / "x.txt") == "deny"
+    assert codex_access(entries, att / "main" / "a.txt") == "read"
+
+
+def test_m3_staging_copies_are_denied(layout: dict[str, Path]) -> None:
+    _, profile, paths = setup(layout)
+    entries = filesystem_entries(profile, paths, ["main"])
+    att = layout["run"] / "groupchats" / "attachments"
+    assert codex_access(entries, att / ".staging-abc123" / "x.txt") == "deny"
+    assert codex_access(entries, att / ".staging-abc123") == "deny"
+
+
+def test_m5_login_folder_outside_home_is_denied(layout: dict[str, Path], tmp_path: Path) -> None:
+    login = tmp_path / "shared" / "codex_home"  # outside the layout's ~
+    (login).mkdir(parents=True)
+    (login / "auth.json").write_text("{}")
+    agent, profile, paths = setup(layout)
+    launch = build_launch(agent, profile, paths, codex_home=login, environ={"PATH": ""})
+    assert launch.filesystem[str(login)] == "deny"
+    assert codex_access(launch.filesystem, login / "auth.json") == "deny"
+
+
+def test_m5_login_folder_is_never_opened(layout: dict[str, Path]) -> None:
+    """Even a read folder inside the login folder does not make it readable."""
+    login = layout["home"] / "logins" / "codex_home"
+    (login / "notes").mkdir(parents=True)
+    _, profile, paths = setup(layout, read_dirs=[str(login / "notes")])
+    entries = filesystem_entries(profile, paths, hard_deny=[login])
+    assert codex_access(entries, login / "auth.json") == "deny"
+    assert codex_access(entries, login / "notes" / "x.md") == "deny"
