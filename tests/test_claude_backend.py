@@ -18,6 +18,7 @@ from claude_agent_sdk import (
     ResultMessage,
     SystemMessage,
     TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -26,6 +27,7 @@ from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk.types import ToolPermissionContext
 
 from arr.auth import CLAUDE_SWITCHES
+from arr.backends import claude_options as claude_options_module
 from arr.backends.base import AgentBackend, CostKind, EventKind
 from arr.backends.claude import ClaudeBackend, tool_request, with_context
 from arr.backends.claude_events import MISSING_RESULT, ClaudeEvents
@@ -36,6 +38,7 @@ from arr.backends.claude_options import (
     static_prompt,
     tmp_link,
 )
+from arr.errors import ArrError
 from arr.models import AuthProfile, Limits, RunInput, Toolchain, Tools, WorkfolderSettings
 from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.policy import PermissionRules, PolicyEngine, RunPaths, profile_for
@@ -131,7 +134,7 @@ def test_a5_options_follow_the_architecture(setup: Setup) -> None:
     try:
         options = options_for(setup, max_budget_usd=0.5, tmpdir=link)
     finally:
-        remove_tmp_link(link)
+        remove_tmp_link(link, profile.tmp_dir)
     agent = setup.agent()
     bare = {"Read", "Grep", "Glob", "Bash", "Write", "Edit"}
     assert not bare & set(options.allowed_tools)
@@ -200,8 +203,8 @@ def test_tmp_link_is_short_reused_and_removed(setup: Setup) -> None:
     try:
         assert len(str(real / "srt-mux-99999-zz.sock")) < 104 and len(str(real)) <= 30
     finally:
-        remove_tmp_link(real)
-    remove_tmp_link(link)
+        remove_tmp_link(real, target)
+    remove_tmp_link(link, target)
     assert not link.exists() and target.is_dir()
 
 
@@ -781,3 +784,125 @@ async def test_hint_also_rides_on_a_failed_tool_call(setup: Setup) -> None:
     output = clients[0].hook_outputs[0]["hookSpecificOutput"]
     assert output == {"hookEventName": "PostToolUseFailure", "additionalContext": "📨 Hinweis"}
     assert any(e.kind is EventKind.HINT for e in events)
+
+
+# --------------------------------------------------------------------------------------------
+# W2-01.1: scrub switch (B2), link in /tmp (B5), lifecycle after close (B6), raw once (B7)
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kind", "secret", "credential"),
+    [
+        ("claude_oauth", SECRET, "CLAUDE_CODE_OAUTH_TOKEN"),
+        ("claude_oauth", None, None),
+        ("claude_api_key", SECRET, "ANTHROPIC_API_KEY"),
+    ],
+)
+async def test_w2011_scrub_switch_for_every_auth_kind(
+    setup: Setup, kind: str, secret: str | None, credential: str | None
+) -> None:
+    auth = AuthProfile(name="p", kind=kind)
+    backend, clients = make_backend(setup, [], auth=auth, reader=lambda s, a: secret)
+    try:
+        await backend.start()
+    finally:
+        await backend.close()
+    env = clients[0].options.env
+    assert env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+    if credential:
+        assert env[credential] == SECRET
+
+
+def test_w2011_tmp_link_with_other_target_is_an_arr_error(setup: Setup) -> None:
+    target = setup.profile().tmp_dir
+    link = tmp_link(target, "r/e1", setup.tmp_root)
+    link.unlink()
+    other = setup.tmp_root / "other"
+    other.mkdir()
+    link.symlink_to(other)
+    with pytest.raises(ArrError, match="schon belegt"):
+        tmp_link(target, "r/e1", setup.tmp_root)
+    remove_tmp_link(link, target)  # not ours: stays
+    assert os.readlink(link) == str(other)
+
+
+def test_w2011_tmp_link_of_another_owner_is_not_reused_or_removed(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = setup.profile().tmp_dir
+    link = tmp_link(target, "r/e1", setup.tmp_root)
+    uid = os.getuid()
+    monkeypatch.setattr(claude_options_module.os, "getuid", lambda: uid + 1)
+    with pytest.raises(ArrError, match="anderer Besitzer"):
+        tmp_link(target, "r/e1", setup.tmp_root)
+    remove_tmp_link(link, target)
+    assert is_link(str(link))
+    monkeypatch.undo()
+    remove_tmp_link(link, target)
+    assert not is_link(str(link))
+
+
+async def test_w2011_run_turn_after_close_starts_no_client(setup: Setup) -> None:
+    backend, clients = make_backend(setup, [tool_turn(), tool_turn()])
+    await collect(backend, "Los")
+    await backend.close()
+    events = await collect(backend, "Noch einmal")
+    assert len(clients) == 1
+    assert [e.kind for e in events] == [EventKind.TURN_START, EventKind.ERROR, EventKind.TURN_END]
+    assert "bereits beendet" in events[1].data["message"]
+    assert events[-1].data["status"] == "error"
+    with pytest.raises(ArrError):
+        await backend.start()
+    assert len(clients) == 1
+    await backend.close()
+
+
+async def test_w2011_cancelled_close_cleans_up_and_passes_cancel_on(setup: Setup) -> None:
+    class Hanging(FakeClient):
+        async def disconnect(self) -> None:
+            await asyncio.Event().wait()
+
+    links: list[str] = []
+    clients: list[Hanging] = []
+
+    def factory(options: Any) -> Hanging:
+        links.append(options.env["TMPDIR"])
+        clients.append(Hanging(options, []))
+        return clients[-1]
+
+    backend = ClaudeBackend(
+        setup.agent(),
+        run_id="r",
+        inbox=ApprovalInbox(setup.engine()),
+        auth=AuthProfile(name="max", kind="claude_oauth"),
+        secret_reader=lambda s, a: None,
+        client_factory=factory,
+    )
+    await backend.start()
+    owner = backend._owner
+    assert owner is not None
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(backend.close(), 0.05)
+    await asyncio.sleep(0)
+    assert owner.done() and owner.cancelled()
+    assert not is_link(links[0])
+
+
+def test_w2011_raw_only_on_the_first_event_of_a_message() -> None:
+    mapper = ClaudeEvents("r1", "e1", "m", None)
+    mapper.start_turn(1)
+    blocks = [
+        ThinkingBlock("überlege", "sig"),
+        TextBlock("los"),
+        ToolUseBlock("t1", "Bash", {"command": "ls"}),
+        ToolUseBlock("t2", "Bash", {"command": "pwd"}),
+    ]
+    usage = {"input_tokens": 3, "output_tokens": 4}
+    events = mapper.feed(AssistantMessage(blocks, "m", message_id="a1", usage=usage))
+    assert [e.kind for e in events][-1] is EventKind.USAGE and len(events) == 5
+    assert events[0].raw is not None and all(e.raw is None for e in events[1:])
+    results = mapper.feed(
+        UserMessage([ToolResultBlock("t1", "a", False), ToolResultBlock("t2", "b", False)])
+    )
+    assert len(results) == 2 and results[0].raw is not None and results[1].raw is None

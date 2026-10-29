@@ -8,8 +8,10 @@ the generated plugin with its skill list, only the `arr-room` MCP server, adapti
 and the process environment (`PATH` with `path_prepend`, `TMPDIR` = Run-tmp).
 """
 
+import contextlib
 import hashlib
 import os
+import stat
 import sys
 from collections.abc import Mapping, Sequence
 from importlib import resources
@@ -19,6 +21,7 @@ from typing import Any
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk.types import CanUseTool, SystemPromptPreset
 
+from arr.errors import ArrError
 from arr.models import Effort, RunVenvMode
 from arr.permissions.policy import ROOM_TOOL_PREFIX, SandboxProfile, claude_options
 from arr.room.server import AGENT_ID_ENV, RUN_DIR_ENV
@@ -98,6 +101,9 @@ def tmp_link(target: Path, key: str, root: Path = TMP_LINK_ROOT) -> Path:
     most ~30 bytes. With the alias, files still land in Run-tmp. The name depends
     on `key` and the target, so a restarted agent reuses its link. Creates Run-tmp if
     missing. Remove the link with `remove_tmp_link`.
+
+    An existing entry is reused only if it is a symlink of this user to `target`; anything
+    else (another target, another owner, a file) raises `ArrError` (W2-01.1, B5).
     """
     target.mkdir(parents=True, exist_ok=True)  # prepare_run does not create Run-tmp
     digest = hashlib.sha1(f"{key}\0{target}".encode()).hexdigest()[:12]
@@ -105,15 +111,33 @@ def tmp_link(target: Path, key: str, root: Path = TMP_LINK_ROOT) -> Path:
     try:
         os.symlink(target, link)
     except FileExistsError:
-        if not (link.is_symlink() and os.readlink(link) == str(target)):
-            raise
+        if not _own_link(link, target):
+            raise ArrError(
+                f"Der Kurzpfad {link} für den Temp-Ordner des Agenten ist schon belegt "
+                "(anderes Ziel oder anderer Besitzer). Entferne ihn und starte den Agenten neu."
+            ) from None
     return link
 
 
-def remove_tmp_link(link: Path) -> None:
-    """Remove a link made by `tmp_link`; anything that is not a symlink stays."""
-    if link.is_symlink():
-        link.unlink(missing_ok=True)
+def _own_link(link: Path, target: Path) -> bool:
+    """Whether `link` is a symlink of this user that points to `target`."""
+    try:
+        info = os.lstat(link)
+        return (
+            stat.S_ISLNK(info.st_mode)
+            and info.st_uid == os.getuid()
+            and os.readlink(link) == str(target)
+        )
+    except OSError:
+        return False
+
+
+def remove_tmp_link(link: Path, target: Path) -> None:
+    """Remove a link made by `tmp_link`; an entry with another target or owner stays."""
+    if not _own_link(link, target):
+        return
+    with contextlib.suppress(FileNotFoundError):
+        link.unlink()
 
 
 def cache_env(run_tmp: Path) -> dict[str, str]:

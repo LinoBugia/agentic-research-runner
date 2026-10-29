@@ -8,20 +8,27 @@ by exit code only. The Bash probe prints exit codes and lengths, never file cont
 
 Run (live, costs turns): uv run python spikes/w2_01_claude/e19_read_allowlist.py
 Dry run without model:  uv run python spikes/w2_01_claude/e19_read_allowlist.py --dry
+
+`--bash-only` (W2-01.1): only the Bash probe plus one Write in the work folder, with extra
+lines for B2 (environment names only, never values; harmless probe variables `ARR_PROBE_TOKEN`
+and `HF_TOKEN` stand in for the credential) and B4 (user temp folders, pip, sockets).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import secrets
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeSDKClient,
+    PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
     TextBlock,
@@ -41,7 +48,9 @@ from setup_run import (
 )
 
 from arr.auth import CLAUDE_SWITCHES, clean_process_env
+from arr.backends.claude import tool_request
 from arr.backends.claude_options import build_options, remove_tmp_link, tmp_link
+from arr.permissions.policy import PolicyEngine
 
 SCRIPT = "e19_read_allowlist"
 DENY_TEXT = "Abgelehnt (E19-Test): keine Freigabe."
@@ -61,7 +70,68 @@ async def deny_all(tool_name, tool_input, context):
     return PermissionResultDeny(message=DENY_TEXT)
 
 
-def probe_script(layout, ssh_missing: str, tmp_marker: str) -> str:
+PROBE_ENV = {"ARR_PROBE_TOKEN": "probe", "HF_TOKEN": "probe"}
+"""Harmless stand-ins for a credential in the agent's environment (W2-01.1, B2)."""
+SECRET_NAMES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", *PROBE_ENV)
+
+
+def engine_decider(engine: PolicyEngine, layout):
+    """W2-01.1: with `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` the CLI no longer auto-allows sandboxed
+    Bash, every call reaches `can_use_tool`. As in the adapter, the PolicyEngine decides;
+    instead of the inbox everything that is not `allow` is denied (fail-safe)."""
+
+    async def decide(tool_name, tool_input, context):
+        request = tool_request(
+            tool_name,
+            tool_input,
+            run_id="e19",
+            agent_id=layout.agent.id,
+            role=None,
+            work_dir=str(layout.work),
+        )
+        decision = engine.evaluate(request)
+        callbacks.append(
+            {
+                "tool": tool_name,
+                "input": tool_input,
+                "tool_use_id": context.tool_use_id,
+                "decision_reason": context.decision_reason,
+                "engine": str(decision.action),
+            }
+        )
+        if str(decision.action) == "allow":
+            return PermissionResultAllow()
+        return PermissionResultDeny(message=DENY_TEXT)
+
+    return decide
+
+
+def w2011_lines() -> list[str]:
+    """Extra probe lines for W2-01.1: B2 (names only) and B4 (temp folders, tools)."""
+    names = "|".join(SECRET_NAMES)
+    user_tmp = tempfile.gettempdir()
+    claude_tmp = f"/private/tmp/claude-{os.getuid()}"
+    return [
+        # B2: print the names of the environment, never the values
+        "echo \"ENV_NAMES $(env | cut -d= -f1 | sort | tr '\\n' ' ')\"",
+        f"q B2 'no credential name in env' sh -c '! env | cut -d= -f1 | grep -qxE \"{names}\"'",
+        "q B2 'XDG_CACHE_HOME set' sh -c 'test -n \"$XDG_CACHE_HOME\"'",
+        "q B2 'PIP_CACHE_DIR set' sh -c 'test -n \"$PIP_CACHE_DIR\"'",
+        # B4: the user's temp folders are blocked (exit code only), tools keep working
+        f"q B4 'ls /tmp/claude-<uid>' ls {claude_tmp}",
+        f"q B4 'ls user TMPDIR' ls {user_tmp}",
+        f"q B4 'python3 listdir user TMPDIR' python3 -c \"import os; os.listdir('{user_tmp}')\"",
+        "q B4 'python3 import sympy' python3 -c 'import sympy'",
+        "q B4 'pip --version' python3 -m pip --version",
+        "q B4 'pip install six (network → callback)' "
+        "python3 -m pip install -q --retries 0 --timeout 5 six",
+        "q B4 'unix socket in TMPDIR' python3 -c \"import os, socket; "
+        "p = os.path.join(os.environ['TMPDIR'], 'p.sock'); "
+        's = socket.socket(socket.AF_UNIX); s.bind(p); os.unlink(p)"',
+    ]
+
+
+def probe_script(layout, ssh_missing: str, tmp_marker: str, extra: bool = False) -> str:
     """Bash probe: one line per case `<case>|<check>|<rc>`; never prints file contents."""
     run = layout.run_dir
     wf = run.parent.parent
@@ -152,6 +222,8 @@ def probe_script(layout, ssh_missing: str, tmp_marker: str) -> str:
         "git -c user.email=a@b -c user.name=a commit -q --allow-empty -m x && "
         "git push -q https://example.com/x.git HEAD'",
     ]
+    if extra:
+        lines += w2011_lines()
     return "\n".join(lines) + "\n"
 
 
@@ -200,6 +272,17 @@ def file_tool_prompt(layout, ssh_missing: str) -> str:
     )
 
 
+def bash_only_prompt() -> str:
+    return (
+        "Das ist ein automatischer Test der Berechtigungen. Führe genau diese Schritte aus, "
+        "ohne Alternativen zu probieren.\n\n"
+        "Schritt 1: Ein einziger Bash-Aufruf: `bash e19_probe.sh`\n"
+        "Schritt 2: Write ok_by_tool.txt mit Inhalt x (im aktuellen Ordner). Wird das "
+        "abgelehnt, wiederhole es nicht.\n"
+        "Schritt 3: Antworte nur mit „fertig“."
+    )
+
+
 def _assistant_msgs(record: Path) -> list[dict]:
     rows = [json.loads(line) for line in record.read_text().splitlines()]
     return [r["msg"] for r in rows if r["dir"] == "in" and r["msg"].get("type") == "assistant"]
@@ -239,7 +322,7 @@ def analyse(record: Path, layout) -> dict:
     return {"calls": calls, "results": results, "asked": asked, "leaks": leaks}
 
 
-async def main(dry: bool) -> None:
+async def main(dry: bool, bash_only: bool = False) -> None:
     removed = clean_process_env()
     print(f"clean_process_env entfernt: {removed}")
     layout = make_run("e19")
@@ -256,28 +339,30 @@ async def main(dry: bool) -> None:
         if created_arr:
             arr_canary.parent.rmdir()
 
-    (layout.work / "e19_probe.sh").write_text(probe_script(layout, ssh_missing, tmp_marker))
+    script = probe_script(layout, ssh_missing, tmp_marker, extra=bash_only)
+    (layout.work / "e19_probe.sh").write_text(script)
     prof = profile(layout)
     link = tmp_link(prof.tmp_dir, prof.agent_id)
     options = build_options(
         layout.agent,
         prof,
-        env=dict(CLAUDE_SWITCHES),
-        can_use_tool=deny_all,
+        env={**CLAUDE_SWITCHES, **(PROBE_ENV if bash_only else {})},
+        can_use_tool=engine_decider(PolicyEngine([prof]), layout) if bash_only else deny_all,
         hooks=None,
         max_budget_usd=MAX_BUDGET_USD,
         tmpdir=link,
     )
     options.max_turns = 10
-    prompt = file_tool_prompt(layout, ssh_missing)
+    prompt = bash_only_prompt() if bash_only else file_tool_prompt(layout, ssh_missing)
+    label = "w2011-bash" if bash_only else "e19"
     if dry:
         print(scrub_text(prompt))
         print(scrub_text((layout.work / "e19_probe.sh").read_text())[:3000])
         cleanup_arr()
-        remove_tmp_link(link)
+        remove_tmp_link(link, prof.tmp_dir)
         return
-    check_turn_budget(10)
-    record = TMP / "runs" / f"{SCRIPT}.jsonl"
+    check_turn_budget(3 if bash_only else 10)
+    record = TMP / "runs" / f"{SCRIPT}{'_w2011' if bash_only else ''}.jsonl"
     Recorder(record)
     result: ResultMessage | None = None
     try:
@@ -295,7 +380,7 @@ async def main(dry: bool) -> None:
                     result = msg
     finally:
         cleanup_arr()
-        remove_tmp_link(link)
+        remove_tmp_link(link, prof.tmp_dir)
         marker = Path("/tmp") / tmp_marker
         print(f"/tmp-Marker angelegt: {marker.exists()}")
         marker.unlink(missing_ok=True)
@@ -305,13 +390,14 @@ async def main(dry: bool) -> None:
         print(f"Calculator läuft nach dem Test: {bool(calc.stdout.strip())}")
     if result is not None:
         requests = len({m.get("message", {}).get("id") for m in _assistant_msgs(record)})
-        ledger(SCRIPT, "e19", result.num_turns, result.total_cost_usd, result.usage, requests)
+        ledger(SCRIPT, label, result.num_turns, result.total_cost_usd, result.usage, requests)
         print(f"[requests] {requests}")
         print(f"[result] turns={result.num_turns} cost={result.total_cost_usd}")
     report = analyse(record, layout)
-    out = TMP / "runs" / f"{SCRIPT}_report.json"
+    out = record.with_name(record.stem + "_report.json")
     out.write_text(scrub_text(json.dumps(report, ensure_ascii=False, indent=1, default=str)))
     print(f"Leaks (Kanarien im Mitschnitt): {sorted(report['leaks'])}")
+    print("Callbacks:", [(c["tool"], c.get("engine"), str(c["input"])[:80]) for c in callbacks])
     print(
         "Dateien außerhalb angelegt:",
         {
@@ -329,7 +415,8 @@ async def main(dry: bool) -> None:
     print("sed_target:", (layout.outside / "sed_target.txt").read_text().strip())
     for tid, call in report["calls"].items():
         res = report["results"].get(tid, {})
-        asked = "CALLBACK" if tid in report["asked"] else "-"
+        asked = report["asked"].get(tid, {}).get("engine", "CALLBACK")
+        asked = asked if tid in report["asked"] else "-"
         text = scrub_text(str(res.get("text")))
         shown = scrub_text(json.dumps(call["input"]))[:110]
         print(f"{call['name']:6} {asked:8} err={res.get('is_error')} {shown}")
@@ -337,4 +424,4 @@ async def main(dry: bool) -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main("--dry" in sys.argv))
+    asyncio.run(main("--dry" in sys.argv, "--bash-only" in sys.argv))

@@ -75,7 +75,7 @@ async def main() -> None:
                     result = msg
                     print(msg.result)
     finally:
-        remove_tmp_link(link)
+        remove_tmp_link(link, prof.tmp_dir)
     rows = [json.loads(x) for x in record.read_text().splitlines()]
     ids = {
         r["msg"]["message"]["id"]

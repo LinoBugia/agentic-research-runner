@@ -29,9 +29,14 @@ CLAUDE_SWITCHES = {
     "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
     "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
     "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS": "1",
+    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
 }
 """Fixed switches for every Claude agent (S1 §3.1): no claude.ai connectors, no auto memory,
-no bundled skills."""
+no bundled skills. `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` keeps the credential out of the
+environment of Bash and other child processes (W2-01.1, B2): without it the CLI passes
+`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` on (only GitHub Actions scrubs by default).
+The CLI then also drops secret-like names (`*_TOKEN`, `*_KEY`, …) and config paths such as
+`XDG_CACHE_HOME`, and forces the permission mode to `default` (writes go to `can_use_tool`)."""
 
 SecretReader = Callable[[str, str], str | None]
 """`(service, account) -> secret or None`, defaults to `keyring.get_password`."""

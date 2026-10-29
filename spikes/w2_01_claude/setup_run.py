@@ -34,7 +34,7 @@ TMP = SPIKE / "tmp"
 BASE_VENV = TMP / "basevenv"
 LEDGER = TMP / "usage.jsonl"
 HAIKU = "claude-haiku-5-5"
-MAX_TOTAL_TURNS = 30
+MAX_TOTAL_TURNS = 36  # 30 for W2-01, 6 more for W2-01.1
 MAX_BUDGET_USD = 0.5
 
 

@@ -45,6 +45,7 @@ from arr.auth import SecretReader, claude_env, clean_process_env, is_billed
 from arr.backends.base import AgentEvent, CostKind, EventKind
 from arr.backends.claude_events import ClaudeEvents
 from arr.backends.claude_options import build_options, remove_tmp_link, tmp_link
+from arr.errors import ArrError
 from arr.models import AuthProfile, Limits, Provider
 from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.policy import NETWORK_TOOLS, READ_TOOLS, SHELL_TOOLS, WRITE_TOOLS
@@ -57,6 +58,7 @@ HINT_METHOD = "post_tool_use"
 CONTEXT_HEADING = "## Projektkontext"
 TASK_HEADING = "## Auftrag"
 _NO_DECISION = "Keine Freigabe erhalten, arbeite ohne weiter oder frage im Chat nach."
+CLOSED = "Der Claude-Agent ist bereits beendet und startet nicht neu."
 
 
 class ClaudeClient(Protocol):
@@ -161,7 +163,7 @@ class ClaudeBackend:
         self._client: ClaudeClient | None = None
         self._owner: asyncio.Task[None] | None = None
         self._closing = asyncio.Event()
-        self._tmp_link: Path | None = None
+        self._tmp_link: tuple[Path, Path] | None = None  # (link, Run-tmp)
         self._turn = 0
         self._running = False
         self._interrupted = False
@@ -175,7 +177,12 @@ class ClaudeBackend:
     # ----------------------------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Clean the process environment, build the options and connect the CLI."""
+        """Clean the process environment, build the options and connect the CLI.
+
+        Raises `ArrError` after `close()`: a closed backend never starts a new CLI.
+        """
+        if self._closed:
+            raise ArrError(CLOSED)
         if self._client is not None:
             return
         removed = clean_process_env()
@@ -183,7 +190,8 @@ class ClaudeBackend:
             log.info("Umgebung bereinigt: %s", ", ".join(removed))
         profile = self.inbox.engine.profile(self.agent.id)
         env = claude_env(self.auth, self._secret_reader)
-        self._tmp_link = tmp_link(profile.tmp_dir, f"{self.run_id}/{self.agent.id}")
+        link = tmp_link(profile.tmp_dir, f"{self.run_id}/{self.agent.id}")
+        self._tmp_link = (link, profile.tmp_dir)
         options = build_options(
             self.agent,
             profile,
@@ -195,7 +203,7 @@ class ClaudeBackend:
                 "PostToolUseFailure": [HookMatcher(matcher=None, hooks=[self._post_tool_use])],
             },
             max_budget_usd=self.limits.budget_usd if self.limits else None,
-            tmpdir=self._tmp_link,
+            tmpdir=link,
             stderr=self._on_stderr,
         )
         self._client = self._client_factory(options)
@@ -205,7 +213,7 @@ class ClaudeBackend:
             await ready
         except BaseException:
             self._client = None
-            await self._release_link()
+            self._release_link()
             raise
         log.info("Claude-Agent %s gestartet (Profil %s)", self.agent.id, self.auth.name)
 
@@ -228,21 +236,35 @@ class ClaudeBackend:
                 await client.disconnect()
 
     async def close(self) -> None:
-        """Disconnect the CLI and remove the temp alias; safe to call more than once."""
+        """Disconnect the CLI and remove the temp alias; safe to call more than once.
+
+        If `close()` itself is cancelled (e.g. `wait_for` of the RunManager), the owner task
+        is cancelled too, the link is removed and the `CancelledError` is passed on.
+        """
         if self._closed:
             return
         self._closed = True
         self._fail_hints()
         self._closing.set()
-        if self._owner is not None:
-            with contextlib.suppress(Exception, asyncio.CancelledError):
-                await self._owner
-        self._client = None
-        await self._release_link()
+        owner = self._owner
+        try:
+            if owner is not None:
+                try:
+                    await owner
+                except asyncio.CancelledError:
+                    owner.cancel()
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                except Exception:
+                    log.debug("Owner-Task von %s endete mit Fehler", self.agent.id, exc_info=True)
+        finally:
+            self._client = None
+            self._release_link()
 
-    async def _release_link(self) -> None:
+    def _release_link(self) -> None:
         if self._tmp_link is not None:
-            remove_tmp_link(self._tmp_link)
+            remove_tmp_link(*self._tmp_link)
             self._tmp_link = None
 
     def session_ref(self) -> dict[str, str]:
@@ -255,7 +277,17 @@ class ClaudeBackend:
     # ----------------------------------------------------------------------------------------
 
     async def run_turn(self, prompt: str, *, stage: str | None = None) -> AsyncIterator[AgentEvent]:
-        """Run one turn; always ends with `turn_end` (also after `interrupt()` and errors)."""
+        """Run one turn; always ends with `turn_end` (also after `interrupt()` and errors).
+
+        After `close()` no new CLI starts: the turn ends at once with `error` and `turn_end`.
+        """
+        if self._closed:
+            self._turn += 1
+            self._events.start_turn(self._turn)
+            yield self._events.event(EventKind.TURN_START, {"prompt": prompt, "stage": stage})
+            for event in self._events.finish(error=CLOSED):
+                yield event
+            return
         if self._client is None:
             await self.start()
         client = self._client

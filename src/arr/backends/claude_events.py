@@ -60,6 +60,14 @@ def _raw(msg: Any) -> Any:
     return strip_private(data)
 
 
+def _raw_once(events: list[AgentEvent]) -> list[AgentEvent]:
+    """Keep the raw message only on the first event of one SDK message (W2-01.1, B7), so
+    `raw.jsonl` holds every message once and not once per block."""
+    for event in events[1:]:
+        event.raw = None
+    return events
+
+
 def result_text(content: Any) -> str | None:
     """Text of a tool result: a string, or the text parts of a content list."""
     if content is None or isinstance(content, str):
@@ -194,17 +202,19 @@ class ClaudeEvents:
             self._seen.add(msg.message_id)
             data = message_usage(msg.usage, msg.model or self.model)
             events.append(self.event(EventKind.USAGE, data, raw))
-        return events
+        return _raw_once(events)
 
     def _user(self, msg: UserMessage) -> list[AgentEvent]:
         if not isinstance(msg.content, list):
             return []
         raw = _raw(msg)
-        return [
-            self._tool_result(block.tool_use_id, bool(block.is_error), block.content, raw)
-            for block in msg.content
-            if isinstance(block, ToolResultBlock)
-        ]
+        return _raw_once(
+            [
+                self._tool_result(block.tool_use_id, bool(block.is_error), block.content, raw)
+                for block in msg.content
+                if isinstance(block, ToolResultBlock)
+            ]
+        )
 
     def _tool_result(self, call_id: str, is_error: bool, content: Any, raw: Any) -> AgentEvent:
         self._open.pop(call_id, None)

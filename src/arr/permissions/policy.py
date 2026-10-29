@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -193,6 +194,17 @@ SENSITIVE_ABSOLUTE_PATHS = ("/Library/Keychains",)
 
 READ_BLOCKED_ROOTS = ("/Volumes",)
 """Besides `~` and the workfolder: roots that are not readable unless on the allowlist."""
+
+
+def user_temp_dirs() -> list[Path]:
+    """Temp folders of the user that agents must not read (W2-01.1, B4).
+
+    `/tmp/claude-<uid>`: work data of all Claude Code sessions of the user (scratchpads,
+    also copies of private files). The temp folder of the arr process
+    (`tempfile.gettempdir()`, on macOS `/private/var/folders/…/T`): files of other apps.
+    """
+    return [Path("/tmp") / f"claude-{os.getuid()}", Path(tempfile.gettempdir())]
+
 
 _PRIVILEGED = "Befehle mit Systemrechten sind nicht erlaubt."
 _CREDENTIALS = "Zugriff auf Schlüsselbund, SSH und Zugangsdaten ist nicht erlaubt."
@@ -681,6 +693,7 @@ def profile_for(
     *,
     home: Path | None = None,
     case_insensitive: bool | None = None,
+    temp_dirs: Iterable[str | Path] | None = None,
 ) -> SandboxProfile:
     """Build the sandbox and read profile of an agent (docs/07 §3 ①, E19, docs/01 §4.1).
 
@@ -688,9 +701,10 @@ def profile_for(
     Read allowlist: write roots, `output/`, the attachments of the agent's own channels,
     `read_dirs`, the Python environment (base venv, its installation prefix, `extra_path`),
     the agent's Claude plugin and paths of always-allow read rules. The run's `skills/`
-    snapshot is not on the list (W2-01). Read blocks: `~`, `/Volumes`
-    and the workfolder (other projects, other agents). `tools.web` switches the web tools
-    on; always-allow host rules become allowed domains of the Claude sandbox.
+    snapshot is not on the list (W2-01). Read blocks: `~`, `/Volumes`, the workfolder
+    (other projects, other agents) and the user's temp folders (`temp_dirs`, default
+    `user_temp_dirs()`, except one below Run-tmp). `tools.web` switches the web tools on;
+    always-allow host rules become allowed domains of the Claude sandbox.
     """
     rules = rules or PermissionRules()
     home = Path(os.path.realpath(home or Path.home()))
@@ -739,6 +753,10 @@ def profile_for(
     sensitive += [norm(p) for p in _existing_matches(home, SENSITIVE_HOME_PATTERNS)]
 
     read_deny = [home, *(norm(p) for p in READ_BLOCKED_ROOTS), workfolder]
+    for raw in user_temp_dirs() if temp_dirs is None else temp_dirs:
+        temp = norm(raw)
+        if not _key_within(_key(temp, ci), _key(tmp_dir, ci)):
+            read_deny.append(temp)
 
     return SandboxProfile(
         agent_id=agent.id,

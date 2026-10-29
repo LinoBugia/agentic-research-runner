@@ -3,6 +3,7 @@ translators for Claude and Codex, always rules, scopes, revocation and approvals
 
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1598,3 +1599,46 @@ def test_w201_attachments_only_of_own_channels(env: Env) -> None:
     assert codex_access(codex, str(own)) == "read" and codex_access(codex, str(foreign)) == "deny"
     none = env.profile(env.agent(channels=[]))
     assert not none.can_read(own)
+
+
+# --------------------------------------------------------------------------------------------
+# W2-01.1 / B4: the user's temp folders are not readable
+# --------------------------------------------------------------------------------------------
+
+
+def test_w2011_user_temp_dirs_are_blocked_by_default(env: Env) -> None:
+    claude_tmp = normalize_path(f"/tmp/claude-{os.getuid()}", base=env.home, home=env.home)
+    process_tmp = normalize_path(tempfile.gettempdir(), base=env.home, home=env.home)
+    for provider in ("claude", "codex"):
+        profile = env.profile(env.agent(provider=provider))
+        assert claude_tmp in profile.read_deny and process_tmp in profile.read_deny
+        assert not profile.can_read(claude_tmp / "scratchpad" / "notes.md")
+        assert profile.can_read(env.work / "a.py") and profile.can_read(env.run / "tmp" / "x")
+        if provider == "claude":
+            deny_read = claude_options(profile).sandbox["filesystem"]["denyRead"]
+            assert str(claude_tmp) in deny_read and str(process_tmp) in deny_read
+        else:
+            assert codex_access(codex_options(profile), str(claude_tmp / "x")) == "deny"
+
+
+def test_w2011_temp_dirs_deny_reading_but_keep_run_tmp(env: Env, tmp_path: Path) -> None:
+    claude_tmp = Path(os.path.realpath(tmp_path)) / "sys" / "claude-501"
+    process_tmp = Path(os.path.realpath(tmp_path)) / "sys" / "T"
+    secret = claude_tmp / "scratchpad" / "copy.txt"
+    other = process_tmp / "pytest-of-user" / "data.txt"
+    profile = env.profile(temp_dirs=[claude_tmp, process_tmp])
+    engine = PolicyEngine([profile])
+    for path in (secret, other):
+        assert not profile.can_read(path)
+        assert engine.evaluate(read(path)).action is ASK
+        assert engine.evaluate(bash(f"cat {path}")).action is DENY
+    run_tmp = env.run / "tmp" / "cache" / "pip"
+    assert profile.can_read(run_tmp) and profile.can_write(run_tmp)
+    assert engine.evaluate(bash(f"python3 -c 1 > {env.run / 'tmp' / 'out.txt'}")).action is ALLOW
+
+
+def test_w2011_temp_dir_below_run_tmp_stays_readable(env: Env) -> None:
+    inside = env.run / "tmp" / "T"
+    profile = env.profile(temp_dirs=[inside])
+    assert inside not in profile.read_deny
+    assert profile.can_read(inside / "x.txt")
