@@ -884,7 +884,7 @@ def _check_codex_toolchain(
                 ConfigIssue(
                     where,
                     f"{label} {shown} liegt unter deinem Benutzerordner (~). Die Codex-Sandbox "
-                    f"sperrt ~ ganz, deshalb startet sie dort für {names} nicht. {hint}",
+                    f"sperrt ~ ganz, deshalb ist es für {names} dort nicht nutzbar. {hint}",
                 )
             )
 
