@@ -298,7 +298,9 @@ class AgentBackend(Protocol):
         """Deliver a short chat hint into the running turn (docs/06-gruppenchats.md §4).
 
         Returns False when no turn is running or the backend cannot deliver it now; the hint
-        then stays in the inbox for the next turn.
+        then stays in the inbox for the next turn. The call may wait until the hint has
+        reached the agent (Claude: until the next tool result), so the orchestrator runs it
+        as a task per agent and never blocks on it (W2-05).
         """
         ...
 

@@ -307,6 +307,50 @@ async def test_start_needs_a_logged_in_profile(tmp_path: Path) -> None:
         await backend.start()
 
 
+async def test_w2_05_login_failure_names_the_profile_and_the_login_command(
+    setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review W2-02 Q13: a turn that fails at the login says how to log in again."""
+    from arr.backends.codex import login_hint
+
+    backend, kit, _ = setup([simple_turn()])
+
+    async def failing_start(codex: Any, *, approvals: bool, **settings: Any) -> Any:
+        raise RuntimeError("HTTP 401 Unauthorized: refresh token expired")
+
+    monkeypatch.setattr(codex_module, "start_thread", failing_start)
+    await backend.start()
+    events = await play(backend)
+    assert kinds(events) == ["turn_start", "error", "turn_end"]
+    message = events[1].data["message"]
+    assert message.startswith(
+        "Profil „chatgpt-test“ neu anmelden: uv run arr auth codex-login chatgpt-test"
+    )
+    assert "401" in message and events[-1].data["status"] == "error"
+    # a `turn/completed` with an auth error gets the hint as well; other errors stay as they are
+    auth = backend.auth
+    assert login_hint(auth, "Unauthorized").startswith("Profil „chatgpt-test“ neu anmelden")
+    assert login_hint(auth, "Not logged in").startswith("Profil „chatgpt-test“ neu anmelden")
+    assert login_hint(auth, "stream disconnected before completion") == (
+        "stream disconnected before completion"
+    )
+
+
+async def test_w2_05_login_error_in_turn_completed_gets_the_hint(setup) -> None:
+    script = [
+        note("turn/started", turn={"id": TURN, "status": "inProgress"}),
+        note(
+            "turn/completed",
+            turn={"id": TURN, "status": "failed", "error": {"message": "401 Unauthorized"}},
+        ),
+    ]
+    backend, _, _ = setup([script])
+    await backend.start()
+    events = await play(backend)
+    errors = [e.data["message"] for e in events if e.kind is EventKind.ERROR]
+    assert errors and all(m.startswith("Profil „chatgpt-test“ neu anmelden") for m in errors)
+
+
 async def test_turn_events_and_session(setup) -> None:
     backend, kit, _ = setup([simple_turn()])
     await backend.start()

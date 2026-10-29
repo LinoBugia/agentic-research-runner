@@ -166,6 +166,7 @@ class ClaudeBackend:
         self._tmp_link: tuple[Path, Path] | None = None  # (link, Run-tmp)
         self._turn = 0
         self._running = False
+        self._ended = asyncio.Event()  # set when the running turn is over (W2-05.1)
         self._interrupted = False
         self._send_context = True
         self._hints: list[tuple[str, asyncio.Future[bool]]] = []
@@ -302,6 +303,7 @@ class ClaudeBackend:
         yield self._events.event(EventKind.TURN_START, {"prompt": sent, "stage": stage})
         error: str | None = None
         self._running = True
+        self._ended.clear()
         try:
             await client.query(sent)
             async for msg in client.receive_response():
@@ -310,10 +312,18 @@ class ClaudeBackend:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("Turn %d von %s abgebrochen: %s", self._turn, self.agent.id, exc)
-            error = f"Die Claude-CLI hat den Turn abgebrochen ({type(exc).__name__})."
+            if self._interrupted:
+                # The CLI went away after the stop, e.g. a Ctrl-C that hit the whole process
+                # group ends the CLI itself (W2-05.1): the turn counts as interrupted.
+                log.info(
+                    "Turn %d von %s nach dem Stopp beendet: %s", self._turn, self.agent.id, exc
+                )
+            else:
+                log.warning("Turn %d von %s abgebrochen: %s", self._turn, self.agent.id, exc)
+                error = f"Die Claude-CLI hat den Turn abgebrochen ({type(exc).__name__})."
         finally:
             self._running = False
+            self._ended.set()
             self._fail_hints()
         for event in self._drain() + self._events.finish(
             interrupted=self._interrupted, error=error
@@ -331,12 +341,26 @@ class ClaudeBackend:
             return ""
 
     async def interrupt(self) -> None:
-        """Stop the running turn; `run_turn` then ends with status `interrupted`."""
+        """Stop the running turn; `run_turn` then ends with status `interrupted`.
+
+        Waits for the CLI's answer to the interrupt request, but at most until the turn is
+        over: a CLI that a Ctrl-C in the terminal has already ended never answers, its stream
+        just ends (W2-05.1, `spikes/w2_05/killpg_probe.py`). Errors of the request are
+        swallowed; the turn's end is what counts.
+        """
         if not self._running or self._client is None:
             return
         self._interrupted = True
-        with contextlib.suppress(Exception):
-            await self._client.interrupt()
+        request = asyncio.ensure_future(self._client.interrupt())
+        ended = asyncio.ensure_future(self._ended.wait())
+        try:
+            await asyncio.wait({request, ended}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (request, ended):
+                if not task.done():
+                    task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
 
     async def deliver_hint(self, text: str) -> bool:
         """Attach `text` to the next tool result of the running turn (`additionalContext`).

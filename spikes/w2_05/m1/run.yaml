@@ -1,0 +1,39 @@
+# M1-Szenario für W2-05 (docs/05 Phase 1): 2 Claude-Agenten, 1 Codex-Agent, zwei Kanäle mit
+# verschiedenen Mitgliedern (einer im Modus event), Topologie waterfall mit erzwungener
+# Nacharbeit (der prover gibt beim ersten Versuch höchstens 4 Punkte, der rater ehrlich; mit
+# pass_score 7 liegt der Mittelwert des ersten Versuchs unter der Grenze, Lauf 1 zeigte 6,0).
+# Auth-Profile kommen aus der arr.yaml des Test-Workfolders (defaults.claude/codex).
+version: 1
+name: "M1 – Collatz-Mini (waterfall)"
+project: collatz-mini
+task_file: task.md
+topology:
+  kind: waterfall
+  params: {pass_score: 7, max_rework: 1, on_fail: continue}
+rubric:
+  scale: [1, 10]
+  criteria: [korrektheit, vollständigkeit, klarheit]
+limits: {wall_time: 20m, turns_per_agent: 6, budget_usd: 0.5}
+defaults:
+  provider: claude
+  model: claude-haiku-5-5
+  effort: low
+  workspace: {mode: copy}
+agents:
+  - {id: strategist, role: roles/strategist.md}
+  - {id: prover, provider: codex, model: gpt-6-luna, effort: low, role: roles/prover.md}
+  - {id: rater, role: roles/rater.md}
+groupchats:
+  - name: main
+    purpose: "Fragen, Anhänge und Ergebnisse aller drei Agenten"
+    members: [strategist, prover, rater]
+    mode: event
+    debounce_s: 5
+  - name: werkstatt
+    purpose: "Beweisplan und Begründungen zwischen Strategist und Prover"
+    members: [strategist, prover]
+    mode: rounds
+stages:
+  - {name: strategie, agent: strategist, produces: strategie.md}
+  - {name: beweis, agent: prover, produces: beweis.md}
+raters: [prover, rater]

@@ -813,3 +813,104 @@ async def test_w2_03_1_interrupts_run_in_parallel_after_cancelling_approvals(
     assert elapsed < 1.8, f"stop took {elapsed:.2f} s, interrupts ran one after the other"
     assert pending_at_interrupt == [0, 0, 0], "approvals are cancelled before interrupt()"
     assert (await waiting).action is DecisionAction.DENY
+
+
+# --------------------------------------------------------------------------------------------
+# W2-05: stop window after the topology (W2-03.1 G8/G9)
+# --------------------------------------------------------------------------------------------
+
+
+def _with_close(manager: RunManager, agent_ids: set[str], close: Any) -> None:
+    """Replace `close()` of the given agents' backends with `close(backend)`."""
+    original = manager.backend_factory
+
+    def factory(prepared: Any) -> Any:
+        backend = original(prepared)
+        if prepared.id in agent_ids:
+            inner = backend.close
+
+            async def closing() -> None:
+                await close(backend)
+                await inner()
+
+            backend.close = closing
+        return backend
+
+    manager.backend_factory = factory
+
+
+async def test_w2_05_stop_while_backends_close_keeps_done(workfolder: Path) -> None:
+    """G8: `finalizing` is set before the teardown, so a stop during `close()` is ignored."""
+    seen: list[RunStatus] = []
+
+    async def topology(ctx: RunContext) -> None:
+        await ctx.turn("a", "los")
+
+    async def close(backend: Any) -> None:
+        seen.append(load_run_meta(manager.run_dir).status)
+        manager.stop()
+        await asyncio.sleep(0.05)
+
+    manager = make_manager(workfolder, topology, {"a": turns([say("x")])})
+    _with_close(manager, {"a"}, close)
+    assert await manager.run() is RunStatus.DONE
+    assert seen == [RunStatus.FINALIZING]
+    assert log_entries(manager.run_dir, "stop") == []
+    assert statuses(manager.run_dir)[-3:] == ["running", "finalizing", "done"]
+
+
+async def test_w2_05_backends_close_in_parallel(workfolder: Path) -> None:
+    """G8: three backends whose `close()` takes 0.4 s each close in well under 1.2 s."""
+
+    async def topology(ctx: RunContext) -> None:
+        await ctx.turns([("a", "x"), ("b", "x"), ("c", "x")])
+
+    async def close(backend: Any) -> None:
+        await asyncio.sleep(0.4)
+
+    scripts = {name: turns([say("ok")]) for name in ("a", "b", "c")}
+    manager = make_manager(workfolder, topology, scripts)
+    _with_close(manager, {"a", "b", "c"}, close)
+    started = time.monotonic()
+    assert await manager.run() is RunStatus.DONE
+    assert time.monotonic() - started < 1.0, "close() ran one after the other"
+
+
+async def test_w2_05_run_waits_for_the_stop_task(workfolder: Path) -> None:
+    """G9: `run()` returns only after the stop (`interrupt()` of every turn) is through."""
+
+    async def topology(ctx: RunContext) -> None:
+        turn = asyncio.create_task(ctx.turn("a", "x"))
+        await eventually(lambda: ctx.agents["a"].status.value == "working")
+        await eventually(lambda: ctx.stop_requested)
+        turn.add_done_callback(lambda _: None)  # the topology returns at once, the turn goes on
+
+    manager = make_manager(workfolder, topology, {"a": turns([say("x"), wait(30)])})
+    original = manager.backend_factory
+    calls: list[float] = []
+
+    def factory(prepared: Any) -> Any:
+        backend = original(prepared)
+        interrupt = backend.interrupt
+
+        async def slow_first_interrupt() -> None:
+            calls.append(time.monotonic())
+            if len(calls) == 1:  # the stop's interrupt is slow, the one of close() is not
+                await asyncio.sleep(0.8)
+            await interrupt()
+
+        backend.interrupt = slow_first_interrupt
+        return backend
+
+    manager.backend_factory = factory
+    running = asyncio.create_task(manager.run())
+    await eventually(
+        lambda: manager.orchestrator is not None and "a" in manager.orchestrator._active
+    )
+    manager.stop()
+    assert await asyncio.wait_for(running, 10) is RunStatus.STOPPED
+    assert manager._stop_task is not None and manager._stop_task.done()
+    assert time.monotonic() - calls[0] >= 0.8, "run() returned while the stop was on its way"
+    await asyncio.sleep(0)
+    others = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    assert others == [], "no task of the run is left after run()"

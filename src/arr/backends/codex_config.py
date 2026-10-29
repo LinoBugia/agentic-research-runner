@@ -106,12 +106,20 @@ relative to the run (`agents/*` = every agent folder), values Codex globs; `*` d
 cross `/`, a folder needs `x` and `x/**`. Used only for folders on the way to an allowed
 root: a readable run folder stays readable."""
 
-ENTRIES_WARN = 500
-"""From this many permission entries on, every start logs a warning (W2-02.1 M1)."""
+ENTRIES_WARN = 250
+"""From this many permission entries on, every start logs a warning (W2-02.1 M1, W2-05)."""
 
-ENTRIES_MAX = 1000
+ENTRIES_MAX = 500
 """From this many entries on, the turn is not started. Seatbelt compiles the profile for every
 command: measured ~0.6 s at 250, ~2.2 s at 500 entries; around 1000 `sandbox-exec` fails."""
+
+PROFILE_MAX_BYTES = 40_000
+"""Cautious upper bound for the TOML text of the `filesystem` map (W2-05, W2-05.1 G3).
+
+Not a limit of the sandbox: the review of W2-05 ran maps of 47 KB to 205 KB (and 1203 short
+entries, 88 KB) through `codex sandbox` without an error. The bound keeps every command fast
+(Seatbelt compiles the profile for each one) and fails with the German message long before the
+`Argument list too long` that W2-02 saw at ≈ 2000 long entries."""
 
 _GLOB_CHARS = frozenset("*?[]{}")
 
@@ -327,17 +335,27 @@ def filesystem_entries(
             )
     for glob in _late_globs(profile, run_paths.run_dir, passage) + _sensitive_globs(profile):
         result[glob] = "deny"
-    _check_size(len(result))
+    _check_size(len(result), len(toml_value(result).encode("utf-8")))
     return result
 
 
-def _check_size(count: int) -> None:
+_TOO_MANY = (
+    "So viele Einträge machen jeden Befehl in der Sandbox sehr langsam oder lassen ihn "
+    "scheitern. Archiviere alte Runs aus „runs/“ oder räume Ordner auf dem Weg zum Workfolder "
+    "auf (z. B. viele Dateien direkt in ~ oder ~/Documents)."
+)
+
+
+def _check_size(count: int, size: int) -> None:
     if count >= ENTRIES_MAX:
         raise ArrError(
-            f"Die Lese-Sperrliste für Codex hat {count} Einträge (Grenze {ENTRIES_MAX}). So "
-            "viele Einträge machen jeden Befehl in der Sandbox sehr langsam oder lassen ihn "
-            "scheitern. Archiviere alte Runs aus „runs/“ oder räume Ordner auf dem Weg zum "
-            "Workfolder auf (z. B. viele Dateien direkt in ~ oder ~/Documents)."
+            f"Die Lese-Sperrliste für Codex hat {count} Einträge (Grenze {ENTRIES_MAX}). "
+            + _TOO_MANY
+        )
+    if size >= PROFILE_MAX_BYTES:
+        raise ArrError(
+            f"Die Lese-Sperrliste für Codex ist {size} Bytes groß (Grenze {PROFILE_MAX_BYTES} "
+            "Bytes). " + _TOO_MANY
         )
     if count >= ENTRIES_WARN:
         logger.warning(

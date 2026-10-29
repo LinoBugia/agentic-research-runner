@@ -142,7 +142,7 @@ def test_a5_options_follow_the_architecture(setup: Setup) -> None:
     assert not bare & set(options.disallowed_tools)
     assert options.setting_sources == []
     assert options.strict_mcp_config is True
-    assert options.permission_mode == "acceptEdits"
+    assert options.permission_mode == "default"  # W2-05: explicit, see PERMISSION_MODE
     from arr.permissions.policy import claude_options
 
     perms = claude_options(profile)
@@ -447,12 +447,13 @@ def make_backend(
     auth: AuthProfile | None = None,
     reader: Callable[[str, str], str | None] | None = None,
     decider: Any = None,
+    client_cls: type[FakeClient] = FakeClient,
 ) -> tuple[ClaudeBackend, list[FakeClient]]:
     clients: list[FakeClient] = []
     inbox = ApprovalInbox(setup.engine(), decider=decider, timeout=5)
 
     def factory(options: Any) -> FakeClient:
-        client = FakeClient(options, script)
+        client = client_cls(options, script)
         clients.append(client)
         return client
 
@@ -680,6 +681,86 @@ async def test_interrupt_ends_the_turn_with_turn_end(setup: Setup) -> None:
     assert events[-1].kind is EventKind.TURN_END and events[-1].data["status"] == "interrupted"
     assert any(e.kind is EventKind.TOOL_RESULT and e.data["is_error"] for e in events)
     await backend.interrupt()  # idle: no-op
+
+
+async def test_w2_05_1_cli_gone_after_the_stop_counts_as_interrupted(setup: Setup) -> None:
+    """A Ctrl-C in the terminal hits the whole process group: the CLI exits by itself (code 0)
+    and the SDK raises; after `interrupt()` that is an interrupted turn, not an error."""
+
+    async def die_after_interrupt(client: FakeClient) -> list[Any]:
+        await client.interrupted.wait()
+        raise ConnectionError("Cannot write to terminated process (exit code: 0)")
+
+    script = [
+        [
+            AssistantMessage([ToolUseBlock("t1", "Bash", {"command": "sleep 60"})], "m"),
+            die_after_interrupt,
+        ]
+    ]
+    backend, _ = make_backend(setup, script)
+    events: list[Any] = []
+    called = asyncio.Event()
+
+    async def run() -> None:
+        async for event in backend.run_turn("Los"):
+            events.append(event)
+            if event.kind is EventKind.TOOL_CALL:
+                called.set()
+
+    try:
+        await backend.start()
+        task = asyncio.create_task(run())
+        await asyncio.wait_for(called.wait(), 2)
+        await backend.interrupt()
+        await asyncio.wait_for(task, 2)
+    finally:
+        await backend.close()
+    assert events[-1].kind is EventKind.TURN_END and events[-1].data["status"] == "interrupted"
+    assert not any(e.kind is EventKind.ERROR for e in events)
+
+
+async def test_w2_05_1_interrupt_returns_with_the_turn_when_the_cli_never_answers(
+    setup: Setup,
+) -> None:
+    """A Ctrl-C in the terminal ends the CLI itself: the interrupt request gets no answer and
+    the stream just ends (`spikes/w2_05/killpg_probe.py`). `interrupt()` returns with the turn,
+    not after the orchestrator's timeout, and the turn is `interrupted`."""
+
+    class SilentClient(FakeClient):
+        async def interrupt(self) -> None:
+            self.interrupted.set()
+            await asyncio.Event().wait()  # the CLI is gone, no answer ever
+
+    async def end_after_interrupt(client: FakeClient) -> list[Any]:
+        await client.interrupted.wait()
+        return []  # the stream ends without a result message
+
+    script = [
+        [
+            AssistantMessage([ToolUseBlock("t1", "Bash", {"command": "sleep 60"})], "m"),
+            end_after_interrupt,
+        ]
+    ]
+    backend, _ = make_backend(setup, script, client_cls=SilentClient)
+    events: list[Any] = []
+    called = asyncio.Event()
+
+    async def run() -> None:
+        async for event in backend.run_turn("Los"):
+            events.append(event)
+            if event.kind is EventKind.TOOL_CALL:
+                called.set()
+
+    try:
+        await backend.start()
+        task = asyncio.create_task(run())
+        await asyncio.wait_for(called.wait(), 2)
+        await asyncio.wait_for(backend.interrupt(), 1)  # returns with the turn's end
+        await asyncio.wait_for(task, 2)
+    finally:
+        await backend.close()
+    assert events[-1].kind is EventKind.TURN_END and events[-1].data["status"] == "interrupted"
+    assert not any(e.kind is EventKind.ERROR for e in events)
 
 
 async def test_cli_failure_gives_error_and_turn_end(setup: Setup) -> None:

@@ -433,7 +433,7 @@ def test_h1_no_virtual_env_without_run_venv(layout: dict[str, Path], tmp_path: P
 def test_m1_limits(layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch, caplog) -> None:
     from arr.backends import codex_config
 
-    assert (codex_config.ENTRIES_WARN, codex_config.ENTRIES_MAX) == (500, 1000)
+    assert (codex_config.ENTRIES_WARN, codex_config.ENTRIES_MAX) == (250, 500)  # W2-05
     _, profile, paths = setup(layout)
     count = len(filesystem_entries(profile, paths, ["main"]))
     monkeypatch.setattr(codex_config, "ENTRIES_WARN", count)
@@ -443,6 +443,24 @@ def test_m1_limits(layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch, cap
     monkeypatch.setattr(codex_config, "ENTRIES_MAX", count)
     with pytest.raises(ArrError, match="Archiviere alte Runs"):
         filesystem_entries(profile, paths, ["main"])
+
+
+def test_w2_05_profile_size_limit_gives_the_german_message(
+    layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nachprüfung W2-02.1 N1: a cautious byte bound with a German message (W2-05.1 G3: the
+    message no longer claims a Seatbelt limit of 65535 bytes, the review measured 205 KB)."""
+    from arr.backends import codex_config
+    from arr.backends.codex_config import toml_value
+
+    assert codex_config.PROFILE_MAX_BYTES == 40_000
+    assert not hasattr(codex_config, "SEATBELT_MAX_BYTES")
+    _, profile, paths = setup(layout)
+    size = len(toml_value(filesystem_entries(profile, paths, ["main"])).encode("utf-8"))
+    monkeypatch.setattr(codex_config, "PROFILE_MAX_BYTES", size)
+    with pytest.raises(ArrError, match=rf"{size} Bytes groß \(Grenze {size} Bytes\)") as info:
+        filesystem_entries(profile, paths, ["main"])
+    assert "65535" not in str(info.value) and "Seatbelt" not in str(info.value)
 
 
 def test_m1_many_old_runs_stop_the_turn(layout: dict[str, Path]) -> None:

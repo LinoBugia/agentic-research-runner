@@ -1,0 +1,30 @@
+# Sonde für M1-Kriterium 6, Teil „wartender Agent (Wecken)“: Die Topologie waterfall hat keine
+# Diskussionsphase, also weckt dort niemand. Hier eine roundtable-Diskussion im Modus event mit
+# zwei Haiku-Agenten: der frager stellt nach seinem ersten Turn eine Frage mit `to`, der
+# antworter wird dafür geweckt, seine Antwort weckt den frager. Etwa 10 Modell-Anfragen.
+version: 1
+name: "M1 – Wecken im Modus event (roundtable)"
+project: collatz-mini
+task: |
+  Kurze Diskussion: Passt die Ausgabe von `python3 code/collatz.py` zur Vermutung s(2^k) = k
+  aus notes.md? Der frager fragt, der antworter antwortet, beide melden danach done.
+topology:
+  kind: roundtable
+  params: {channel: main}
+limits: {wall_time: 6m, turns_per_agent: 4, budget_usd: 0.2}
+defaults:
+  provider: claude
+  model: claude-haiku-5-5
+  effort: low
+  workspace: {mode: copy}
+agents:
+  - {id: frager, role: roles/frager.md}
+  - {id: antworter, role: roles/antworter.md}
+groupchats:
+  - name: main
+    purpose: "Frage und Antwort zur Collatz-Vermutung für Zweierpotenzen"
+    members: [frager, antworter]
+    mode: event
+    debounce_s: 3
+    quiet_after_s: 90
+    max_wakeups_per_agent: 2

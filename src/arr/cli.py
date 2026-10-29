@@ -95,6 +95,154 @@ def gui(
         _fail(str(exc))
 
 
+WorkfolderOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--workfolder",
+        "-w",
+        help="Workfolder (Standard: vom aktuellen Ordner aufwärts bis zur arr.yaml).",
+        show_default=False,
+    ),
+]
+
+
+@app.command()
+def run(
+    run_file: Annotated[
+        Path, typer.Argument(help="Die run.yaml des Runs.", show_default=False, metavar="RUN_YAML")
+    ],
+    param: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--param",
+            "-p",
+            help="Parameter der Topologie als name=wert, mehrfach möglich.",
+            show_default=False,
+        ),
+    ] = None,
+    workfolder: WorkfolderOption = None,
+    verbose: Annotated[
+        bool, typer.Option("--verbose", "-v", help="Auch Info-Meldungen der Backends zeigen.")
+    ] = False,
+) -> None:
+    """Run aus einer run.yaml starten. Freigaben fragt arr hier im Terminal nach.
+
+    Strg-C stoppt den Run sauber (Finalizer läuft), ein zweites Strg-C bricht hart ab.
+    Exit-Code 0 bei „done“, 130 bei „stopped“, sonst 1.
+    """
+    import asyncio
+
+    from arr.log import setup_logging
+    from arr.permissions.inbox import TerminalDecider
+    from arr.runs.launch import exit_code, parse_params, plan_launch, run_launch
+
+    setup_logging("INFO" if verbose else "WARNING")
+    try:
+        launch = plan_launch(run_file, params=parse_params(param or []), workfolder=workfolder)
+    except ArrError as exc:
+        _fail(str(exc))
+    typer.echo(f"Workfolder: {launch.workfolder}")
+    try:
+        result = asyncio.run(run_launch(launch, decider=TerminalDecider(), report=typer.echo))
+    except ArrError as exc:
+        _fail(str(exc))
+    except KeyboardInterrupt:
+        _fail("Abgebrochen.")
+    raise typer.Exit(code=exit_code(result.status))
+
+
+runs_app = typer.Typer(help="Runs des Workfolders anzeigen und steuern.", no_args_is_help=True)
+app.add_typer(runs_app, name="runs")
+
+RunIdArgument = Annotated[
+    str, typer.Argument(help="Run-ID, siehe „arr runs list“.", show_default=False)
+]
+
+
+def _runs_workfolder(given: Path | None) -> Path:
+    from arr.runs.launch import find_workfolder
+
+    try:
+        return find_workfolder(given)
+    except ArrError as exc:
+        _fail(str(exc))
+    raise AssertionError("unreachable")
+
+
+def _run_folder(workfolder: Path | None, run_id: str) -> Path:
+    from arr.runs.inspect import run_folder
+
+    try:
+        return run_folder(_runs_workfolder(workfolder), run_id)
+    except ArrError as exc:
+        _fail(str(exc))
+    raise AssertionError("unreachable")
+
+
+@runs_app.command("list")
+def runs_list(workfolder: WorkfolderOption = None) -> None:
+    """Runs des Workfolders auflisten, neueste zuerst."""
+    from arr.runs.inspect import format_runs, list_runs
+
+    root = _runs_workfolder(workfolder)
+    typer.echo(format_runs(root, list_runs(root)))
+
+
+@runs_app.command("status")
+def runs_status(run_id: RunIdArgument, workfolder: WorkfolderOption = None) -> None:
+    """Status, Grund, letzter Checkpoint, Turns, Usage und offene Freigaben eines Runs."""
+    from arr.runs.inspect import format_status, run_status
+
+    folder = _run_folder(workfolder, run_id)
+    try:
+        typer.echo(format_status(run_status(folder)))
+    except (OSError, ValueError, ArrError) as exc:
+        _fail(f"Der Run-Ordner {folder} ist nicht lesbar: {exc}")
+
+
+@runs_app.command("stop")
+def runs_stop(run_id: RunIdArgument, workfolder: WorkfolderOption = None) -> None:
+    """Laufenden Run stoppen: legt eine Stopp-Anforderung ab, die der ausführende „arr run“-Prozess
+    innerhalb weniger Sekunden umsetzt (laufende Turns unterbrochen, danach der Finalizer)."""
+    from arr.runs.launch import request_stop
+
+    folder = _run_folder(workfolder, run_id)
+    try:
+        new = request_stop(folder)
+    except ArrError as exc:
+        _fail(str(exc))
+    if new:
+        typer.echo(
+            f"Stopp angefordert für {run_id}. Er wirkt, solange ein arr-run-Prozess den Run "
+            "ausführt: der stoppt ihn innerhalb weniger Sekunden, danach läuft der Finalizer."
+        )
+    else:
+        typer.echo(f"Für {run_id} liegt schon eine Stopp-Anforderung vor.")
+
+
+@runs_app.command("scan")
+def runs_scan(run_id: RunIdArgument, workfolder: WorkfolderOption = None) -> None:
+    """Run-Ordner auf Secrets prüfen (Werte der Auth-Profile und bekannte Muster)."""
+    from arr.models import ResolvedRun
+    from arr.resolve import load_yaml_model
+    from arr.runs.launch import load_profiles
+    from arr.runs.secret_scan import format_report, profile_secrets, record_scan, scan_run_dir
+
+    folder = _run_folder(workfolder, run_id)
+    secrets: dict[str, str] = {}
+    try:
+        names = {a.auth for a in load_yaml_model(folder / "run.yaml", ResolvedRun).agents}
+        profiles = [p for p in load_profiles().profiles if p.name in names]
+        secrets = profile_secrets(profiles)
+    except ArrError as exc:
+        typer.echo(f"Hinweis: Nur Muster werden geprüft, keine Profil-Werte ({exc.message})")
+    report = scan_run_dir(folder, secrets)
+    record_scan(folder, report)
+    typer.echo(format_report(report))
+    if not report.clean:
+        raise typer.Exit(code=1)
+
+
 auth_app = typer.Typer(
     help="Anmeldungen der Auth-Profile verwalten.",
     no_args_is_help=True,

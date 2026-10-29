@@ -37,6 +37,11 @@ WEB_TOOLS = ("WebFetch", "WebSearch")
 
 THINKING = {"type": "adaptive", "display": "summarized"}
 
+PERMISSION_MODE = "default"
+"""Every Bash, Write and Edit call goes to `can_use_tool` (PolicyEngine, then the inbox). The
+scrub switch `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` makes the CLI force `default` anyway (W2-01.1);
+set explicitly so the options say what happens (Nachprüfung W2-01.1 N2, W2-05)."""
+
 TMP_LINK_ROOT = Path("/tmp")
 """Where the short alias of Run-tmp lives (see `tmp_link`)."""
 
@@ -198,7 +203,7 @@ def build_options(
         tools=tool_set(agent),
         allowed_tools=list(perms.allowed_tools),
         disallowed_tools=list(perms.disallowed_tools),
-        permission_mode=perms.permission_mode,  # type: ignore[arg-type]
+        permission_mode=PERMISSION_MODE,  # not `perms.permission_mode` (acceptEdits), see above
         sandbox=perms.sandbox,  # type: ignore[arg-type]
         system_prompt=system_prompt(agent),
         setting_sources=[],

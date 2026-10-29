@@ -229,6 +229,8 @@ class _ActiveTurn:
     pending: list[Message] = field(default_factory=list)
     blocked: bool = False
     retry_at_calls: int = 0
+    delivery: asyncio.Task[None] | None = None
+    """The hint on its way to this agent (at most one at a time, W2-05)."""
 
 
 @dataclass(slots=True)
@@ -477,6 +479,8 @@ class Orchestrator(RunContext):
             self._close_log(agent_id, record, TurnStatus.ERROR, record.error)
         finally:
             self._active.pop(agent_id, None)
+            if active.delivery is not None and not active.delivery.done():
+                active.delivery.cancel()  # the backend has already let the hint go
             self._finish_status(handle)
             self._write_session(agent_id, backend)
             for listener in list(self._listeners):
@@ -839,29 +843,41 @@ class Orchestrator(RunContext):
                 self._set_status(self._handles[agent_id], status)
 
     async def deliver_hints(self) -> None:
-        """Deliver queued hints to working agents within the `HintGate` (docs/06 §4)."""
+        """Start the delivery of queued hints to working agents (docs/06 §4).
+
+        `deliver_hint` of a backend may wait, with Claude until the next tool result (W2-01
+        review B1). So every delivery runs as its own task, at most one per agent at a time,
+        and neither the watching of the room nor the hints of other agents wait for it.
+        """
         for agent_id, active in list(self._active.items()):
+            if active.delivery is not None:
+                if not active.delivery.done():
+                    continue
+                active.delivery = None
             if not active.pending or active.blocked or active.tool_calls < active.retry_at_calls:
                 continue
             if not active.gate.allows(active.tool_calls):
                 continue
             messages = list(active.pending)
-            text = compose_hint(agent_id, messages)
-            try:
-                delivered = await active.backend.deliver_hint(text)
-            except Exception:
-                logger.exception("Hinweis an %s fehlgeschlagen", agent_id)
-                delivered = False
-            if self._active.get(agent_id) is not active:
-                continue  # the turn ended meanwhile; the messages are in the next inbox
-            if not delivered:
-                active.retry_at_calls = active.tool_calls + 1
-                continue
-            active.gate.delivered(active.tool_calls)
-            del active.pending[: len(messages)]
-            ids = [m.id for m in messages]
-            self.log.write("hint", agent=agent_id, text=text, messages=ids)
-            self.mark_delivered(ids, DeliveryStatus.HINT_MID_TURN)
+            active.delivery = asyncio.create_task(self._deliver(agent_id, active, messages))
+
+    async def _deliver(self, agent_id: str, active: _ActiveTurn, messages: list[Message]) -> None:
+        text = compose_hint(agent_id, messages)
+        try:
+            delivered = await active.backend.deliver_hint(text)
+        except Exception:
+            logger.exception("Hinweis an %s fehlgeschlagen", agent_id)
+            delivered = False
+        if self._active.get(agent_id) is not active:
+            return  # the turn ended meanwhile; the messages are in the next inbox
+        if not delivered:
+            active.retry_at_calls = active.tool_calls + 1
+            return
+        active.gate.delivered(active.tool_calls)
+        del active.pending[: len(messages)]
+        ids = [m.id for m in messages]
+        self.log.write("hint", agent=agent_id, text=text, messages=ids)
+        self.mark_delivered(ids, DeliveryStatus.HINT_MID_TURN)
 
     # ----------------------------------------------------------------------------------------
     # Stop, limits, pause
@@ -873,6 +889,13 @@ class Orchestrator(RunContext):
             return
         self._stop_reason, self._limit = reason, limit
         self._halt_task = asyncio.get_running_loop().create_task(self._halt(info))
+
+    async def wait_halted(self) -> None:
+        """Wait for a halt started by `_start_halt` (a limit found in sync code) to finish."""
+        task = self._halt_task
+        if task is not None and not task.done():
+            with contextlib.suppress(Exception):
+                await task
 
     async def halt(self, reason: StopReason, limit: LimitKind | None = None, **info: Any) -> None:
         """Stop the run: cancel open approvals, then interrupt all running turns at once.
