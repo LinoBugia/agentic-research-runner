@@ -598,3 +598,70 @@ def test_format_loc() -> None:
     assert format_loc(("agents", 1, "model")) == "agents[1].model"
     assert format_loc(("skills", "list[str]", 0)) == "skills[0]"
     assert format_loc(()) == ""
+
+
+# --- W2-04: carry-overs from the W1-01.1 review (N1, N2, N4) -------------------------------
+
+
+def test_w2_04_stage_with_an_active_and_a_disabled_variant_of_one_id(
+    settings: WorkfolderSettings,
+) -> None:
+    """N1: the active agent counts first, a switched-off variant of the same ID does not."""
+    variants = [
+        {"id": "p", "when": {"param": "mode", "equals": "a"}},
+        {"id": "p", "when": {"param": "mode", "equals": "b"}},
+        {"id": "r"},
+    ]
+    run = free_run(
+        variants,
+        topology={"kind": "waterfall", "params": {"mode": "a"}},
+        stages=[{"name": "s1", "agent": "p"}],
+    )
+    assert resolve_run(run, None, settings).stages[0].agent == "p"
+    # a switched-off count agent `j` next to an own agent `j-1`
+    run = free_run(
+        [{"id": "j", "count": 0}, {"id": "j-1"}],
+        topology={"kind": "waterfall"},
+        stages=[{"name": "s1", "agent": "j-1"}],
+    )
+    assert resolve_run(run, None, settings).stages[0].agent == "j-1"
+    # only disabled: still the specific message
+    run = free_run(
+        [{"id": "p", "when": {"param": "mode", "equals": "b"}}, {"id": "r"}],
+        topology={"kind": "waterfall", "params": {"mode": "a"}},
+        stages=[{"name": "s1", "agent": "p"}],
+    )
+    with pytest.raises(ConfigError, match="ausgeschaltet") as info:
+        resolve_run(run, None, settings)
+    assert info.value.path == "stages[0].agent"
+
+
+@pytest.mark.parametrize("value", [2.5, -1, 51, True])
+def test_w2_04_count_error_from_a_placeholder_names_the_parameter(
+    settings: WorkfolderSettings, value: Any
+) -> None:
+    """N2: the message names the start parameter, not only `count`."""
+    run = free_run([{"id": "judge", "count": "{{ params.judges }}"}], topology={"kind": "solo"})
+    with pytest.raises(ConfigError) as info:
+        resolve_run(run, None, settings, {"judges": value})
+    assert info.value.path == "agents[0].count"
+    assert info.value.issue_message.startswith("Parameter „judges“ = ")
+    assert "wird als „count“ benutzt und muss eine ganze Zahl" in info.value.issue_message
+
+
+def test_w2_04_integral_float_counts_as_integer(settings: WorkfolderSettings) -> None:
+    run = free_run([{"id": "judge", "count": "{{ params.judges }}"}], topology={"kind": "solo"})
+    assert ids(resolve_run(run, None, settings, {"judges": 2.0})) == ["judge-1", "judge-2"]
+
+
+def test_w2_04_timeout_null_has_a_german_message(settings: WorkfolderSettings) -> None:
+    """N4: `approvals: {timeout: null}` no longer shows the English pydantic text."""
+    run = free_run([{"id": "a"}], approvals={"timeout": None})
+    with pytest.raises(ConfigError) as info:
+        resolve_run(run, None, settings)
+    assert info.value.path == "approvals.timeout"
+    assert info.value.issue_message == (
+        "Die Dauer fehlt. Gib sie z. B. als „2h“, „90m“, „1h30m“ oder „45s“ an oder als Zahl "
+        "in Sekunden."
+    )
+    assert "valid" not in info.value.issue_message
