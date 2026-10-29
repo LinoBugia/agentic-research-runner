@@ -67,7 +67,7 @@ def sandbox(cwd: str, env: dict[str, str], command: list[str]) -> subprocess.Com
     )
 
 
-def late_files(lab: Lab) -> dict[str, Path]:
+def late_files(lab: Lab, *, create: bool = True) -> dict[str, Path]:
     """Files that appear after the profile was built (new names in `~`, `runs/` …)."""
     tag = secrets.token_hex(3)
     runs = lab.workfolder / "runs"
@@ -82,11 +82,16 @@ def late_files(lab: Lab) -> dict[str, Path]:
         "late_venv_shorter": venv_root() / "runs" / lab.run.run_id[:-1] / "c.txt",
         "late_base_venv": base_venv_dir(f"w3-00-late-{tag}") / "c.txt",
     }
-    for path in late.values():
-        canary(path)
+    if create:
+        create_late(late)
     lab.cleanup += [late["late_home"]]
     lab.cleanup += [late[n].parent for n in late if "venv" in n]
     return late
+
+
+def create_late(late: dict[str, Path]) -> None:
+    for path in late.values():
+        canary(path)
 
 
 def cases(lab: Lab, late: dict[str, Path], login: Path) -> list[tuple[str, str, str]]:

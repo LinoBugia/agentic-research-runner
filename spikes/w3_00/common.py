@@ -15,7 +15,7 @@
   parallel run, another base venv, `<run>/skills`, attachments of a foreign channel.
 
 Real sensitive paths are probed by exit code only. Live requests are counted in
-`tmp/requests.jsonl` (budget: Codex 15, Claude 5).
+`tmp/requests.jsonl` (budget: Codex 15, Claude 8, §12).
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ HOME = Path.home()
 CODEX_MODEL = "gpt-6-luna"
 CODEX_EFFORT = "low"
 CLAUDE_MODEL = "claude-haiku-5-5"
-BUDGET = {"codex": 15, "claude": 5}
+BUDGET = {"codex": 15, "claude": 8}
 AGENT = "gpt-1"
 AUTH = os.environ.get("W3_00_AUTH", "chatgpt-w2-02a")
 CLAUDE_AUTH = os.environ.get("W3_00_CLAUDE_AUTH", "max")

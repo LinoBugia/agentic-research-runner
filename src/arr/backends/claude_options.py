@@ -96,6 +96,22 @@ def agent_path(agent: PreparedAgent, venv_dir: Path, base_path: str | None = Non
     return os.pathsep.join(dict.fromkeys(parts))
 
 
+def python_env(agent: PreparedAgent, venv_dir: Path) -> dict[str, str]:
+    """Python variables of the agent (W3-00 live check): `VIRTUAL_ENV` names the run venv,
+    never arr's own (`uv run arr` sets it), and Python skips the user site folder below `~`.
+
+    The run venv sees the system site packages (`--system-site-packages`), so Python would
+    look for `~/Library/Python/…` and `pip list` fails behind the read block on `~`.
+    """
+    overlay = agent.file.run_venv is RunVenvMode.OVERLAY
+    return {
+        "VIRTUAL_ENV": str(venv_dir) if overlay else "",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": "",
+        "PYTHONHOME": "",
+    }
+
+
 def tmp_link(target: Path, key: str, root: Path = TMP_LINK_ROOT) -> Path:
     """Short alias `/tmp/arr-<hash>` → Run-tmp, used as `TMPDIR` and `CLAUDE_CODE_TMPDIR`.
 
@@ -195,6 +211,7 @@ def build_options(
     plugin = agent.plugin_dir
     venv_dir = RunPaths(profile.workfolder, agent.run_dir).venv_dir
     process_env = {**env, **perms.env, "PATH": agent_path(agent, venv_dir)}
+    process_env.update(python_env(agent, venv_dir))
     process_env.update(cache_env(Path(perms.env["TMPDIR"])))
     if tmpdir is not None:
         process_env["TMPDIR"] = process_env["CLAUDE_CODE_TMPDIR"] = str(tmpdir)

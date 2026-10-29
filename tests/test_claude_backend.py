@@ -179,7 +179,23 @@ def test_a5_options_follow_the_architecture(setup: Setup) -> None:
     real = os.path.realpath(venv)  # PATH, add_dirs and the sandbox name the same run venv
     assert real in options.add_dirs and real in options.sandbox["filesystem"]["allowWrite"]
     assert real in options.sandbox["filesystem"]["allowRead"]
+    assert env["VIRTUAL_ENV"] == str(venv)  # not arr's own venv (W3-00 live check)
+    assert env["PYTHONNOUSERSITE"] == "1"  # no user site folder below ~ (pip list)
+    assert env["PYTHONPATH"] == env["PYTHONHOME"] == ""
     assert path[1 : 1 + len(agent.file.path_prepend)] == agent.file.path_prepend
+
+
+def test_w3_00_no_virtual_env_without_run_venv(setup: Setup, monkeypatch) -> None:
+    monkeypatch.setenv("VIRTUAL_ENV", "/arr/.venv")
+    agent = setup.agent()
+    file = agent.file.model_copy(update={"run_venv": "off"})
+    from arr.runs.prepare import PreparedAgent
+
+    off = PreparedAgent(file, agent.run_dir)
+    options = build_options(
+        off, setup.profile(), env=dict(CLAUDE_SWITCHES), can_use_tool=None, hooks=None
+    )
+    assert options.env["VIRTUAL_ENV"] == ""
 
 
 def test_a5_system_prompt_is_byte_identical_per_role(setup: Setup) -> None:
