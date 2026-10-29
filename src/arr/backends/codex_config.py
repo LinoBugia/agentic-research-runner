@@ -242,13 +242,12 @@ def filesystem_entries(
     """Permission profile entries `path → read|write|deny` for one agent (E19, variant 1).
 
     Codex applies the most specific entry; a glob `deny` beats every path entry. `:root`
-    keeps system folders readable (Python, toolchain; docs/01 §8). Narrower than the
-    `SandboxProfile` in two places, both denied explicitly so a broader read folder (e.g.
-    `run:`) cannot reopen them:
+    keeps system folders readable (Python, toolchain; docs/01 §8). Three folders are denied
+    explicitly, so a broader read folder (e.g. `run:`) cannot reopen them:
 
-    - the run's `skills/` snapshot and the Claude plugin: Codex agents read their skills from
-      the copies in `work/.agents/skills/` (L14);
-    - chat attachments: only the folders of the agent's own channels,
+    - the run's `skills/` snapshot (L14) and the Claude plugin, which the `SandboxProfile`
+      allows: Codex agents read their skills from the copies in `work/.agents/skills/`;
+    - chat attachments except the folders of the agent's own channels,
       `groupchats/attachments/<channel>/` (L15, docs/02 §6).
 
     Then the denied parents of allowed roots are opened and their other entries denied one

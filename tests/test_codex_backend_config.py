@@ -226,9 +226,10 @@ def test_skills_snapshot_and_plugin_denied(layout: dict[str, Path]) -> None:
     _, profile, paths = setup(layout)
     entries = filesystem_entries(profile, paths)
     run = layout["run"]
-    assert profile.can_read(run / "skills")  # the SandboxProfile allows it …
-    assert entries[str(run / "skills")] == "deny"  # … Codex agents do not need it (L14)
-    assert entries[str(run / "agents" / "gpt-1" / "plugin")] == "deny"
+    assert not profile.can_read(run / "skills")  # W2-01: not in the profile any more …
+    assert entries[str(run / "skills")] == "deny"  # … and denied explicitly (L14)
+    assert profile.can_read(run / "agents" / "gpt-1" / "plugin")  # the profile allows it …
+    assert entries[str(run / "agents" / "gpt-1" / "plugin")] == "deny"  # … Codex needs none
 
 
 def test_only_own_channel_attachments(layout: dict[str, Path]) -> None:

@@ -191,9 +191,7 @@ def build_lab(
     engine = PolicyEngine(profiles, rules=rules)
     for aid in run.agents:
         (run_paths.tmp_dir / "home" / aid).mkdir(parents=True, exist_ok=True)
-    return Lab(
-        outer, wf, run, agent, run_paths, profiles[0], engine, canaries, cleanup, run.agents
-    )
+    return Lab(outer, wf, run, agent, run_paths, profiles[0], engine, canaries, cleanup, run.agents)
 
 
 def remove_cleanup(lab: Lab) -> None:
