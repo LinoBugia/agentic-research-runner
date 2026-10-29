@@ -11,7 +11,8 @@ always set), runs it, scans the run folder for secrets and reports progress thro
 
 Two ways to stop a run from outside: `StopControl` (Ctrl-C: the first stops the run with the
 finalizer, the second aborts hard) and `stop.request`, a file that `arr runs stop` puts into
-the run folder and that the running process polls (`watch_stop_request`). The module knows
+the run folder and that the running process polls and consumes (`watch_stop_request`; none
+stays behind when `run_launch` returns). The module knows
 neither Typer nor a terminal: text goes through `report`, approvals through the `decider`.
 """
 
@@ -596,11 +597,13 @@ def request_stop(run_dir: str | Path, *, source: str = "cli") -> bool:
 async def watch_stop_request(
     manager: RunManager, report: Report, done: asyncio.Event, *, interval_s: float = 1.0
 ) -> None:
-    """Poll `stop.request` in the run folder and stop the run when it appears.
+    """Poll `stop.request` in the run folder until `done`; the first request stops the run.
 
-    A request that arrives in `finalizing` (or later) is consumed and answered with a line;
-    `RunManager.stop()` would not act any more and the finalizer runs to its end.
+    Every request is consumed. A later one (a second `arr runs stop` while the turns are still
+    being interrupted, W2-05.3) or one that arrives in `finalizing` or later, when
+    `RunManager.stop()` would not act any more, is only answered with a line.
     """
+    stopped = False
     while not done.is_set():
         prepared = manager.prepared
         if prepared is not None:
@@ -614,10 +617,14 @@ async def watch_stop_request(
                         "Stopp-Anforderung erhalten (arr runs stop), aber der Run wird schon "
                         "abgeschlossen; der Finalizer läuft zu Ende."
                     )
+                elif stopped:
+                    report(
+                        "Stopp-Anforderung erhalten (arr runs stop): Der Run wird schon gestoppt."
+                    )
                 else:
+                    stopped = True
                     report("Stopp-Anforderung erhalten (arr runs stop): Der Run wird gestoppt …")
                     manager.stop()
-                return
         await asyncio.sleep(interval_s)
 
 
@@ -907,6 +914,8 @@ async def run_launch(
         return result
     finally:
         remove()
+        with contextlib.suppress(OSError):  # a request after the watcher's last poll (W2-05.3)
+            (run_dir / STOP_REQUEST).unlink(missing_ok=True)
         lock.release()
 
 

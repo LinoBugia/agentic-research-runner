@@ -662,3 +662,78 @@ async def test_w2_05_1_a_signal_repeated_within_the_window_is_the_same_ctrl_c(
     clock.now = 1.5
     control.on_interrupt()  # a deliberate second Ctrl-C
     assert exits == [130]
+
+
+# --------------------------------------------------------------------------------------------
+# W2-05.3: a second stop.request while the run is still stopping; none stays behind
+# --------------------------------------------------------------------------------------------
+
+
+def hang(seconds: float) -> dict[str, Any]:
+    """Wait that ignores `interrupt()` (the stop takes that long)."""
+    return {"do": "hang", "seconds": seconds}
+
+
+async def test_w2_05_3_a_second_stop_request_while_stopping_is_consumed(workfolder: Path) -> None:
+    """The first request is consumed at once, the run stays `running` while its turn is being
+    interrupted: a second `arr runs stop` then puts a new file (what CI saw). The watcher
+    consumes it too, stops only once, and nothing stays behind."""
+    lines: list[str] = []
+    launch = plan_launch(write_run(workfolder), cwd=workfolder)
+    running = asyncio.create_task(
+        run_launch(
+            launch,
+            decider=None,
+            report=lines.append,
+            builders=fake_builders({"a": turns([say("x"), hang(1.5), wait(30)])}),
+            signals=False,
+            interval_s=0.02,
+            stop_poll_s=0.02,
+        )
+    )
+    await eventually(lambda: any(line.startswith("▶ a: Turn 1") for line in lines))
+    [run_dir] = [p for p in (workfolder / "runs").iterdir() if p.is_dir()]
+    assert request_stop(run_dir) is True
+    first = "Stopp-Anforderung erhalten (arr runs stop): Der Run wird gestoppt …"
+    await eventually(lambda: first in lines)
+    assert not (run_dir / STOP_REQUEST).exists(), "consumed"
+    assert load_run_meta(run_dir).status is RunStatus.RUNNING, "the turn ignores the interrupt"
+    assert request_stop(run_dir) is True, "a new file, as the second `arr runs stop` in CI"
+    second = "Stopp-Anforderung erhalten (arr runs stop): Der Run wird schon gestoppt."
+    await eventually(lambda: second in lines)
+    result = await asyncio.wait_for(running, 10)
+    assert result.status is RunStatus.STOPPED
+    assert not (run_dir / STOP_REQUEST).exists(), "nothing stays behind"
+    assert len(log_entries(run_dir, "stop")) == 1, "stopped once"
+
+
+async def test_w2_05_3_a_request_after_the_last_poll_is_removed_at_the_end(
+    workfolder: Path,
+) -> None:
+    gate = asyncio.Event()
+    seen: list[RunStatus] = []
+
+    async def slow_finalizer(prepared: PreparedRun) -> None:
+        seen.append(load_run_meta(prepared.run_dir).status)
+        await gate.wait()
+
+    launch = plan_launch(write_run(workfolder), cwd=workfolder)
+    running = asyncio.create_task(
+        run_launch(
+            launch,
+            decider=None,
+            report=no_report,
+            builders=fake_builders({"a": turns([say("x")])}),
+            finalizer=slow_finalizer,
+            signals=False,
+            interval_s=0.02,
+            stop_poll_s=60,  # the watcher never looks again
+        )
+    )
+    await eventually(lambda: seen == [RunStatus.FINALIZING])
+    [run_dir] = [p for p in (workfolder / "runs").iterdir() if p.is_dir()]
+    (run_dir / STOP_REQUEST).write_text("{}", encoding="utf-8")
+    gate.set()
+    result = await asyncio.wait_for(running, 10)
+    assert result.status is RunStatus.DONE
+    assert not (run_dir / STOP_REQUEST).exists(), "removed when run_launch returns"
