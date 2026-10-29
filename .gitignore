@@ -31,5 +31,8 @@ htmlcov/
 # Claude Code agent worktrees (see umsetzung/Arbeitsweise.md §9)
 .claude/worktrees/
 
-# Screenshots that are generated locally and not committed (see docs/ux/werkzeuge/screenshots.sh)
-/docs/ux/screens/_lokal/
+# Working method and research docs stay local, never in git (workflow 01 v1.2).
+# Only CLAUDE.md, AGENTS.md and the plan diagram below are tracked.
+/docs/
+/umsetzung/*
+!/umsetzung/Codeplan_Ablauf.md

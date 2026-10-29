@@ -2,6 +2,7 @@
 
 `arr` (agentic research runner) ist eine lokale Bibliothek für Mathe-Projekte plus Agent-Harness mit Web-GUI. Aus einem Claude-Code-Chat heraus startet arr Research-Groups aus Claude- und ChatGPT-Agenten mit eigenen Arbeitsordnern, Rollen und Gruppenchats.
 
+- **Doku liegt nur lokal** im Haupt-Ordner des Repos, nicht im Git (`docs/`, `umsetzung/`; im Git nur [umsetzung/Codeplan_Ablauf.md](umsetzung/Codeplan_Ablauf.md)). In Worktrees und Klonen fehlt sie: Pfade daher immer im Haupt-Ordner lesen.
 - Planung und Entwurf: [docs/](docs/) – Einstieg [00 Projektauftrag](docs/00-projektauftrag.md), [01 Architektur](docs/01-architektur.md)
 - Umsetzung: [umsetzung/](umsetzung/) – [Codeplan](umsetzung/Codeplan.md), [Arbeitsweise](umsetzung/Arbeitsweise.md)
 
