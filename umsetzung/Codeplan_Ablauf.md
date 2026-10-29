@@ -20,9 +20,11 @@ Welle 2   W2-01 ClaudeBackend ─┐
           W2-02 CodexBackend  ─┼──► W2-05 CLI + Live-E2E ──► M1
           W2-03 RunManager + Chat-Taktung ─► W2-04 Topologien + Finalizer ─┘
                                 │
-Welle 3   W3-01 Service ─┬─► W3-02 GUI: Runs live, Neuer Run
-                         ├─► W3-03 Freigabe-Inbox end-to-end
-                         └─► W3-04 Workfolder, Projekte, Auth-Profile ──► UX-Abnahme 3
+Welle 3   W3-00 Codex-E19 Variante 2 ──► (vor W3-04 und W3-05)
+          W3-01 Service ─┬─► W3-02 GUI: Runs live, Neuer Run ─────┐
+                         ├─► W3-03 Freigabe-Inbox end-to-end ─────┤
+                         ├─► W3-04 Workfolder, Projekte (+W3-00) ─┼──► UX-Abnahme 3
+                         └─► W3-05 Auth-Profile (+W3-00) ─────────┘
                                 │
 Welle 4   W4-01 MCP-Bridge + Projektvorlage ─┐
           W4-02 SkillRegistry + Skills-Seite ┼─► W4-05 Start-Skills ─► W4-06 E2E ─► M2
