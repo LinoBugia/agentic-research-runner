@@ -12,12 +12,14 @@ The profile values are searched as bytes (UTF-8, also UTF-16) in **every** regul
 files, `tmp/home/`, `tmp/cache/` and `.venv/` included: these are the places agents can write to
 besides their work folder (W2-05.1 M2). The patterns are searched line by line in text files
 (no NUL byte in the first 8 KB) outside `.venv/`, where installed software would give false
-alarms. Symlinks are never followed.
+alarms. Only regular files are opened: symlinks are never followed, and a FIFO, socket or
+device an agent could leave behind would block `open()` forever (W2-05.2 N1).
 """
 
 import json
 import os
 import re
+import stat
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -239,9 +241,9 @@ def scan_run_dir(
         for name in sorted(files):
             path = Path(folder) / name
             rel = prefix + name
-            if path.is_symlink():
-                continue
             try:
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    continue  # symlinks, FIFOs, sockets, devices: `open()` could block (N1)
                 with path.open("rb") as handle:
                     report.files += 1
                     found = [(n, f"Wert von {label}") for n, label in _value_hits(handle, needles)]

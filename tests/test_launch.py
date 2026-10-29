@@ -588,7 +588,7 @@ async def test_w2_05_1_first_ctrl_c_in_finalizing_lets_the_finalizer_finish(
     control.on_interrupt()
     assert lines[-1] == (
         "Strg-C: Der Run wird schon abgeschlossen, der Finalizer läuft zu Ende. "
-        "Noch einmal Strg-C bricht hart ab."
+        "Noch einmal Strg-C (nach einer Sekunde) bricht hart ab."
     )
     gate.set()
     assert await asyncio.wait_for(running, 10) is RunStatus.DONE

@@ -1,10 +1,16 @@
 """Secret scan over a run folder (W2-05 A4): planted values and patterns are found and named by
 file, line and kind, never by value; a clean folder is clean. W2-05.1 M2: profile values are
 found in every regular file (`tmp/home/`, `tmp/cache/`, `.venv/`, binary and UTF-16 files),
-patterns only in text files outside `.venv/`."""
+patterns only in text files outside `.venv/`. W2-05.2 N1: only regular files are opened, a
+FIFO in an agent's work folder does not block the scan."""
 
 import json
+import os
+import sys
+import time
 from pathlib import Path
+
+import pytest
 
 from arr.models import AuthKind, AuthProfile
 from arr.runs import secret_scan as scan_module
@@ -165,3 +171,22 @@ def test_keychain_errors_do_not_stop_the_scan() -> None:
         raise RuntimeError("no keyring")
 
     assert profile_secrets([AuthProfile(name="max", kind=AuthKind.CLAUDE_OAUTH)], broken) == {}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="os.mkfifo")
+def test_w2_05_2_a_fifo_in_the_work_folder_does_not_block_the_scan(tmp_path: Path) -> None:
+    """`open()` on a FIFO without a writer blocks forever; an agent can create one with
+    `mkfifo`. The scan skips everything that is not a regular file and still finds the value in
+    the file next to it."""
+    run = _run_dir(tmp_path)
+    work = run / "agents/a/work"
+    work.mkdir()
+    os.mkfifo(work / "pipe")
+    _write(work / "notes.txt", f"x\n{VALUE}\n")
+    started = time.monotonic()
+    report = scan_run_dir(run, {"Profil „max“": VALUE})
+    assert time.monotonic() - started < 2
+    assert {(f.file, f.line, f.kind) for f in report.findings} == {
+        ("agents/a/work/notes.txt", 2, "Wert von Profil „max“")
+    }
+    assert report.files == 3 and report.skipped == []  # the FIFO is neither read nor "unreadable"

@@ -519,7 +519,7 @@ class StopControl:
         if status is RunStatus.FINALIZING:
             self.report(
                 "Strg-C: Der Run wird schon abgeschlossen, der Finalizer läuft zu Ende. "
-                "Noch einmal Strg-C bricht hart ab."
+                "Noch einmal Strg-C (nach einer Sekunde) bricht hart ab."
             )
             return
         self.report(
