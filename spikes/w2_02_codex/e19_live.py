@@ -10,7 +10,8 @@ One agent (gpt-6-luna, effort low) with the launch settings of the adapter
 Afterwards the whole raw log and the rollout are searched for the canary tokens: a token in
 any message from the app-server means the model saw it.
 
-    uv run python spikes/w2_02_codex/e19_live.py strict     # adapter config (1 turn)
+    uv run python spikes/w2_02_codex/e19_live.py v1         # adapter config, variant 1 (1 turn)
+    uv run python spikes/w2_02_codex/e19_live.py strict     # same code; before variant 1: ~ denied
     uv run python spikes/w2_02_codex/e19_live.py siblings   # variant: deny siblings (1 turn)
 """
 

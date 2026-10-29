@@ -1,4 +1,371 @@
 """ChatGPT backend adapter based on `openai-codex` (ChatGPT subscription).
 
+One `AsyncCodex` (= one app-server process) per agent, with `CODEX_HOME` = the login folder of
+its auth profile (docs/spikes/S2_codex.md §15). The process is started anew for every turn and
+the thread continued with `thread/resume`, so the sibling list of the read allowlist is fresh
+per turn (variant 1, docs/07 §3 ①, `codex_config`). The backend writes no transcript; it
+yields `AgentEvent`s with the raw notification attached.
+
+- Settings: `codex_config.build_launch` (environment, isolation, permission profile, room
+  server, role text), approvals through `codex_approvals.ApprovalBridge` and the SDK layer
+  `codex_sdk` (reviewer `user`; without the internals `never` = sandbox only).
+- Events: `codex_events.TurnEvents`; after the turn the rollout fills in the commands the
+  stream missed. `rate_limit` comes from the raw message hook (it is not routed to a turn).
+- Project context: Codex reads `AGENTS.md` in its `cwd` itself; `context.md` goes into the
+  first prompt only in workspace mode `shared` (docstring of `AgentFile`).
+- Hints: `deliver_hint` steers the running turn and emits a `hint` event; a rejected request's
+  reason reaches the agent the same way. `interrupt` ends a waiting approval first.
+
 See docs/01-architektur.md §4.2.
 """
+
+import asyncio
+import contextlib
+import logging
+from collections.abc import AsyncIterator, Callable, Mapping
+from typing import Any
+
+from arr.backends.base import (
+    AgentEvent,
+    ErrorData,
+    EventKind,
+    HintData,
+    TurnEndData,
+    TurnStartData,
+    TurnStatus,
+    UsageData,
+)
+from arr.backends.codex_approvals import ApprovalBridge
+from arr.backends.codex_config import CodexLaunch, build_launch, codex_home_for
+from arr.backends.codex_events import TurnEvents, read_rollout, rollout_calls
+from arr.backends.codex_sdk import (
+    install_approval_handler,
+    install_message_hooks,
+    internals_available,
+    resume_thread,
+    start_thread,
+)
+from arr.errors import ArrError
+from arr.models import AuthProfile, WorkspaceMode
+from arr.permissions.inbox import ApprovalInbox
+from arr.permissions.policy import RunPaths
+from arr.runs.prepare import PreparedAgent
+
+__all__ = ["CodexBackend"]
+
+logger = logging.getLogger(__name__)
+
+CodexFactory = Callable[[Any], Any]
+"""Builds an `AsyncCodex` from a `CodexConfig`; tests pass a fake."""
+
+_DENIED = "Abgelehnt: {reason}"
+_END = object()
+
+
+def _default_factory(config: Any) -> Any:
+    from openai_codex import AsyncCodex
+
+    return AsyncCodex(config)
+
+
+def _codex_config(launch: CodexLaunch) -> Any:
+    from openai_codex import CodexConfig
+
+    return CodexConfig(env=launch.env, config_overrides=launch.config_overrides)
+
+
+def _payload(note: Any) -> dict[str, Any]:
+    payload = getattr(note, "payload", None)
+    if hasattr(payload, "model_dump"):
+        return payload.model_dump(mode="json", by_alias=True)
+    return dict(payload or {})
+
+
+class CodexBackend:
+    """`AgentBackend` for one Codex agent (see module docstring)."""
+
+    def __init__(
+        self,
+        agent: PreparedAgent,
+        *,
+        run_id: str,
+        inbox: ApprovalInbox,
+        auth: AuthProfile,
+        factory: CodexFactory | None = None,
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
+        self.agent = agent
+        self.config = agent.file.config
+        self.run_id = run_id
+        self.inbox = inbox
+        self.engine = inbox.engine
+        self.profile = self.engine.profile(agent.id)
+        self.auth = auth
+        self.codex_home = codex_home_for(auth)
+        self.run_paths = RunPaths(self.profile.workfolder, agent.run_dir)
+        self._factory = factory or _default_factory
+        self._environ = environ
+        self._started = False
+        self._closed = False
+        self._turn = 0
+        self._thread_id: str | None = None
+        self._rollout: str | None = None
+        self._codex: Any = None
+        self._bridge: ApprovalBridge | None = None
+        self._handle: Any = None
+        self._queue: asyncio.Queue[Any] | None = None
+        self._interrupted = False
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    # -- lifecycle --------------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Check the login folder and prepare the agent's folders (the process starts per turn)."""
+        if self._closed:
+            raise RuntimeError("Das Codex-Backend ist geschlossen.")
+        if not (self.codex_home / "auth.json").is_file():
+            raise ArrError(
+                f"Das Profil „{self.auth.name}“ ist nicht bei ChatGPT angemeldet. Melde es einmal "
+                f"an: uv run arr auth codex-login {self.auth.name}"
+            )
+        home = self.profile.tmp_dir / "home" / self.agent.id
+        home.mkdir(parents=True, exist_ok=True)
+        self._started = True
+
+    async def close(self) -> None:
+        """Stop a running turn and end the app-server; safe to call more than once."""
+        if self._closed:
+            return
+        self._closed = True
+        await self.interrupt()
+        await self._shutdown()
+
+    def session_ref(self) -> dict[str, str]:
+        """Thread ID and rollout path for `session.json` (resume, S2 §9)."""
+        ref = {"thread_id": self._thread_id} if self._thread_id else {}
+        if self._rollout:
+            ref["rollout"] = self._rollout
+        return ref
+
+    async def interrupt(self) -> None:
+        """Stop the running turn: end a waiting approval first, then `turn/interrupt`."""
+        if self._queue is None:
+            return
+        self._interrupted = True
+        if self._bridge is not None:
+            self._bridge.cancel_waiting()
+        if self._handle is not None:
+            try:
+                await self._handle.interrupt()
+            except Exception:  # noqa: BLE001 - the turn may have ended in the meantime
+                logger.info("Codex-Turn von %s ließ sich nicht unterbrechen", self.agent.id)
+
+    async def deliver_hint(self, text: str) -> bool:
+        """Steer a short chat hint into the running turn; False without an active turn."""
+        if self._handle is None or self._queue is None or self._closed:
+            return False
+        try:
+            await self._handle.steer(text)
+        except Exception:  # noqa: BLE001 - e.g. „no active turn to steer“
+            return False
+        hint = HintData(text=text, channel=None, method="steer")
+        self._queue.put_nowait(self._event(EventKind.HINT, dict(hint)))
+        return True
+
+    # -- turn -------------------------------------------------------------------------------
+
+    def run_turn(self, prompt: str, *, stage: str | None = None) -> AsyncIterator[AgentEvent]:
+        """Run one turn in a fresh app-server; ends with `turn_end` also after errors."""
+        if not self._started or self._closed:
+            raise RuntimeError("Das Codex-Backend ist nicht gestartet.")
+        if self._queue is not None:
+            raise RuntimeError("Es läuft schon ein Turn.")
+        self._queue = asyncio.Queue()
+        self._turn += 1
+        self._interrupted = False
+        return self._run(prompt, stage)
+
+    async def _run(self, prompt: str, stage: str | None) -> AsyncIterator[AgentEvent]:
+        events = TurnEvents(model=self.config.model)
+        try:
+            yield self._event(EventKind.TURN_START, dict(TurnStartData(prompt=prompt, stage=stage)))
+            try:
+                async for event in self._play(self._first_prompt(prompt), events):
+                    yield event
+            except Exception as exc:  # noqa: BLE001 - every turn ends with turn_end
+                logger.warning("Codex-Turn von %s fehlgeschlagen: %s", self.agent.id, exc)
+                events.status = TurnStatus.ERROR
+                data = ErrorData(
+                    message=str(exc) or type(exc).__name__,
+                    type=type(exc).__name__,
+                    recoverable=False,
+                )
+                yield self._event(EventKind.ERROR, dict(data))
+            await self._shutdown()
+            yield self._turn_end(events)
+        finally:
+            await self._shutdown()
+            self._queue = None
+
+    def _first_prompt(self, prompt: str) -> str:
+        if self._turn != 1 or self.config.workspace.mode is not WorkspaceMode.SHARED:
+            return prompt
+        context = self.agent.run_dir / self.agent.file.context_file
+        try:
+            text = context.read_text(encoding="utf-8").strip()
+        except OSError:
+            return prompt
+        return f"{text}\n\n{prompt}" if text else prompt
+
+    async def _play(self, prompt: str, events: TurnEvents) -> AsyncIterator[AgentEvent]:
+        queue = self._queue
+        assert queue is not None
+        thread = await self._open(queue)
+        effort = self.config.effort.value if self.config.effort else None
+        self._handle = await thread.turn(prompt, effort=effort, summary="detailed")
+        if self._interrupted:
+            await self.interrupt()
+        pump = asyncio.create_task(self._pump(self._handle, queue))
+        try:
+            while (entry := await queue.get()) is not _END:
+                if isinstance(entry, AgentEvent):
+                    yield entry
+                    continue
+                method, params = entry
+                for kind, data in events.feed(method, params):
+                    yield self._event(kind, data, raw={"method": method, "params": params})
+            await pump
+        finally:
+            self._handle = None
+            if not pump.done():
+                pump.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pump
+        if events.status is None:
+            events.status = TurnStatus.INTERRUPTED if self._interrupted else TurnStatus.ERROR
+            if events.status is TurnStatus.ERROR:
+                events.error = "Der Turn endete ohne Abschluss von Codex."
+        for event in self._rollout_events(events):
+            yield event
+        if events.status is TurnStatus.ERROR:
+            data = ErrorData(
+                message=events.error or "Codex-Fehler", type="turn_failed", recoverable=False
+            )
+            yield self._event(EventKind.ERROR, dict(data))
+
+    async def _open(self, queue: asyncio.Queue[Any]) -> Any:
+        """Start this turn's app-server and start or resume the thread."""
+        launch = build_launch(
+            self.agent,
+            self.profile,
+            self.run_paths,
+            codex_home=self.codex_home,
+            environ=self._environ,
+        )
+        codex = self._factory(_codex_config(launch))
+        self._codex = codex
+        approvals = internals_available(codex)
+        loop = asyncio.get_running_loop()
+        if approvals:
+            bridge = ApprovalBridge(
+                self.inbox,
+                run_id=self.run_id,
+                agent_id=self.agent.id,
+                role=self.config.role,
+                work_dir=launch.cwd,
+                loop=loop,
+                on_denied=lambda reason: loop.call_soon_threadsafe(self._steer_reason, reason),
+            )
+            self._bridge = bridge
+            install_approval_handler(codex, bridge)
+
+            def on_in(message: dict[str, Any]) -> None:
+                bridge.observe(message)
+                if message.get("method") == "account/rateLimits/updated":
+                    entry = ("account/rateLimits/updated", message.get("params") or {})
+                    loop.call_soon_threadsafe(queue.put_nowait, entry)
+
+            install_message_hooks(codex, on_in=on_in)
+        else:
+            logger.warning("Codex-Freigaben für %s nur über die Sandbox (deny_all)", self.agent.id)
+        settings = {
+            "cwd": launch.cwd,
+            "model": self.config.model,
+            "developer_instructions": launch.developer_instructions,
+            "config": launch.thread_config,
+        }
+        if self._thread_id is None:
+            thread, started = await start_thread(codex, approvals=approvals, **settings)
+        else:
+            thread, started = await resume_thread(
+                codex, self._thread_id, approvals=approvals, **settings
+            )
+        self._thread_id = started.thread.id
+        self._rollout = getattr(started.thread, "path", None) or self._rollout
+        return thread
+
+    async def _pump(self, handle: Any, queue: asyncio.Queue[Any]) -> None:
+        try:
+            async for note in handle.stream():
+                queue.put_nowait((note.method, _payload(note)))
+        finally:
+            queue.put_nowait(_END)
+
+    def _steer_reason(self, reason: str) -> None:
+        handle = self._handle
+        if handle is None or self._interrupted:
+            return
+        task = asyncio.create_task(self._steer(handle, _DENIED.format(reason=reason)))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _steer(self, handle: Any, text: str) -> None:
+        try:
+            await handle.steer(text)
+        except Exception:  # noqa: BLE001 - the turn may already be over
+            logger.info("Begründung für %s nicht zugestellt", self.agent.id)
+
+    def _rollout_events(self, events: TurnEvents) -> list[AgentEvent]:
+        """Blocked commands from the rollout that the stream missed (S2 §15)."""
+        if not self._rollout or not events.turn_id:
+            return []
+        calls = rollout_calls(read_rollout(self._rollout), events.turn_id)
+        return [
+            self._event(kind, data, raw={"rollout": data["id"]})
+            for kind, data in events.reconcile(calls)
+        ]
+
+    async def _shutdown(self) -> None:
+        bridge, self._bridge = self._bridge, None
+        if bridge is not None:
+            bridge.cancel_waiting()
+        codex, self._codex = self._codex, None
+        if codex is not None:
+            try:
+                await codex.close()
+            except Exception:  # noqa: BLE001
+                logger.warning("Codex-Prozess von %s ließ sich nicht sauber beenden", self.agent.id)
+
+    # -- events -----------------------------------------------------------------------------
+
+    def _event(self, kind: EventKind, data: dict[str, Any], raw: Any = None) -> AgentEvent:
+        return AgentEvent(
+            run_id=self.run_id,
+            agent_id=self.agent.id,
+            turn=self._turn,
+            kind=kind,
+            data=data,
+            raw=raw,
+        )
+
+    def _turn_end(self, events: TurnEvents) -> AgentEvent:
+        usage = events.usage()
+        data = TurnEndData(
+            status=(events.status or TurnStatus.ERROR).value,
+            usage=UsageData(**usage.tokens(), model=self.config.model),
+            cost_usd=None,  # subscription without a price per token (docs/08 §5.0)
+            cost_kind=None,
+            session=self._thread_id,
+            num_turns=events.requests or None,
+        )
+        return self._event(EventKind.TURN_END, dict(data))

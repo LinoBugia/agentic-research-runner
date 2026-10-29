@@ -7,7 +7,7 @@
 - `outer/wf/` is a workfolder (`arr init`) with project `demo` and a second project `other`
   (canary). The project brings its own decoy `.codex/config.toml`.
 - `prepare_run` creates the run with one Codex agent `gpt-1` (skill `demo-skill`, read folder
-  `outer/readdir`), the run venv is created with `uv venv --seed`.
+  `outer/readdir`); run venv and room database as the RunManager creates them.
 - Canaries with random content: outside the allowlist (`outer/outside`, other project,
   `<run>/skills`, `~/.arr`), attachments of a foreign and an own channel.
 
@@ -38,6 +38,8 @@ from arr.permissions.policy import (
     profile_for,
 )
 from arr.resolve import resolve_run, validate_model
+from arr.room.store import RoomStore
+from arr.runs.manager import create_run_venv
 from arr.runs.prepare import PreparedAgent, PreparedRun, prepare_run
 from arr.workfolder import init_workfolder, load_project_settings
 
@@ -69,6 +71,7 @@ class Lab:
     engine: PolicyEngine
     canaries: dict[str, Path]
     cleanup: list[Path]
+    agents: dict[str, PreparedAgent]
 
 
 def _write(path: Path, text: str) -> Path:
@@ -93,8 +96,13 @@ def ensure_base_venv() -> Path:
     return BASE_VENV
 
 
-def build_lab(*, base_venv: Path | None = BASE_VENV, run_venv: bool = True) -> Lab:
-    """Fresh lab under tmp/lab/ (see module docstring)."""
+def build_lab(
+    *,
+    base_venv: Path | None = BASE_VENV,
+    run_venv: bool = True,
+    agents: tuple[tuple[str, str], ...] = ((AGENT, AUTH),),
+) -> Lab:
+    """Fresh lab under tmp/lab/ (see module docstring); `agents` = (id, auth profile) pairs."""
     if base_venv is not None:
         ensure_base_venv()
     if LAB.exists():
@@ -153,29 +161,22 @@ def build_lab(*, base_venv: Path | None = BASE_VENV, run_venv: bool = True) -> L
             "topology": {"kind": "solo"},
             "defaults": {"provider": "codex", "model": MODEL, "auth": AUTH, "effort": EFFORT},
             "agents": [
-                {
-                    "id": AGENT,
-                    "skills": ["demo-skill"],
-                    "read_dirs": [str(readdir)],
-                }
+                {"id": aid, "auth": auth, "skills": ["demo-skill"], "read_dirs": [str(readdir)]}
+                for aid, auth in agents
             ],
-            "groupchats": [{"name": "main", "members": [AGENT]}],
+            "groupchats": [{"name": "main", "members": [aid for aid, _ in agents]}],
         },
     )
     resolved = resolve_run(
         run_input, None, settings, project_settings=load_project_settings(project)
     )
     run = prepare_run(wf, run_input, resolved, settings, now=datetime.now())
-    agent = run.agents[AGENT]
+    agent = run.agents[agents[0][0]]
     run_paths = RunPaths(wf, run.run_dir, settings.toolchain)
     (run.run_dir / "tmp").mkdir(exist_ok=True)
     if run_venv:
-        python = [str(base_venv / "bin" / "python")] if base_venv else []
-        subprocess.run(
-            ["uv", "venv", "-q", "--seed", "--system-site-packages", str(run_paths.venv_dir)]
-            + (["--python", *python] if python else []),
-            check=True,
-        )
+        create_run_venv(run.run_dir, agent.file.base_python)  # like the RunManager (W2-03)
+    RoomStore.create(run.run_dir).setup_channels(resolved.groupchats, {})
     canaries["run_skills"] = run.run_dir / "skills" / "demo-skill" / "SKILL.md"
     att = run.run_dir / "groupchats" / "attachments"
     canaries["foreign_attachment"] = _canary(att / "secret-channel" / "m-1" / "note.txt")
@@ -186,10 +187,13 @@ def build_lab(*, base_venv: Path | None = BASE_VENV, run_venv: bool = True) -> L
     cleanup = [canaries["arr_home"]]
 
     rules = PermissionRules(sensitive_paths=[str(readdir / ".secret")])
-    profile = profile_for(agent.file.config, run_paths, rules)
-    engine = PolicyEngine([profile], rules=rules)
-    (run_paths.tmp_dir / "home" / AGENT).mkdir(parents=True, exist_ok=True)
-    return Lab(outer, wf, run, agent, run_paths, profile, engine, canaries, cleanup)
+    profiles = [profile_for(a.file.config, run_paths, rules) for a in run.agents.values()]
+    engine = PolicyEngine(profiles, rules=rules)
+    for aid in run.agents:
+        (run_paths.tmp_dir / "home" / aid).mkdir(parents=True, exist_ok=True)
+    return Lab(
+        outer, wf, run, agent, run_paths, profiles[0], engine, canaries, cleanup, run.agents
+    )
 
 
 def remove_cleanup(lab: Lab) -> None:
