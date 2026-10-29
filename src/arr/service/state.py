@@ -2,11 +2,11 @@
 list of recently used workfolders.
 
 `service.json` (mode 0600) tells a second `arr serve`, the MCP bridge (W4-01) and the Dock
-start (W5-02) where the running service listens and how to open it: port, token, PID, start
-time and workfolder. It is written at start and removed at the end; a stale file (process
-gone) is overwritten by the next start. `workfolders.json` remembers the workfolders the
-service was started with, most recent first, so `arr serve` without `--workfolder` opens the
-last one.
+start (W5-02) where the running service listens and how to open it: hostname
+(`<random>.localhost`, W3-01.1 M1), port, token, PID, start time and workfolder. It is
+written at start and removed at the end; a stale file (process gone) is overwritten by the
+next start. `workfolders.json` remembers the workfolders the service was started with, most
+recent first, so `arr serve` without `--workfolder` opens the last one.
 """
 
 import json
@@ -29,6 +29,7 @@ class ServiceInfo(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     version: int = 1
+    host: str
     port: int
     token: str
     pid: int
@@ -37,8 +38,8 @@ class ServiceInfo(BaseModel):
 
     @property
     def url(self) -> str:
-        """Base URL of the service, without token."""
-        return f"http://127.0.0.1:{self.port}"
+        """Base URL of the service (its own hostname), without token."""
+        return f"http://{self.host}:{self.port}"
 
     @property
     def open_url(self) -> str:

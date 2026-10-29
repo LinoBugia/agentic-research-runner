@@ -1,16 +1,26 @@
-"""Protection of the service against other websites and processes (W3-01 §3.2, docs/01 §8).
+"""Protection of the service against other websites and processes (W3-01 §3.2, W3-01.1 M1,
+docs/01-architektur.md §8).
 
 `Guard` is a pure ASGI middleware around the whole NiceGUI app, so it also covers the static
 files, the `/_nicegui/…` endpoints and the Socket.IO websocket under `/_nicegui_ws/`:
 
-- **Token → cookie:** the browser is opened once with `/?token=…`. A request with the right
-  token gets the cookie `arr_session` (`HttpOnly`, `SameSite=Strict`) and is redirected to the
-  same URL without the token. Every other request needs that cookie; without it the answer is
-  a German page that says how to open arr (status 401), for the websocket a refused handshake.
-- **Host check** (DNS rebinding): only `127.0.0.1:<port>` and `localhost:<port>` (status 403).
-- **Origin check** for the websocket and for every request that is not a plain read
-  (`GET`, `HEAD`, `OPTIONS`): only the service's own origin, so no other website in the same
-  browser can trigger an action (status 403).
+- **Own hostname:** every start of the service gets a fresh name `<random>.localhost`
+  (`new_hostname`, 20 characters `[a-z0-9]` from `secrets`). Browsers resolve `*.localhost`
+  to the loopback address (RFC 6761). Cookies are scoped by host and not by port
+  (RFC 6265 §8.5), so the cookie below reaches no other server on `127.0.0.1`: nobody else
+  knows the name.
+- **Token → cookie:** the browser is opened once with `http://<random>.localhost:<port>/?token=…`.
+  A request with the right token gets the host-only cookie `arr_session` (`HttpOnly`,
+  `SameSite=Strict`, `Path=/`, no `Domain`) and is redirected to the same URL without the
+  token. Every other request needs that cookie; without it the answer is a German page that
+  says how to open arr (status 401), for the websocket a refused handshake.
+- **Host check** (DNS rebinding): only `<random>.localhost:<port>` gets data (status 403
+  otherwise, with the German page and without a cookie). A token link on `127.0.0.1:<port>`
+  or `localhost:<port>` only redirects to the own hostname.
+- **Origin check:** a request that carries an `Origin` header is refused unless it is the
+  own origin, for every method and for the websocket (status 403; so no CORS answer of
+  Engine.IO ever reaches another site). Requests without `Origin` may only read (`GET`,
+  `HEAD`, `OPTIONS`); everything else needs the own origin.
 
 Tokens are compared in constant time (`hmac.compare_digest`) and never logged.
 """
@@ -19,16 +29,21 @@ import hmac
 import secrets
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, quote, urlencode
 
 COOKIE = "arr_session"
 TOKEN_PARAM = "token"
 COOKIE_MAX_AGE_S = 30 * 24 * 3600
 """The cookie lives this long in the browser; it is only good for one start of the service
-(each start has a new token), so an old one simply stops working."""
+(each start has a new token and a new hostname), so an old one simply stops working."""
 SERVICE_HEADER = b"x-arr-service"
 """Response header on every refusal, so `arr serve` can tell a running service on the port
 from some other program."""
+HOSTNAME_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
+HOSTNAME_LENGTH = 20
+HOSTNAME_SUFFIX = ".localhost"
+LOOPBACK_NAMES = ("127.0.0.1", "localhost")
+"""Names a token link may use by mistake; the guard only redirects them to the own name."""
 
 READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
@@ -43,12 +58,20 @@ def new_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def allowed_hosts(port: int) -> frozenset[str]:
-    return frozenset({f"127.0.0.1:{port}", f"localhost:{port}"})
+def new_hostname() -> str:
+    """A fresh hostname `<random>.localhost` that no other program knows (W3-01.1 M1)."""
+    name = "".join(secrets.choice(HOSTNAME_CHARS) for _ in range(HOSTNAME_LENGTH))
+    return name + HOSTNAME_SUFFIX
 
 
-def allowed_origins(port: int) -> frozenset[str]:
-    return frozenset({f"http://{host}" for host in allowed_hosts(port)})
+def service_host(hostname: str, port: int) -> str:
+    """The only `Host` the service answers: `<hostname>:<port>`."""
+    return f"{hostname}:{port}".lower()
+
+
+def service_origin(hostname: str, port: int) -> str:
+    """The only origin the service accepts."""
+    return f"http://{service_host(hostname, port)}"
 
 
 def refusal_page() -> str:
@@ -89,14 +112,16 @@ def _cookie_value(scope: Scope, name: str) -> str | None:
 
 
 class Guard:
-    """ASGI middleware: cookie, host and origin checks (see the module docstring)."""
+    """ASGI middleware: hostname, cookie and origin checks (see the module docstring)."""
 
-    def __init__(self, app: ASGIApp, *, token: str, port: int) -> None:
+    def __init__(self, app: ASGIApp, *, token: str, port: int, hostname: str) -> None:
         self.app = app
         self._token = token
         self.port = port
-        self.hosts = allowed_hosts(port)
-        self.origins = allowed_origins(port)
+        self.hostname = hostname.lower()
+        self.host = service_host(hostname, port)
+        self.origin = service_origin(hostname, port)
+        self.loopback_hosts = frozenset(f"{name}:{port}" for name in LOOPBACK_NAMES)
         self._page = refusal_page().encode("utf-8")
 
     # -- checks ------------------------------------------------------------------------------
@@ -109,11 +134,16 @@ class Guard:
 
     def host_ok(self, scope: Scope) -> bool:
         host = _header(scope, b"host")
-        return host is not None and host.lower() in self.hosts
+        return host is not None and host.lower() == self.host
 
     def origin_ok(self, scope: Scope) -> bool:
         origin = _header(scope, b"origin")
-        return origin is not None and origin.lower() in self.origins
+        return origin is not None and origin.lower() == self.origin
+
+    def origin_foreign(self, scope: Scope) -> bool:
+        """True for a request that names another origin (also `null`)."""
+        origin = _header(scope, b"origin")
+        return origin is not None and origin.lower() != self.origin
 
     def cookie_ok(self, scope: Scope) -> bool:
         return self.token_ok(_cookie_value(scope, COOKIE))
@@ -138,11 +168,14 @@ class Guard:
         await self.app(scope, receive, send)
 
     async def _http(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if not self.host_ok(scope):
-            await self._refuse(send, 403, b"text/plain; charset=utf-8", b"arr: falscher Host")
-            return
         method = str(scope.get("method", "GET")).upper()
         query = dict(parse_qsl(scope.get("query_string", b"").decode("latin-1")))
+        if not self.host_ok(scope):
+            await self._wrong_host(scope, send, method, query)
+            return
+        if self.origin_foreign(scope):
+            await self._refuse(send, 403, b"text/plain; charset=utf-8", b"arr: fremder Origin")
+            return
         if method in ("GET", "HEAD") and TOKEN_PARAM in query:
             await self._login(scope, send, query)
             return
@@ -154,29 +187,47 @@ class Guard:
             return
         await self.app(scope, receive, send)
 
+    async def _wrong_host(self, scope: Scope, send: Send, method: str, query: dict) -> None:
+        """No data and no cookie for another host; a token link on `127.0.0.1`/`localhost`
+        is sent on to the own hostname (the token stays in the link for that one hop)."""
+        host = (_header(scope, b"host") or "").lower()
+        if (
+            host in self.loopback_hosts
+            and method in ("GET", "HEAD")
+            and self.token_ok(query.get(TOKEN_PARAM))
+        ):
+            location = self.origin + self._location(scope, query, keep_token=True)
+            await self._redirect(send, location, cookie=None)
+            return
+        await self._refuse(send, 403, b"text/html; charset=utf-8", self._page)
+
     async def _login(self, scope: Scope, send: Send, query: dict[str, str]) -> None:
-        """`?token=…`: set the cookie and redirect to the URL without the token."""
+        """`?token=…` on the own host: set the cookie and redirect without the token."""
         if not self.token_ok(query.get(TOKEN_PARAM)):
             await self._refuse(send, 401, b"text/html; charset=utf-8", self._page)
             return
-        rest = urlencode([(k, v) for k, v in query.items() if k != TOKEN_PARAM])
-        path = scope.get("path") or "/"
-        location = path + (f"?{rest}" if rest else "")
         cookie = (
             f"{COOKIE}={self._token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={COOKIE_MAX_AGE_S}"
         )
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 303,
-                "headers": [
-                    (b"location", location.encode("latin-1")),
-                    (b"set-cookie", cookie.encode("latin-1")),
-                    (b"cache-control", b"no-store"),
-                    (b"content-length", b"0"),
-                ],
-            }
-        )
+        await self._redirect(send, self._location(scope, query, keep_token=False), cookie=cookie)
+
+    @staticmethod
+    def _location(scope: Scope, query: dict[str, str], *, keep_token: bool) -> str:
+        """Path and query of the request, percent-encoded (the path arrives decoded)."""
+        items = [(k, v) for k, v in query.items() if keep_token or k != TOKEN_PARAM]
+        rest = urlencode(items)
+        path = quote(scope.get("path") or "/")
+        return path + (f"?{rest}" if rest else "")
+
+    async def _redirect(self, send: Send, location: str, *, cookie: str | None) -> None:
+        headers = [
+            (b"location", location.encode("ascii")),
+            (b"cache-control", b"no-store"),
+            (b"content-length", b"0"),
+        ]
+        if cookie is not None:
+            headers.append((b"set-cookie", cookie.encode("latin-1")))
+        await send({"type": "http.response.start", "status": 303, "headers": headers})
         await send({"type": "http.response.body", "body": b""})
 
     async def _refuse(self, send: Send, status: int, content_type: bytes, body: bytes) -> None:

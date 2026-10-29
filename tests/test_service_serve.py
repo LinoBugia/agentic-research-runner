@@ -173,11 +173,71 @@ def test_serve_refuses_a_port_another_program_uses(tmp_path: Path, home: Path) -
 def test_stale_service_json_is_ignored(tmp_path: Path, home: Path) -> None:
     (home / "service.json").write_text(
         json.dumps(
-            {"port": free_port(), "token": "x", "pid": 999999, "started": 0, "workfolder": "/"}
+            {
+                "host": "abcdefghijklmnopqrst.localhost",
+                "port": free_port(),
+                "token": "x",
+                "pid": 999999,
+                "started": 0,
+                "workfolder": "/",
+            }
         )
     )
     assert serve_module.running_service() is None
     assert read_service_info() is not None  # the file is still there, just not alive
+
+
+def test_foreign_server_on_the_old_port_is_not_taken_for_arr(tmp_path: Path, home: Path) -> None:
+    """W3-01.1 G3: a stale `service.json` whose PID lives on (another program) and whose port
+    answers 200 from some other server is no running arr; the token link never goes there."""
+    import http.server
+    import os
+    import threading
+
+    seen: list[str] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - http.server API
+            seen.append(self.path)
+            body = b"not arr"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    foreign = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=foreign.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = foreign.server_address[1]
+        (home / "service.json").write_text(
+            json.dumps(
+                {
+                    "host": "abcdefghijklmnopqrst.localhost",
+                    "port": port,
+                    "token": "old-token",
+                    "pid": os.getpid(),
+                    "started": 0,
+                    "workfolder": "/",
+                }
+            )
+        )
+        assert not serve_module.answers_as_arr(port, "abcdefghijklmnopqrst.localhost")
+        assert serve_module.running_service() is None
+        workfolder = make_workfolder(tmp_path)
+        lines: list[str] = []
+        with pytest.raises(ArrError) as error:  # the old port is taken by that program
+            serve(workfolder=workfolder, port=port, open_browser=False, report=lines.append)
+        assert "nicht von arr" in str(error.value)
+        assert not any("läuft schon" in line for line in lines)
+        assert not any("old-token" in path for path in seen), seen
+    finally:
+        foreign.shutdown()
+        foreign.server_close()
+        thread.join(5)
 
 
 def test_cli_serve_passes_the_options(monkeypatch: pytest.MonkeyPatch) -> None:

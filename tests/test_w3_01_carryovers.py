@@ -268,3 +268,57 @@ def test_run_start_agent_carries_the_agents_skills(
     )
     assert not result.errors, result.errors
     assert [a.skills for a in result.agents] == [["sympy-check"]]
+
+
+# --- N2, part 2: the clean-up is called at the start of `arr run` and of the service ---------
+
+
+def test_arr_run_and_the_service_remove_an_old_orphan_at_start(
+    tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fails when `run_launch` or `RealApi.start` no longer call the clean-up (W3-01.1 G4)."""
+    from run_kit import fake_builders
+
+    from arr.models import RunInput
+    from arr.runs.launch import plan_run_input, run_launch
+    from arr.service.real_api import RealApi
+
+    arr_home.mkdir(parents=True, exist_ok=True)
+    write_profiles(arr_home, {"fake-auth": "claude_oauth"})
+    monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
+    workfolder = make_workfolder(tmp_path)
+    (workfolder / "arr.yaml").write_text("version: 1\ntoolchain: {run_venv: off}\n")
+
+    def orphan(name: str) -> Path:
+        folder = reserve(workfolder, name)
+        meta = json.loads((folder / "meta.json").read_text())
+        (folder / "meta.json").write_text(json.dumps({**meta, "created": time.time() - 3600}))
+        return folder
+
+    first = orphan("20261029-1000_demo_custom_0a01")
+    api = RealApi(workfolder, base_url="http://127.0.0.1:1")
+    asyncio.run(api.start())
+    asyncio.run(api.close())
+    assert not first.exists(), "RealApi.start() must remove an old orphaned reservation"
+
+    second = orphan("20261029-1001_demo_custom_0a02")
+    run_input = {
+        "project": "demo",
+        "task": "x",
+        "topology": {"kind": "solo"},
+        "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
+        "agents": [agent("a")],
+    }
+    launch = plan_run_input(RunInput.model_validate(run_input), workfolder=workfolder)
+    status = asyncio.run(
+        run_launch(
+            launch,
+            decider=None,
+            report=lambda line: None,
+            builders=fake_builders({"a": turns([say("hallo")])}),
+            signals=False,
+            scan=False,
+        )
+    ).status
+    assert status is RunStatus.DONE
+    assert not second.exists(), "run_launch must remove an old orphaned reservation"

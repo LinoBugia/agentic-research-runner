@@ -1,18 +1,26 @@
-"""Protection of the service against other websites and processes (W3-01 A2), against a real
-server in a child process: token link → cookie and redirect, no cookie → German page, wrong
-host → refused, foreign origin on writes and on the websocket → refused."""
+"""Protection of the service against other websites and processes (W3-01 A2, W3-01.1 M1 and
+G1–G3), against a real server in a child process: own hostname `<random>.localhost`, token
+link → host-only cookie and redirect, no cookie → German page, other hosts → no data and no
+cookie, foreign origin → refused for every method and the websocket."""
 
 import json
 import re
 from collections.abc import Iterator
 
-import httpx
 import pytest
 from service_kit import ServiceProcess, make_workfolder, start_service
 from websockets.exceptions import InvalidStatus
-from websockets.sync.client import connect
 
-from arr.service.guard import COOKIE, SERVICE_HEADER, Guard, new_token
+from arr.service.guard import (
+    COOKIE,
+    HOSTNAME_LENGTH,
+    SERVICE_HEADER,
+    Guard,
+    new_hostname,
+    new_token,
+)
+
+POLLING = "/_nicegui_ws/socket.io/?EIO=4&transport=polling"
 
 
 @pytest.fixture(scope="module")
@@ -28,55 +36,65 @@ def service(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ServiceProcess
         proc.stop()
 
 
-def client(service: ServiceProcess, **kwargs: object) -> httpx.Client:
-    return httpx.Client(base_url=service.url, follow_redirects=False, timeout=10.0, **kwargs)
+def cookie_of(service: ServiceProcess) -> str:
+    return f"{COOKIE}={service.token}"
 
 
-def cookie_jar(service: ServiceProcess) -> dict[str, str]:
-    return {COOKIE: service.token}
+# --- hostname -----------------------------------------------------------------------------------
 
 
-def ws_url(service: ServiceProcess) -> str:
-    return f"ws://127.0.0.1:{service.port}/_nicegui_ws/socket.io/?EIO=4&transport=websocket"
+def test_service_has_a_random_localhost_name_in_service_json_and_link(
+    service: ServiceProcess,
+) -> None:
+    info = json.loads((service.arr_home / "service.json").read_text())
+    assert info["host"] == service.hostname
+    assert re.fullmatch(rf"[a-z0-9]{{{HOSTNAME_LENGTH},}}\.localhost", service.hostname)
+    assert info["token"] == service.token and info["port"] == service.port
+    assert re.fullmatch(r"[A-Za-z0-9_-]{40,}", service.token)
+    link = [line for line in service.output().splitlines() if "token=" in line]
+    assert link and f"http://{service.hostname}:{service.port}/?token=" in link[0]
+    assert "127.0.0.1" not in link[0]
+    assert new_hostname() != new_hostname()
+    assert len(new_hostname()) == HOSTNAME_LENGTH + len(".localhost")
 
 
 # --- without cookie -----------------------------------------------------------------------------
 
 
-def test_without_cookie_pages_static_and_nicegui_endpoints_are_refused(
-    service: ServiceProcess,
-) -> None:
-    with client(service) as http:
-        for path in [
-            "/",
-            "/runs",
-            "/arr-static/arr.js",
-            "/_nicegui_ws/socket.io/?EIO=4&transport=polling",
-        ]:
+def test_without_cookie_nothing_is_served(service: ServiceProcess) -> None:
+    with service.client() as http:
+        for path in ["/", "/runs", "/arr-static/arr.js", POLLING]:
             response = http.get(path)
             assert response.status_code == 401, path
             assert response.headers.get(SERVICE_HEADER.decode()) == "refused"
             assert "nicht freigeschaltet" in response.text and "arr" in response.text
             assert "nicegui" not in response.text.lower()
+            assert service.token not in response.text
 
 
 def test_wrong_token_is_refused_and_sets_no_cookie(service: ServiceProcess) -> None:
-    with client(service) as http:
+    with service.client() as http:
         response = http.get("/?token=" + new_token())
         assert response.status_code == 401
         assert "set-cookie" not in response.headers
 
 
-def test_token_link_sets_http_only_strict_cookie_and_redirects_without_token(
+# --- token link → cookie ------------------------------------------------------------------------
+
+
+def test_token_link_sets_host_only_cookie_and_redirects_without_token(
     service: ServiceProcess,
 ) -> None:
-    with client(service) as http:
+    with service.client() as http:
         response = http.get(f"/?token={service.token}")
         assert response.status_code == 303
         assert response.headers["location"] == "/"
         cookie = response.headers["set-cookie"]
+        attributes = {part.strip().split("=")[0].lower() for part in cookie.split(";")[1:]}
         assert cookie.startswith(f"{COOKIE}={service.token}")
-        assert "HttpOnly" in cookie and "SameSite=Strict" in cookie and "Path=/" in cookie
+        assert {"httponly", "samesite", "path", "max-age"} <= attributes
+        assert "domain" not in attributes, "host-only: no Domain attribute"
+        assert "SameSite=Strict" in cookie and "Path=/" in cookie
         # other parameters survive, the token does not
         response = http.get(f"/runs?status=aktiv&token={service.token}&n=100")
         assert response.status_code == 303
@@ -85,68 +103,105 @@ def test_token_link_sets_http_only_strict_cookie_and_redirects_without_token(
         assert set(location.split("?", 1)[1].split("&")) == {"status=aktiv", "n=100"}
 
 
+def test_token_link_with_non_latin1_path_redirects_encoded(service: ServiceProcess) -> None:
+    """W3-01.1 G2: `/€?token=…` used to end in a 500."""
+    with service.client() as http:
+        response = http.get(f"/%E2%82%AC?token={service.token}")
+        assert response.status_code == 303
+        assert response.headers["location"] == "/%E2%82%AC"
+        assert "set-cookie" in response.headers
+
+
 def test_with_cookie_pages_and_static_files_load(service: ServiceProcess) -> None:
-    with client(service, cookies=cookie_jar(service)) as http:
+    with service.client(cookie=True) as http:
         page = http.get("/")
         assert page.status_code == 200
         assert "nicegui" in page.text.lower()
         assert http.get("/arr-static/arr.js").status_code == 200
+        assert http.get("/", headers={"Host": service.host.upper()}).status_code == 200
 
 
-# --- host and origin ----------------------------------------------------------------------------
+# --- host ---------------------------------------------------------------------------------------
 
 
-def test_wrong_host_is_refused_even_with_cookie(service: ServiceProcess) -> None:
-    with client(service, cookies=cookie_jar(service)) as http:
-        for host in [
-            "evil.example",
-            f"evil.example:{service.port}",
-            f"127.0.0.1:{service.port + 1}",
-        ]:
-            response = http.get("/", headers={"Host": host})
+def test_other_hosts_get_no_data_and_no_cookie(service: ServiceProcess) -> None:
+    """W3-01.1 M1: `127.0.0.1`, `localhost`, other names, other ports → 403 without cookie."""
+    port = service.port
+    hosts = [
+        f"127.0.0.1:{port}",
+        f"localhost:{port}",
+        f"anders.localhost:{port}",
+        f"{service.hostname}:{port + 1}",
+        "evil.example",
+        f"evil.example:{port}",
+        service.hostname,  # without port
+    ]
+    for host in hosts:
+        with service.client(cookie=True, host=host) as http:
+            response = http.get("/")
             assert response.status_code == 403, host
-        assert http.get("/", headers={"Host": f"localhost:{service.port}"}).status_code == 200
+            assert "nicegui" not in response.text.lower()
+            assert "set-cookie" not in response.headers
+            # a token link on a wrong host sets no cookie either
+            response = http.get(f"/?token={service.token}")
+            assert "set-cookie" not in response.headers, host
+            if host in (f"127.0.0.1:{port}", f"localhost:{port}"):
+                # … but is sent on to the own name, token kept for that one hop
+                assert response.status_code == 303, host
+                assert response.headers["location"] == f"{service.url}/?token={service.token}"
+            else:
+                assert response.status_code == 403, host
+        with pytest.raises(InvalidStatus) as refused:
+            service.ws_connect({"Origin": service.url, "Cookie": cookie_of(service)}, host=host)
+        assert refused.value.response.status_code == 403, host
 
 
-def test_writes_need_the_own_origin(service: ServiceProcess) -> None:
-    path = "/_nicegui_ws/socket.io/?EIO=4&transport=polling"
-    with client(service, cookies=cookie_jar(service)) as http:
-        assert http.post(path, content=b"x").status_code == 403  # no Origin at all
-        assert (
-            http.post(path, content=b"x", headers={"Origin": "http://evil.example"}).status_code
-            == 403
-        )
-        assert http.post(
-            path, content=b"x", headers={"Origin": f"http://127.0.0.1:{service.port}"}
-        ).status_code not in (401, 403)
-        # without cookie the origin does not help
-    with client(service) as http:
-        assert (
-            http.post(
-                path, content=b"x", headers={"Origin": f"http://127.0.0.1:{service.port}"}
-            ).status_code
-            == 401
-        )
+# --- origin -------------------------------------------------------------------------------------
+
+
+def test_foreign_origin_is_refused_for_every_method(service: ServiceProcess) -> None:
+    """W3-01.1 G1: also GET (Socket.IO polling) with a foreign origin, and `null`."""
+    foreign = [
+        "http://evil.example",
+        f"http://127.0.0.1:{service.port}",
+        f"http://localhost:{service.port}",
+        f"http://anders.localhost:{service.port}",
+        f"http://{service.hostname}:{service.port + 1}",
+        f"https://{service.host}",
+        "null",
+    ]
+    with service.client(cookie=True) as http:
+        for origin in foreign:
+            for method, path in [("GET", POLLING), ("GET", "/"), ("POST", POLLING)]:
+                response = http.request(method, path, headers={"Origin": origin}, content=b"x")
+                assert response.status_code == 403, (method, origin)
+                assert "access-control-allow-origin" not in response.headers, origin
+        assert http.post(POLLING, content=b"x").status_code == 403  # write without Origin
+        for method in ["PUT", "DELETE", "PATCH"]:
+            assert http.request(method, "/").status_code == 403, method
+        own = http.post(POLLING, content=b"x", headers={"Origin": service.url})
+        assert own.status_code not in (401, 403)
+        assert http.get(POLLING, headers={"Origin": service.url}).status_code == 200
+    with service.client() as http:  # without cookie the origin does not help
+        assert http.post(POLLING, content=b"x", headers={"Origin": service.url}).status_code == 401
 
 
 def test_websocket_needs_cookie_and_own_origin(service: ServiceProcess) -> None:
-    own = f"http://127.0.0.1:{service.port}"
-    cookie = f"{COOKIE}={service.token}"
-    with (
-        pytest.raises(InvalidStatus) as refused,
-        connect(ws_url(service), additional_headers={"Origin": own}),
-    ):
-        pass
-    assert refused.value.response.status_code == 403
-    with (
-        pytest.raises(InvalidStatus) as refused,
-        connect(
-            ws_url(service), additional_headers={"Origin": "http://evil.example", "Cookie": cookie}
-        ),
-    ):
-        pass
-    assert refused.value.response.status_code == 403
-    with connect(ws_url(service), additional_headers={"Origin": own, "Cookie": cookie}) as ws:
+    cookie = cookie_of(service)
+    refusals = [
+        {"Origin": service.url},  # no cookie
+        {"Cookie": cookie},  # no origin
+        {"Cookie": cookie, "Origin": "null"},
+        {"Cookie": cookie, "Origin": "http://evil.example"},
+        {"Cookie": cookie, "Origin": f"http://127.0.0.1:{service.port}"},
+        {"Cookie": cookie, "Origin": f"http://localhost:{service.port}"},
+        {"Cookie": f"{COOKIE}=x", "Origin": service.url},
+    ]
+    for headers in refusals:
+        with pytest.raises(InvalidStatus) as refused:
+            service.ws_connect(headers)
+        assert refused.value.response.status_code == 403, headers
+    with service.ws_connect({"Origin": service.url, "Cookie": cookie}) as ws:
         first = ws.recv(timeout=10)
         assert isinstance(first, str) and first.startswith("0{"), first  # engine.io „open“
 
@@ -161,15 +216,7 @@ def test_token_appears_in_no_log_line_but_the_link(service: ServiceProcess) -> N
 
 
 def test_guard_compares_tokens_in_constant_time() -> None:
-    guard = Guard(lambda *a: None, token="abc", port=1)  # type: ignore[arg-type]
+    guard = Guard(lambda *a: None, token="abc", port=1, hostname="abc123.localhost")  # type: ignore[arg-type]
     assert guard.token_ok("abc") and not guard.token_ok("abd") and not guard.token_ok(None)
-    assert guard.hosts == {"127.0.0.1:1", "localhost:1"}
-    assert guard.origins == {"http://127.0.0.1:1", "http://localhost:1"}
-
-
-def test_service_json_holds_the_token_and_the_page_never_shows_it(service: ServiceProcess) -> None:
-    info = json.loads((service.arr_home / "service.json").read_text())
-    assert info["token"] == service.token and info["port"] == service.port
-    with client(service) as http:
-        assert service.token not in http.get("/").text
-    assert re.fullmatch(r"[A-Za-z0-9_-]{40,}", service.token)
+    assert guard.host == "abc123.localhost:1" and guard.origin == "http://abc123.localhost:1"
+    assert guard.loopback_hosts == {"127.0.0.1:1", "localhost:1"}

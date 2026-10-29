@@ -22,6 +22,7 @@ from arr.room.store import RoomStore
 from arr.runs.inspect import RunLock
 from arr.runs.manager import set_run_status
 from arr.runs.prepare import prepare_run
+from arr.service.guard import COOKIE
 from arr.service.state import ServiceInfo
 
 TESTS_DIR = Path(__file__).parent
@@ -56,7 +57,12 @@ def write_json(path: Path, data: Any) -> Path:
 
 
 class ServiceProcess:
-    """`arr serve` as a child process on a free port, with FakeBackend builders."""
+    """`arr serve` as a child process on a free port, with FakeBackend builders.
+
+    The service answers only under its own hostname `<random>.localhost` (W3-01.1 M1).
+    Clients of the tests connect to `127.0.0.1` and send that name in `Host`, so no test
+    depends on the resolver of the machine (`client`, `ws_connect`).
+    """
 
     def __init__(self, process: subprocess.Popen[str], port: int, arr_home: Path, log: Path):
         self.process = process
@@ -66,13 +72,53 @@ class ServiceProcess:
         self.info: ServiceInfo | None = None
 
     @property
+    def hostname(self) -> str:
+        assert self.info is not None
+        return self.info.host
+
+    @property
+    def host(self) -> str:
+        """`<hostname>:<port>`, the only `Host` the service answers."""
+        return f"{self.hostname}:{self.port}"
+
+    @property
     def url(self) -> str:
+        """The service's own URL (resolves through `*.localhost`)."""
+        return f"http://{self.host}"
+
+    @property
+    def loopback_url(self) -> str:
+        """The address the tests connect to, with `Host` set separately."""
         return f"http://127.0.0.1:{self.port}"
 
     @property
     def token(self) -> str:
         assert self.info is not None
         return self.info.token
+
+    def client(self, *, cookie: bool = False, host: str | None = None, **kwargs: Any) -> Any:
+        """An `httpx.Client` to the loopback address with the service's `Host` (or `host`)."""
+        import httpx
+
+        headers = {"Host": host or self.host, **kwargs.pop("headers", {})}
+        cookies = {COOKIE: self.token} if cookie else None
+        return httpx.Client(
+            base_url=self.loopback_url,
+            headers=headers,
+            cookies=cookies,
+            follow_redirects=False,
+            timeout=10.0,
+            **kwargs,
+        )
+
+    def ws_connect(self, headers: Mapping[str, str] | None = None, host: str | None = None) -> Any:
+        """Open the Socket.IO websocket over a socket to the loopback address; the handshake
+        carries the service's hostname (or `host`) in `Host`."""
+        from websockets.sync.client import connect
+
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        uri = f"ws://{host or self.host}/_nicegui_ws/socket.io/?EIO=4&transport=websocket"
+        return connect(uri, sock=sock, additional_headers=dict(headers or {}), open_timeout=10)
 
     def output(self) -> str:
         try:

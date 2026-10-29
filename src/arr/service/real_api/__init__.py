@@ -3,15 +3,15 @@ docs/04-service-gui-und-schnittstellen.md §3, docs/02-workfolder-und-runs.md §
 
 It is assembled from areas, one class per module, each the border of a later order:
 
-- `runs` (`runs.py`, W3-01; W3-02 ändert): list_runs, get_run, run_action (pause, resume,
+- `runs` (`runs.py`, W3-01; W3-02 changes it): list_runs, get_run, run_action (pause, resume,
   stop), list_channels, get_messages, post_message, list_agents, get_transcript, get_results,
   get_log, get_changes, resolve_run, start_run.
-- `live` (`live.py`, W3-01): subscribe, now; startet den Beobachter (`arr.service.watcher`).
+- `live` (`live.py`, W3-01): subscribe, now; starts the watcher (`arr.service.watcher`).
 - `workfolder` (`workfolder.py`, W3-01): get_workfolder, get_counts, list_warnings.
-- `catalog` (`catalog.py`, W3-01, nur lesen): list_projects, get_project, list_skills,
+- `catalog` (`catalog.py`, W3-01, read only): list_projects, get_project, list_skills,
   get_skill, get_skill_file, list_profiles.
 - `approvals` (`approvals.py`, W3-03): list_approvals, get_approval, decide_approval,
-  revoke_approval; dazu der `decider` der Runs des Service.
+  revoke_approval; plus the `decider` of the runs of the service.
 - `setup` (`setup.py`, W3-04): get_setup_state, select_workfolder, create_project,
   setup_project, get/update_app_settings, get/update_workfolder_settings, get/update_mandate,
   list/delete_fixed_rule, test_toolchain.

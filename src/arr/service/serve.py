@@ -1,12 +1,14 @@
 """`arr serve`: the local service with the GUI on real data (W3-01 §3.1, docs/04 §1).
 
-One process runs NiceGUI (and so FastAPI and uvicorn) on `127.0.0.1` with `RealApi` on the
-workfolder. The whole app sits behind the `Guard` (token cookie, host and origin checks,
+One process runs NiceGUI (and so FastAPI and uvicorn) on the loopback address with `RealApi`
+on the workfolder. It answers only under its own fresh hostname `<random>.localhost`
+(W3-01.1 M1); the whole app sits behind the `Guard` (token cookie, host and origin checks,
 `arr.service.guard`). `~/.arr/service.json` (0600) tells where the service listens; a second
-`arr serve` finds a running service (process alive, port answers as arr), opens it in the
-browser and ends. Ctrl-C or SIGTERM stops every run of the service with finalizer and secret
-scan, then the process ends; a second signal aborts hard like `arr run` (status
-`interrupted`). At start, runs left active by a crash become `interrupted` (`RealApi.start`).
+`arr serve` finds a running service (process alive, port answers as arr under that name),
+opens it in the browser and ends. Ctrl-C or SIGTERM stops every run of the service with
+finalizer and secret scan, then the process ends; a second signal aborts hard like `arr run`
+(status `interrupted`). At start, runs left active by a crash become `interrupted`
+(`RealApi.start`).
 
 This module knows no Typer: `arr.cli` calls `serve()`.
 """
@@ -32,7 +34,7 @@ from arr.runs.launch import EXIT_STOPPED, REPEAT_WINDOW_S, find_workfolder
 from arr.runs.manager import set_run_status
 from arr.runs.orchestrator import OrchestratorLog
 from arr.runs.prepare import load_run_meta
-from arr.service.guard import SERVICE_HEADER, Guard, new_token
+from arr.service.guard import SERVICE_HEADER, Guard, new_hostname, new_token, service_host
 from arr.service.real_api import RealApi
 from arr.service.state import (
     ServiceInfo,
@@ -84,16 +86,21 @@ def port_free(port: int, host: str = "127.0.0.1") -> bool:
     return True
 
 
-def answers_as_arr(port: int, timeout_s: float = 1.0) -> bool:
-    """True if an arr service answers on the port (its refusal page carries a header)."""
+def answers_as_arr(port: int, hostname: str, timeout_s: float = 1.0) -> bool:
+    """True if the arr service with this hostname answers on the port.
+
+    Asked without a cookie under its own `Host`, a real arr always answers 401 with the
+    header `x-arr-service` (W3-01.1 G3). Any other answer, e.g. 200 from some other program
+    on the port or 403 from an arr with another name, means „not this service“.
+    """
     try:
         con = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout_s)
         try:
-            con.request("GET", "/", headers={"Host": f"127.0.0.1:{port}"})
+            con.request("GET", "/", headers={"Host": service_host(hostname, port)})
             response = con.getresponse()
-            return response.getheader(SERVICE_HEADER.decode("ascii")) is not None or (
-                200 <= response.status < 400
-            )
+            response.read()
+            marked = response.getheader(SERVICE_HEADER.decode("ascii")) is not None
+            return marked and response.status == 401
         finally:
             con.close()
     except OSError:
@@ -101,11 +108,15 @@ def answers_as_arr(port: int, timeout_s: float = 1.0) -> bool:
 
 
 def running_service() -> ServiceInfo | None:
-    """The service of `service.json`, if its process lives and its port answers as arr."""
+    """The service of `service.json`, if its process lives and its port answers as that arr.
+
+    A stale file (process gone, or another program on the port) counts as no service, so the
+    token link never goes to anything but arr.
+    """
     info = read_service_info()
     if info is None or not info.alive() or info.pid == os.getpid():
         return None
-    if not answers_as_arr(info.port):
+    if not answers_as_arr(info.port, info.host):
         return None
     return info
 
@@ -295,8 +306,9 @@ def serve(
             "Port oder beende das Programm, das den Port nutzt."
         )
     token = new_token()
-    api = RealApi(root, base_url=f"http://127.0.0.1:{port}")
-    info = ServiceInfo(port=port, token=token, pid=os.getpid(), workfolder=str(root))
+    hostname = new_hostname()
+    info = ServiceInfo(host=hostname, port=port, token=token, pid=os.getpid(), workfolder=str(root))
+    api = RealApi(root, base_url=info.url)
     runtime = ServiceRuntime(api, info, open_browser=open_browser, report=report)
 
     from nicegui import app, ui
@@ -304,7 +316,7 @@ def serve(
     from arr.service.gui.app import setup
 
     setup(api)
-    app.add_middleware(Guard, token=token, port=port)
+    app.add_middleware(Guard, token=token, port=port, hostname=hostname)
     app.on_startup(runtime.startup)
     app.on_shutdown(runtime.shutdown)
     report(f"arr startet auf {info.url} mit Workfolder {root}. Beenden mit Strg+C.")
