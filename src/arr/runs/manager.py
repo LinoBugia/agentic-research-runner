@@ -52,6 +52,7 @@ from arr.permissions.policy import (
 from arr.room.store import RoomStore
 from arr.runs.context import RunContext
 from arr.runs.eventlog import EventLogger
+from arr.runs.inspect import run_lock_held
 from arr.runs.orchestrator import PLAN_STAGE, LimitKind, Orchestrator, OrchestratorLog, StopReason
 from arr.runs.pacing import PacingSettings
 from arr.runs.prepare import (
@@ -132,6 +133,8 @@ def mark_interrupted_runs(workfolder: str | Path) -> list[str]:
     """Set runs left `preparing`, `running`, `paused` or `finalizing` to `interrupted`.
 
     These runs were active when arr went down; a crash during the preparation also counts.
+    A run whose `run.lock` another process holds is still being executed (by another
+    `arr run`, W2-05.1 M1) and is left alone.
 
     Called when arr starts, before any run of this process. Logs stay as they are and remain
     readable; returns the IDs of the runs that were changed.
@@ -145,7 +148,7 @@ def mark_interrupted_runs(workfolder: str | Path) -> list[str]:
         except (OSError, ValueError):
             logger.warning("meta.json in %s ist nicht lesbar", run_dir)
             continue
-        if meta.status not in INTERRUPTIBLE_STATUSES:
+        if meta.status not in INTERRUPTIBLE_STATUSES or run_lock_held(run_dir):
             continue
         set_run_status(run_dir, RunStatus.INTERRUPTED)
         OrchestratorLog(run_dir).write(

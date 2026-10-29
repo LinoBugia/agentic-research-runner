@@ -1,15 +1,18 @@
 """Secret scan over a run folder (M1 criterion 5, docs/01 §8).
 
-`scan_run_dir` searches every text file of a run folder for (a) the secret values of the auth
-profiles the run used (`profile_secrets`: the keychain secret of a Claude or API-key profile,
-the tokens in the login folder of a Codex profile; held in memory only) and (b) the patterns of
+`scan_run_dir` searches the run folder for (a) the secret values of the auth profiles the run
+used (`profile_secrets`: the keychain secret of a Claude or API-key profile, the tokens in the
+login folder of a Codex profile; held in memory only) and (b) the patterns of
 `arr.permissions.policy.redact` (API keys, private keys, `KEY=…` assignments, auth headers,
 credentials in URLs). A finding names file, line and kind, never the value. `arr run` runs the
 scan after the finalizer and records the result as `secret_scan` in `orchestrator.jsonl`;
 `arr runs scan <id>` repeats it.
 
-Skipped: the run venv (`.venv/`, installed software), caches and the Codex homes below `tmp/`,
-symlinks and binary files (NUL byte in the first 8 KB).
+The profile values are searched as bytes (UTF-8, also UTF-16) in **every** regular file, binary
+files, `tmp/home/`, `tmp/cache/` and `.venv/` included: these are the places agents can write to
+besides their work folder (W2-05.1 M2). The patterns are searched line by line in text files
+(no NUL byte in the first 8 KB) outside `.venv/`, where installed software would give false
+alarms. Symlinks are never followed.
 """
 
 import json
@@ -32,8 +35,8 @@ from arr.permissions.policy import (
 from arr.runs.orchestrator import OrchestratorLog
 
 __all__ = [
+    "PATTERN_SKIP",
     "SCAN_KIND",
-    "SKIP_PREFIXES",
     "Finding",
     "ScanReport",
     "format_report",
@@ -45,13 +48,17 @@ __all__ = [
 SCAN_KIND = "secret_scan"
 """Kind of the entry in `orchestrator.jsonl` (`data`: `ScanReport.to_data()`)."""
 
-SKIP_PREFIXES = (".venv/", "tmp/cache/", "tmp/home/")
-"""Folders of the run that are not scanned (POSIX paths relative to the run folder)."""
+PATTERN_SKIP = (".venv/",)
+"""Folders (POSIX paths relative to the run) whose files get no pattern scan: installed
+software (pip's own `KEY=…` lines, `https://user:pw@` examples). Profile values are searched
+there too."""
 
 MIN_SECRET_LENGTH = 8
 """Shorter profile secrets are not searched for (too many chance hits)."""
 
 _SNIFF = 8192
+_CHUNK = 1 << 20
+_ENCODINGS = ("utf-8", "utf-16-le", "utf-16-be")
 _TOKEN_KEY_RE = re.compile(r"(?i)token|key|secret")
 
 PATTERN_KINDS = (
@@ -163,46 +170,88 @@ def profile_secrets(
 
 
 def _skipped(rel: str, skip: Sequence[str]) -> bool:
-    return any(rel == prefix.rstrip("/") or rel.startswith(prefix) for prefix in skip)
+    return any(rel.startswith(prefix) for prefix in skip)
 
 
-def _kinds(line: str, values: Sequence[tuple[str, str]]) -> list[str]:
-    kinds = [f"Wert von {label}" for label, value in values if value in line]
-    kinds += [kind for kind, pattern in _NAMED_PATTERNS if pattern.search(line)]
-    return kinds
+def _needles(values: Sequence[tuple[str, str]]) -> list[tuple[str, bytes]]:
+    """`(label, bytes)` of every value in every encoding, without duplicates."""
+    needles: dict[bytes, str] = {}
+    for label, value in values:
+        for encoding in _ENCODINGS:
+            needles.setdefault(value.encode(encoding), label)
+    return [(label, needle) for needle, label in needles.items()]
+
+
+def _value_hits(handle: Any, needles: Sequence[tuple[str, bytes]]) -> set[tuple[int, str]]:
+    """`(line, label)` of every needle found in the file, read in chunks of `_CHUNK` bytes.
+
+    The last `longest needle - 1` bytes of a chunk are kept in front of the next one, so a
+    value across the boundary is found; a hit that ends inside that carry was counted before.
+    """
+    if not needles:
+        return set()
+    hits: set[tuple[int, str]] = set()
+    keep = max(len(needle) for _, needle in needles) - 1
+    carry = b""
+    base_line = 1  # line number of the first byte of `carry`
+    while chunk := handle.read(_CHUNK):
+        buffer = carry + chunk
+        for label, needle in needles:
+            start = 0
+            while (index := buffer.find(needle, start)) != -1:
+                if index + len(needle) > len(carry):
+                    hits.add((base_line + buffer.count(b"\n", 0, index), label))
+                start = index + 1
+        cut = max(len(buffer) - keep, 0)
+        base_line += buffer.count(b"\n", 0, cut)
+        carry = buffer[cut:]
+    return hits
+
+
+def _pattern_hits(handle: Any) -> list[tuple[int, str]]:
+    """`(line, kind)` of the patterns in a text file; empty for a binary file."""
+    if b"\0" in handle.read(_SNIFF):
+        return []
+    handle.seek(0)
+    hits = []
+    for number, raw in enumerate(handle, start=1):
+        line = raw.decode("utf-8", errors="replace")
+        hits += [(number, kind) for kind, pattern in _NAMED_PATTERNS if pattern.search(line)]
+    return hits
 
 
 def scan_run_dir(
     run_dir: str | Path,
     secrets: Mapping[str, str] | None = None,
     *,
-    skip: Sequence[str] = SKIP_PREFIXES,
+    pattern_skip: Sequence[str] = PATTERN_SKIP,
 ) -> ScanReport:
-    """Scan every text file below `run_dir` for the secret values and the patterns."""
+    """Scan every regular file below `run_dir`: the profile values everywhere, the patterns in
+    text files outside `pattern_skip` (see the module docstring)."""
     root = Path(run_dir)
     values = [(k, v) for k, v in (secrets or {}).items() if len(v) >= MIN_SECRET_LENGTH]
+    needles = _needles(values)
     report = ScanReport(secrets=len(values))
     for folder, dirs, files in os.walk(root):
         rel_folder = Path(folder).relative_to(root).as_posix()
         prefix = "" if rel_folder == "." else rel_folder + "/"
-        dirs[:] = sorted(d for d in dirs if not _skipped(prefix + d, skip))
+        dirs.sort()
         for name in sorted(files):
             path = Path(folder) / name
             rel = prefix + name
-            if path.is_symlink() or _skipped(rel, skip):
+            if path.is_symlink():
                 continue
             try:
                 with path.open("rb") as handle:
-                    if b"\0" in handle.read(_SNIFF):
-                        continue
-                    handle.seek(0)
                     report.files += 1
-                    for number, raw in enumerate(handle, start=1):
-                        line = raw.decode("utf-8", errors="replace")
-                        for kind in _kinds(line, values):
-                            report.findings.append(Finding(rel, number, kind))
+                    found = [(n, f"Wert von {label}") for n, label in _value_hits(handle, needles)]
+                    if not _skipped(rel, pattern_skip):
+                        handle.seek(0)
+                        found += _pattern_hits(handle)
             except OSError:
                 report.skipped.append(rel)
+                continue
+            report.findings += [Finding(rel, number, kind) for number, kind in sorted(found)]
     return report
 
 

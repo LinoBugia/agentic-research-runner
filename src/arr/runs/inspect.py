@@ -2,7 +2,8 @@
 
 Everything comes from the files of docs/02 §4: `meta.json`, `orchestrator.jsonl`,
 `approvals.jsonl`, `usage.json`, plus `stop.request`, the stop request of `arr runs stop`
-(`arr.runs.launch`).
+(`arr.runs.launch`), and `run.lock`, the lock an `arr run` process holds while it executes
+the run (`run_lock_held`).
 """
 
 import re
@@ -19,7 +20,14 @@ from arr.runs.orchestrator import OrchestratorLog
 from arr.runs.prepare import RunMeta, load_run_meta
 from arr.usage import USAGE_FILE, RunUsage
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows: no flock, no run is ever seen as held
+    fcntl = None  # type: ignore[assignment]
+
 __all__ = [
+    "LOCKS_AVAILABLE",
+    "RUN_LOCK",
     "STATUS_TEXT",
     "STOP_REQUEST",
     "RunStatusView",
@@ -31,12 +39,48 @@ __all__ = [
     "list_runs",
     "open_approvals",
     "run_folder",
+    "run_lock_held",
     "run_reason",
     "run_status",
 ]
 
 STOP_REQUEST = "stop.request"
 """File in the run folder that asks the running `arr run` process to stop (docs/02 §4)."""
+
+RUN_LOCK = "run.lock"
+"""File in the run folder on which the executing `arr run` process holds an `fcntl.flock`
+(W2-05.1 M1). The lock falls with the process, also after `os._exit` or a crash; the file
+itself stays. A run in an active status without the lock is one whose process is gone."""
+
+LOCKS_AVAILABLE = fcntl is not None
+"""False on platforms without `fcntl` (Windows): then nothing is locked or checked."""
+
+ACTIVE_STATUSES = frozenset(
+    {RunStatus.PREPARING, RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.FINALIZING}
+)
+"""Statuses in which some process should be executing the run."""
+
+
+def run_lock_held(run_dir: str | Path) -> bool:
+    """True if a process (or another file handle) holds the run's lock right now.
+
+    Tries a non-blocking lock on a fresh handle and releases it at once; a missing lock file
+    counts as not held. Without `fcntl` always False.
+    """
+    if fcntl is None:
+        return False
+    try:
+        handle = (Path(run_dir) / RUN_LOCK).open("rb")
+    except OSError:
+        return False
+    with handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return False
+
 
 STATUS_TEXT = {
     RunStatus.DRAFT: "Entwurf",
@@ -130,6 +174,7 @@ class RunStatusView:
     usage: RunUsage | None = None
     open_approvals: list[dict[str, Any]] = field(default_factory=list)
     stop_requested: bool = False
+    locked: bool = False
     secret_scan: dict[str, Any] | None = None
 
 
@@ -224,6 +269,7 @@ def run_status(run_dir: str | Path) -> RunStatusView:
             view.usage = None
     view.open_approvals = open_approvals(_approval_entries(folder))
     view.stop_requested = (folder / STOP_REQUEST).exists()
+    view.locked = run_lock_held(folder)
     return view
 
 
@@ -360,6 +406,14 @@ def format_status(view: RunStatusView, *, now: float | None = None) -> str:
         lines.append("Offene Freigaben: keine")
     if view.stop_requested:
         lines.append("Stopp angefordert: ja (stop.request liegt vor)")
+    if meta.status in ACTIVE_STATUSES and LOCKS_AVAILABLE:
+        if view.locked:
+            lines.append("Prozess:   ein arr-run-Prozess führt den Run aus (hält run.lock)")
+        else:
+            lines.append(
+                "Prozess:   keiner hält run.lock – der arr-run-Prozess ist wohl abgestürzt; "
+                "beim nächsten „arr run“ gilt der Run als unterbrochen (interrupted)"
+            )
     if view.secret_scan is not None:
         scan = view.secret_scan
         state = "sauber" if scan.get("clean") else f"{len(scan.get('findings') or [])} Funde"

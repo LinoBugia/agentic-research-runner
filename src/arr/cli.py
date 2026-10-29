@@ -202,7 +202,8 @@ def runs_status(run_id: RunIdArgument, workfolder: WorkfolderOption = None) -> N
 
 @runs_app.command("stop")
 def runs_stop(run_id: RunIdArgument, workfolder: WorkfolderOption = None) -> None:
-    """Laufenden Run stoppen: legt eine Stopp-Anforderung ab, die „arr run“ ausführt."""
+    """Laufenden Run stoppen: legt eine Stopp-Anforderung ab, die der ausführende „arr run“-Prozess
+    innerhalb weniger Sekunden umsetzt (laufende Turns unterbrochen, danach der Finalizer)."""
     from arr.runs.launch import request_stop
 
     folder = _run_folder(workfolder, run_id)
@@ -212,8 +213,8 @@ def runs_stop(run_id: RunIdArgument, workfolder: WorkfolderOption = None) -> Non
         _fail(str(exc))
     if new:
         typer.echo(
-            f"Stopp angefordert für {run_id}. Der laufende arr-run-Prozess stoppt den Run "
-            "innerhalb weniger Sekunden; der Finalizer läuft danach."
+            f"Stopp angefordert für {run_id}. Er wirkt, solange ein arr-run-Prozess den Run "
+            "ausführt: der stoppt ihn innerhalb weniger Sekunden, danach läuft der Finalizer."
         )
     else:
         typer.echo(f"Für {run_id} liegt schon eine Stopp-Anforderung vor.")

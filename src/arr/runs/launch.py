@@ -3,7 +3,9 @@
 `plan_launch` finds the workfolder (`--workfolder`, else upwards from the current folder to
 the `arr.yaml`), loads `run.yaml` with its group skill and the `--param` overrides, resolves
 the run and checks the topology, all before anything is created. `run_launch` then marks runs
-left active by a crash as `interrupted`, builds the `RunManager` with the real backends
+left active by a crash as `interrupted` (never a run another process holds the lock of),
+reserves the run folder and takes its lock (`RunLock` on `run.lock`, held until the end
+including the secret scan), builds the `RunManager` with the real backends
 (`ClaudeBackend`/`CodexBackend` per provider, auth profile from `profiles.yaml`, finalizer
 always set), runs it, scans the run folder for secrets and reports progress through callbacks.
 
@@ -17,16 +19,19 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import signal
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ruamel.yaml import YAML, YAMLError
 
+from arr import __version__
 from arr.auth import SecretReader
 from arr.backends.base import AgentBackend
 from arr.errors import ArrError, ConfigError
@@ -46,15 +51,23 @@ from arr.permissions.inbox import ApprovalDecider
 from arr.resolve import load_group_spec, load_run_input, load_yaml_model, resolve_run
 from arr.runs.finalize import finalize_run, last_turn_error
 from arr.runs.inspect import (
+    LOCKS_AVAILABLE,
+    RUN_LOCK,
     STATUS_TEXT,
     STOP_REQUEST,
     TURN_TEXT,
     describe_checkpoint,
+    run_lock_held,
     run_reason,
 )
 from arr.runs.manager import Finalizer, RunManager, mark_interrupted_runs, set_run_status
 from arr.runs.orchestrator import ORCHESTRATOR_LOG, OrchestratorLog
-from arr.runs.prepare import PreparedAgent, load_run_meta
+from arr.runs.prepare import PreparedAgent, RunMeta, load_run_meta, new_run_id
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows: no flock
+    fcntl = None  # type: ignore[assignment]
 from arr.runs.secret_scan import (
     SCAN_KIND,
     ScanReport,
@@ -79,10 +92,12 @@ __all__ = [
     "EXIT_OK",
     "EXIT_STOPPED",
     "PROFILES_FILE",
+    "REPEAT_WINDOW_S",
     "STOP_REQUEST",
     "Launch",
     "LiveFactory",
     "Report",
+    "RunLock",
     "RunResult",
     "StopControl",
     "build_manager",
@@ -96,6 +111,7 @@ __all__ = [
     "parse_params",
     "plan_launch",
     "request_stop",
+    "reserve_run",
     "run_launch",
     "watch_stop_request",
 ]
@@ -103,6 +119,11 @@ __all__ = [
 PROFILES_FILE = "profiles.yaml"
 EXIT_OK, EXIT_FAILED, EXIT_STOPPED = 0, 1, 130
 """Exit codes of `arr run`: `done`, anything else, stopped by the user (like SIGINT)."""
+
+REPEAT_WINDOW_S = 1.0
+"""A second SIGINT/SIGTERM within this time counts as the same Ctrl-C. A real Ctrl-C goes to
+the whole process group; `uv run` survives it, waits for arr and forwards the signal to arr
+about 0.2 s after the kernel already delivered it (W2-05.1, point 7)."""
 
 Report = Callable[[str], None]
 """Receives one German line of progress; `arr run` prints it."""
@@ -361,6 +382,93 @@ def build_manager(
 
 
 # --------------------------------------------------------------------------------------------
+# Run folder: reservation and lock (W2-05.1 M1)
+# --------------------------------------------------------------------------------------------
+
+
+class RunLock:
+    """Owner mark of the run this process executes: `fcntl.flock` on `<run>/run.lock`.
+
+    Taken right after the run folder is reserved and held until `run_launch` returns, the
+    secret scan included. Other processes see it with `run_lock_held`: a second `arr run`
+    leaves the run alone when it marks crashed runs, and `arr runs stop` tells when no process
+    executes a run any more. The lock falls with the process (also after `os._exit` and a
+    crash); the file stays. Without `fcntl` (Windows) nothing is locked.
+    """
+
+    def __init__(self, run_dir: str | Path) -> None:
+        self.path = Path(run_dir) / RUN_LOCK
+        self._handle: Any = None
+
+    @property
+    def held(self) -> bool:
+        return self._handle is not None
+
+    def acquire(self) -> None:
+        """Take the lock; `ArrError` if another process holds it."""
+        if fcntl is None or self._handle is not None:
+            return
+        handle = self.path.open("ab")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            raise ArrError(
+                f"Den Run {self.path.parent.name} führt schon ein anderer arr-run-Prozess aus."
+            ) from None
+        self._handle = handle
+
+    def release(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        with contextlib.suppress(OSError):
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
+def reserve_run(launch: Launch, *, now: datetime | None = None) -> Path:
+    """Create the run folder with a `meta.json` in status `queued` and return it.
+
+    `prepare_run(run_id=…)` takes such a reserved folder over (docs/02 §7, W2-03). Reserving
+    first lets `run_launch` hold the lock before the run ever is `preparing`, so no other
+    process can take it for a crashed run in between.
+    """
+    moment = now or datetime.now()
+    runs = launch.workfolder / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    resolved = launch.resolved
+    for _ in range(50):
+        run_id = new_run_id(resolved.project, resolved.skill, now=moment)
+        folder = runs / run_id
+        try:
+            folder.mkdir()
+        except FileExistsError:
+            continue
+        meta = RunMeta(
+            run_id=run_id,
+            status=RunStatus.QUEUED,
+            starter=Starter.CLI,
+            project=resolved.project,
+            skill=resolved.skill,
+            name=resolved.name,
+            created=moment.timestamp(),
+            arr_version=__version__,
+        )
+        (folder / "meta.json").write_text(meta.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        return folder
+    raise ArrError("Es konnte keine freie Run-ID gefunden werden. Versuche es noch einmal.")
+
+
+def _discard_unprepared(folder: Path) -> None:
+    """Remove a reserved folder that `prepare_run` never filled (a configuration error): a
+    run that could not be prepared leaves no folder behind, as before the reservation."""
+    with contextlib.suppress(OSError):
+        if {p.name for p in folder.iterdir()} <= {"meta.json", RUN_LOCK}:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------------------------
 # Stopping: Ctrl-C and stop.request
 # --------------------------------------------------------------------------------------------
 
@@ -369,9 +477,12 @@ class StopControl:
     """Ctrl-C of `arr run`: the first stops the run, the second aborts hard (docs/02 §7).
 
     The first interrupt calls `RunManager.stop()`: approvals are cancelled, turns interrupted
-    and the finalizer runs, the run ends `stopped`. A second one, e.g. while the finalizer
-    runs, ends the process at once with `EXIT_STOPPED`: the run folder stays as it is and
-    `meta.json` says `interrupted` (as after a crash). `hard_exit` is `os._exit` outside tests.
+    and the finalizer runs, the run ends `stopped`. In `finalizing` it only says so (the
+    finalizer runs to its end), after the end it says the run is over. A second one, e.g.
+    while the finalizer runs, ends the process at once with `EXIT_STOPPED`: the run folder
+    stays as it is and `meta.json` says `interrupted` (as after a crash). Signals within
+    `REPEAT_WINDOW_S` of the previous one are the same Ctrl-C (forwarded by `uv run`) and
+    are ignored. `hard_exit` is `os._exit` outside tests, `clock` is `time.monotonic`.
     """
 
     def __init__(
@@ -380,14 +491,23 @@ class StopControl:
         report: Report,
         *,
         hard_exit: Callable[[int], Any] = os._exit,
+        clock: Callable[[], float] = time.monotonic,
+        repeat_window_s: float = REPEAT_WINDOW_S,
     ) -> None:
         self.manager = manager
         self.report = report
         self.hard_exit = hard_exit
+        self.clock = clock
+        self.repeat_window_s = repeat_window_s
         self.interrupts = 0
+        self._last: float | None = None
 
     def on_interrupt(self) -> None:
         """Handle one SIGINT/SIGTERM."""
+        now = self.clock()
+        if self._last is not None and now - self._last < self.repeat_window_s:
+            return  # the same Ctrl-C, delivered twice (process group + uv run)
+        self._last = now
         self.interrupts += 1
         if self.interrupts > 1:
             self.hard_abort()
@@ -396,9 +516,15 @@ class StopControl:
         if status is not None and status.is_final:
             self.report("Der Run ist schon beendet. Noch einmal Strg-C beendet arr sofort.")
             return
+        if status is RunStatus.FINALIZING:
+            self.report(
+                "Strg-C: Der Run wird schon abgeschlossen, der Finalizer läuft zu Ende. "
+                "Noch einmal Strg-C bricht hart ab."
+            )
+            return
         self.report(
             "Strg-C: Der Run wird gestoppt. Laufende Turns werden unterbrochen, danach läuft "
-            "der Finalizer. Noch einmal Strg-C bricht hart ab."
+            "der Finalizer. Noch einmal Strg-C (nach einer Sekunde) bricht hart ab."
         )
         self.manager.stop()
 
@@ -441,17 +567,24 @@ def install_signal_handlers(
 def request_stop(run_dir: str | Path, *, source: str = "cli") -> bool:
     """Put `stop.request` into the run folder (`arr runs stop`); False if it was already there.
 
-    Only for a run in `preparing`, `running` or `paused`; otherwise `ArrError`. The running
-    `arr run` process picks the file up within about a second (`watch_stop_request`) and
-    calls `RunManager.stop()`; no signal goes to another process.
+    Only for a run in `preparing`, `running` or `paused` whose lock a process holds; otherwise
+    `ArrError`. The running `arr run` process picks the file up within about a second
+    (`watch_stop_request`) and calls `RunManager.stop()`; no signal goes to another process.
     """
     folder = Path(run_dir)
     meta = load_run_meta(folder)
+    state = STATUS_TEXT.get(meta.status, meta.status.value)
     if meta.status not in (RunStatus.PREPARING, RunStatus.RUNNING, RunStatus.PAUSED):
-        state = STATUS_TEXT.get(meta.status, meta.status.value)
         raise ArrError(
             f"Der Run {meta.run_id} läuft nicht (Status: {state}, {meta.status.value}). "
             "Stoppen geht nur bei einem aktiven Run."
+        )
+    if LOCKS_AVAILABLE and not run_lock_held(folder):
+        raise ArrError(
+            f"Der Run {meta.run_id} läuft in keinem arr-run-Prozess mehr (Status: {state}, "
+            f"{meta.status.value}, aber niemand hält run.lock); der Prozess ist wohl "
+            "abgestürzt. Beim nächsten „arr run“ im Workfolder gilt der Run als unterbrochen "
+            "(interrupted)."
         )
     request = folder / STOP_REQUEST
     if request.exists():
@@ -463,7 +596,11 @@ def request_stop(run_dir: str | Path, *, source: str = "cli") -> bool:
 async def watch_stop_request(
     manager: RunManager, report: Report, done: asyncio.Event, *, interval_s: float = 1.0
 ) -> None:
-    """Poll `stop.request` in the run folder and stop the run when it appears."""
+    """Poll `stop.request` in the run folder and stop the run when it appears.
+
+    A request that arrives in `finalizing` (or later) is consumed and answered with a line;
+    `RunManager.stop()` would not act any more and the finalizer runs to its end.
+    """
     while not done.is_set():
         prepared = manager.prepared
         if prepared is not None:
@@ -471,8 +608,15 @@ async def watch_stop_request(
             if request.exists():
                 with contextlib.suppress(OSError):
                     request.unlink()
-                report("Stopp-Anforderung erhalten (arr runs stop): Der Run wird gestoppt …")
-                manager.stop()
+                status = manager.status
+                if status is RunStatus.FINALIZING or (status is not None and status.is_final):
+                    report(
+                        "Stopp-Anforderung erhalten (arr runs stop), aber der Run wird schon "
+                        "abgeschlossen; der Finalizer läuft zu Ende."
+                    )
+                else:
+                    report("Stopp-Anforderung erhalten (arr runs stop): Der Run wird gestoppt …")
+                    manager.stop()
                 return
         await asyncio.sleep(interval_s)
 
@@ -695,17 +839,30 @@ async def run_launch(
     secret_reader: SecretReader | None = None,
     **manager_kwargs: Any,
 ) -> RunResult:
-    """Run a planned run to its end: crash recovery, RunManager, watchers, secret scan.
+    """Run a planned run to its end: crash recovery, reservation and lock, RunManager,
+    watchers, secret scan.
 
-    Configuration errors of the preparation are raised (`ArrError`); everything later ends in
-    a final status. With `signals` Ctrl-C goes to a `StopControl` (needs the main thread).
+    Configuration errors of the preparation are raised (`ArrError`, the reserved folder is
+    removed again); everything later ends in a final status. With `signals` Ctrl-C goes to a
+    `StopControl` (needs the main thread) until the secret scan is over, so a Ctrl-C after the
+    end only says „schon beendet“ and the exit code still follows the status.
     """
     for run_id in mark_interrupted_runs(launch.workfolder):
         report(
             f"Run {run_id} war beim letzten Mal noch aktiv und gilt jetzt als unterbrochen "
             "(interrupted)."
         )
-    manager = build_manager(launch, decider=decider, builders=builders, finalizer=finalizer)
+    run_dir = reserve_run(launch)
+    lock = RunLock(run_dir)
+    lock.acquire()
+    manager = build_manager(
+        launch,
+        decider=decider,
+        builders=builders,
+        finalizer=finalizer,
+        run_id=run_dir.name,
+        **manager_kwargs,
+    )
     control = StopControl(manager, report, hard_exit=hard_exit)
     remove = _no_signals
     if signals:
@@ -717,32 +874,40 @@ async def run_launch(
     follower = asyncio.create_task(follow_run(manager, report, done, interval_s=interval_s))
     stopper = asyncio.create_task(watch_stop_request(manager, report, done, interval_s=stop_poll_s))
     try:
-        status = await manager.run()
+        try:
+            status = await manager.run()
+        except BaseException:
+            if manager.prepared is None:  # never prepared: no run folder stays behind
+                lock.release()
+                _discard_unprepared(run_dir)
+            raise
+        finally:
+            done.set()
+            with contextlib.suppress(Exception):
+                await follower
+            stopper.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await stopper
+        run_id = manager.prepared.run_id if manager.prepared else run_dir.name
+        reason = run_reason(load_run_meta(run_dir), OrchestratorLog(run_dir).entries())
+        result = RunResult(run_id, run_dir, status, reason)
+        report("")
+        report(f"Run {run_id} beendet: {STATUS_TEXT.get(status, status.value)} ({status.value}).")
+        report(f"Grund: {reason}")
+        if result.summary_file.is_file():
+            report(f"Zusammenfassung: {result.summary_file}")
+        else:
+            report("Keine Zusammenfassung: output/summary.md fehlt (siehe orchestrator.jsonl).")
+        if scan:
+            profiles = launch.used_profiles()
+            secrets = await asyncio.to_thread(profile_secrets, profiles, secret_reader)
+            result.scan = await asyncio.to_thread(scan_run_dir, run_dir, secrets)
+            record_scan(run_dir, result.scan)
+            report(format_report(result.scan))
+        return result
     finally:
-        done.set()
         remove()
-        with contextlib.suppress(Exception):
-            await follower
-        stopper.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await stopper
-    run_dir = manager.run_dir
-    run_id = manager.prepared.run_id if manager.prepared else run_dir.name
-    reason = run_reason(load_run_meta(run_dir), OrchestratorLog(run_dir).entries())
-    result = RunResult(run_id, run_dir, status, reason)
-    report("")
-    report(f"Run {run_id} beendet: {STATUS_TEXT.get(status, status.value)} ({status.value}).")
-    report(f"Grund: {reason}")
-    if result.summary_file.is_file():
-        report(f"Zusammenfassung: {result.summary_file}")
-    else:
-        report("Keine Zusammenfassung: output/summary.md fehlt (siehe orchestrator.jsonl).")
-    if scan:
-        secrets = await asyncio.to_thread(profile_secrets, launch.used_profiles(), secret_reader)
-        result.scan = await asyncio.to_thread(scan_run_dir, run_dir, secrets)
-        record_scan(run_dir, result.scan)
-        report(format_report(result.scan))
-    return result
+        lock.release()
 
 
 def latest_scan(run_dir: str | Path) -> dict[str, Any] | None:

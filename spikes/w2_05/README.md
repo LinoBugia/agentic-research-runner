@@ -8,6 +8,7 @@
 - `setup_workfolder.py <ziel>` – legt den Test-Workfolder außerhalb des Repos an (`arr init`, `arr.yaml` mit `toolchain.python`, Projekt, Szenario).
 - `check_m1.py <run-ordner>` – prüft maschinell, was sich am Run-Ordner prüfen lässt (Kriterien 1, 2, 5, 6, 7), Tabelle ✅/❌ plus Kennzahlen (Anfragen, Kosten, Dauer).
 - `ask.py <run-ordner> <kanal> <agent> "<frage>"` – stellt während eines Laufs eine Frage als `user` mit `to`, für den Hinweis mitten im Turn bzw. den Posteingang.
+- `killpg_probe.py [room|claude|codex|uv|all]` (W2-05.1, Punkt 7) – Offline-Sonde ohne Modell: welche Kindprozesse eines `arr run` in seiner Prozessgruppe sitzen und was sie bei einem echten Strg-C (`os.killpg`) tun. Ergebnis: Room-Server überleben, die Claude-CLI beendet sich mit Code 0, der Codex-App-Server stirbt (−2), `uv run` wartet weiter und leitet das Signal ≈ 0,2 s später noch einmal an arr weiter.
 
 **Ausführung** (Voraussetzungen: Claude-Login des Macs, ein angemeldetes Codex-Profil, Basis-venv `~/.venvs/mathe` mit `sympy`, `~/.arr/profiles.yaml` mit den Profilen `max` und `chatgpt-w2-02a`):
 

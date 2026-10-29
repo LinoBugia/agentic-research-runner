@@ -1,10 +1,13 @@
 """Secret scan over a run folder (W2-05 A4): planted values and patterns are found and named by
-file, line and kind, never by value; a clean folder is clean; `.venv/` and caches are skipped."""
+file, line and kind, never by value; a clean folder is clean. W2-05.1 M2: profile values are
+found in every regular file (`tmp/home/`, `tmp/cache/`, `.venv/`, binary and UTF-16 files),
+patterns only in text files outside `.venv/`."""
 
 import json
 from pathlib import Path
 
 from arr.models import AuthKind, AuthProfile
+from arr.runs import secret_scan as scan_module
 from arr.runs.orchestrator import OrchestratorLog
 from arr.runs.secret_scan import (
     SCAN_KIND,
@@ -39,8 +42,8 @@ def test_finds_planted_values_and_patterns_without_naming_them(tmp_path: Path) -
     _write(run / "orchestrator.jsonl", f'{{"kind": "x", "data": {{"m": "{ANTHROPIC}"}}}}\n')
     _write(run / "base/notes.md", f"# Notizen\n\nexport GITHUB_TOKEN={GITHUB}\n")
     _write(run / "agents/a/work/run.sh", "curl -u bob:hunter2 https://user:pw@example.org/\n")
-    _write(run / ".venv/lib/site.py", f"KEY = '{ANTHROPIC}'\n")  # installed software: skipped
-    _write(run / "tmp/cache/pip/x.txt", VALUE + "\n")  # cache: skipped
+    _write(run / ".venv/lib/site.py", f"KEY = '{ANTHROPIC}'\n")  # installed software: no patterns
+    _write(run / "tmp/cache/pip/x.txt", VALUE + "\n")  # cache: values are searched (M2)
     _write(run / "tmp/work.txt", "harmlos\n")
     (run / "groupchats").mkdir()
     (run / "groupchats/room.sqlite").write_bytes(b"SQLite format 3\0" + VALUE.encode())  # binary
@@ -50,6 +53,8 @@ def test_finds_planted_values_and_patterns_without_naming_them(tmp_path: Path) -
     found = {(f.file, f.line, f.kind) for f in report.findings}
     assert found == {
         ("agents/a/raw.jsonl", 2, "Wert von Profil „max“"),
+        ("tmp/cache/pip/x.txt", 1, "Wert von Profil „max“"),
+        ("groupchats/room.sqlite", 1, "Wert von Profil „max“"),
         ("orchestrator.jsonl", 1, "anthropic_key"),
         ("orchestrator.jsonl", 1, "openai_key"),  # the generic `sk-` pattern matches as well
         ("base/notes.md", 3, "github_token"),
@@ -57,12 +62,45 @@ def test_finds_planted_values_and_patterns_without_naming_them(tmp_path: Path) -
         ("agents/a/work/run.sh", 1, "url_credentials"),
     }
     assert not report.clean and report.skipped == []
-    assert report.files == 7  # meta, transcript, raw, orchestrator, notes, run.sh, work.txt
+    assert report.files == 10, "every regular file is read"
     text = format_report(report) + json.dumps(report.to_data())
     for secret in (VALUE, ANTHROPIC, GITHUB, "hunter2", "user:pw"):
         assert secret not in text
     assert "agents/a/raw.jsonl:2 – Wert von Profil „max“" in text
-    assert "6 Funde" in text
+    assert "8 Funde" in text
+
+
+def test_w2_05_1_values_are_found_in_every_file_and_patterns_only_in_text_outside_the_venv(
+    tmp_path: Path,
+) -> None:
+    run = _run_dir(tmp_path)
+    _write(run / "tmp/home/prover/.bash_history", f"echo {VALUE} > ~/x\n")  # Codex HOME
+    _write(run / "tmp/cache/pip/log.txt", f"downloaded {VALUE}\n")
+    _write(run / ".venv/lib/python3.12/site-packages/leak.txt", f"x\n{VALUE}\n")  # overlay
+    (run / "groupchats").mkdir()
+    (run / "groupchats/room.sqlite").write_bytes(b"SQLite format 3\0" * 5 + b"\n" + VALUE.encode())
+    (run / "agents/a/work").mkdir()
+    (run / "agents/a/work/notes-utf16.txt").write_text(f"Hinweis\n{VALUE}\n", encoding="utf-16")
+    chunk = scan_module._CHUNK
+    (run / "agents/a/work/big.bin").write_bytes(b"\0" * (chunk - 5) + VALUE.encode() + b"\n")
+    _write(run / ".venv/lib/site.py", f"KEY = '{ANTHROPIC}'\n")  # a pattern in the venv: no
+    _write(run / "tmp/home/prover/.zshrc", f"export GITHUB_TOKEN={GITHUB}\n")  # outside: yes
+
+    report = scan_run_dir(run, {"Profil „max“": VALUE})
+    found = {(f.file, f.line, f.kind) for f in report.findings}
+    value = "Wert von Profil „max“"
+    assert found == {
+        ("tmp/home/prover/.bash_history", 1, value),
+        ("tmp/cache/pip/log.txt", 1, value),
+        (".venv/lib/python3.12/site-packages/leak.txt", 2, value),
+        ("groupchats/room.sqlite", 2, value),
+        ("agents/a/work/notes-utf16.txt", 2, value),
+        ("agents/a/work/big.bin", 1, value),  # across the chunk boundary
+        ("tmp/home/prover/.zshrc", 1, "github_token"),
+        ("tmp/home/prover/.zshrc", 1, "env_assignment"),
+    }
+    assert report.files == 10 and report.skipped == []
+    assert VALUE not in format_report(report) + json.dumps(report.to_data())
 
 
 def test_clean_folder_is_clean_and_symlinks_are_not_followed(tmp_path: Path) -> None:
@@ -70,8 +108,9 @@ def test_clean_folder_is_clean_and_symlinks_are_not_followed(tmp_path: Path) -> 
     outside = tmp_path / "outside.txt"
     outside.write_text(ANTHROPIC + "\n", encoding="utf-8")
     (run / "agents/a/link.txt").symlink_to(outside)
-    report = scan_run_dir(run)
-    assert report.clean and report.files == 2 and report.secrets == 0
+    (run / "agents/a/dir-link").symlink_to(tmp_path, target_is_directory=True)
+    report = scan_run_dir(run, {"Profil „max“": ANTHROPIC})
+    assert report.clean and report.files == 2 and report.secrets == 1
     assert format_report(report).startswith("Secret-Scan: sauber (2 Dateien geprüft")
 
 

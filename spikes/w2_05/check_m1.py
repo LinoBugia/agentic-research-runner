@@ -123,19 +123,41 @@ class M1Folder:
     def events_of_turn(self, agent: str, turn: int) -> list[dict[str, Any]]:
         return [e for e in self.transcripts.get(agent, []) if e["turn"] == turn]
 
-    def answered(self, question: Message) -> Message | None:
+    def answered(self, question: Message) -> tuple[Message, bool] | None:
+        """The answer of the asked agent: first by `reply_to` (exact), else its first later
+        message of kind `answer` in the channel, marked as fallback (W2-05.1 G4)."""
         [agent] = question.to[:1] or [None]
-        for msg in self.messages:
-            if msg.sender != agent or msg.id <= question.id or msg.channel != question.channel:
-                continue
-            if msg.reply_to == question.id or msg.kind is MessageKind.ANSWER:
-                return msg
         later = [
             m
             for m in self.messages
             if m.sender == agent and m.id > question.id and m.channel == question.channel
         ]
-        return later[0] if later else None
+        for msg in later:
+            if msg.reply_to == question.id:
+                return msg, True
+        for msg in later:
+            if msg.kind is MessageKind.ANSWER:
+                return msg, False
+        return None
+
+    @staticmethod
+    def answer_label(found: tuple[Message, bool] | None) -> str:
+        if found is None:
+            return "keine Antwort"
+        msg, exact = found
+        return f"Antwort #{msg.id}" + ("" if exact else " (ohne reply_to)")
+
+    def hint_seq(self, agent: str, turn: int, hint: dict[str, Any]) -> int | None:
+        """`seq` of the transcript's `hint` event that belongs to an orchestrator `hint` entry
+        (same text, nearest time), not just the first hint of the turn (W2-05.1 G4)."""
+        candidates = [
+            e
+            for e in self.events_of_turn(agent, turn)
+            if e["kind"] == "hint" and e["data"].get("text") == hint["data"].get("text")
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda e: abs(e["ts"] - hint["ts"]))["seq"]
 
     def questions(self) -> list[Message]:
         return [m for m in self.messages if m.kind is MessageKind.QUESTION and m.to]
@@ -260,14 +282,14 @@ class M1Folder:
         for q in self.questions():
             [agent] = q.to[:1]
             turn = self.turn_at(agent, q.ts)
-            answer = self.answered(q)
+            found = self.answered(q)
             if turn is None and not waiting_ok:
-                waiting_detail = f"#{q.id} von {q.sender} an {agent} (wartend)" + (
-                    f" → Antwort #{answer.id} in Turn {self.turn_at(agent, answer.ts)}"
-                    if answer
-                    else " → keine Antwort"
+                waiting_detail = f"#{q.id} von {q.sender} an {agent} (wartend) → " + (
+                    f"{self.answer_label(found)} in Turn {self.turn_at(agent, found[0].ts)}"
+                    if found
+                    else "keine Antwort"
                 )
-                waiting_ok = answer is not None
+                waiting_ok = found is not None
         for hint in hints:
             agent = hint["data"]["agent"]
             ids = hint["data"].get("messages") or []
@@ -285,7 +307,7 @@ class M1Folder:
             if turn is None:
                 continue
             events = self.events_of_turn(agent, turn)
-            hint_seq = next((e["seq"] for e in events if e["kind"] == "hint" and q.id in ids), None)
+            hint_seq = self.hint_seq(agent, turn, hint)
             read_after = [
                 e
                 for e in events
@@ -294,19 +316,19 @@ class M1Folder:
                 and hint_seq is not None
                 and e["seq"] > hint_seq
             ]
-            answer = self.answered(q)
-            same_turn = answer is not None and self.turn_at(agent, answer.ts) == turn
-            if read_after and answer is not None:
+            found = self.answered(q)
+            same_turn = found is not None and self.turn_at(agent, found[0].ts) == turn
+            if read_after and found is not None:
                 followed_ok = True
                 tool = read_after[0]["data"]["name"]
                 when = "im selben Turn" if same_turn else "später"
                 followed_detail = (
-                    f"{agent} liest nach dem Hinweis ({tool}), antwortet #{answer.id} {when}"
+                    f"{agent} liest nach dem Hinweis seq {hint_seq} ({tool}), "
+                    f"{self.answer_label(found)} {when}"
                 )
                 break
-            read = "gelesen" if read_after else "nicht gelesen"
-            answered = "beantwortet" if answer else "keine Antwort"
-            followed_detail = f"{agent}: {read}, {answered}"
+            read = f"gelesen nach seq {hint_seq}" if read_after else "nicht gelesen"
+            followed_detail = f"{agent}: {read}, {self.answer_label(found)}"
         attachment_ok, attachment_detail = False, "kein get_attachment eines anderen Agenten"
         senders = {m.id: m.sender for m in self.messages if m.refs}
         for agent_id, events in self.transcripts.items():
@@ -398,19 +420,16 @@ class M1Folder:
                                 True,
                                 f"{agent_id}: Sandbox/Regel: {content[:90]}",
                             )
-        pip = [
-            e
-            for e in opened
-            if "pip install" in str((e.get("request") or {}).get("command") or "")
-            or "install" in ((e.get("request") or {}).get("categories") or [])
-            or "network" in ((e.get("request") or {}).get("categories") or [])
+        pip = [  # only the category `install` counts (W2-05.1 G4), not every network request
+            e for e in opened if "install" in ((e.get("request") or {}).get("categories") or [])
         ]
-        pip_detail = "keine Anfrage"
+        pip_detail = "keine Anfrage der Kategorie install"
         if pip:
             request = pip[0].get("request") or {}
             what = request.get("command") or request.get("hosts")
             who = f"{request.get('agent_id')} · {request.get('tool')}"
-            pip_detail = f"{who} · {what} → {pip[0].get('item_id')}"
+            pip_detail = f"{who} · {what} ({', '.join(request.get('categories') or [])})"
+            pip_detail += f" → {pip[0].get('item_id')}"
         return [
             Check(
                 "7a", "Python-Skript im Arbeitsordner läuft ohne Freigabe", script_ok, script_detail

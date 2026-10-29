@@ -113,13 +113,13 @@ ENTRIES_MAX = 500
 """From this many entries on, the turn is not started. Seatbelt compiles the profile for every
 command: measured ~0.6 s at 250, ~2.2 s at 500 entries; around 1000 `sandbox-exec` fails."""
 
-SEATBELT_MAX_BYTES = 65535
-"""Seatbelt refuses a profile above this size with a raw error."""
-
 PROFILE_MAX_BYTES = 40_000
-"""Upper bound for the TOML text of the `filesystem` map. Codex turns every entry into several
-Seatbelt rules, so the generated profile is larger than the map; this bound keeps it below
-`SEATBELT_MAX_BYTES` and gives the German message instead of the raw Seatbelt error (W2-05)."""
+"""Cautious upper bound for the TOML text of the `filesystem` map (W2-05, W2-05.1 G3).
+
+Not a limit of the sandbox: the review of W2-05 ran maps of 47 KB to 205 KB (and 1203 short
+entries, 88 KB) through `codex sandbox` without an error. The bound keeps every command fast
+(Seatbelt compiles the profile for each one) and fails with the German message long before the
+`Argument list too long` that W2-02 saw at ≈ 2000 long entries."""
 
 _GLOB_CHARS = frozenset("*?[]{}")
 
@@ -354,8 +354,8 @@ def _check_size(count: int, size: int) -> None:
         )
     if size >= PROFILE_MAX_BYTES:
         raise ArrError(
-            f"Die Lese-Sperrliste für Codex ist {size} Bytes groß (Grenze {PROFILE_MAX_BYTES}, "
-            f"die Sandbox erlaubt höchstens {SEATBELT_MAX_BYTES} Bytes je Profil). " + _TOO_MANY
+            f"Die Lese-Sperrliste für Codex ist {size} Bytes groß (Grenze {PROFILE_MAX_BYTES} "
+            "Bytes). " + _TOO_MANY
         )
     if count >= ENTRIES_WARN:
         logger.warning(

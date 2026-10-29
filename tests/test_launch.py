@@ -1,6 +1,8 @@
 """Start service of `arr run` (W2-05 A2, A3, A6) with FakeBackend agents: workfolder lookup,
 `--param`, profiles, `check_topology` before `prepare_run`, backend factory per provider, crash
-recovery, Ctrl-C (call and real signal), `stop.request` and the German progress lines."""
+recovery, Ctrl-C (call and real signal), `stop.request` and the German progress lines.
+W2-05.1: the run lock (M1), signal handlers until after the scan (G1), texts in `finalizing`
+(G2) and the repeated signal of `uv run` (point 7)."""
 
 import asyncio
 import json
@@ -25,6 +27,7 @@ from run_kit import (
 
 from arr.errors import ArrError, ConfigError
 from arr.models import RunStatus
+from arr.runs import launch as launch_module
 from arr.runs.launch import (
     EXIT_FAILED,
     EXIT_OK,
@@ -42,7 +45,19 @@ from arr.runs.launch import (
     request_stop,
     run_launch,
 )
+from arr.runs.manager import mark_interrupted_runs
 from arr.runs.prepare import PreparedRun, load_run_meta
+
+
+class Clock:
+    """A clock for `StopControl` that the test moves."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
 
 SOLO = """\
 version: 1
@@ -241,11 +256,12 @@ async def test_stop_control_first_stops_with_finalizer_second_aborts_hard(
 ) -> None:
     lines: list[str] = []
     exits: list[int] = []
+    clock = Clock()
     launch = plan_launch(write_run(workfolder), cwd=workfolder)
     manager = build_manager(
         launch, decider=None, builders=fake_builders({"a": turns([say("x"), wait(30)])})
     )
-    control = StopControl(manager, lines.append, hard_exit=exits.append)
+    control = StopControl(manager, lines.append, hard_exit=exits.append, clock=clock)
     running = asyncio.create_task(manager.run())
     await eventually(
         lambda: manager.orchestrator is not None and "a" in manager.orchestrator._active
@@ -255,6 +271,7 @@ async def test_stop_control_first_stops_with_finalizer_second_aborts_hard(
     assert await asyncio.wait_for(running, 10) is RunStatus.STOPPED
     assert (manager.run_dir / "output" / "summary.md").is_file(), "finalizer ran"
     assert exits == [] and exit_code(RunStatus.STOPPED) == EXIT_STOPPED
+    clock.now = 2.0
     control.on_interrupt()
     assert exits == [130] and "harter Abbruch" in lines[-1]
     assert load_run_meta(manager.run_dir).status is RunStatus.STOPPED, "a finished run stays"
@@ -269,6 +286,7 @@ async def test_second_interrupt_during_finalizing_aborts_hard(workfolder: Path) 
         seen.append(load_run_meta(prepared.run_dir).status)
         await asyncio.sleep(0.6)
 
+    clock = Clock()
     launch = plan_launch(write_run(workfolder), cwd=workfolder)
     manager = build_manager(
         launch,
@@ -276,13 +294,14 @@ async def test_second_interrupt_during_finalizing_aborts_hard(workfolder: Path) 
         builders=fake_builders({"a": turns([say("x"), wait(30)])}),
         finalizer=slow_finalizer,
     )
-    control = StopControl(manager, lines.append, hard_exit=exits.append)
+    control = StopControl(manager, lines.append, hard_exit=exits.append, clock=clock)
     running = asyncio.create_task(manager.run())
     await eventually(
         lambda: manager.orchestrator is not None and "a" in manager.orchestrator._active
     )
     control.on_interrupt()
     await eventually(lambda: seen == [RunStatus.FINALIZING])
+    clock.now = 2.0
     control.on_interrupt()
     assert exits == [130] and "Zweites Strg-C: harter Abbruch" in lines[-1]
     assert load_run_meta(manager.run_dir).status is RunStatus.INTERRUPTED
@@ -419,3 +438,227 @@ def test_exit_codes() -> None:
     assert exit_code(RunStatus.DONE) == EXIT_OK == 0
     assert exit_code(RunStatus.STOPPED) == EXIT_STOPPED == 130
     assert exit_code(RunStatus.FAILED) == EXIT_FAILED == 1
+
+
+# --------------------------------------------------------------------------------------------
+# W2-05.1: run lock (M1), handlers until after the scan (G1), finalizing (G2), uv's repeat
+# --------------------------------------------------------------------------------------------
+
+
+def stale_run(workfolder: Path, name: str, status: str = "running") -> Path:
+    folder = workfolder / "runs" / name
+    folder.mkdir(parents=True)
+    meta = {
+        "run_id": name,
+        "status": status,
+        "starter": "cli",
+        "project": "demo",
+        "created": 1.0,
+        "arr_version": "0",
+    }
+    (folder / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return folder
+
+
+def held(run_dir: Path) -> bool:
+    """Does some process hold `run.lock`? (Own `flock` probe, independent of arr's code.)"""
+    import fcntl
+
+    with (run_dir / "run.lock").open("rb") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fcntl.flock")
+async def test_w2_05_1_a_run_whose_lock_another_process_holds_is_not_interrupted(
+    workfolder: Path,
+) -> None:
+    import fcntl
+
+    stale = stale_run(workfolder, "20261029-0900_demo_custom_dead")
+    other = (stale / "run.lock").open("ab")  # a second handle behaves like another process
+    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert held(stale)
+    lines: list[str] = []
+    locked_while_running: list[bool] = []
+    launch = plan_launch(write_run(workfolder), cwd=workfolder)
+
+    async def look_while_running() -> None:
+        await eventually(lambda: any(line.startswith("▶ a: Turn 1") for line in lines))
+        [own] = [p for p in (workfolder / "runs").iterdir() if p != stale]
+        locked_while_running.append(held(own))
+
+    looker = asyncio.create_task(look_while_running())
+    result = await run_launch(
+        launch,
+        decider=None,
+        report=lines.append,
+        builders=fake_builders({"a": turns([say("x"), wait(0.5)])}),
+        signals=False,
+        interval_s=0.02,
+    )
+    await looker
+    assert load_run_meta(stale).status is RunStatus.RUNNING, "left to the other process"
+    assert not any("unterbrochen" in line for line in lines)
+    assert locked_while_running == [True], "our own run is locked while it runs"
+    assert result.status is RunStatus.DONE
+    assert (result.run_dir / "run.lock").is_file() and not held(result.run_dir)
+    # the other process is gone: `arr runs stop` says so, the next start marks the run
+    fcntl.flock(other, fcntl.LOCK_UN)
+    other.close()
+    with pytest.raises(ArrError, match="in keinem arr-run-Prozess mehr"):
+        request_stop(stale)
+    assert mark_interrupted_runs(workfolder) == [stale.name]
+    assert load_run_meta(stale).status is RunStatus.INTERRUPTED
+
+
+async def test_w2_05_1_a_run_that_cannot_be_prepared_leaves_no_folder(workfolder: Path) -> None:
+    run_file = write_run(workfolder, SOLO.replace("auth: fake-auth", "auth: niemand"))
+    launch = plan_launch(run_file, cwd=workfolder)  # the profiles are checked by prepare_run
+    with pytest.raises(ArrError, match="niemand"):
+        await run_launch(
+            launch,
+            decider=None,
+            report=no_report,
+            builders=fake_builders({"a": turns([say("x")])}),
+            signals=False,
+        )
+    assert list((workfolder / "runs").iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+async def test_w2_05_1_ctrl_c_during_the_scan_says_finished_and_keeps_the_exit_code(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from arr.runs.secret_scan import scan_run_dir
+
+    lines: list[str] = []
+    handler_during_scan: list[Any] = []
+
+    def slow_scan(run_dir: Path, secrets: Any = None, **kwargs: Any) -> Any:
+        handler_during_scan.append(signal.getsignal(signal.SIGINT))
+        if handler_during_scan[0] is not signal.default_int_handler:  # arr still listens
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.3)
+        return scan_run_dir(run_dir, secrets, **kwargs)
+
+    monkeypatch.setattr(launch_module, "scan_run_dir", slow_scan)
+    launch = plan_launch(write_run(workfolder), cwd=workfolder)
+    result = await run_launch(
+        launch,
+        decider=None,
+        report=lines.append,
+        builders=fake_builders({"a": turns([say("x")])}),
+        hard_exit=lambda code: None,
+        interval_s=0.02,
+    )
+    assert handler_during_scan[0] is not signal.default_int_handler, "removed before the scan"
+    assert "Der Run ist schon beendet. Noch einmal Strg-C beendet arr sofort." in lines
+    assert result.status is RunStatus.DONE and exit_code(result.status) == EXIT_OK
+    assert result.scan is not None and log_entries(result.run_dir, "secret_scan")
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler, "removed afterwards"
+
+
+async def test_w2_05_1_first_ctrl_c_in_finalizing_lets_the_finalizer_finish(
+    workfolder: Path,
+) -> None:
+    gate = asyncio.Event()
+    seen: list[RunStatus] = []
+    lines: list[str] = []
+    exits: list[int] = []
+
+    async def slow_finalizer(prepared: PreparedRun) -> None:
+        seen.append(load_run_meta(prepared.run_dir).status)
+        await gate.wait()
+
+    launch = plan_launch(write_run(workfolder), cwd=workfolder)
+    manager = build_manager(
+        launch,
+        decider=None,
+        builders=fake_builders({"a": turns([say("x")])}),
+        finalizer=slow_finalizer,
+    )
+    control = StopControl(manager, lines.append, hard_exit=exits.append)
+    running = asyncio.create_task(manager.run())
+    await eventually(lambda: seen == [RunStatus.FINALIZING])
+    control.on_interrupt()
+    assert lines[-1] == (
+        "Strg-C: Der Run wird schon abgeschlossen, der Finalizer läuft zu Ende. "
+        "Noch einmal Strg-C bricht hart ab."
+    )
+    gate.set()
+    assert await asyncio.wait_for(running, 10) is RunStatus.DONE
+    assert exits == [] and log_entries(manager.run_dir, "stop") == []
+
+
+async def test_w2_05_1_stop_request_in_finalizing_is_answered_not_executed(
+    workfolder: Path,
+) -> None:
+    gate = asyncio.Event()
+    seen: list[RunStatus] = []
+    lines: list[str] = []
+
+    async def slow_finalizer(prepared: PreparedRun) -> None:
+        seen.append(load_run_meta(prepared.run_dir).status)
+        await gate.wait()
+
+    launch = plan_launch(write_run(workfolder), cwd=workfolder)
+    running = asyncio.create_task(
+        run_launch(
+            launch,
+            decider=None,
+            report=lines.append,
+            builders=fake_builders({"a": turns([say("x")])}),
+            finalizer=slow_finalizer,
+            signals=False,
+            interval_s=0.02,
+            stop_poll_s=0.02,
+        )
+    )
+    await eventually(lambda: seen == [RunStatus.FINALIZING])
+    [run_dir] = [p for p in (workfolder / "runs").iterdir() if p.is_dir()]
+    with pytest.raises(ArrError, match="läuft nicht"):
+        request_stop(run_dir)  # `arr runs stop` refuses in finalizing …
+    request = run_dir / STOP_REQUEST
+    request.write_text("{}", encoding="utf-8")  # … but a file that is there is answered
+    await eventually(lambda: not request.exists())
+    assert lines[-1] == (
+        "Stopp-Anforderung erhalten (arr runs stop), aber der Run wird schon abgeschlossen; "
+        "der Finalizer läuft zu Ende."
+    )
+    gate.set()
+    result = await asyncio.wait_for(running, 10)
+    assert result.status is RunStatus.DONE and log_entries(run_dir, "stop") == []
+
+
+async def test_w2_05_1_a_signal_repeated_within_the_window_is_the_same_ctrl_c(
+    workfolder: Path,
+) -> None:
+    """`uv run` forwards the terminal's SIGINT to arr ≈ 0.2 s after the kernel delivered it to
+    the whole process group: the second one must not count as the hard abort."""
+    clock = Clock()
+    lines: list[str] = []
+    exits: list[int] = []
+    launch = plan_launch(write_run(workfolder), cwd=workfolder)
+    manager = build_manager(
+        launch, decider=None, builders=fake_builders({"a": turns([say("x"), wait(30)])})
+    )
+    control = StopControl(manager, lines.append, hard_exit=exits.append, clock=clock)
+    running = asyncio.create_task(manager.run())
+    await eventually(
+        lambda: manager.orchestrator is not None and "a" in manager.orchestrator._active
+    )
+    control.on_interrupt()  # the terminal's signal
+    clock.now = 0.2
+    control.on_interrupt()  # the same one, forwarded by uv run
+    assert exits == [] and sum(line.startswith("Strg-C") for line in lines) == 1
+    assert "(nach einer Sekunde)" in lines[-1]
+    assert await asyncio.wait_for(running, 10) is RunStatus.STOPPED
+    assert (manager.run_dir / "output" / "summary.md").is_file(), "finalizer ran"
+    clock.now = 1.5
+    control.on_interrupt()  # a deliberate second Ctrl-C
+    assert exits == [130]
