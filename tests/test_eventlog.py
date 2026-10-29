@@ -470,3 +470,32 @@ def test_rechnerisch_only_at_the_first_estimated_amount() -> None:
     assert "Turn 2 beendet: ok · ≈ 0,50 $ (rechnerisch)*" in rendered
     assert "Turn 3 beendet: ok · ≈ 0,25 $*" in rendered
     assert rendered.count("(rechnerisch)") == 1
+
+
+# --------------------------------------------------------------------------------------------
+# W2-01: large tool inputs (input_blob)
+# --------------------------------------------------------------------------------------------
+
+
+def test_large_tool_input_goes_to_blobs(tmp_path: Path) -> None:
+    big = "ä" * 600_000  # 1.2 MB in UTF-8
+    tool_input = {"file_path": "proof.tex", "content": big}
+    ev = event(EventKind.TOOL_CALL, {"id": "toolu/02", "name": "Write", "input": tool_input})
+    with EventLogger(tmp_path) as logger:
+        record = logger.log(ev)
+    assert record["data"]["input"] == {"file_path": "proof.tex"}
+    assert record["data"]["input_blob"] == "blobs/000001-toolu_02.input.json"
+    assert json.loads((tmp_path / record["data"]["input_blob"]).read_text("utf-8")) == tool_input
+    assert ev.data["input"]["content"] == big  # the caller's event is untouched
+    assert "ä" * 100 not in (tmp_path / "transcript.jsonl").read_text(encoding="utf-8")
+    md = render_transcript(read_events(tmp_path / "transcript.jsonl"))
+    assert "Eingabe ausgelagert: `blobs/000001-toolu_02.input.json`" in md
+
+
+def test_small_tool_input_stays_inline(tmp_path: Path) -> None:
+    with EventLogger(tmp_path) as logger:
+        record = logger.log(
+            event(EventKind.TOOL_CALL, {"id": "t", "name": "Bash", "input": {"command": "ls"}})
+        )
+    assert record["data"] == {"id": "t", "name": "Bash", "input": {"command": "ls"}}
+    assert not (tmp_path / "blobs").exists()

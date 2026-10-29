@@ -3,8 +3,9 @@
 Per agent the logger appends to `transcript.jsonl` (normalized, docs/02 §6) and `raw.jsonl`
 (raw SDK objects). Both files are only appended to and flushed after every event, so a
 crash loses at most the event in flight. Tool output above 1 MB goes to `blobs/` and the
-transcript refers to it. `render_transcript` turns a transcript into Markdown for
-`transcript.md` (written by the finalizer, docs/02 §7).
+transcript refers to it; so does a tool input above 1 MB (e.g. `Write` with a large file),
+as `input_blob` next to the small fields of the input. `render_transcript` turns a
+transcript into Markdown for `transcript.md` (written by the finalizer, docs/02 §7).
 
 See docs/02-workfolder-und-runs.md §4, §6.
 """
@@ -29,6 +30,9 @@ log = logging.getLogger(__name__)
 
 BLOB_THRESHOLD = 1_000_000
 """Tool output above this many bytes (UTF-8) is stored in `blobs/` (docs/02 §4, §6)."""
+
+INPUT_KEEP_BYTES = 1_000
+"""Fields of an offloaded tool input up to this size (JSON) stay in the transcript."""
 
 TRANSCRIPT_FILE = "transcript.jsonl"
 RAW_FILE = "raw.jsonl"
@@ -190,7 +194,10 @@ class EventLogger:
 
         A `tool_result` with output above the threshold is stored in `blobs/<seq>-<id>.txt`;
         the record then has `content: null` and `blob` set to the path relative to the agent
-        folder. The blob is written before the transcript line, so the reference never dangles.
+        folder. A `tool_call` whose input (as JSON) is above the threshold is stored in
+        `blobs/<seq>-<id>.input.json`; the record keeps only the small input fields and gets
+        `input_blob`. Blobs are written before the transcript line, so a reference never
+        dangles.
         """
         with self._lock:
             if self._transcript is None or self._raw is None:
@@ -200,6 +207,8 @@ class EventLogger:
             record = event.to_record()
             if event.kind is EventKind.TOOL_RESULT:
                 record["data"] = self._offload(event)
+            elif event.kind is EventKind.TOOL_CALL:
+                record["data"] = self._offload_input(event)
             if event.raw is not None:
                 raw = {"seq": event.seq, "ts": event.ts, "raw": event.raw}
                 self._raw.write(_encode_line(raw, "raw") + "\n")
@@ -217,14 +226,39 @@ class EventLogger:
         encoded = text.encode("utf-8", errors="replace")
         if len(encoded) <= self.blob_threshold:
             return data
-        name = f"{event.seq:06d}-{_UNSAFE_NAME.sub('_', str(data.get('id', 'tool')))[:60]}.txt"
+        data["content"] = None
+        data["blob"] = self._write_blob(event, data, ".txt", encoded)
+        return data
+
+    def _offload_input(self, event: AgentEvent) -> dict[str, Any]:
+        data = dict(event.data)
+        tool_input = data.get("input")
+        if not tool_input:
+            return data
+        encoded = _dumps(tool_input).encode("utf-8", errors="replace")
+        if len(encoded) <= self.blob_threshold:
+            return data
+        if isinstance(tool_input, Mapping):
+            small = {
+                key: value
+                for key, value in tool_input.items()
+                if len(_dumps(value).encode("utf-8", errors="replace")) <= INPUT_KEEP_BYTES
+            }
+        else:
+            small = {}
+        data["input"] = small
+        data["input_blob"] = self._write_blob(event, data, ".input.json", encoded)
+        return data
+
+    def _write_blob(
+        self, event: AgentEvent, data: dict[str, Any], suffix: str, encoded: bytes
+    ) -> str:
+        name = f"{event.seq:06d}-{_UNSAFE_NAME.sub('_', str(data.get('id', 'tool')))[:60]}{suffix}"
         self.blobs_dir.mkdir(exist_ok=True)
         with (self.blobs_dir / name).open("wb") as handle:
             handle.write(encoded)
             handle.flush()
-        data["content"] = None
-        data["blob"] = f"{BLOBS_DIR}/{name}"
-        return data
+        return f"{BLOBS_DIR}/{name}"
 
     def close(self) -> None:
         """Close both files; safe to call more than once."""
@@ -344,7 +378,10 @@ def _render_event(rec: Mapping[str, Any], state: _RenderState) -> str | None:
             return _quote(f"**{label}**\n\n{data.get('text', '')}")
         case "tool_call":
             body = json.dumps(data.get("input", {}), indent=2, ensure_ascii=False, default=str)
-            return f"**Werkzeug** `{data.get('name', '?')}` · {clock}\n\n{_fence(body, 'json')}"
+            text = f"**Werkzeug** `{data.get('name', '?')}` · {clock}\n\n{_fence(body, 'json')}"
+            if data.get("input_blob"):
+                text += f"\n\nEingabe ausgelagert: `{data['input_blob']}`"
+            return text
         case "tool_result":
             status = "Fehler" if data.get("is_error") else "ok"
             head = f"**Ergebnis** `{data.get('id', '?')}` · {status}"
