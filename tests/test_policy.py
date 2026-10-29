@@ -27,6 +27,7 @@ from arr.permissions.policy import (
     normalize_path,
     profile_for,
     redact,
+    user_temp_dirs,
 )
 from arr.permissions.types import (
     DecidedBy,
@@ -1642,3 +1643,32 @@ def test_w2011_temp_dir_below_run_tmp_stays_readable(env: Env) -> None:
     profile = env.profile(temp_dirs=[inside])
     assert inside not in profile.read_deny
     assert profile.can_read(inside / "x.txt")
+
+
+# --------------------------------------------------------------------------------------------
+# W2-01.2: the system-wide /tmp is never blocked as the process temp folder (Linux CI)
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("system_tmp", ["/tmp", "/private/tmp"])
+def test_w2012_system_tmp_is_not_a_user_temp_dir(
+    monkeypatch: pytest.MonkeyPatch, system_tmp: str
+) -> None:
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: system_tmp)
+    assert user_temp_dirs() == [Path("/tmp") / f"claude-{os.getuid()}"]
+
+
+def test_w2012_macos_temp_dir_is_blocked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    macos_like = tmp_path / "var" / "folders" / "xy" / "abc" / "T"
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(macos_like))
+    assert user_temp_dirs() == [Path("/tmp") / f"claude-{os.getuid()}", macos_like]
+
+
+def test_w2012_write_to_dev_stderr_with_tmp_as_process_temp(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: "/tmp")
+    profile = env.profile()
+    assert normalize_path("/tmp", base=env.home, home=env.home) not in profile.read_deny
+    decision = env.engine(profile).evaluate(bash("echo hi > /dev/stderr"))
+    assert decision.action is ALLOW, decision.reason

@@ -197,13 +197,19 @@ READ_BLOCKED_ROOTS = ("/Volumes",)
 
 
 def user_temp_dirs() -> list[Path]:
-    """Temp folders of the user that agents must not read (W2-01.1, B4).
+    """Temp folders of the user that agents must not read (W2-01.1, B4; W2-01.2).
 
     `/tmp/claude-<uid>`: work data of all Claude Code sessions of the user (scratchpads,
-    also copies of private files). The temp folder of the arr process
+    also copies of private files), always on the list. The temp folder of the arr process
     (`tempfile.gettempdir()`, on macOS `/private/var/folders/…/T`): files of other apps.
+    It is left out when it is the system-wide `/tmp` (Linux), which would block all of
+    `/tmp` (e.g. `/dev/stderr` → a file in `/tmp` in the CI, check N3).
     """
-    return [Path("/tmp") / f"claude-{os.getuid()}", Path(tempfile.gettempdir())]
+    dirs = [Path("/tmp") / f"claude-{os.getuid()}"]
+    process_tmp = Path(tempfile.gettempdir())
+    if os.path.realpath(process_tmp) not in ("/tmp", "/private/tmp"):
+        dirs.append(process_tmp)
+    return dirs
 
 
 _PRIVILEGED = "Befehle mit Systemrechten sind nicht erlaubt."
