@@ -311,7 +311,10 @@ class StartPage:
 
     async def _load_runs(self) -> tuple[list[RunSummary], list[ApprovalItem]]:
         page = await self.api.list_runs(status=RunFilter.ACTIVE, limit=100)
-        items = await self.api.list_approvals(status=[ApprovalStatus.OPEN])
+        try:
+            items = await self.api.list_approvals(status=[ApprovalStatus.OPEN])
+        except ApiException:
+            items = []  # no inbox yet (W3-03): run cards without approval links
         return page.items, items
 
     # --- areas ---------------------------------------------------------------------------------

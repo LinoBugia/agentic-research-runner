@@ -13,6 +13,7 @@ from nicegui import ui
 from arr.permissions.types import ApprovalStatus
 from arr.service.api_client import ApiClient
 from arr.service.api_models import (
+    ApiException,
     LiveEvent,
     RunFilter,
     RunsPage,
@@ -178,7 +179,10 @@ class RunsPageView:
             limit=self.count,
         )
         self.page = page
-        approvals = await api.list_approvals(status=[ApprovalStatus.OPEN])
+        try:
+            approvals = await api.list_approvals(status=[ApprovalStatus.OPEN])
+        except ApiException:
+            approvals = []  # no inbox yet (W3-03): rows link to no approval
         first_open: dict[str, str] = {}
         for item in approvals:
             first_open.setdefault(item.run.id, item.id)

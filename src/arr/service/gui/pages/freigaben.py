@@ -32,7 +32,7 @@ from arr.service.gui.components.badge import badge_html
 from arr.service.gui.components.banner import banner, empty_state
 from arr.service.gui.components.base import button, esc, raw
 from arr.service.gui.components.dialog import ConfirmDialog
-from arr.service.gui.components.page_state import forced_state, state_api
+from arr.service.gui.components.page_state import error_html, forced_state, state_api
 from arr.service.gui.layout import Frame
 from arr.service.gui.texts import (
     APPROVAL_FILTERS,
@@ -80,7 +80,15 @@ class FreigabenPage:
     async def build(self) -> None:
         api = self.api
         self.workfolder = (await api.get_workfolder()).name
-        open_items = await api.list_approvals(status=[ApprovalStatus.OPEN], type=self.type_filter)
+        try:
+            open_items = await api.list_approvals(
+                status=[ApprovalStatus.OPEN], type=self.type_filter
+            )
+        except ApiException as exc:  # no inbox yet (W3-03): the message instead of the page
+            with self.frame.content:
+                raw('<div class="page-head"><h1 tabindex="-1">Freigaben</h1></div>', tag="div")
+                raw(error_html(exc, retry_href="/freigaben"))
+            return
         with self.frame.content:
             self.dialog = ConfirmDialog()
             with ui.element("div").classes("page-head"):

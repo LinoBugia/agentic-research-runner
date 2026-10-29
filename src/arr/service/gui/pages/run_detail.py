@@ -578,7 +578,10 @@ class RunDetailPage:
     # --- overview ---------------------------------------------------------------------------
 
     async def _load_approvals(self) -> None:
-        items = await self.api.list_approvals(status=[ApprovalStatus.OPEN], run_id=self.run_id)
+        try:
+            items = await self.api.list_approvals(status=[ApprovalStatus.OPEN], run_id=self.run_id)
+        except ApiException:
+            items = []  # no inbox yet (W3-03): no compact cards
         self.open_items = {i.id: i for i in items}
 
     async def _scan_questions(self) -> None:

@@ -107,6 +107,37 @@ WorkfolderOption = Annotated[
 
 
 @app.command()
+def serve(
+    workfolder: Annotated[
+        Path | None,
+        typer.Option(
+            "--workfolder",
+            "-w",
+            help="Workfolder (Standard: der zuletzt genutzte).",
+            show_default=False,
+        ),
+    ] = None,
+    port: Annotated[int | None, typer.Option(help="Port auf 127.0.0.1 (Standard: 8765).")] = None,
+    browser: Annotated[
+        bool, typer.Option("--browser/--no-browser", help="Oberfläche im Browser öffnen.")
+    ] = True,
+) -> None:
+    """Service mit Oberfläche starten: Runs starten, live verfolgen, anhalten und stoppen.
+
+    Läuft arr schon, wird die Oberfläche nur geöffnet. Strg-C stoppt die Runs des Service
+    (Finalizer und Secret-Scan laufen) und beendet arr; ein zweites Strg-C bricht hart ab.
+    """
+    from arr.log import setup_logging
+    from arr.service.serve import serve as run_service
+
+    setup_logging("INFO")
+    try:
+        run_service(workfolder=workfolder, port=port, open_browser=browser)
+    except ArrError as exc:
+        _fail(str(exc))
+
+
+@app.command()
 def run(
     run_file: Annotated[
         Path, typer.Argument(help="Die run.yaml des Runs.", show_default=False, metavar="RUN_YAML")
