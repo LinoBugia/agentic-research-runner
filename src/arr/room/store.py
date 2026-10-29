@@ -702,6 +702,12 @@ class RoomStore:
                 raise ArrError(f"Den Kanal „{channel}“ gibt es nicht.")
             return [self._with_alias(_row_to_message(r), ch) for r in con.execute(sql, args)]
 
+    def messages_after(self, after_id: int = 0) -> list[Message]:
+        """Messages of all channels with an ID above `after_id`, in order (orchestrator)."""
+        with self._read() as con:
+            rows = con.execute("SELECT * FROM msg WHERE id>? ORDER BY id", (after_id,)).fetchall()
+        return [_row_to_message(r) for r in rows]
+
     @staticmethod
     def _with_alias(msg: Message, ch: _Channel | None) -> Message:
         if ch is None or not ch.anonymous or msg.sender not in ch.members:
@@ -1398,7 +1404,11 @@ class AgentRoom:
         reply_to: int | None = None,
         refs: list[str] | None = None,
     ) -> Message:
-        """Post into an own open channel; `refs` are copied to `attachments/<msg-id>/`."""
+        """Post into an own open channel; `refs` are copied to `attachments/<kanal>/<msg-id>/`.
+
+        Attachments are kept per channel, so each agent can be given read access to exactly
+        the attachments of its own channels (E19).
+        """
         kind = _enum(MessageKind, kind, "Nachrichtenart")
         if kind is MessageKind.VOTE:
             raise RoomError("Stimmen gibst du mit dem Tool „vote“ ab, nicht als Nachricht.")
@@ -1429,7 +1439,7 @@ class AgentRoom:
                     Attachment(
                         name=name,
                         size=(staging / name).stat().st_size,
-                        path=f"{ROOM_DIR}/{ATTACHMENTS_DIR}/{msg_id}/{name}",
+                        path=f"{ROOM_DIR}/{ATTACHMENTS_DIR}/{ch.name}/{msg_id}/{name}",
                     )
                     for name in names
                     if staging is not None
@@ -1446,9 +1456,10 @@ class AgentRoom:
                     msg_id=msg_id,
                 )
                 if staging is not None:
-                    final_dir = self.store.attachments_dir / str(msg_id)
+                    final_dir = self.store.attachments_dir / ch.name / str(msg_id)
                     # A leftover folder can only stem from a transaction that never committed.
                     shutil.rmtree(final_dir, ignore_errors=True)
+                    final_dir.parent.mkdir(exist_ok=True)
                     staging.rename(final_dir)
                     staging = None
                 msg = self._view(self.store._load_msg(con, msg_id), ch)

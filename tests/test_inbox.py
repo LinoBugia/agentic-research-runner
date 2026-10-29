@@ -23,10 +23,12 @@ from arr.permissions.policy import (
 from arr.permissions.types import (
     ApprovalItem,
     ApprovalStatus,
+    ApprovalType,
     DecidedBy,
     Decision,
     DecisionAction,
     DecisionScope,
+    EscalationOption,
     PermissionRequest,
 )
 
@@ -501,3 +503,71 @@ async def test_b3_revoke_gatekeeper_once_is_a_no_op(engine: PolicyEngine) -> Non
     assert last["event"] == "revoked" and "Einmalige" in last["note"]
     # the next identical request asks again (nothing was remembered)
     assert engine.evaluate(install()).action is DecisionAction.ASK
+
+
+# --------------------------------------------------------------------------------------------
+# W2-03: escalations of topologies (RunContext.escalate, docs/07 §6, E15)
+# --------------------------------------------------------------------------------------------
+
+OPTIONS = [EscalationOption.RETRY, EscalationOption.CONTINUE, EscalationOption.END]
+
+
+def choose(option: EscalationOption, **kw: Any) -> Decision:
+    return Decision(action=DecisionAction.OPTION, option=option, decided_by=DecidedBy.USER, **kw)
+
+
+async def open_escalation(inbox: ApprovalInbox) -> tuple["asyncio.Task[Decision | None]", str]:
+    waiting = asyncio.create_task(
+        inbox.ask_escalation("r1", "beweis", "Ø 5,5 nach 2 Versuchen", OPTIONS)
+    )
+    await asyncio.sleep(0.01)
+    [item] = inbox.pending()
+    assert item.type is ApprovalType.ESCALATION and item.deadline is None
+    assert (item.stage, item.options) == ("beweis", OPTIONS)
+    return waiting, item.id
+
+
+async def test_escalation_only_user_once_with_an_offered_option(engine: PolicyEngine) -> None:
+    inbox = ApprovalInbox(engine, timeout=0.01)  # the permission timeout does not apply
+    waiting, item_id = await open_escalation(inbox)
+    with pytest.raises(ValueError, match="nur der User"):
+        Decision(
+            action=DecisionAction.OPTION,
+            option=EscalationOption.RETRY,
+            decided_by=DecidedBy.GATEKEEPER,
+        )
+    with pytest.raises(ArrError, match="nur du selbst"):
+        inbox.resolve(item_id, choose(EscalationOption.RETRY, scope=DecisionScope.RUN))
+    with pytest.raises(ArrError, match="angebotenen Optionen"):
+        inbox.resolve(item_id, Decision(action=ALLOW, decided_by=DecidedBy.USER))
+    await asyncio.sleep(0.05)
+    assert not waiting.done(), "wrong decisions leave the escalation open, without deadline"
+    item = inbox.resolve(item_id, choose(EscalationOption.CONTINUE))
+    assert item.status is ApprovalStatus.DECIDED
+    decision = await waiting
+    assert decision is not None and decision.option is EscalationOption.CONTINUE
+    assert engine.log is not None
+    events = [e["event"] for e in engine.log.entries() if e.get("item_id") == item_id]
+    assert events == ["open", "decided"]
+
+
+async def test_escalation_cancelled_on_stop_returns_none(engine: PolicyEngine) -> None:
+    inbox = ApprovalInbox(engine)
+    waiting, item_id = await open_escalation(inbox)
+    inbox.cancel_all()
+    assert await waiting is None
+    item = inbox.get(item_id)
+    assert item.status is ApprovalStatus.OBSOLETE and item.decision is None
+
+
+async def test_terminal_escalation_takes_whole_words(engine: PolicyEngine) -> None:
+    terminal = FakeTerminal("w", "nochmal")
+    inbox = ApprovalInbox(engine, decider=terminal.decider())
+    decision = await asyncio.wait_for(
+        inbox.ask_escalation("r1", "beweis", "Ø 5,5", [EscalationOption.RETRY]), 5
+    )
+    assert decision is not None and decision.option is EscalationOption.RETRY
+    assert decision.decided_by is DecidedBy.USER and decision.scope is DecisionScope.ONCE
+    assert "Eskalation" in terminal.text and "nochmal" in terminal.text
+    assert "weiter" not in terminal.text.split("Deine Wahl")[0], "only offered options"
+    assert "„w“ verstehe ich nicht" in terminal.text

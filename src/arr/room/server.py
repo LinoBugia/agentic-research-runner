@@ -25,7 +25,7 @@ from pydantic import ValidationError
 
 from arr.errors import ArrError
 from arr.log import setup_logging
-from arr.room.store import AgentRoom, RoomStore
+from arr.room.store import USER, AgentRoom, RoomStore
 from arr.room.types import ChannelInfo, Inbox, Message, RoomError
 
 log = logging.getLogger("arr.room.server")  # fixed name, also under `python -m`
@@ -67,14 +67,22 @@ def _size(size: int) -> str:
 
 
 def render_message(msg: Message) -> str:
-    """One message as text; the header starts with `[#<id> ` (parsed by tests and tools)."""
+    """One message as text; the header starts with `[#<id> ` (parsed by tests and tools).
+
+    Messages of `user` are marked „★ vom User, hat Vorrang“ (docs/06 §10).
+    """
     head = f"[#{msg.id} {msg.sender} · {msg.kind.value}"
     if msg.reply_to is not None:
         head += f" → #{msg.reply_to}"
     if msg.to:
         head += " · an " + ", ".join(msg.to)
     head += f" · #{msg.channel}]"
-    flags = [flag for flag, on in (("angeheftet", msg.pinned), ("offene Frage", msg.open)) if on]
+    marks = (
+        ("★ vom User, hat Vorrang", msg.sender == USER),
+        ("angeheftet", msg.pinned),
+        ("offene Frage", msg.open),
+    )
+    flags = [flag for flag, on in marks if on]
     if flags:
         head += " (" + ", ".join(flags) + ")"
     lines = [head, msg.body]

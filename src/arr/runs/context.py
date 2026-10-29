@@ -7,11 +7,12 @@ See docs/01-architektur.md §3, §6 and docs/03-skills-und-research-groups.md §
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from arr.backends.base import TurnOutcome
-from arr.models import AgentConfig, AgentStatus, ResolvedRun
+from arr.models import AgentConfig, AgentStatus, ChannelMode, ResolvedRun
 from arr.permissions.types import EscalationOption
 from arr.room.types import MessageKind, Rating, Result
 
@@ -40,6 +41,32 @@ class TurnJob:
     agent_id: str
     prompt: str
     context: Mapping[str, Any] | None = None
+
+
+class DiscussionEnd(StrEnum):
+    """Why a discussion phase ended (docs/06-gruppenchats.md §5.1, §5.2, §7).
+
+    Logged as `discussion_end` in `orchestrator.jsonl`.
+    """
+
+    ROUNDS = "rounds"  # rounds: N rounds played
+    ALL_PASSED = "all_passed"  # rounds: nobody posted anything but `pass` in a round
+    ALL_DONE = "all_done"  # all members reported `done`
+    QUIET = "quiet"  # event: `quiet_after_s` without messages and nobody working
+    STOPPED = "stopped"  # user stop
+    LIMIT = "limit"  # a run limit was reached
+
+
+@dataclass(slots=True)
+class DiscussionOutcome:
+    """Result of `RunContext.discuss`: why it ended, rounds, wake-ups and all turns (docs/06 §5)."""
+
+    channel: str
+    mode: ChannelMode
+    ended_by: DiscussionEnd
+    rounds: int = 0
+    wakeups: dict[str, int] = field(default_factory=dict)
+    outcomes: list[TurnOutcome] = field(default_factory=list)
 
 
 class RunContext(ABC):
@@ -141,4 +168,32 @@ class RunContext(ABC):
         """Pause the run, put an escalation into the approval inbox and wait for the user.
 
         Used by `waterfall` with `on_fail: escalate` (docs/03 §4.4). Returns the chosen option.
+        """
+
+    @abstractmethod
+    async def discuss(
+        self,
+        channel: str,
+        prompt: str | None = None,
+        *,
+        stage: str | None = None,
+        rounds: int | None = None,
+        context: Mapping[str, Any] | None = None,
+        kickoff: bool = True,
+    ) -> DiscussionOutcome:
+        """Run a discussion phase in `channel` with the channel's pacing and wait for its end.
+
+        - With `stage`, the phase starts with `checkpoint(stage, channel=…, phase=
+          "discussion")`, which opens channels with that `open_from`. The channel must be open.
+        - `rounds` mode: per round all members that are not `done` get a turn (parallel or
+          in order), prompt „Runde r von N …“ plus `prompt`. Ends after `rounds` rounds
+          (default 3), when nobody posted anything but `pass` in a round, or on stop.
+        - `event` mode: with `kickoff`, all members that are not `done` get `prompt` at once.
+          Then idle members are woken on `wake_on` events after `debounce_s`, at most
+          `max_wakeups_per_agent` times per channel; own messages and messages of the
+          orchestrator never wake; the ping-pong guard stops waking two agents that talk in
+          circles. Ends when nobody works, no wake-up is due and either all members are `done`
+          or nothing happened for `quiet_after_s` (messages and turn ends count).
+        - Wake-up turns get `stage` and `context` like the kick-off turns. Hints mid-turn and
+          the inbox work in and outside of discussions.
         """

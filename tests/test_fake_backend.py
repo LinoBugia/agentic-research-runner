@@ -257,6 +257,34 @@ async def test_script_exhausted_gives_error_then_turn_end_error() -> None:
     assert events[2].data["status"] == "error"
 
 
+def texts(events: list[AgentEvent]) -> list[str]:
+    return [e.data["text"] for e in events if e.kind is EventKind.TEXT]
+
+
+async def test_by_stage_picks_turns_per_stage_and_keeps_the_main_order() -> None:
+    def turn(text: str) -> dict[str, Any]:
+        return {"steps": [{"do": "text", "text": text}]}
+
+    backend = await started(
+        {
+            "turns": [turn("haupt 1"), turn("haupt 2")],
+            "by_stage": {
+                "discussion": {"repeat_last": True, "turns": [turn("weck 1"), turn("weck n")]},
+                "review": {"turns": [turn("review 1")]},
+            },
+        }
+    )
+    played = []
+    for stage in ("explore", "discussion", "discussion", "discussion", None, "review"):
+        played += texts(await play(backend, stage=stage))
+    assert played == ["haupt 1", "weck 1", "weck n", "weck n", "haupt 2", "review 1"]
+
+    events = await play(backend, stage="review")
+    assert kinds(events) == ["turn_start", "error", "turn_end"]
+    assert "keinen Eintrag für Turn 2 in Stufe „review“" in events[1].data["message"]
+    assert events[-1].turn == 7, "turn numbers count all turns"
+
+
 async def test_repeat_last_plays_the_last_turn_again() -> None:
     backend = await started(
         {"repeat_last": True, "turns": [{"steps": [{"do": "text", "text": "immer"}]}]}
