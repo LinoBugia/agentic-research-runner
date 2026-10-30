@@ -107,7 +107,13 @@ _AGENT_PATH = re.compile(r"agents\[(\d+)\]\.(\w+)")
 _FORM_PATHS = {"task": "task_md", "task_file": "task_md", "limits.wall_time": "limits.wall_time_s"}
 
 
-def form_input(run_input: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict]:
+def _task_missing(run_input: Mapping[str, Any]) -> bool:
+    return "task_md" in run_input and not str(run_input["task_md"] or "").strip()
+
+
+def form_input(
+    run_input: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """A run input as `RunInput` data, start parameters and overrides per agent.
 
     The form of „Neuer Run“ sends `project`, `skill`, `name`, `task_md`, `params`, `agents` (per
@@ -120,7 +126,8 @@ def form_input(run_input: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
     params = dict(params) if isinstance(params, Mapping) else {}
     if "task_md" not in data:
         return data, params, {}
-    data["task"] = data.pop("task_md") or TASK_PLACEHOLDER
+    data["task"] = TASK_PLACEHOLDER if _task_missing(run_input) else data["task_md"]
+    del data["task_md"]
     overrides = data.pop("agents", None) or {}
     decider = data.pop("decider", None)
     if decider:
@@ -529,8 +536,9 @@ class RunsArea:
         return launch
 
     async def resolve_run(self, run_input: dict[str, Any]) -> ResolveResult:
-        task = run_input.get("task_md", "-")
-        missing = [] if task else [FieldIssue(path="task_md", message=TASK_MISSING)]
+        missing = []
+        if _task_missing(run_input):
+            missing.append(FieldIssue(path="task_md", message=TASK_MISSING))
         try:
             launch = await asyncio.to_thread(self._plan, run_input)
         except ConfigError as exc:
@@ -597,7 +605,7 @@ class RunsArea:
         )
 
     async def start_run(self, run_input: dict[str, Any]) -> StartRunResponse:
-        if "task_md" in run_input and not run_input["task_md"]:
+        if _task_missing(run_input):
             raise ApiException.of(
                 ErrorCode.CONFIG_INVALID,
                 TASK_MISSING,
