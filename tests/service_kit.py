@@ -39,9 +39,30 @@ def _clean_env() -> dict[str, str]:
 
 
 def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+    """A port that is free on `127.0.0.1` and, where IPv6 exists, on `::1` (W3-01.2)."""
+    for _ in range(50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+        if not ipv6_available():
+            return port
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock6:
+            try:
+                sock6.bind(("::1", port))
+            except OSError:
+                continue
+        return port
+    raise RuntimeError("kein Port frei auf 127.0.0.1 und ::1")
+
+
+def ipv6_available() -> bool:
+    """True if `::1` can be bound on this machine (not in every CI)."""
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+            sock.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
 
 
 def make_workfolder(root: Path) -> Path:

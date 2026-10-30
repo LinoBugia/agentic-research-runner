@@ -1,14 +1,15 @@
 """`arr serve`: the local service with the GUI on real data (W3-01 §3.1, docs/04 §1).
 
-One process runs NiceGUI (and so FastAPI and uvicorn) on the loopback address with `RealApi`
-on the workfolder. It answers only under its own fresh hostname `<random>.localhost`
-(W3-01.1 M1); the whole app sits behind the `Guard` (token cookie, host and origin checks,
-`arr.service.guard`). `~/.arr/service.json` (0600) tells where the service listens; a second
-`arr serve` finds a running service (process alive, port answers as arr under that name),
-opens it in the browser and ends. Ctrl-C or SIGTERM stops every run of the service with
-finalizer and secret scan, then the process ends; a second signal aborts hard like `arr run`
-(status `interrupted`). At start, runs left active by a crash become `interrupted`
-(`RealApi.start`).
+One process runs NiceGUI (and so FastAPI and uvicorn) on `127.0.0.1` with `RealApi` on the
+workfolder, and holds `[::1]:<port>` itself with a relay to it (`arr.service.loopback`,
+W3-01.2), so no other program can sit where browsers connect first. It answers only under its
+own fresh hostname `<random>.localhost` (W3-01.1 M1); the whole app sits behind the `Guard`
+(token cookie, host and origin checks, `arr.service.guard`). `~/.arr/service.json` (0600)
+tells where the service listens; a second `arr serve` finds a running service (process alive,
+port answers as arr under that name), opens it in the browser and ends. Ctrl-C or SIGTERM
+stops every run of the service with finalizer and secret scan, then the process ends; a
+second signal aborts hard like `arr run` (status `interrupted`). At start, runs left active
+by a crash become `interrupted` (`RealApi.start`).
 
 This module knows no Typer: `arr.cli` calls `serve()`.
 """
@@ -19,7 +20,6 @@ import http.client
 import logging
 import os
 import signal
-import socket
 import sys
 import threading
 import time
@@ -35,6 +35,7 @@ from arr.runs.manager import set_run_status
 from arr.runs.orchestrator import OrchestratorLog
 from arr.runs.prepare import load_run_meta
 from arr.service.guard import SERVICE_HEADER, Guard, new_hostname, new_token, service_host
+from arr.service.loopback import LoopbackRelay, port_in_use
 from arr.service.real_api import RealApi
 from arr.service.state import (
     ServiceInfo,
@@ -75,15 +76,9 @@ def resolve_workfolder(given: str | Path | None) -> Path:
     )
 
 
-def port_free(port: int, host: str = "127.0.0.1") -> bool:
-    """True if nothing listens on the port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind((host, port))
-        except OSError:
-            return False
-    return True
+def port_free(port: int) -> bool:
+    """True if arr can take the port on `127.0.0.1` and `[::1]` (see `port_in_use`)."""
+    return port_in_use(port) is None
 
 
 def answers_as_arr(port: int, hostname: str, timeout_s: float = 1.0) -> bool:
@@ -145,6 +140,7 @@ class ServiceStop:
         hard_exit: Callable[[int], Any] = os._exit,
         clock: Callable[[], float] = time.monotonic,
         repeat_window_s: float = REPEAT_WINDOW_S,
+        relay: LoopbackRelay | None = None,
     ) -> None:
         self.api = api
         self.shutdown = shutdown
@@ -152,6 +148,7 @@ class ServiceStop:
         self.hard_exit = hard_exit
         self.clock = clock
         self.repeat_window_s = repeat_window_s
+        self.relay = relay
         self.interrupts = 0
         self._last: float | None = None
         self._task: asyncio.Task[None] | None = None
@@ -197,6 +194,8 @@ class ServiceStop:
                     )
         with contextlib.suppress(Exception):
             remove_service_info(os.getpid())
+        if self.relay is not None:
+            self.relay.close()  # the process end would release it too; be explicit
         for stream in (sys.stdout, sys.stderr):
             with contextlib.suppress(Exception):
                 stream.flush()
@@ -218,17 +217,21 @@ class ServiceRuntime:
         *,
         open_browser: bool,
         report: Report = _print,
+        relay: LoopbackRelay | None = None,
     ) -> None:
         self.api = api
         self.info = info
         self.open_browser = open_browser
         self.report = report
+        self.relay = relay
         self.stop: ServiceStop | None = None
         self._remove_signals: Callable[[], None] = lambda: None
 
     async def startup(self) -> None:
         from nicegui import app
 
+        if self.relay is not None:
+            await self.relay.start()
         self.info.pid = os.getpid()
         self.info.started = time.time()
         write_service_info(self.info)
@@ -239,7 +242,7 @@ class ServiceRuntime:
                 f"Run {run_id} war beim letzten Mal noch aktiv und gilt jetzt als unterbrochen "
                 "(interrupted)."
             )
-        self.stop = ServiceStop(self.api, app.shutdown, self.report)
+        self.stop = ServiceStop(self.api, app.shutdown, self.report, relay=self.relay)
         self._remove_signals = self._install_signals(self.stop)
         self.report(f"arr läuft auf {self.info.url} (Workfolder {self.info.workfolder}).")
         if self.open_browser:
@@ -270,6 +273,8 @@ class ServiceRuntime:
             await self.api.close()
         finally:
             self._remove_signals()
+            if self.relay is not None:
+                self.relay.close()
             remove_service_info(os.getpid())
             self.report("arr ist beendet.")
 
@@ -300,16 +305,20 @@ def serve(
         else:
             report(f"Öffne die Oberfläche mit diesem Link: {running.open_url}")
         return
-    if not port_free(port):
+    taken = port_in_use(port)
+    if taken is not None:
         raise ArrError(
-            f"Der Port {port} ist belegt, aber nicht von arr. Wähle mit „--port“ einen anderen "
-            "Port oder beende das Programm, das den Port nutzt."
+            f"Der Port {port} ist unter {taken} belegt, aber nicht von arr. Wähle mit „--port“ "
+            "einen anderen Port oder beende das Programm, das den Port nutzt."
         )
+    relay = LoopbackRelay(port)  # [::1]:<port> is arr's before the token link exists (W3-01.2)
+    if not relay.bind():
+        report(f"Kein IPv6 auf diesem Rechner: arr reserviert [::1]:{port} nicht.")
     token = new_token()
     hostname = new_hostname()
     info = ServiceInfo(host=hostname, port=port, token=token, pid=os.getpid(), workfolder=str(root))
     api = RealApi(root, base_url=info.url)
-    runtime = ServiceRuntime(api, info, open_browser=open_browser, report=report)
+    runtime = ServiceRuntime(api, info, open_browser=open_browser, report=report, relay=relay)
 
     from nicegui import app, ui
 
@@ -322,16 +331,19 @@ def serve(
     report(f"arr startet auf {info.url} mit Workfolder {root}. Beenden mit Strg+C.")
     if not open_browser:
         report(f"Öffne die Oberfläche mit diesem Link (gilt für diesen Start): {info.open_url}")
-    ui.run(
-        host="127.0.0.1",
-        port=port,
-        title="arr",
-        language="de",
-        reload=False,
-        show=False,
-        show_welcome_message=False,
-        tailwind=False,
-        favicon="✋",
-        reconnect_timeout=10.0,
-        uvicorn_logging_level="warning",
-    )
+    try:
+        ui.run(
+            host="127.0.0.1",
+            port=port,
+            title="arr",
+            language="de",
+            reload=False,
+            show=False,
+            show_welcome_message=False,
+            tailwind=False,
+            favicon="✋",
+            reconnect_timeout=10.0,
+            uvicorn_logging_level="warning",
+        )
+    finally:
+        relay.close()
