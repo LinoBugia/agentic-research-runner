@@ -182,6 +182,7 @@
   // seen. Cmd+Enter also needs a fresh key press (no auto-repeat). Dialogs accept granting
   // ARM_MS after they opened.
   const ARM_MS = 1500;
+  const TALL_MARGIN = 48;
   function inView(r, top, bottom) {
     return r.height > 0 && r.top >= top - 1 && r.bottom <= bottom + 1;
   }
@@ -231,6 +232,15 @@
       // bottom edge (CSS .tall); otherwise head and buttons could never be in view together.
       card.classList.toggle("tall", card.offsetHeight > room - 8);
       const [top, bottom] = band(card);
+      if (card.classList.contains("compact")) {
+        // A compact card taller than its column can never be seen whole: it says so and leaves
+        // „Details“ instead of a button that stays locked (W1-07.1). The margin keeps the hint
+        // from flickering, because it changes the height of the card a little.
+        const column = bottom - top;
+        const height = card.offsetHeight;
+        if (height > column) card.classList.add("too-tall");
+        else if (height + TALL_MARGIN < column) card.classList.remove("too-tall");
+      }
       const commands = noteCommands(card, top, bottom);
       if (!seen(card, top, bottom)) {
         card._arrSince = null; // out of view: an armed card has to be seen again

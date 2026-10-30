@@ -1038,11 +1038,11 @@ def test_b1_codex_escalation_is_never_allowed_by_a_fixed_rule(env: Env) -> None:
     assert "ohne Sandbox" in assessment.decision.reason
     # also without provider in the request: the profile says codex
     assert engine.evaluate(bash(command)).action is ASK
-    # only a decision allows it
+    # only a decision allows it, and only once (W3-03, review W2-02): the scope is lowered
     run_scope = Decision(action=ALLOW, scope=DecisionScope.RUN, decided_by=DecidedBy.USER)
-    engine.remember("apr_x_0001", bash(command, provider="codex"), run_scope)
-    decision = engine.evaluate(bash(command, provider="codex"))
-    assert decision.action is ALLOW and decision.decided_by is DecidedBy.USER
+    kept = engine.remember("apr_x_0001", bash(command, provider="codex"), run_scope)
+    assert kept.decision.scope is DecisionScope.ONCE and kept.grant is None and kept.note
+    assert engine.evaluate(bash(command, provider="codex")).action is ASK
     # pure network approval with host and without command may follow a host rule
     network = req("commandExecution", provider="codex", hosts=["pypi.org"])
     assert engine.evaluate(network).action is ALLOW
@@ -1347,7 +1347,10 @@ def test_w1052_b1_shell_envelope_is_not_high_risk(env: Env, provider: str, comma
     assert first.risk is not None and first.risk.level is RiskLevel.MEDIUM
     _grant(engine, "apr_x_0001", request)
     second = engine.evaluate(request)
-    assert second.action is ALLOW and second.decided_by is DecidedBy.USER
+    if provider == "codex":  # a Codex escalation asks every time (W3-03)
+        assert second.action is ASK
+    else:
+        assert second.action is ALLOW and second.decided_by is DecidedBy.USER
 
 
 def test_w1052_b1_host_grant_covers_the_wrapped_curl(env: Env) -> None:

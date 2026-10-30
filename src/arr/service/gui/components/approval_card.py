@@ -167,7 +167,7 @@ class ApprovalCard:
         )
         self.element.mark(f"card-{item.id}")
         with self.element:
-            raw(self._head(now), classes="ah")
+            self.head = raw(self._head(now), classes="ah")
             raw(
                 f'<h3 id="{heading_id(item.id)}" tabindex="-1">{esc(item.title)}</h3>',
                 tag="div",
@@ -178,6 +178,11 @@ class ApprovalCard:
                 self._escalation_body()
             else:
                 self._run_start_body()
+
+    def update(self, item: ApprovalItem, now: float) -> None:
+        """Take over a new count of equal requests (live); the decision stays as it is."""
+        self.item = item
+        self.head.set_content(self._head(now))
 
     def show_decided(self, message: str, note: str, *, positive: bool) -> None:
         """Replace the content by a confirmation of the same height, without buttons (N1).
@@ -200,6 +205,8 @@ class ApprovalCard:
     def _head(self, now: float) -> str:
         item = self.item
         parts = [badge_html(_WAIT, word=APPROVAL_TYPE[item.type])]
+        if item.count > 1:
+            parts.append(f'<span class="tag">{item.count} gleiche Anfragen</span>')
         run_link = link_html(item.run.name, f"/runs/{item.run.id}")
         if item.type is ApprovalType.PERMISSION:
             parts += [f'<span class="tag">{esc(CATEGORY[c])}</span>' for c in item.categories]
@@ -230,7 +237,7 @@ class ApprovalCard:
         agent = item.agent
         assert agent is not None
         what = item.command or item.path or item.url or item.tool or ""
-        why = "Du entscheidest jede Anfrage selbst."
+        why = esc(item.why or "Du entscheidest jede Anfrage selbst.")
         if item.escalated_by is not None:
             who = (
                 "Vollmacht (von arr geprüft):"
@@ -250,6 +257,12 @@ class ApprovalCard:
         reason = f"„{esc(item.reason)}“" if item.reason else '<span class="muted">keine</span>'
         rows.append(("Begründung des Agenten", f'<div class="quote">{reason}</div>'))
         rows.append(("Warum bei dir", why))
+        if item.no_sandbox:
+            rows.append(("Achtung", f"<b>{esc(NO_SANDBOX)}</b>"))
+        if item.count > 1:
+            rows.append(
+                ("Gleiche Anfragen", f"Deine Entscheidung beantwortet alle {item.count} Anfragen.")
+            )
         if RequestCategory.READ_OUTSIDE in item.categories and item.content_to:
             vendors = fmt.join_de([VENDOR[v] for v in item.content_to])
             rows.append(("Inhalt geht an", f"<b>{esc(vendors)}</b> (als Kontext des Agenten)"))
@@ -276,6 +289,9 @@ class ApprovalCard:
             f'<div class="row small" style="margin-top:8px">{" · ".join(links)}</div>',
             classes="ab",
         )
+        if item.terminal:
+            self._terminal_foot()
+            return
         with ui.element("div").classes("af"):
             with ui.element("div").classes("field"):
                 label_id = f"{item.id}-scope"
@@ -287,7 +303,9 @@ class ApprovalCard:
                     .classes("seg")
                     .props(f'role="radiogroup" aria-labelledby="{label_id}"')
                 ):
-                    for scope in DecisionScope:
+                    # a Codex escalation runs without a sandbox: only this one request (W3-03)
+                    scopes = [DecisionScope.ONCE] if item.no_sandbox else list(DecisionScope)
+                    for scope in scopes:
                         text = scope_label(scope, agent.id) + (
                             " …" if scope is DecisionScope.ALWAYS else ""
                         )
@@ -298,7 +316,7 @@ class ApprovalCard:
                             scope is DecisionScope.ONCE,
                             lambda s=scope: self._set_scope(s),
                         )
-            self._comment_input(f"Kommentar an {agent.id} (optional)")
+            self._comment_input(f"Kommentar (optional, bei Ablehnung an {agent.id})")
             with ui.element("div").classes("decide"):
                 self.buttons.append(
                     button("Ablehnen", lambda: self._decide(DecisionAction.DENY)).mark("deny")
@@ -369,6 +387,9 @@ class ApprovalCard:
                 f'<div class="small" style="margin-top:8px">{" · ".join(links)}</div></div>'
                 f'<div style="flex:1;min-width:280px" class="stack small">{comments}</div></div>'
             )
+            if item.terminal:
+                self._terminal_foot()
+                return
             group = f"{item.id}-opt"
             with (
                 ui.element("div")
@@ -553,6 +574,9 @@ class ApprovalCard:
 
     # --- shared ---------------------------------------------------------------------------
 
+    def _terminal_foot(self) -> None:
+        raw(esc(TERMINAL_HINT), classes="af small muted").mark(f"terminal-{self.item.id}")
+
     def _radio(
         self, name: str, value: str, label: str, checked: bool, on_change: Callable[[], None]
     ) -> None:
@@ -599,10 +623,13 @@ class ApprovalCard:
                     set_disabled(b, b is getattr(self, "decide_button", None) and not self.option)
 
 
+TERMINAL_HINT = "Dieser Run läuft im Terminal. Entscheide die Anfrage dort, hier siehst du sie nur."
+NO_SANDBOX = "Läuft ohne Sandbox: Nach der Freigabe schützt nichts Dateien und Netz."
 COMPACT_LINE_CHARS = 32
 """Characters of a command per line in the compact card (300 px column, 12 px monospace)."""
 COMPACT_MAX_LINES = 12
 """Longer commands are not decided in the compact card, only on the Freigaben page (W1-07.1)."""
+TOO_TALL_HINT = "Die Karte passt nicht in die Spalte. Erlauben geht über „Details“."
 
 
 def compact_lines(command: str) -> int:
@@ -645,15 +672,21 @@ def compact_card(
         raw(f'<h3 id="{heading}">{esc(item.title)}</h3>')
         details = f"/freigaben/{item.id}"
         if item.type is ApprovalType.PERMISSION:
-            why = item.escalated_by.note if item.escalated_by else "Du entscheidest jede Anfrage."
+            why = item.why or "Du entscheidest jede Anfrage."
+            if item.escalated_by:
+                why = item.escalated_by.note
             what = item.command or item.path or item.url or ""
             raw(
                 f'<span class="cmd" style="font-size:12px">{esc(what)}</span>'
                 f'<div class="reason" style="margin-top:6px" title="{esc(item.reason or "")}">'
                 f"<b>Begründung:</b> „{esc(item.reason or '')}“</div>"
-                f'<div style="margin-top:4px"><b>Warum bei dir:</b> {esc(why)}</div>',
+                f'<div style="margin-top:4px"><b>Warum bei dir:</b> {esc(why)}</div>'
+                + (f'<div style="margin-top:4px"><b>{esc(NO_SANDBOX)}</b></div>' * item.no_sandbox),
                 classes="ab small",
             )
+            if item.terminal:
+                raw(esc(TERMINAL_HINT), classes="af small muted")
+                return element
             if compact_lines(what) > COMPACT_MAX_LINES:
                 # too long to be read whole in the narrow column: decide on the Freigaben page
                 raw(
@@ -671,6 +704,8 @@ def compact_card(
 
             with ui.element("div").classes("af"):
                 raw(f'<a class="btn btn-sm" href="{esc(details)}">Details</a>', tag="span")
+                # shown by arr.js when the card is taller than its column (W1-07.1)
+                raw(TOO_TALL_HINT, tag="span", classes="too-tall-note small muted")
                 with ui.element("div").classes("decide"):
                     button("Ablehnen", lambda: decide(DecisionAction.DENY), classes="btn btn-sm")
                     button(

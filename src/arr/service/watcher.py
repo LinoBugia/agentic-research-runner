@@ -4,10 +4,10 @@ Every `interval_s` (0.25 s) the watcher looks at the runs of the workfolder. Run
 over cost nothing but a look at the folder list and, every `full_every_s`, a `stat` of their
 `meta.json`. For active runs it reads what has grown since the last tick: `meta.json`
 (status → `run.status`, `counts.changed`), `orchestrator.jsonl` (checkpoints →
-`stage.checkpoint`, turns → `agent.state`), `approvals.jsonl`, every `transcript.jsonl`
-(`agent.event`, `agent.activity`), and `room.sqlite` by the newest IDs (`channel.message`,
-`result.submitted`, `rating.submitted`, agent rows → `agent.state`). Running runs also get a
-`usage.tick` every second and a `limit.warning` once per limit at 80 %.
+`stage.checkpoint`, turns → `agent.state`), `approvals.jsonl` (`approval.*`), every
+`transcript.jsonl` (`agent.event`, `agent.activity`), and `room.sqlite` by the newest IDs
+(`channel.message`, `result.submitted`, `rating.submitted`, agent rows → `agent.state`).
+Running runs also get a `usage.tick` every second and a `limit.warning` once per limit at 80 %.
 
 Half-written lines wait for their newline, truncated and unreadable files are tolerated
 (`JsonlTail`, `TranscriptIndex`), a failing tick is logged and the next one runs. The watcher
@@ -24,11 +24,13 @@ from typing import Any
 
 from arr.errors import ArrError
 from arr.models import RunStatus
+from arr.permissions.types import ApprovalStatus
 from arr.service.api_models import (
     AgentActivityEvent,
     AgentState,
     AgentStateEvent,
     AgentTranscriptEvent,
+    ApprovalEvent,
     ChannelMessageEvent,
     CountsChangedEvent,
     LimitKind,
@@ -39,6 +41,7 @@ from arr.service.api_models import (
     StageCheckpointEvent,
     UsageTickEvent,
 )
+from arr.service.real_api.approvals import ApprovalReader
 from arr.service.real_api.base import ServiceState
 from arr.service.real_api.rundir import (
     RunRecord,
@@ -61,6 +64,14 @@ INTERVAL_S = 0.25
 FULL_EVERY_S = 5.0
 TICK_EVERY_S = 1.0
 WARN_RATIO = 0.8
+APPROVAL_EVENTS = {
+    "open": "approval.created",
+    "decision": "approval.updated",
+    "decided": "approval.decided",
+    "expired": "approval.expired",
+    "obsolete": "approval.expired",
+    "revoked": "approval.revoked",
+}
 
 
 @dataclass
@@ -71,6 +82,8 @@ class _Seen:
     active: bool
     log_len: int = 0
     approvals_len: int = 0
+    open_ids: set[str] = field(default_factory=set)
+    counts_dirty: bool = False
     transcript_lines: dict[str, int] = field(default_factory=dict)
     msg_id: int = 0
     result_id: int = 0
@@ -92,6 +105,7 @@ class RunWatcher:
         tick_every_s: float = TICK_EVERY_S,
     ) -> None:
         self.state = state
+        self.approvals = ApprovalReader(state)
         self.interval_s = interval_s
         self.full_every_s = full_every_s
         self.tick_every_s = tick_every_s
@@ -150,6 +164,8 @@ class RunWatcher:
                 counts_dirty = True
                 seen.status = record.status
             seen.active = record.status.is_active
+            counts_dirty = counts_dirty or seen.counts_dirty
+            seen.counts_dirty = False
         if counts_dirty:
             self._emit(CountsChangedEvent, run_id=None, counts=counts(self.state))
         self._primed = True
@@ -161,6 +177,8 @@ class RunWatcher:
         seen = _Seen(status=record.status, active=record.status.is_active)
         seen.log_len = len(record.log.entries)
         seen.approvals_len = len(record.approvals.entries)
+        if seen.active:
+            seen.open_ids = self._open_ids(record)
         seen.transcript_lines = {a: len(r.transcript.lines) for a, r in record.agents.items()}
         room = record.room
         if room.available:
@@ -223,14 +241,18 @@ class RunWatcher:
 
         # approvals.jsonl
         approvals = record.approvals.entries
+        new_approvals: list[dict[str, Any]] = []
         if len(approvals) < seen.approvals_len:
             seen.approvals_len = 0
         if len(approvals) != seen.approvals_len:
-            for entry in approvals[seen.approvals_len :]:
+            new_approvals = approvals[seen.approvals_len :]
+            for entry in new_approvals:
                 request = entry.get("request")
                 if isinstance(request, dict) and isinstance(request.get("agent_id"), str):
                     agents_dirty.add(request["agent_id"])
             seen.approvals_len = len(approvals)
+            run_dirty = True
+        if (new_approvals or seen.open_ids) and self._approval_events(record, seen, new_approvals):
             run_dirty = True
 
         # transcripts
@@ -341,6 +363,42 @@ class RunWatcher:
                 tokens_total=tokens,
             )
             self._warn_limits(record, seen, limits)
+
+    def _open_ids(self, record: RunRecord) -> set[str]:
+        items = self.approvals.items(record)
+        return {i.id for i in items.values() if i.status is ApprovalStatus.OPEN}
+
+    def _approval_events(
+        self, record: RunRecord, seen: _Seen, entries: list[dict[str, Any]]
+    ) -> bool:
+        """`approval.*` for new lines, and for open items of a run that died without a line."""
+        items = self.approvals.items(record)
+        emitted = False
+        told: set[str] = set()
+        for entry in entries:
+            item = items.get(str(entry.get("item_id")))
+            kind = APPROVAL_EVENTS.get(str(entry.get("event")))
+            if item is None or kind is None:
+                continue
+            still_open = item.status is ApprovalStatus.OPEN
+            if kind in ("approval.created", "approval.updated") and not still_open:
+                continue  # opened and closed within one tick: only the closing counts
+            self._emit(ApprovalEvent, run_id=record.run_id, type=kind, item=item)
+            told.add(item.id)
+            emitted = True
+        open_now = {i.id for i in items.values() if i.status is ApprovalStatus.OPEN}
+        for item_id in seen.open_ids - open_now - told:
+            if item_id in items:
+                self._emit(
+                    ApprovalEvent,
+                    run_id=record.run_id,
+                    type="approval.expired",
+                    item=items[item_id],
+                )
+                emitted = True
+        seen.open_ids = open_now
+        seen.counts_dirty = seen.counts_dirty or emitted
+        return emitted
 
     def _warn_limits(self, record: RunRecord, seen: _Seen, limits: Any) -> None:
         checks = [

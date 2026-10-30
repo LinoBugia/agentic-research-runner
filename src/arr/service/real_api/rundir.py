@@ -34,6 +34,8 @@ from arr.models import (
     TopologyKind,
     parse_duration,
 )
+from arr.permissions.policy import is_codex_escalation
+from arr.permissions.types import RequestCategory
 from arr.resolve import load_yaml_model
 from arr.room.store import RoomStore
 from arr.room.types import Message as RoomMessage
@@ -749,27 +751,58 @@ def status_since(entries: Sequence[Mapping[str, Any]], meta: RunMeta) -> float |
     return meta.started or meta.created
 
 
+def run_alive(record: RunRecord) -> bool:
+    """True while a process executes the run: not over, and `run.lock` is held."""
+    return not record.final and run_lock_held(record.run_dir)
+
+
 def open_items(record: RunRecord) -> list[dict[str, Any]]:
-    """Open entries of `approvals.jsonl`; none for a run that is over."""
+    """Open entries of `approvals.jsonl`; none for a run that nobody executes any more."""
     if record.final:
         return []
-    return open_approvals(record.approvals.entries)
+    items = open_approvals(record.approvals.entries)
+    return items if items and run_alive(record) else []
 
 
 def _item_is_escalation(entry: Mapping[str, Any]) -> bool:
     return entry.get("request") is None
 
 
+def item_title(entry: Mapping[str, Any], *, stage: str | None = None, attempts: int = 0) -> str:
+    """The sentence of an item (title of the card), without the full command (docs/08 R5)."""
+    request = entry.get("request") or {}
+    if not isinstance(request, Mapping) or not request:
+        if not stage:
+            return entry.get("note") or "Eine Eskalation wartet auf deine Entscheidung"
+        tries = f" nach {attempts} Versuchen" if attempts > 1 else ""
+        return f"Stufe „{stage}“{tries} nicht bestanden"
+    agent = str(request.get("agent_id"))
+    categories = request.get("categories") or []
+    hosts = request.get("hosts") or []
+    if is_codex_escalation(request):
+        return f"{agent} möchte einen Befehl ohne Sandbox ausführen"
+    if RequestCategory.INSTALL.value in categories:
+        return f"{agent} möchte etwas installieren"
+    if hosts:
+        return f"{agent} möchte auf {', '.join(hosts)} zugreifen"
+    if RequestCategory.READ_OUTSIDE.value in categories:
+        return f"{agent} möchte außerhalb seines Arbeitsbereichs lesen"
+    if RequestCategory.WRITE_OUTSIDE.value in categories:
+        return f"{agent} möchte außerhalb des Runs schreiben"
+    if RequestCategory.NETWORK.value in categories:
+        return f"{agent} möchte aufs Netzwerk zugreifen"
+    tool = request.get("tool")
+    return f"{agent} möchte {tool} nutzen" if tool else agent
+
+
 def describe_item(entry: Mapping[str, Any]) -> str:
     """One German line for an open item (banner „Wartet auf dich“)."""
     request = entry.get("request") or {}
+    title = item_title(entry)
     if not isinstance(request, Mapping) or not request:
-        return entry.get("note") or "Eine Eskalation wartet auf deine Entscheidung"
-    what = request.get("command") or ", ".join(request.get("hosts") or request.get("paths") or [])
-    tool = request.get("tool")
-    agent = str(request.get("agent_id"))
-    head = f"{agent} möchte {tool} nutzen" if tool else agent
-    return head + (f": {what}" if what else "")
+        return title
+    what = request.get("command") or ", ".join(request.get("paths") or [])
+    return title + (f": {what}" if what else "")
 
 
 # --------------------------------------------------------------------------------------------

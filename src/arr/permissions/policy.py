@@ -391,6 +391,10 @@ _R_WEB_OFF = (
 _R_CODEX_ESCALATION = (
     "Codex will diesen Befehl ohne Sandbox ausführen; das braucht immer eine Freigabe."
 )
+_R_CODEX_ONCE = (
+    "Eine Codex-Eskalation läuft ohne Sandbox. Deshalb gilt die Entscheidung nur für diese "
+    "eine Anfrage."
+)
 _R_SECRET_IN_RULE = (
     "Die Anfrage enthält ein Geheimnis, deshalb wird daraus keine „Immer“-Regel (sie stünde "
     "in arr.yaml). Die Entscheidung gilt nur für diesen Run."
@@ -1883,6 +1887,20 @@ def _covers(granted: ItemKey, item: ItemKey) -> bool:
     return granted[1] == item[1]
 
 
+def is_codex_escalation(request: PermissionRequest | Mapping[str, Any]) -> bool:
+    """True for a Codex shell request: once allowed it runs without any sandbox (H2, S2 §15).
+
+    Such a decision covers exactly one request. Takes the request or a line of
+    `approvals.jsonl`, where the adapter has set the provider.
+    """
+    data = request if isinstance(request, Mapping) else request.model_dump(mode="json")
+    return (
+        data.get("provider") == Provider.CODEX.value
+        and data.get("tool") in SHELL_TOOLS
+        and bool(str(data.get("command") or "").strip())
+    )
+
+
 def _host_matches(pattern: str, host: str) -> bool:
     pattern = pattern.rstrip(".").lower()
     if pattern.startswith("*."):
@@ -1971,6 +1989,8 @@ class PolicyEngine:
         """Keep a final decision according to its scope (docs/07 §3 ④).
 
         `once` is not kept. `agent` and `run` become grants that cover the same items later.
+        A Codex escalation is always kept as `once`, whatever the scope was (it runs without
+        a sandbox).
         `always` (user only, enforced by `Decision`) becomes an `AlwaysRule` in `self.rules`,
         returned so the caller can store it in `arr.yaml`. If an item of the request contains
         a secret, no always rule is made; the decision is kept with scope `run` instead.
@@ -1986,6 +2006,9 @@ class PolicyEngine:
         items = frozenset(analysis.grey)
         if not items:
             return Remembered(decision)
+        if analysis.no_rules:
+            once = decision.model_copy(update={"scope": DecisionScope.ONCE})
+            return Remembered(once, note=_R_CODEX_ONCE)
         note = None
         if decision.scope is DecisionScope.ALWAYS:
             rule = _rule_from_items(analysis, decision)
@@ -2099,10 +2122,14 @@ class PolicyEngine:
                 reason="Erlaubt durch eine feste Regel aus arr.yaml.",
                 risk=_risk(analysis, grey),
             )
+        # A Codex escalation leaves the sandbox: no grant reaches it, not even one for the same
+        # command text given to a Claude agent of the run (review W2-02).
         allow_grants = [
             g
             for g in self._grants.values()
-            if g.decision.action is DecisionAction.ALLOW and g.applies_to(request)
+            if g.decision.action is DecisionAction.ALLOW
+            and g.applies_to(request)
+            and not analysis.no_rules
         ]
         covering = [
             next((g for g in allow_grants if any(_covers(i, key) for i in g.items)), None)
