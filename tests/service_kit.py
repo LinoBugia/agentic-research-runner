@@ -85,12 +85,27 @@ class ServiceProcess:
     depends on the resolver of the machine (`client`, `ws_connect`).
     """
 
-    def __init__(self, process: subprocess.Popen[str], port: int, arr_home: Path, log: Path):
+    def __init__(
+        self,
+        process: subprocess.Popen[str],
+        port: int,
+        arr_home: Path,
+        log: Path | None,
+        reader_fd: int | None = None,
+    ):
         self.process = process
         self.port = port
         self.arr_home = arr_home
         self.log = log
+        self.reader_fd = reader_fd
         self.info: ServiceInfo | None = None
+
+    def close_reader(self) -> None:
+        """Close the read end of the child's output pipe, like a `tee` that went away: the
+        child's next print raises `BrokenPipeError` (W3-01.3 N3)."""
+        if self.reader_fd is not None:
+            os.close(self.reader_fd)
+            self.reader_fd = None
 
     @property
     def hostname(self) -> str:
@@ -142,6 +157,8 @@ class ServiceProcess:
         return connect(uri, sock=sock, additional_headers=dict(headers or {}), open_timeout=10)
 
     def output(self) -> str:
+        if self.log is None:
+            return ""
         try:
             return self.log.read_text("utf-8", errors="replace")
         except OSError:
@@ -174,11 +191,13 @@ def start_service(
     env: Mapping[str, str] | None = None,
     port: int | None = None,
     wait_ready: bool = True,
+    pipe_output: bool = False,
 ) -> ServiceProcess:
     """Start the service child; `scripts` are FakeBackend scripts by agent ID, `autostart` a
-    run input the child starts right after startup."""
+    run input the child starts right after startup. With `pipe_output` the child's output
+    goes to a pipe the test can close (`ServiceProcess.close_reader`) instead of a log."""
     port = port or free_port()
-    log = tmp_path / f"service-{port}.log"
+    log: Path | None = tmp_path / f"service-{port}.log"
     child_env = {
         **_clean_env(),
         "ARR_HOME": str(arr_home),
@@ -193,17 +212,23 @@ def start_service(
     if autostart is not None:
         start_file = write_json(tmp_path / f"start-{port}.json", autostart)
         child_env["ARR_TEST_AUTOSTART"] = str(start_file)
-    handle = log.open("w", encoding="utf-8")
+    reader_fd: int | None = None
+    if pipe_output:
+        reader_fd, out_fd = os.pipe()
+        log = None
+    else:
+        assert log is not None
+        out_fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     process = subprocess.Popen(
         [sys.executable, str(CHILD)],
         env=child_env,
-        stdout=handle,
+        stdout=out_fd,
         stderr=subprocess.STDOUT,
         start_new_session=True,
         text=True,
     )
-    handle.close()
-    service = ServiceProcess(process, port, arr_home, log)
+    os.close(out_fd)
+    service = ServiceProcess(process, port, arr_home, log, reader_fd)
     if wait_ready:
         wait_for_service(service)
     return service

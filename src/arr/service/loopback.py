@@ -36,6 +36,8 @@ NO_IPV6_ERRNOS = frozenset(
 LOOPBACK_V4 = "127.0.0.1"
 LOOPBACK_V6 = "::1"
 RELAY_CHUNK = 65536
+GRACE_S = 1.0
+"""When one direction of a relayed connection ends, the other may finish for this long."""
 
 
 def _socket(family: int) -> socket.socket:
@@ -64,8 +66,9 @@ def port_in_use(port: int) -> str | None:
     a specific bind pass next to a wildcard holder. Without IPv6 only IPv4 is checked.
     """
     for family, address, label in PROBES:
-        sock = _socket(family)
+        sock = None
         try:
+            sock = _socket(family)  # a kernel without AF_INET6 fails already here (N5)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((address, port))
         except OSError as exc:
@@ -73,7 +76,8 @@ def port_in_use(port: int) -> str | None:
                 continue
             return label
         finally:
-            sock.close()
+            if sock is not None:
+                sock.close()
     return None
 
 
@@ -103,13 +107,15 @@ class LoopbackRelay:
         """
         if self._sock is not None:
             return True
-        sock = _socket(socket.AF_INET6)
+        sock = None
         try:
+            sock = _socket(socket.AF_INET6)  # may fail with EAFNOSUPPORT (N5)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((LOOPBACK_V6, self.port))
             sock.listen(64)
         except OSError as exc:
-            sock.close()
+            if sock is not None:
+                sock.close()
             if exc.errno in NO_IPV6_ERRNOS:
                 log.info("Kein IPv6 auf diesem Rechner: [::1]:%s wird nicht reserviert.", self.port)
                 return False
@@ -131,15 +137,32 @@ class LoopbackRelay:
         self._server = await asyncio.start_server(self._handle, sock=self._sock)
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Relay one connection; both sides are closed whatever happens (W3-01.3 N4).
+
+        When one direction ends (EOF, reset, uvicorn's keep-alive timeout), the other gets
+        `GRACE_S` to finish and is then cancelled, so no half-open pair stays behind.
+        """
+        up_writer: asyncio.StreamWriter | None = None
         try:
             up_reader, up_writer = await asyncio.open_connection(LOOPBACK_V4, self.port)
-        except OSError:
-            writer.close()
-            return
-        await asyncio.gather(_pipe(reader, up_writer), _pipe(up_reader, writer))
-        for stream in (writer, up_writer):
-            with contextlib.suppress(Exception):
-                stream.close()
+            tasks = {
+                asyncio.ensure_future(_pipe(reader, up_writer)),
+                asyncio.ensure_future(_pipe(up_reader, writer)),
+            }
+            _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if pending:
+                _, pending = await asyncio.wait(pending, timeout=GRACE_S)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        except Exception as exc:  # the upstream refused, a reset during the handshake, …
+            log.debug("Relay: Verbindung beendet: %r", exc)
+        finally:
+            for stream in (writer, up_writer):
+                if stream is not None:
+                    with contextlib.suppress(Exception):
+                        stream.close()
 
     def close(self) -> None:
         """Release the address (also safe to call twice and after a hard abort)."""
@@ -153,6 +176,7 @@ class LoopbackRelay:
 
 
 async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+    """Copy one direction until EOF; every failure ends the direction quietly (N4)."""
     try:
         while True:
             data = await src.read(RELAY_CHUNK)
@@ -160,8 +184,10 @@ async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
                 break
             dst.write(data)
             await dst.drain()
-    except (OSError, asyncio.IncompleteReadError, asyncio.CancelledError):
-        pass
+    except asyncio.CancelledError:
+        pass  # the other direction ended and the grace period is over
+    except Exception as exc:  # EPIPE, ECONNRESET, uvloop's RuntimeError on a closed transport
+        log.debug("Relay: Richtung beendet: %r", exc)
     finally:
         with contextlib.suppress(Exception):
             if dst.can_write_eof():

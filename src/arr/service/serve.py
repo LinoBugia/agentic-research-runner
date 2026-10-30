@@ -54,7 +54,22 @@ log = logging.getLogger("arr.service")
 
 
 def _print(line: str) -> None:
-    print(line, flush=True)
+    """Print a line for the user; a closed standard output never stops the service (N3).
+
+    `arr serve | tee …` whose reader is gone makes `print` raise `BrokenPipeError`. Then
+    further output goes nowhere, so neither a later line nor the flush at exit can fail.
+    """
+    try:
+        print(line, flush=True)
+    except OSError:
+        with contextlib.suppress(Exception):
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+
+
+def _say(report: Report, line: str) -> None:
+    """Report without ever raising (a broken reporter must not stop anything, N3)."""
+    with contextlib.suppress(Exception):
+        report(line)
 
 
 # --------------------------------------------------------------------------------------------
@@ -164,13 +179,14 @@ class ServiceStop:
             return
         active = len(self.api.state.registry.active())
         if active:
-            self.report(
+            _say(
+                self.report,
                 f"Strg-C: {active} Run{'s' if active != 1 else ''} des Service "
                 f"{'werden' if active != 1 else 'wird'} gestoppt (Finalizer und Secret-Scan "
-                "laufen), dann endet arr. Noch einmal Strg-C (nach einer Sekunde) bricht hart ab."
+                "laufen), dann endet arr. Noch einmal Strg-C (nach einer Sekunde) bricht hart ab.",
             )
         else:
-            self.report("Strg-C: arr wird beendet.")
+            _say(self.report, "Strg-C: arr wird beendet.")
         self._task = asyncio.get_running_loop().create_task(self._graceful())
 
     async def _graceful(self) -> None:
@@ -181,9 +197,10 @@ class ServiceStop:
         self.shutdown()
 
     def hard_abort(self) -> None:
-        self.report(
+        _say(
+            self.report,
             "Zweites Strg-C: harter Abbruch. Laufende Runs bleiben unvollständig, ihr Status "
-            "wird „unterbrochen“ (interrupted)."
+            "wird „unterbrochen“ (interrupted).",
         )
         for handle in self.api.state.registry.active():
             with contextlib.suppress(Exception):
@@ -238,13 +255,14 @@ class ServiceRuntime:
         remember_workfolder(self.info.workfolder)
         await self.api.start()
         for run_id in self.api.state.interrupted_at_start:
-            self.report(
+            _say(
+                self.report,
                 f"Run {run_id} war beim letzten Mal noch aktiv und gilt jetzt als unterbrochen "
-                "(interrupted)."
+                "(interrupted).",
             )
         self.stop = ServiceStop(self.api, app.shutdown, self.report, relay=self.relay)
         self._remove_signals = self._install_signals(self.stop)
-        self.report(f"arr läuft auf {self.info.url} (Workfolder {self.info.workfolder}).")
+        _say(self.report, f"arr läuft auf {self.info.url} (Workfolder {self.info.workfolder}).")
         if self.open_browser:
             url = self.info.open_url
             threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
@@ -276,7 +294,7 @@ class ServiceRuntime:
             if self.relay is not None:
                 self.relay.close()
             remove_service_info(os.getpid())
-            self.report("arr ist beendet.")
+            _say(self.report, "arr ist beendet.")
 
 
 def serve(
@@ -313,7 +331,7 @@ def serve(
         )
     relay = LoopbackRelay(port)  # [::1]:<port> is arr's before the token link exists (W3-01.2)
     if not relay.bind():
-        report(f"Kein IPv6 auf diesem Rechner: arr reserviert [::1]:{port} nicht.")
+        _say(report, f"Kein IPv6 auf diesem Rechner: arr reserviert [::1]:{port} nicht.")
     token = new_token()
     hostname = new_hostname()
     info = ServiceInfo(host=hostname, port=port, token=token, pid=os.getpid(), workfolder=str(root))
@@ -328,9 +346,11 @@ def serve(
     app.add_middleware(Guard, token=token, port=port, hostname=hostname)
     app.on_startup(runtime.startup)
     app.on_shutdown(runtime.shutdown)
-    report(f"arr startet auf {info.url} mit Workfolder {root}. Beenden mit Strg+C.")
+    _say(report, f"arr startet auf {info.url} mit Workfolder {root}. Beenden mit Strg+C.")
     if not open_browser:
-        report(f"Öffne die Oberfläche mit diesem Link (gilt für diesen Start): {info.open_url}")
+        _say(
+            report, f"Öffne die Oberfläche mit diesem Link (gilt für diesen Start): {info.open_url}"
+        )
     try:
         ui.run(
             host="127.0.0.1",

@@ -265,3 +265,62 @@ def test_gui_without_mock_points_to_serve() -> None:
     with pytest.raises(ArrError) as error:
         run(mock=False)
     assert "arr serve" in str(error.value)
+
+
+# --- W3-01.3 N3: a closed standard output never prevents the stop ------------------------------
+
+
+def _log_kinds(run_dir: Path) -> list[str]:
+    lines = (run_dir / "orchestrator.jsonl").read_text().splitlines()
+    return [json.loads(line)["kind"] for line in lines]
+
+
+def test_ctrl_c_stops_even_with_closed_standard_output(tmp_path: Path, home: Path) -> None:
+    """`arr serve | tee log` whose tee is gone: the signal must still stop the run (N3)."""
+    workfolder = make_workfolder(tmp_path)
+    scripts = {"a": turns([say("los"), wait(120)])}
+    service = start_service(
+        tmp_path, home, workfolder, scripts=scripts, autostart=RUN_INPUT, pipe_output=True
+    )
+    try:
+        wait_for(lambda: bool(run_dirs(workfolder)), what="run folder")
+        [run_dir] = run_dirs(workfolder)
+        wait_for(lambda: read_meta(run_dir)["status"] == "running", what="running")
+        service.close_reader()
+        service.signal(signal.SIGINT)
+        code = service.wait(timeout=30)
+    finally:
+        service.stop()
+    assert code == 0
+    assert read_meta(run_dir)["status"] == "stopped"
+    assert (run_dir / "output" / "summary.md").is_file(), "finalizer ran"
+    assert "secret_scan" in _log_kinds(run_dir)
+    assert not (run_dir / "stop.request").exists()
+    assert not (home / "service.json").exists()
+
+
+def test_second_ctrl_c_aborts_hard_even_with_closed_standard_output(
+    tmp_path: Path, home: Path
+) -> None:
+    workfolder = make_workfolder(tmp_path)
+    scripts = {"a": turns([say("los"), {"do": "hang", "seconds": 120}])}
+    service = start_service(
+        tmp_path, home, workfolder, scripts=scripts, autostart=RUN_INPUT, pipe_output=True
+    )
+    try:
+        wait_for(lambda: bool(run_dirs(workfolder)), what="run folder")
+        [run_dir] = run_dirs(workfolder)
+        wait_for(lambda: read_meta(run_dir)["status"] == "running", what="running")
+        service.close_reader()
+        service.signal(signal.SIGINT)
+        time.sleep(1.5)
+        service.signal(signal.SIGINT)
+        code = service.wait(timeout=30)
+    finally:
+        service.stop()
+    assert code == 130
+    assert read_meta(run_dir)["status"] == "interrupted"
+    lines = (run_dir / "orchestrator.jsonl").read_text().splitlines()
+    entries = [json.loads(line) for line in lines]
+    assert any(e["kind"] == "status" and e["data"].get("previous") == "hard_abort" for e in entries)
+    assert not (home / "service.json").exists()

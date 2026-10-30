@@ -6,8 +6,11 @@ is not inheritable and is released at the end."""
 import errno
 import http.client
 import select
+import shutil
 import socket
 import statistics
+import struct
+import subprocess
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -147,6 +150,53 @@ def test_relay_adds_little_delay(service: ServiceProcess) -> None:
     assert via_v6 < 0.25, "ein Aufruf über das Relay darf nicht spürbar langsamer sein"
 
 
+def _relay_connections(service: ServiceProcess) -> list[str]:
+    """Connections of the service process on its port, as `lsof` shows them."""
+    out = subprocess.run(
+        ["lsof", "-nP", "-a", "-p", str(service.process.pid), f"-iTCP:{service.port}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    return [line for line in out.splitlines() if "ESTABLISHED" in line or "CLOSE_WAIT" in line]
+
+
+def test_relay_cleans_up_after_resets_and_after_the_upstream_closes(
+    service: ServiceProcess,
+) -> None:
+    """W3-01.3 N4: connections over `::1` that end with a reset leave no unretrieved task
+    exception; when uvicorn closes its side, the client side is closed after the grace
+    period even if the client never closes."""
+    if shutil.which("lsof") is None:
+        pytest.skip("lsof fehlt")
+    cookie = f"{COOKIE}={service.token}"
+    request = (
+        f"GET /arr-static/arr.js HTTP/1.1\r\nHost: {service.host}\r\nCookie: {cookie}\r\n\r\n"
+    ).encode()
+    for _ in range(60):  # answer starts, then a reset in the middle of it
+        sock = socket.create_connection(("::1", service.port), timeout=10)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.sendall(request)
+        sock.recv(512)
+        sock.close()
+    holders = []
+    for _ in range(5):  # read the whole answer, then keep the socket open
+        sock = socket.create_connection(("::1", service.port), timeout=10)
+        sock.sendall(
+            f"GET / HTTP/1.1\r\nHost: {service.host}\r\nConnection: close\r\n\r\n".encode()
+        )
+        while sock.recv(65536):
+            pass
+        holders.append(sock)
+    try:
+        wait_for(lambda: not _relay_connections(service), timeout=10, what="Relay-Reste")
+    finally:
+        for sock in holders:
+            sock.close()
+    output = service.output()
+    assert "never retrieved" not in output and "Traceback" not in output, output[-2000:]
+
+
 # --- start refused when taken, release at the end -------------------------------------------------
 
 
@@ -228,3 +278,23 @@ def test_service_releases_the_ipv6_port_at_the_end(tmp_path: Path, home: Path) -
     finally:
         service.stop()
     wait_for(lambda: port_in_use(port) is None, timeout=10, what="[::1] frei nach dem Ende")
+
+
+def test_without_ipv6_at_socket_creation_the_reservation_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W3-01.3 N5: a kernel without `AF_INET6` fails at `socket()`, not at `bind`."""
+    port = free_port()
+    real_socket = socket.socket
+
+    def no_inet6(*args: Any, **kwargs: Any) -> Any:
+        family = args[0] if args else kwargs.get("family", socket.AF_INET)
+        if family == socket.AF_INET6:
+            raise OSError(errno.EAFNOSUPPORT, "Address family not supported by protocol")
+        return real_socket(*args, **kwargs)
+
+    monkeypatch.setattr(socket, "socket", no_inet6)
+    assert port_in_use(port) is None
+    relay = LoopbackRelay(port)
+    assert relay.bind() is False and not relay.bound
+    relay.close()
