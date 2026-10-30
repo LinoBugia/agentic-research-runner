@@ -6,11 +6,16 @@ live stream, the registry of the runs this service executes (`RunHandle` with th
 `RunManager`), the `ProfileGate`s shared by all runs, and the base URL for `gui_url`s. The
 helpers below build the uniform errors (docs/08 §8.4) and the German messages of the areas
 that later orders fill in (`unavailable`).
+
+`switch_workfolder` replaces workfolder, settings, store and registry (W3-04), so areas read
+them from the state on every use and never keep them. `hub` and `gates` stay: subscribers
+hang on the hub, and a profile's concurrency and rate-limit state belong to the process.
 """
 
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -124,6 +129,7 @@ class ServiceState:
         self.store = RunStore(self.workfolder / "runs")
         self.interrupted_at_start: list[str] = []
         self.started = time.time()
+        self.on_switch: list[Callable[[], None]] = []
 
     @staticmethod
     def now() -> float:
@@ -151,4 +157,28 @@ class ServiceState:
     def reload_settings(self) -> WorkfolderSettings:
         """Read `arr.yaml` again (the service keeps its settings otherwise)."""
         self.settings = load_workfolder_settings(self.workfolder)
+        self._sync_gates()
         return self.settings
+
+    def _sync_gates(self) -> None:
+        """Existing `ProfileGate`s take the limits of the settings; waiters check again."""
+        for name, gate in self.gates.items():
+            gate.limit = self.settings.concurrency.get(name)
+            gate.kick()
+
+    def switch_workfolder(
+        self, workfolder: Path, settings: WorkfolderSettings, interrupted: list[str]
+    ) -> None:
+        """Go over to `workfolder` in one step; the caller makes sure no own run is active.
+
+        `interrupted`: runs of the new workfolder that its recovery changed. Runs through
+        without yielding to the event loop, so no area sees a half-switched state.
+        """
+        self.workfolder = workfolder
+        self.settings = settings
+        self.store = RunStore(workfolder / "runs")
+        self.registry = RunRegistry()
+        self.interrupted_at_start = interrupted
+        self._sync_gates()
+        for listener in self.on_switch:
+            listener()

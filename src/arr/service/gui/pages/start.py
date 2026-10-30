@@ -4,6 +4,7 @@ Left „Wartet auf dich“ and „Aktive Runs“, right „Warnungen“, „Zule
 at 1440 × 760 and 1280 × 680 the first three areas fit without scrolling (T1). Every area loads
 on its own (skeleton, banner on errors). Live: new approvals appear on top, run cards and
 counters update; usage ticks only patch the figures, so the focus stays where it is.
+`?workfolder=neu` opens the dialog for a new workfolder (W3-04).
 """
 
 from nicegui import ui
@@ -22,6 +23,7 @@ from arr.service.api_models import (
     RunSummary,
     SkillInfo,
     SkillKind,
+    ToolchainCandidate,
     UsageTickEvent,
     WarningInfo,
     WorkfolderInfo,
@@ -33,6 +35,8 @@ from arr.service.gui.components.badge import badge_html, run_badges_html
 from arr.service.gui.components.banner import empty_state_html
 from arr.service.gui.components.base import button, esc, icon, raw
 from arr.service.gui.components.dialog import ConfirmDialog
+from arr.service.gui.components.form import Field, checkbox
+from arr.service.gui.components.form_dialog import FormDialog
 from arr.service.gui.components.page_state import (
     error_html,
     load_into,
@@ -200,12 +204,15 @@ class StartPage:
         self.zustand = zustand
         self.active: dict[str, RunSummary] = {}
         self.dirty: set[str] = set()
+        self.candidates: list[ToolchainCandidate] = []
 
     async def build(self) -> None:
         workfolder = await self.api.get_workfolder()
         with self.frame.content:
             self.dialog = ConfirmDialog()
+            self.form = FormDialog()
             self._head(workfolder)
+            self.notice = ui.element("div")
             with ui.element("div").classes("start-grid") as self.grid:
                 with ui.element("div"):
                     self.empty_box = ui.element("div")
@@ -219,9 +226,30 @@ class StartPage:
                         "h-done", "Zuletzt beendet", "/runs?status=fertig", more="Alle →"
                     )
                     self.skills = self._section("h-quick", "Neuer Run aus Skill", None)
+        await load_into(
+            self.notice, self._load_toolchain, self._render_notice, retry_href="/", skeleton=""
+        )
         await self._load_all()
         self.frame.on_event(self._on_event)
         ui.timer(1.0, self._flush)
+
+    async def _load_toolchain(self) -> str | None:
+        """Base venvs for a new workfolder and the warning about the current Python (§8.4)."""
+        try:
+            settings = await self.api.get_workfolder_settings()
+        except ApiException:
+            return None  # arr.yaml is broken: the settings page says why
+        self.candidates = settings.toolchain_candidates
+        return settings.toolchain_notice
+
+    def _render_notice(self, notice: str | None) -> None:
+        if notice:
+            raw(
+                '<div class="banner warn" role="status" style="margin-bottom:16px">'
+                f'{icon("warning")}<div class="txt">{esc(notice)}</div>'
+                '<a class="btn btn-sm" href="/einstellungen#python">Python-Umgebung wählen</a>'
+                "</div>"
+            )
 
     def _head(self, wf: WorkfolderInfo) -> None:
         with ui.element("div").classes("page-head start-head").props('id="workfolder"'):
@@ -233,7 +261,9 @@ class StartPage:
                 tag="div",
             )
             with ui.element("div").classes("actions"):
-                button("Workfolder wechseln ▾", lambda: self._switch_dialog(wf))
+                button("Workfolder wechseln ▾", lambda: self._switch_dialog(wf)).mark(
+                    "switch-workfolder"
+                )
                 raw(
                     f'<a class="btn primary" href="/neuer-run">{icon("add")}Neuer Run</a>',
                     tag="span",
@@ -454,9 +484,7 @@ class StartPage:
             except ApiException as exc:
                 self.frame.toast(exc.error.message, error=True)
                 return
-            self.frame.toast(
-                f"Workfolder „{info.name}“ geöffnet. Im Prototyp bleiben die Beispieldaten gleich."
-            )
+            self._opened(info)
 
         self.dialog.show(
             "Workfolder wechseln",
@@ -464,8 +492,8 @@ class StartPage:
             "Wechseln",
             switch,
             danger=False,
-            intro=f"Laufende Runs in „{wf.name}“ laufen weiter. Du siehst sie wieder, wenn du "
-            "zurückwechselst.",
+            intro=f"Runs aus dem Terminal in „{wf.name}“ laufen weiter. Du siehst sie wieder, "
+            "wenn du zurückwechselst.",
         )
         with self.dialog.body, ui.element("div").classes("db"):
             with ui.element("div").classes("radio-cards"):
@@ -475,6 +503,7 @@ class StartPage:
                             f'type="radio" name="wf" value="{esc(path)}"'
                             + (" checked" if path == wf.path else "")
                         )
+                        radio.mark(f"workfolder-{ref.name}")
                         radio.on("change", lambda _e, p=path: chosen.__setitem__("path", p))
                         active = (
                             f"{ref.active_runs} Runs aktiv"
@@ -487,10 +516,64 @@ class StartPage:
                             f"{ref.projects_count} Projekte, {active}</span></span>",
                             tag="span",
                         )
-            raw(
-                '<p class="small" style="margin-top:12px"><a href="/einrichtung?schritt=1">'
-                "Neuen Workfolder anlegen …</a></p>"
+            with ui.element("p").classes("small").style("margin-top:12px"):
+                button(
+                    "Neuen Workfolder anlegen oder anderen Ordner öffnen …",
+                    self._new_dialog,
+                    classes="btn btn-sm",
+                ).mark("new-workfolder")
+
+    def _opened(self, info: WorkfolderInfo) -> None:
+        """Feedback after a switch; open pages of the service reload on their own."""
+        tail = (
+            " Im Prototyp bleiben die Beispieldaten gleich."
+            if hasattr(self.api, "datasets")
+            else ""
+        )
+        self.frame.toast(f"Workfolder „{info.name}“ geöffnet.{tail}")
+
+    def _new_dialog(self) -> None:
+        """„Neuer Workfolder“: path, and the base venv if there is exactly one (W3-00 §7)."""
+        self.dialog.close()
+        fields: dict[str, Field] = {}
+        suggested = self.candidates[0].path if len(self.candidates) == 1 else None
+        chosen = {"python": suggested}
+
+        def build() -> None:
+            fields["path"] = Field(
+                "Ordner",
+                name="workfolder-path",
+                value="~/",
+                help_text="Ein neuer oder leerer Ordner, z. B. ~/Test-UX3. Liegt dort schon ein "
+                "Workfolder, öffnet arr ihn. arr legt arr.yaml, projects/, skills/ und runs/ an.",
+                attrs='autocomplete="off" spellcheck="false"',
             )
+            if suggested:
+                checkbox(
+                    f"Python-Umgebung „{suggested.rsplit('/', 1)[-1]}“ für die Agenten nutzen",
+                    checked=True,
+                    on_change=lambda v: chosen.__setitem__("python", suggested if v else None),
+                    marker="workfolder-python",
+                )
+
+        async def submit() -> str | None:
+            try:
+                info = await self.api.select_workfolder(
+                    WorkfolderRequest(
+                        path=fields["path"].value.strip() or "~/",
+                        create=True,
+                        python=chosen["python"],
+                    )
+                )
+            except ApiException as exc:
+                if exc.error.field == "path":
+                    fields["path"].set_error(exc.error.message)
+                    return "Dieser Ordner geht nicht."
+                return exc.error.message
+            self._opened(info)
+            return None
+
+        self.form.open("Neuer Workfolder", "Anlegen", build, submit)
 
     # --- live ------------------------------------------------------------------------------------
 
@@ -562,7 +645,7 @@ def register() -> None:
     """Register `/` (docs/08 §5.1)."""
 
     @ui.page("/")
-    async def start(zustand: str = "") -> None:
+    async def start(zustand: str = "", workfolder: str = "") -> None:
         base = get_api()
         api = state_api(base, "leer" if zustand == "ohne-profil" else zustand)
         use_screen_assets()
@@ -585,3 +668,5 @@ def register() -> None:
             return
         page = StartPage(frame, api, zustand)
         await page.build()
+        if workfolder == "neu":
+            page._new_dialog()

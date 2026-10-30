@@ -18,6 +18,7 @@ from nicegui import ui
 from arr.models import Decider, Effort, Provider, RunVenvMode
 from arr.service.api_client import ApiClient
 from arr.service.api_models import (
+    SYSTEM_PYTHON,
     ApiException,
     Appearance,
     AppSettings,
@@ -27,8 +28,8 @@ from arr.service.api_models import (
     NotificationEvent,
     OpenIn,
     ProfileInfo,
+    ProviderDefaultsInfo,
     RuleEffect,
-    SetupState,
     WorkfolderSettingsInfo,
 )
 from arr.service.gui import format as fmt
@@ -185,7 +186,6 @@ class EinstellungenPage:
             "wf": await self.api.get_workfolder_settings(),
             "rules": await self.api.list_fixed_rules(),
             "profiles": await self.api.list_profiles(),
-            "setup": await self.api.get_setup_state(),
         }
 
     async def _render_wf(self, data: dict[str, Any]) -> None:
@@ -202,7 +202,7 @@ class EinstellungenPage:
         self.rules_box = ui.element("div").style("margin-top:16px")
         self._rules(data["rules"])
         self._standards(data["profiles"])
-        self._python(data["setup"])
+        self._python()
         self._retention()
 
     # --- Freigaben und Vollmacht ----------------------------------------------------------------
@@ -395,7 +395,7 @@ class EinstellungenPage:
                                             lambda r=rule: self._remove_rule(r),
                                             classes="btn btn-sm",
                                             title=f"Regel „{rule.rule}“ entfernen",
-                                        )
+                                        ).mark("remove-rule")
                 raw(
                     '<p class="small muted" style="margin:8px 0 0">Regeln, die du über die '
                     "Reichweite „immer“ angelegt hast, stehen hier mit Herkunft und lassen sich "
@@ -424,6 +424,10 @@ class EinstellungenPage:
                 for provider in (Provider.CLAUDE, Provider.CODEX):
                     defaults = wf.defaults.get(provider)
                     own = [p.name for p in profiles if p.provider is provider]
+                    model = (defaults.model if defaults else "") or MODELS[provider][0]
+                    effort = defaults.effort.value if defaults and defaults.effort else "high"
+                    models = list(dict.fromkeys([*MODELS[provider], model]))
+                    efforts = list(dict.fromkeys([*(e.value for e in EFFORTS[provider]), effort]))
                     with ui.element("div"):
                         raw(f"<h3>{PROVIDER_WORD[provider]}</h3>")
                         fields[f"{provider.value}.auth"] = Field(
@@ -437,17 +441,15 @@ class EinstellungenPage:
                             "Modell",
                             name=f"defaults.{provider.value}.model",
                             kind="select",
-                            value=(defaults.model if defaults else "") or MODELS[provider][0],
-                            options=[(m, m) for m in MODELS[provider]],
+                            value=model,
+                            options=[(m, m) for m in models],
                         )
                         fields[f"{provider.value}.effort"] = Field(
                             "Effort",
                             name=f"defaults.{provider.value}.effort",
                             kind="select",
-                            value=(
-                                defaults.effort.value if defaults and defaults.effort else "high"
-                            ),
-                            options=[(e.value, e.value) for e in EFFORTS[provider]],
+                            value=effort,
+                            options=[(e, e) for e in efforts],
                         )
             with card:
                 raw("<h3>Limits pro Run</h3>")
@@ -481,6 +483,8 @@ class EinstellungenPage:
                     '<a href="/profile">Auth-Profile</a> ein.</p>'
                 )
 
+                shown = {key: field.value for key, field in fields.items()}
+
                 async def save() -> None:
                     wall = parse_duration(fields["wall"].value)
                     budget = parse_money(fields["budget"].value)
@@ -501,15 +505,14 @@ class EinstellungenPage:
                     assert self.wf is not None
                     defaults = dict(self.wf.defaults)
                     for provider in (Provider.CLAUDE, Provider.CODEX):
+                        keys = [f"{provider.value}.{n}" for n in ("auth", "model", "effort")]
+                        changed = any(fields[k].value != shown[k] for k in keys)
                         old = defaults.get(provider)
-                        if old is None:
-                            continue
-                        defaults[provider] = old.model_copy(
-                            update={
-                                "auth": fields[f"{provider.value}.auth"].value or None,
-                                "model": fields[f"{provider.value}.model"].value,
-                                "effort": Effort(fields[f"{provider.value}.effort"].value),
-                            }
+                        if old is None and not changed:
+                            continue  # what the fields show for a provider without standards
+                        auth, model, effort = (fields[k].value for k in keys)
+                        defaults[provider] = ProviderDefaultsInfo(
+                            auth=auth or None, model=model, effort=Effort(effort)
                         )
                     limits = self.wf.limits.model_copy(
                         update={"wall_time_s": wall, "turns_per_agent": turns, "budget_usd": budget}
@@ -521,16 +524,29 @@ class EinstellungenPage:
 
                 save_row(save)
 
-    def _python(self, setup: SetupState) -> None:
+    def _python_notice(self) -> str:
+        """The message of `toolchain_notice` (§8.4), empty when the environment is fine."""
+        assert self.wf is not None
+        notice = self.wf.toolchain_notice
+        if not notice:
+            return ""
+        return (
+            f'<div class="banner warn" role="status">{icon("warning")}<div class="txt">'
+            f"{esc(notice)}</div></div>"
+        )
+
+    def _python(self) -> None:
         assert self.wf is not None
         toolchain = self.wf.toolchain
-        candidates = [c.path for c in setup.toolchain_candidates]
-        current = toolchain.python or "System-Python"
-        if current not in candidates:
-            candidates.insert(0, current)
+        candidates = [c.path for c in self.wf.toolchain_candidates]
+        current = toolchain.python or SYSTEM_PYTHON
+        for option in (current, SYSTEM_PYTHON):
+            if option not in candidates:
+                candidates.append(option)
         with ui.element("div").style("margin-top:16px"):
             card = section_card("python", "Python-Umgebung der Agenten")
             with card:
+                self.python_notice = raw(self._python_notice(), tag="div")
                 with ui.element("div").classes("grid-2e"):
                     with ui.element("div"):
                         env = Field(
@@ -587,12 +603,13 @@ class EinstellungenPage:
                     extra = [p.strip() for p in path.value.split(",") if p.strip()]
                     updated = self.wf.toolchain.model_copy(
                         update={
-                            "python": env.value,
+                            "python": None if env.value == SYSTEM_PYTHON else env.value,
                             "run_venv": RunVenvMode(venv.value),
                             "extra_path": extra,
                         }
                     )
                     await self._save_wf({"toolchain": updated}, "Gespeichert: Python-Umgebung")
+                    self.python_notice.set_content(self._python_notice())
 
                 with ui.element("div").classes("save-row"):
                     button("Testen", test, classes="btn")
@@ -714,9 +731,10 @@ class EinstellungenPage:
                 name="app.port",
                 kind="number",
                 value=str(s.port),
-                help_text="Deep-Links aus Claude Code nutzen diesen Port. Standard 8765.",
+                help_text="Deep-Links aus Claude Code nutzen diesen Port. Ändern lässt er sich "
+                "im Betrieb nicht.",
                 width="110px",
-                attrs='min="1024" max="65535"',
+                attrs='min="1024" max="65535" readonly',
             )
             folders = " · ".join(
                 f'{esc(w.name)} <span class="mono faint">{esc(w.path)}</span>'
@@ -724,9 +742,9 @@ class EinstellungenPage:
             )
             raw(
                 '<dl class="kv small" style="margin:4px 0 0"><dt>Workfolder</dt>'
-                f'<dd>{folders} · <a href="/einrichtung?schritt=1">＋ anlegen</a></dd>'
-                "<dt>Start</dt><dd>Dock-Symbol, startet beim Anmelden und nach einem Absturz neu "
-                "(kommt in einer späteren Version)</dd></dl>"
+                f'<dd>{folders} · <a href="/?workfolder=neu">＋ anlegen</a></dd>'
+                "<dt>Start</dt><dd>Eigenes Fenster, Dock-Symbol, Start beim Anmelden und nach "
+                "einem Absturz kommen in einer späteren Version</dd></dl>"
             )
 
             async def save() -> None:
@@ -759,9 +777,8 @@ class EinstellungenPage:
                                 attrs='disabled aria-disabled="true"' if always else "",
                             )
                 raw(
-                    '<p class="small muted" style="margin-top:8px">Im Prototyp erscheinen '
-                    "Mitteilungen als Hinweis unten rechts. Die echten macOS-Mitteilungen kommen "
-                    "mit der fertigen App.</p>"
+                    '<p class="small muted" style="margin-top:8px">Gilt für arr auf diesem Mac. '
+                    "Neue Freigaben melden sich immer.</p>"
                 )
 
                 async def save() -> None:

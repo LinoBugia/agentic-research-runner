@@ -176,7 +176,7 @@ class ProjektePage:
                     finder = button(
                         "Im Finder öffnen",
                         lambda: self.frame.toast(
-                            f"Im Finder geöffnet: {project.path} (im Prototyp nur angezeigt)"
+                            f"Im Finder öffnen kommt mit der fertigen App. Pfad: {project.path}"
                         ),
                         classes="btn btn-sm",
                     )
@@ -271,8 +271,8 @@ class ProjektePage:
                         button(
                             action.label,
                             lambda: self.frame.toast(
-                                "Im Prototyp gibt es keinen Ordnerdialog. arr sucht den Ordner "
-                                "über „Ordner wählen …“."
+                                "Einen Ordnerdialog gibt es noch nicht. Lege den Ordner wieder "
+                                "unter projects/ ab."
                             ),
                             classes="btn btn-sm",
                         )
@@ -382,8 +382,8 @@ class ProjektePage:
                 "Ordner",
                 name="existing-path",
                 value=f"{self.root}/",
-                help_text="Im Prototyp tippst du den Pfad. Die fertige App öffnet dafür den "
-                "Ordnerdialog von macOS.",
+                help_text="Tippe den Pfad. Die fertige App öffnet dafür den Ordnerdialog von "
+                "macOS.",
             )
 
         async def submit() -> str | None:
@@ -402,8 +402,10 @@ class ProjektePage:
                 fields["path"].set_error(exc.error.message)
                 return "Der Ordner lässt sich so nicht einrichten."
             added = ", ".join(result.created)
-            self.frame.toast(f"{result.message} arr hat ergänzt: {added}.")
-            await self._reload(name)
+            self.frame.toast(
+                f"{result.message} arr hat ergänzt: {added}." if added else result.message
+            )
+            await self._reload(result.project.name)
             return None
 
         self.dialog.open("Vorhandenen Ordner einrichten", "Einrichten", build, submit)

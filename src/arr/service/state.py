@@ -1,25 +1,32 @@
-"""Files of the service in the app folder (`~/.arr/`, docs/04 §1): `service.json` and the
-list of recently used workfolders.
+"""Files of the service in the app folder (`~/.arr/`, docs/04 §1): `service.json`, the list of
+recently used workfolders and the app settings.
 
 `service.json` (mode 0600) tells a second `arr serve`, the MCP bridge (W4-01) and the Dock
 start (W5-02) where the running service listens and how to open it: hostname
 (`<random>.localhost`, W3-01.1 M1), port, token, PID, start time and workfolder. It is
 written at start and removed at the end; a stale file (process gone) is overwritten by the
 next start. `workfolders.json` remembers the workfolders the service was started with, most
-recent first, so `arr serve` without `--workfolder` opens the last one.
+recent first, so `arr serve` without `--workfolder` opens the last one. `settings.yaml` holds
+what the settings page keeps for this Mac (docs/02 §1): `open_in`, `appearance` and
+`notifications` (event → on/off, keys of `NotificationEvent`; a missing key means on).
 """
 
+import io
 import json
 import os
 import time
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+from ruamel.yaml import YAML, YAMLError
 
 from arr.settings import app_dir
 
 SERVICE_FILE = "service.json"
 WORKFOLDERS_FILE = "workfolders.json"
+SETTINGS_FILE = "settings.yaml"
 MAX_RECENT = 10
 
 
@@ -131,3 +138,26 @@ def remember_workfolder(path: str | Path) -> None:
     recent = [str(p) for p in recent_workfolders() if str(p) != folder]
     data = {"version": 1, "workfolders": [folder, *recent][:MAX_RECENT]}
     _write_private(workfolders_file(), json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def app_settings_file() -> Path:
+    return app_dir() / SETTINGS_FILE
+
+
+def read_app_settings() -> dict[str, Any]:
+    """Content of `settings.yaml`; empty if there is none or it is unreadable."""
+    try:
+        data = YAML(typ="safe").load(app_settings_file().read_text(encoding="utf-8"))
+    except (OSError, YAMLError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_app_settings(data: Mapping[str, Any]) -> None:
+    """Write `settings.yaml` (0600, atomically)."""
+    yaml = YAML(typ="safe")
+    yaml.default_flow_style = False
+    yaml.allow_unicode = True
+    buffer = io.StringIO()
+    yaml.dump(dict(data), buffer)
+    _write_private(app_settings_file(), buffer.getvalue())

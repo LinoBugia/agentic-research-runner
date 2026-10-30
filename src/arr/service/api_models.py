@@ -1645,6 +1645,10 @@ class AppSettings(ApiModel):
         return self
 
 
+SYSTEM_PYTHON = "System-Python"
+"""Choice „no base venv“ in the settings: the Python arr itself is based on."""
+
+
 class ProviderDefaultsInfo(ApiModel):
     """Standard profile, model and effort of one provider (docs/08 §5.11 „Standards“)."""
 
@@ -1682,7 +1686,9 @@ class WorkfolderSettingsInfo(ApiModel):
     """Settings of the current workfolder (`arr.yaml`, docs/08 §5.11).
 
     `user_agent_runs_require_approval` is shown only and always true (E15). `running_runs`
-    feeds the hint „gilt sofort, auch in n laufenden Runs“.
+    feeds the hint „gilt sofort, auch in n laufenden Runs“. `toolchain_candidates` are the
+    base venvs to choose from, `toolchain_notice` says why Codex agents cannot use the current
+    Python, before a run fails on it (docs/08 §8.4).
     """
 
     defaults: dict[Provider, ProviderDefaultsInfo] = Field(default_factory=dict)
@@ -1693,6 +1699,8 @@ class WorkfolderSettingsInfo(ApiModel):
     retention: RetentionInfo = Field(default_factory=RetentionInfo)
     user_agent_runs_require_approval: Literal[True] = True
     running_runs: int = Field(default=0, ge=0)
+    toolchain_candidates: list[ToolchainCandidate] = Field(default_factory=list)
+    toolchain_notice: str | None = None
 
 
 class MandateChecks(ApiModel):
@@ -1727,6 +1735,16 @@ class RuleEffect(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     ASK = "ask"
+
+
+BUILTIN_FIXED_RULES = [
+    (RuleEffect.ALLOW, "Lesen und Schreiben im Arbeitsordner, Python in der Sandbox"),
+    (RuleEffect.DENY, "Schreiben außerhalb des Runs (auch Original-Projekt)"),
+    (RuleEffect.DENY, "Sensible Pfade (~/.ssh, ~/.aws, ~/.arr, Schlüsselbund, Browser-Profile)"),
+    (RuleEffect.DENY, "sudo, security, launchctl, ssh, git push"),
+    (RuleEffect.ASK, "Lesen außerhalb des Runs, sonstiges Netzwerk, Paketinstallation"),
+]
+"""The standard rules of docs/07 §3 ② as the settings page shows them."""
 
 
 class FixedRule(ApiModel):
@@ -1859,11 +1877,15 @@ class SkillFile(ApiModel):
 
 
 class WorkfolderRequest(ApiModel):
-    """Open or create a workfolder (docs/08 §5.12, `POST /api/workfolder`)."""
+    """Open or create a workfolder (docs/08 §5.12, `POST /api/workfolder`).
+
+    `python`: a base venv from `toolchain_candidates` for `toolchain.python` of a new workfolder.
+    """
 
     path: str = Field(min_length=1)
     create: bool = False
     name: str | None = None
+    python: str | None = None
 
 
 class UiSeen(ApiModel):
