@@ -14,7 +14,9 @@ keychain). The rules of docs/01 §8 hold for every byte of that output:
 The child can never outlive its limit: it is the session leader with the pty as controlling
 terminal, so the end of the service, however hard, closes the master and the kernel sends
 SIGHUP; `alarm` (kept across `exec`) ends it at the deadline even then. A cancelled
-`capture_token` stops it as well.
+`capture_token` stops it as well. On macOS the CLI stays in its exit until the terminal is
+closed, so the terminal is read until the stop and the wait for the exit comes after the close
+and never blocks the event loop.
 
 See docs/04-service-gui-und-schnittstellen.md §5, docs/08-ux-konzept.md G4.
 """
@@ -214,18 +216,21 @@ def _signal_group(process: subprocess.Popen[bytes], signum: int) -> None:
         os.killpg(process.pid, signum)
 
 
+async def _ended(process: subprocess.Popen[bytes], wait_s: float) -> bool:
+    """Wait without blocking the event loop; True once the process is gone."""
+    for _ in range(int(wait_s / POLL_S)):
+        if process.poll() is not None:
+            return True
+        await asyncio.sleep(POLL_S)
+    return process.poll() is not None
+
+
 async def stop_process(process: subprocess.Popen[bytes]) -> None:
-    """End the child's process group: SIGTERM, after `STOP_WAIT_S` SIGKILL. Always reaps it."""
-    try:
-        if process.poll() is None:
-            _signal_group(process, signal.SIGTERM)
-            for _ in range(int(STOP_WAIT_S / POLL_S)):
-                if process.poll() is not None:
-                    break
-                await asyncio.sleep(POLL_S)
-    finally:
-        _signal_group(process, signal.SIGKILL)
-        process.wait()
+    """End the child's process group: SIGTERM, after `STOP_WAIT_S` SIGKILL."""
+    if process.poll() is None:
+        _signal_group(process, signal.SIGTERM)
+        await _ended(process, STOP_WAIT_S)
+    _signal_group(process, signal.SIGKILL)
 
 
 async def capture_token(
@@ -270,6 +275,16 @@ async def capture_token(
                 loop.remove_reader(master)
                 closed.set()
 
+        def discard() -> None:
+            """Read on and forget: the CLI writes while it stops and must not block on it."""
+            try:
+                if not os.read(master, 65536):
+                    loop.remove_reader(master)
+            except BlockingIOError:
+                pass
+            except OSError:
+                loop.remove_reader(master)
+
         async def ended() -> None:
             while not closed.is_set() and process.poll() is None:  # noqa: ASYNC110 - a child
                 await asyncio.sleep(POLL_S)
@@ -296,10 +311,16 @@ async def capture_token(
             found.clear()
             scanner.clear()
             loop.remove_reader(master)
+            loop.add_reader(master, discard)
             try:
                 await stop_process(process)
             finally:
+                _signal_group(process, signal.SIGKILL)
+                loop.remove_reader(master)
                 os.close(master)
+            # The CLI stays in its exit until the terminal is gone (macOS), so only now.
+            if not await _ended(process, STOP_WAIT_S):
+                log.warning("Claude-Anmeldung: Der Prozess endet verzögert.")
 
 
 # --------------------------------------------------------------------------------------------

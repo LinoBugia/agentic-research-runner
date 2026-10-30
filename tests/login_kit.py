@@ -40,6 +40,10 @@ time.sleep(0.05)
 print("\\x1b[0m\\x1b[33m" + text[30:] + "\\x1b[39m\\r\\nStore this token securely.", flush=True)
 time.sleep(30)
 """
+FLOOD = PRINT_TOKEN.replace(
+    "time.sleep(30)", 'while True:\n    os.write(1, b"x" * 4096 + b"\\r\\n")'
+)
+"""Output the service no longer reads after the token: fills the terminal buffer."""
 HANG = "time.sleep(60)\n"
 FAIL = 'print("Failed to exchange authorization code", flush=True)\nsys.exit(1)\n'
 IGNORE_TERM = "signal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)\n"

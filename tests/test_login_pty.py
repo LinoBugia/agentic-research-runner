@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from login_kit import (
     FAIL,
+    FLOOD,
     HANG,
     IGNORE_HUP,
     IGNORE_TERM,
@@ -135,7 +136,8 @@ async def test_cli_that_cannot_start(tmp_path: Path) -> None:
 
 def _parent(cli: Path, limit: int, grace: int) -> subprocess.Popen[bytes]:
     child = Path(__file__).with_name("login_child.py")
-    return subprocess.Popen([sys.executable, str(child), str(cli), str(limit), str(grace)])
+    env = {**os.environ, "TMPDIR": str(cli.parent)}  # a killed parent leaves its folder there
+    return subprocess.Popen([sys.executable, str(child), str(cli), str(limit), str(grace)], env=env)
 
 
 def test_killing_the_parent_ends_the_child_by_sighup(tmp_path: Path) -> None:
@@ -168,6 +170,34 @@ def test_the_alarm_ends_a_child_that_ignores_sighup_at_the_deadline(tmp_path: Pa
         parent.wait()
 
 
+def test_unread_output_after_the_token_does_not_hang_the_capture(tmp_path: Path) -> None:
+    cli, facts = fake_cli(tmp_path, FLOOD)
+    parent = _parent(cli, 30, 5)
+    try:
+        assert parent.wait(15) == 0, "the capture did not come back"
+        assert wait_until(lambda: not alive(facts_of(facts)["pid"]), 5)
+    finally:
+        parent.kill()
+        parent.wait()
+
+
+@pytest.mark.macos
+def test_the_real_cli_ends_without_blocking_the_capture(tmp_path: Path) -> None:
+    """The real CLI stays in its exit until the terminal is closed: waiting for it first hung
+    the event loop for good, seen only with the real CLI (gate of W3-05). The plain start
+    shows a welcome screen, so no login, no browser and no model request."""
+    child = Path(__file__).with_name("login_child.py")
+    parent = subprocess.Popen(
+        [sys.executable, str(child), str(claude_cli()), "3", "5", "interactive"],
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    try:
+        assert parent.wait(15) == 0, "the capture did not come back"
+    finally:
+        parent.kill()
+        parent.wait()
+
+
 # -- the end of the service -------------------------------------------------------------------
 
 
@@ -177,6 +207,7 @@ def _service(tmp_path: Path, arr_home: Path, cli: Path) -> subprocess.Popen[byte
     child = Path(__file__).with_name("login_service_child.py")
     env = {
         **_clean_env(),
+        "TMPDIR": str(tmp_path),
         "ARR_HOME": str(arr_home),
         "ARR_TEST_CLI": str(cli),
         "ARR_TEST_PROFILE": "max",

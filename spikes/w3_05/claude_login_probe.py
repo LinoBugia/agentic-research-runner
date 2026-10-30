@@ -63,6 +63,7 @@ async def main() -> int:
     started = time.monotonic()
 
     def store(token: str) -> None:
+        say("Token erkannt, Ablage im Schlüsselbund …")
         keyring.set_password(DEFAULT_SERVICE, PROFILE, token)
 
     result = await capture_token(store, timeout_s=TIMEOUT_S)
