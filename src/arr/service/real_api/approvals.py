@@ -26,9 +26,7 @@ from arr.errors import ArrError
 from arr.models import Provider, TopologyKind
 from arr.permissions.inbox import ApprovalInbox, install_hosts
 from arr.permissions.policy import AlwaysRule, is_codex_escalation
-from arr.permissions.types import (
-    ApprovalItem as CoreApprovalItem,
-)
+from arr.permissions.types import ApprovalItem as CoreApprovalItem
 from arr.permissions.types import (
     ApprovalStatus,
     ApprovalType,

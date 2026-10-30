@@ -6,7 +6,6 @@ import asyncio
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -181,8 +180,9 @@ async def test_a8_a_failing_sender_holds_nothing_up() -> None:
     subscriber = hub.add(None, None)
     hub.publish(created(permission()))
     hub.publish(created(permission(id="apr_2", gui_url="http://x/2")))
-    end = time.monotonic() + 5
-    while len(sent) < 2 and time.monotonic() < end:
+    for _ in range(500):
+        if len(sent) == 2:
+            break
         await asyncio.sleep(0.01)
     assert len(sent) == 2
     assert len(subscriber.drain()) == 2

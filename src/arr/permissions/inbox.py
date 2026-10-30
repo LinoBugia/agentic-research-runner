@@ -187,7 +187,7 @@ class ApprovalInbox:
             covered = self._by_install_pass(assessment)
             return covered if covered is not None else await self.ask(assessment)
         if decision.action is DecisionAction.ALLOW and decision.decided_by is DecidedBy.USER:
-            self._grant_install_pass(assessment.request, decision.reason)  # used a grant again
+            self._grant_install_pass(assessment.request, "aus einer früheren Entscheidung")
         return decision
 
     async def ask(self, assessment: Assessment) -> Decision:

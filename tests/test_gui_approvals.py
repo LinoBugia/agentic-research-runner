@@ -104,7 +104,8 @@ async def test_a4_grant_buttons_are_no_single_key_and_the_scope_starts_at_once(w
     async with service(wf, {"a": {**SLOW, "asks": [HOST]}}) as (user, api):
         item = await asyncio.wait_for(_started(api, "a"), 15)
         await user.open(f"/freigaben/{item.id}")
-        await see(user, item.title)
+        html = await see(user, item.title)
+        assert f'data-focus-card="{item.id}"' in html  # heading, never a button (arr.js)
         with user.client:
             [allow] = list(ElementFilter(marker="allow"))
             assert "data-grant" in allow._props and "data-primary" in allow._props

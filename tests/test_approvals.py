@@ -5,6 +5,7 @@ a real notification (`notify` records) or uses a real model."""
 import asyncio
 import hashlib
 import json
+import signal
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -17,7 +18,10 @@ from service_kit import (
     hold_lock,
     make_run_folder,
     make_workfolder,
+    read_meta,
+    run_dirs,
     start_run_process,
+    start_service,
     wait_for,
 )
 
@@ -319,6 +323,38 @@ async def test_a2_open_item_of_a_dead_run_is_not_open(wf: Path) -> None:
         with pytest.raises(ApiException) as error:
             await svc.api.decide_approval(item.id, ALLOW)
         assert error.value.error.code is ErrorCode.CONFLICT
+
+
+def test_a2_ctrl_c_of_a_real_service_closes_items_without_granting(
+    tmp_path: Path, wf: Path, arr_home: Path
+) -> None:
+    script = {**turns([say("nie"), wait(60)]), "asks": [HOST]}
+    service = start_service(
+        tmp_path, arr_home, wf, scripts={"a": script}, autostart=run_input({"id": "a"})
+    )
+    try:
+        wait_for(lambda: bool(run_dirs(wf)), what="run folder")
+        [run_dir] = run_dirs(wf)
+        approvals = run_dir / "approvals.jsonl"
+        wait_for(lambda: approvals.is_file() and '"open"' in approvals.read_text(), what="open")
+        service.signal(signal.SIGINT)
+        assert service.wait(timeout=90) == 0, service.output()
+    finally:
+        service.stop()
+    assert read_meta(run_dir)["status"] == "stopped"
+    assert "decided" not in events_of(wf, run_dir.name)
+    assert events_of(wf, run_dir.name)[-1] == "obsolete"
+
+
+async def test_a2_open_line_of_a_killed_run_is_obsolete_after_the_restart(wf: Path) -> None:
+    folder = make_run_folder(wf, status=RunStatus.INTERRUPTED)
+    request = {"run_id": folder.name, "agent_id": "a", "tool": "Bash", "command": "curl x"}
+    line = {"ts": time.time(), "event": "open", "item_id": "apr_k_0001", "request": request}
+    append(folder / "approvals.jsonl", json.dumps(line) + "\n")
+    api = RealApi(wf, base_url=BASE)
+    assert not await api.list_approvals(status=OPEN)
+    item = await api.get_approval("apr_k_0001")
+    assert item.status is ApprovalStatus.OBSOLETE and "läuft nicht mehr" in item.status_text
 
 
 # --- A3: the only way to a grant -------------------------------------------------------------
