@@ -10,6 +10,7 @@ from the keychain only, never logged and never put into an error message.
 See docs/01-architektur.md §8, docs/04-service-gui-und-schnittstellen.md §5.
 """
 
+import contextlib
 import logging
 import os
 from collections.abc import Callable, MutableMapping
@@ -40,6 +41,10 @@ The CLI then also drops secret-like names (`*_TOKEN`, `*_KEY`, …) and config p
 
 SecretReader = Callable[[str, str], str | None]
 """`(service, account) -> secret or None`, defaults to `keyring.get_password`."""
+SecretWriter = Callable[[str, str, str], None]
+"""`(service, account, secret)`, defaults to `keyring.set_password`."""
+SecretDeleter = Callable[[str, str], None]
+"""`(service, account)`, defaults to `keyring.delete_password`; no entry is no error."""
 
 
 class AuthError(ArrError):
@@ -117,6 +122,62 @@ def claude_env(profile: AuthProfile, reader: SecretReader | None = None) -> dict
             f"Das Profil „{profile.name}“ ({profile.kind}) passt nicht zu einem Claude-Agenten."
         )
     return env
+
+
+def owns_keychain_item(profile: AuthProfile) -> bool:
+    """True for arr's own item (`arr` + profile name), the only kind arr writes or deletes.
+
+    A hand-written `keychain` reference may point to an item of another program.
+    """
+    ref = keychain_ref(profile)
+    return ref.service == DEFAULT_SERVICE and ref.account == profile.name
+
+
+def _keyring_set(service: str, account: str, secret: str) -> None:
+    import keyring
+
+    keyring.set_password(service, account, secret)
+
+
+def _keyring_delete(service: str, account: str) -> None:
+    import keyring
+    from keyring.errors import PasswordDeleteError
+
+    with contextlib.suppress(PasswordDeleteError):
+        keyring.delete_password(service, account)
+
+
+def store_secret(profile: AuthProfile, secret: str, writer: SecretWriter | None = None) -> None:
+    """Keep a token or API key in the profile's own keychain item.
+
+    Errors become an `AuthError` that names the profile, never the secret.
+    """
+    if not owns_keychain_item(profile):
+        raise AuthError(f"Das Profil „{profile.name}“ verweist auf einen fremden Eintrag.")
+    ref = keychain_ref(profile)
+    try:
+        (writer or _keyring_set)(ref.service, ref.account, secret)
+    except Exception as exc:
+        raise AuthError(
+            f"Der Schlüsselbund nimmt das Secret von „{profile.name}“ nicht an "
+            f"({type(exc).__name__})."
+        ) from None
+
+
+def delete_secret(profile: AuthProfile, deleter: SecretDeleter | None = None) -> bool:
+    """Remove the profile's own keychain item; a foreign reference stays. True if arr tried."""
+    if not owns_keychain_item(profile):
+        log.info("Profil „%s“: fremder Schlüsselbund-Eintrag bleibt bestehen.", profile.name)
+        return False
+    ref = keychain_ref(profile)
+    try:
+        (deleter or _keyring_delete)(ref.service, ref.account)
+    except Exception as exc:
+        raise AuthError(
+            f"Der Schlüsselbund gibt das Secret von „{profile.name}“ nicht frei "
+            f"({type(exc).__name__})."
+        ) from None
+    return True
 
 
 def is_billed(profile: AuthProfile) -> bool:

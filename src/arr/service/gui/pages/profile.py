@@ -22,6 +22,7 @@ from arr.service.api_models import (
     CreateProfileRequest,
     LoginState,
     ProfileInfo,
+    ProviderDefaultsInfo,
 )
 from arr.service.gui import format as fmt
 from arr.service.gui.app import get_api
@@ -61,6 +62,12 @@ LOGIN_LABEL = {
     AuthKind.CLAUDE_OAUTH: "Mit Claude anmelden",
     AuthKind.CODEX_CHATGPT: "Mit ChatGPT anmelden",
 }
+LOGIN_INTRO = {
+    AuthKind.CLAUDE_OAUTH: "arr öffnet die Anmeldung von Claude im Browser. Du meldest dich dort "
+    "an, arr übernimmt das Token und legt es im Schlüsselbund ab. Du musst nichts kopieren.",
+    AuthKind.CODEX_CHATGPT: "arr zeigt dir einen Link und einen Code. Du meldest dich damit im "
+    "Browser an, arr legt den Login im Ordner des Profils ab.",
+}
 PROVIDER_WORD = {Provider.CLAUDE: "Claude", Provider.CODEX: "ChatGPT"}
 CONCURRENCY_HINT = {
     AuthKind.CLAUDE_OAUTH: "Bei Max-Abos sind 3–4 ein guter Wert.",
@@ -73,15 +80,11 @@ MIN_TEST_S = 0.8
 """„Testen …“ stays at least this long, so the result does not flash by (§5.8 „lädt“)."""
 
 
-def _service(kind: AuthKind) -> str:
-    return "Claude" if kind is AuthKind.CLAUDE_OAUTH else "ChatGPT"
-
-
 def status_badge(profile: ProfileInfo, now: float) -> str:
     """„✓ funktioniert“ with the time of the last test, „✕ Test fehlgeschlagen“ or „nicht
     verbunden“ (§5.8)."""
     test = profile.last_test
-    if test is None or not profile.secret_present:
+    if test is None:
         return badge_html(Status("st-neutral", "link_off", "nicht verbunden"))
     when = f' <span class="faint">getestet {esc(fmt.when(test.ts, now))}</span>'
     if test.ok:
@@ -99,11 +102,14 @@ class ProfilePage:
         self.new = new
         self.profiles: list[ProfileInfo] = []
         self.testing: set[str] = set()
+        self.waiting: tuple[str, dict[str, Any]] | None = None
+        """The login this page waits for; closing the dialog cancels it."""
 
     async def build(self) -> None:
         with self.frame.content:
             self.confirm = ConfirmDialog()
             self.dialog = FormDialog(wide=True)
+            self.dialog.element.on("close", self._dialog_closed)
             with ui.element("div").classes("page-head"):
                 raw(
                     '<h1 tabindex="-1">Auth-Profile</h1><span class="faint">Zugänge zu Claude '
@@ -193,7 +199,9 @@ class ProfilePage:
                     "Parallel",
                     f"<b>{use.in_use} von {use.limit}</b> Plätzen belegt"
                     f'<span class="meter inline-meter{full}" aria-hidden="true"><span class="bar">'
-                    f'<i style="width:{width:.0f}%"></i></span></span>',
+                    f'<i style="width:{width:.0f}%"></i></span></span>'
+                    if use.limit
+                    else f"<b>{use.in_use} belegt</b>, keine Grenze gesetzt",
                 )
             )
             if p.usage_window:
@@ -212,6 +220,8 @@ class ProfilePage:
                 label = p.keychain_label
                 where = f' <span class="faint">({esc(label)})</span>' if label else ""
                 rows.append(("Secret", f"im Schlüsselbund ✓{where}"))
+            elif p.kind is AuthKind.CLAUDE_OAUTH and test and test.ok:
+                rows.append(("Login", "Claude-Login dieses Macs"))
             else:
                 rows.append(("Secret", "noch keins – melde dich an"))
             body = "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows)
@@ -249,6 +259,11 @@ class ProfilePage:
         test_button = button(test_label, None, classes="btn btn-sm").mark(f"test-{p.name}")
         test_button.on("click", lambda _e, b=test_button: self._test(p, b))
         button("Bearbeiten", lambda: self._edit_dialog(p), classes="btn btn-sm")
+        if p.provider not in p.default_for:
+            word = PROVIDER_WORD[p.provider]
+            button(f"Standard für {word}", lambda: self._set_default(p), classes="btn btn-sm").mark(
+                f"default-{p.name}"
+            )
         if not bad and p.secret_present and not key_kind:
             button("Neu anmelden", lambda: self._relogin(p), classes="btn btn-sm")
         button("Löschen …", lambda: self._delete(p), classes="btn btn-sm ghost danger")
@@ -283,6 +298,45 @@ class ProfilePage:
             self.frame.toast(test.message or f"{p.name} funktioniert nicht.", error=True)
         await self._load()
 
+    async def _set_default(self, p: ProfileInfo) -> None:
+        """„Standard für …“: the profile new agents of this provider use (arr.yaml `defaults`)."""
+        try:
+            settings = await self.api.get_workfolder_settings()
+            defaults = dict(settings.defaults)
+            current = defaults.get(p.provider, ProviderDefaultsInfo())
+            defaults[p.provider] = current.model_copy(update={"auth": p.name})
+            await self.api.update_workfolder_settings(
+                settings.model_copy(update={"defaults": defaults})
+            )
+        except ApiException as exc:
+            self.frame.toast(exc.error.message, error=True)
+            return
+        self.frame.toast(f"{p.name} ist jetzt Standard für {PROVIDER_WORD[p.provider]}.")
+        await self._load()
+
+    async def _save_concurrency(self, name: str, limit: int) -> None:
+        """Keep the limit from „Neues Profil“ in arr.yaml; the profile exists either way."""
+        try:
+            settings = await self.api.get_workfolder_settings()
+            concurrency = {**settings.concurrency, name: limit}
+            await self.api.update_workfolder_settings(
+                settings.model_copy(update={"concurrency": concurrency})
+            )
+        except ApiException as exc:
+            self.frame.toast(exc.error.message, error=True)
+
+    async def _test_saved(self, name: str, done: str) -> None:
+        """„Speichern und testen“: the test after saving, with its result as toast."""
+        try:
+            test = (await self.api.test_profile(name)).last_test
+        except ApiException as exc:
+            self.frame.toast(exc.error.message, error=True)
+            return
+        if test and test.ok:
+            self.frame.toast(done)
+        else:
+            self.frame.toast((test.message if test else None) or done, error=True)
+
     def _relogin(self, p: ProfileInfo) -> None:
         self._login_dialog(p.name, p.kind, title=f"{p.name} neu anmelden")
 
@@ -292,11 +346,7 @@ class ProfilePage:
         area: dict[str, ui.element] = {}
 
         def build() -> None:
-            raw(
-                f"<p>arr öffnet die Anmeldung von {esc(_service(kind))} im Browser."
-                " Du meldest dich dort an, arr übernimmt das Token und legt es im "
-                "Schlüsselbund ab. Du musst nichts kopieren.</p>"
-            )
+            raw(f"<p>{esc(LOGIN_INTRO[kind])}</p>")
             area["box"] = ui.element("div")
 
         async def start() -> bool:
@@ -322,9 +372,15 @@ class ProfilePage:
         self.dialog.set_confirm("", visible=False)
         box.clear()
         with box, ui.element("div").classes("login-wait").props('role="status"'):
+            link = (
+                f' <a href="{esc(login.browser_url)}" target="_blank" rel="noopener">'
+                "Anmeldeseite öffnen</a>"
+                if login.device_code and login.browser_url
+                else ""
+            )
             raw(
                 f"{icon('hourglass_top')}<span><b>Warte auf die Anmeldung im Browser …</b>"
-                f'<span class="small muted" style="display:block">{esc(login.note or "")}'
+                f'<span class="small muted" style="display:block">{esc(login.note or "")}{link}'
                 + (
                     f" Code: <b class='mono'>{esc(login.device_code)}</b>"
                     if login.device_code
@@ -333,9 +389,10 @@ class ProfilePage:
                 + "</span></span>",
                 tag="span",
             )
-            button("Abbrechen", lambda: cancel(), classes="btn btn-sm")
+            button("Abbrechen", lambda: cancel(), classes="btn btn-sm").mark("login-cancel")
 
         async def cancel() -> None:
+            self.waiting = None
             if state["timer"] is not None:
                 state["timer"].cancel()
             result = await self.api.cancel_login(name)
@@ -345,18 +402,32 @@ class ProfilePage:
             status = await self.api.get_login_status(name)
             if status.state is LoginState.WAITING:
                 return
+            self.waiting = None
             state["timer"].cancel()
             if status.state is LoginState.DONE:
                 self.dialog.close()
-                self.frame.toast(f"✓ {name} angemeldet und getestet.")
+                test = status.profile_info.last_test if status.profile_info else None
+                if test is None or test.ok:
+                    self.frame.toast(f"✓ {name} angemeldet und getestet.")
+                else:
+                    self.frame.toast(test.message or f"{name} funktioniert nicht.", error=True)
                 result = on_done()
                 if hasattr(result, "__await__"):
                     await result
                 return
             self._login_failed(box, status.message or "", name, kind, state, on_done)
 
+        self.waiting = (name, state)
         with box:
             state["timer"] = ui.timer(LOGIN_POLL_S, poll)
+
+    async def _dialog_closed(self) -> None:
+        """Esc or „Abbrechen“ in the footer: a login never runs on behind a closed dialog."""
+        if self.waiting is None:
+            return
+        (name, state), self.waiting = self.waiting, None
+        state["timer"].cancel()
+        await self.api.cancel_login(name)
 
     def _login_failed(
         self,
@@ -502,10 +573,12 @@ class ProfilePage:
                     return exc.error.message
             else:
                 profile = existing
+            if existing is None:
+                await self._save_concurrency(profile.name, concurrency)
             if k in LOGIN_LABEL:
                 await self._run_login(profile.name, k, parts["login"], state, on_done=self._load)
                 return False
-            self.frame.toast(f"✓ {profile.name} gespeichert und getestet.")
+            await self._test_saved(profile.name, f"✓ {profile.name} gespeichert und getestet.")
             await self._load()
             return None
 
@@ -546,7 +619,7 @@ class ProfilePage:
                 )
             except ApiException as exc:
                 return exc.error.message
-            self.frame.toast(f"✓ Key von {p.name} ersetzt und getestet.")
+            await self._test_saved(p.name, f"✓ Key von {p.name} ersetzt und getestet.")
             await self._load()
             return None
 

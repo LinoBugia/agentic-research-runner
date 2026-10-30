@@ -1783,6 +1783,8 @@ class LoginStart(ApiModel):
     """Start of a login in the browser or by device code (docs/08 §5.8, E18).
 
     `note` tells what arr runs for it (G4, e.g. „arr führt dafür `claude setup-token` aus“).
+    With `browser` the CLI opens the browser itself, `browser_url` stays empty; with
+    `device_code` it is the page where the user enters the code.
     """
 
     profile: str
@@ -1795,8 +1797,6 @@ class LoginStart(ApiModel):
 
     @model_validator(mode="after")
     def _matches_method(self) -> Self:
-        if (self.method == "browser") != (self.browser_url is not None):
-            raise ValueError("browser_url gehört genau zu method=browser")
         if (self.method == "device_code") != (self.device_code is not None):
             raise ValueError("device_code gehört genau zu method=device_code")
         return self

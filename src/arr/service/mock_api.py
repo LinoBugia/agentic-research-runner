@@ -6479,7 +6479,6 @@ class MockApi:
             return LoginStart(
                 profile=name,
                 method="browser",
-                browser_url="https://claude.ai/oauth/authorize?arr=mock",
                 poll_url=poll,
                 expires_at=now + 600,
                 note="arr führt dafür claude setup-token aus.",
@@ -6488,6 +6487,7 @@ class MockApi:
             return LoginStart(
                 profile=name,
                 method="device_code",
+                browser_url="https://auth.openai.com/codex/device",
                 device_code="ARR-4K7Q",
                 poll_url=poll,
                 expires_at=now + 900,

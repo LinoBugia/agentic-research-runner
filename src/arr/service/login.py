@@ -31,17 +31,36 @@ import subprocess
 import sys
 import tempfile
 import termios
-from collections.abc import Callable
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
+from typing import Any
 
-from arr.auth import clean_process_env
+from arr.auth import clean_process_env, store_secret
+from arr.backends.codex_login import codex_login
+from arr.models import AuthKind, AuthProfile
+from arr.service.api_models import (
+    Action,
+    ApiException,
+    ErrorCode,
+    LoginStart,
+    LoginState,
+    LoginStatus,
+    ProfileInfo,
+)
 
 log = logging.getLogger("arr.service")
 
 SETUP_TOKEN_NOTE = "arr führt dafür claude setup-token aus."
+CODEX_NOTE = "arr meldet Codex im Login-Ordner des Profils an."
+WAITING_TEXT = "Warte auf die Anmeldung im Browser …"
 CLAUDE_LOGIN_TIMEOUT_S = 300.0
+CODEX_LOGIN_TIMEOUT_S = 900.0
+"""Codex lets a device code expire after 15 minutes."""
+CODEX_START_TIMEOUT_S = 30.0
 
 PTY_COLUMNS = 1000
 """Wide enough that the terminal UI never breaks the token over two lines."""
@@ -78,6 +97,32 @@ class CaptureOutcome(StrEnum):
     TIMEOUT = "timeout"
     START_FAILED = "start_failed"
     STORE_FAILED = "store_failed"
+
+
+CLAUDE_FAILURES = {
+    CaptureOutcome.NO_TOKEN: (
+        "Die Claude-Anmeldung wurde abgebrochen. Versuche es erneut oder nimm einen Claude-API-Key."
+    ),
+    CaptureOutcome.TIMEOUT: (
+        "Die Claude-Anmeldung ist abgelaufen. Versuche es erneut oder nimm einen Claude-API-Key."
+    ),
+    CaptureOutcome.START_FAILED: (
+        "Die Claude-Anmeldung ließ sich nicht starten. Versuche es erneut oder nimm einen "
+        "Claude-API-Key."
+    ),
+    CaptureOutcome.STORE_FAILED: (
+        "Das Token ließ sich nicht im Schlüsselbund ablegen. Erlaube den Zugriff und versuche "
+        "es erneut."
+    ),
+}
+CODEX_FAILED = "Die ChatGPT-Anmeldung hat nicht geklappt. Versuche es erneut."
+CODEX_EXPIRED = "Die ChatGPT-Anmeldung ist abgelaufen. Melde dich neu an."
+
+
+def cancelled_text(kind: AuthKind) -> str:
+    if kind is AuthKind.CLAUDE_OAUTH:
+        return CLAUDE_FAILURES[CaptureOutcome.NO_TOKEN]
+    return "Die ChatGPT-Anmeldung wurde abgebrochen. Versuche es erneut."
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,7 +271,7 @@ async def capture_token(
                 closed.set()
 
         async def ended() -> None:
-            while not closed.is_set() and process.poll() is None:
+            while not closed.is_set() and process.poll() is None:  # noqa: ASYNC110 - a child
                 await asyncio.sleep(POLL_S)
             # A helper of the CLI may keep the terminal open: read what is left, then go on.
             with contextlib.suppress(TimeoutError):
@@ -255,3 +300,181 @@ async def capture_token(
                 await stop_process(process)
             finally:
                 os.close(master)
+
+
+# --------------------------------------------------------------------------------------------
+# Logins of the service
+# --------------------------------------------------------------------------------------------
+
+
+@dataclass(eq=False)
+class LoginJob:
+    """One running or finished login; holds what the page polls, never a secret."""
+
+    profile: AuthProfile
+    expires_at: float
+    state: LoginState = LoginState.WAITING
+    message: str | None = WAITING_TEXT
+    action: Action | None = None
+    info: ProfileInfo | None = None
+    task: asyncio.Task[None] | None = None
+
+    def finish(
+        self,
+        state: LoginState,
+        message: str,
+        *,
+        action: Action | None = None,
+        info: ProfileInfo | None = None,
+    ) -> None:
+        self.state, self.message, self.action, self.info = state, message, action, info
+
+
+AfterLogin = Callable[[AuthProfile], Awaitable[ProfileInfo]]
+"""Called after a successful login: notes the secret, tests and returns the profile."""
+
+
+class LoginService:
+    """Runs one login per profile as a task with a deadline (docs/08 §5.8, E18).
+
+    A new start replaces a running login of the profile. Every message is a fixed text: no
+    output of the CLI or Codex reaches the page.
+    """
+
+    def __init__(
+        self,
+        after: AfterLogin,
+        *,
+        poll_url: Callable[[str], str],
+        codex_factory: Any = None,
+    ) -> None:
+        self.after = after
+        self.poll_url = poll_url
+        self.codex_factory = codex_factory
+        self.jobs: dict[str, LoginJob] = {}
+
+    async def start(self, profile: AuthProfile) -> LoginStart:
+        await self.cancel(profile.name)
+        if profile.kind is AuthKind.CODEX_CHATGPT:
+            return await self._start_codex(profile)
+        now = time.time()
+        job = LoginJob(profile, expires_at=now + CLAUDE_LOGIN_TIMEOUT_S)
+        self.jobs[profile.name] = job
+        job.task = asyncio.create_task(self._claude(job), name=f"arr-login-{profile.name}")
+        return LoginStart(
+            profile=profile.name,
+            method="browser",
+            poll_url=self.poll_url(profile.name),
+            expires_at=job.expires_at,
+            note=SETUP_TOKEN_NOTE,
+        )
+
+    async def _after(self, job: LoginJob) -> None:
+        try:
+            info = await self.after(job.profile)
+        except Exception as exc:  # noqa: BLE001 - the login itself worked
+            log.warning("Test nach der Anmeldung: %s", type(exc).__name__)
+            job.finish(LoginState.DONE, "Angemeldet. Teste das Profil auf seiner Karte.")
+            return
+        job.finish(LoginState.DONE, "Angemeldet und getestet.", info=info)
+
+    def _retry(self, job: LoginJob, service: str) -> Action:
+        return Action(label=f"Erneut mit {service} anmelden", url=f"/profile/{job.profile.name}")
+
+    async def _claude(self, job: LoginJob) -> None:
+        store = partial(store_secret, job.profile)
+        try:
+            result = await capture_token(store, timeout_s=CLAUDE_LOGIN_TIMEOUT_S)
+        except asyncio.CancelledError:
+            job.finish(LoginState.CANCELLED, cancelled_text(AuthKind.CLAUDE_OAUTH))
+            raise
+        log.info("Claude-Anmeldung %s: %s", job.profile.name, result.outcome.value)
+        if result.outcome is CaptureOutcome.TOKEN:
+            await self._after(job)
+            return
+        job.finish(
+            LoginState.FAILED,
+            CLAUDE_FAILURES[result.outcome],
+            action=self._retry(job, "Claude"),
+        )
+
+    async def _start_codex(self, profile: AuthProfile) -> LoginStart:
+        now = time.time()
+        job = LoginJob(profile, expires_at=now + CODEX_LOGIN_TIMEOUT_S)
+        self.jobs[profile.name] = job
+        ready: asyncio.Future[tuple[str, str]] = asyncio.get_running_loop().create_future()
+
+        def show(link: str, code: str) -> None:
+            if not ready.done():
+                ready.set_result((link, code))
+
+        job.task = asyncio.create_task(self._codex(job, show), name=f"arr-login-{profile.name}")
+        job.task.add_done_callback(lambda _task: ready.cancel())
+        try:
+            link, code = await asyncio.wait_for(asyncio.shield(ready), CODEX_START_TIMEOUT_S)
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            if not isinstance(exc, TimeoutError) and job.state is LoginState.WAITING:
+                raise  # the caller was cancelled, not the login
+            await self.cancel(profile.name)
+            raise ApiException.of(
+                ErrorCode.UNAVAILABLE,
+                "Die ChatGPT-Anmeldung ließ sich nicht starten. Prüfe deine Internetverbindung "
+                "und versuche es erneut.",
+            ) from None
+        return LoginStart(
+            profile=profile.name,
+            method="device_code",
+            browser_url=link,
+            device_code=code,
+            poll_url=self.poll_url(profile.name),
+            expires_at=job.expires_at,
+            note=CODEX_NOTE,
+        )
+
+    async def _codex(self, job: LoginJob, show: Callable[[str, str], None]) -> None:
+        try:
+            async with asyncio.timeout(CODEX_LOGIN_TIMEOUT_S):
+                result = await codex_login(job.profile, show=show, factory=self.codex_factory)
+        except asyncio.CancelledError:
+            job.finish(LoginState.CANCELLED, cancelled_text(AuthKind.CODEX_CHATGPT))
+            raise
+        except TimeoutError:
+            job.finish(LoginState.FAILED, CODEX_EXPIRED, action=self._retry(job, "ChatGPT"))
+            return
+        except Exception as exc:  # noqa: BLE001 - the type only, a message may quote Codex
+            log.warning("ChatGPT-Anmeldung %s: %s", job.profile.name, type(exc).__name__)
+            job.finish(LoginState.FAILED, CODEX_FAILED, action=self._retry(job, "ChatGPT"))
+            return
+        if result.success:
+            await self._after(job)
+        else:
+            job.finish(LoginState.FAILED, CODEX_FAILED, action=self._retry(job, "ChatGPT"))
+
+    def status(self, name: str) -> LoginStatus:
+        job = self.jobs.get(name)
+        if job is None:
+            return LoginStatus(
+                profile=name, state=LoginState.CANCELLED, message="Keine Anmeldung läuft."
+            )
+        return LoginStatus(
+            profile=name,
+            state=job.state,
+            message=job.message,
+            action=job.action,
+            profile_info=job.info,
+        )
+
+    async def cancel(self, name: str) -> LoginStatus:
+        """Stop a running login and wait until its process is gone."""
+        job = self.jobs.get(name)
+        if job is not None and job.task is not None and not job.task.done():
+            job.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await job.task
+            if job.state is LoginState.WAITING:  # cancelled before the task started
+                job.finish(LoginState.CANCELLED, cancelled_text(job.profile.kind))
+        return self.status(name)
+
+    async def close(self) -> None:
+        for name in list(self.jobs):
+            await self.cancel(name)

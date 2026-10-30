@@ -16,15 +16,28 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from arr.backends.base import RateLimitData
 from arr.backends.codex_config import SECRET_ENV, codex_home_for
+from arr.backends.codex_events import rate_limit_status
+from arr.backends.codex_sdk import install_message_hooks, internals_available
 from arr.models import AuthProfile
 
-__all__ = ["AccountState", "LoginResult", "codex_account", "codex_login"]
+__all__ = [
+    "AccountState",
+    "CodexCheck",
+    "LoginResult",
+    "codex_account",
+    "codex_check",
+    "codex_login",
+]
 
 logger = logging.getLogger(__name__)
 
 CodexFactory = Callable[[Any], Any]
 """Builds an `AsyncCodex` from a `CodexConfig`; tests pass a fake."""
+
+TEST_MODEL = "gpt-6-luna"
+TEST_PROMPT = "Antworte nur mit: ok"
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +66,15 @@ class LoginResult:
     success: bool
     account: AccountState
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CodexCheck:
+    """Outcome of a test turn. `problem`: `login`, `limit` or `other`, no text of Codex."""
+
+    account: AccountState
+    problem: str | None = None
+    limit: RateLimitData | None = None
 
 
 def _default_factory(config: Any) -> Any:
@@ -93,6 +115,62 @@ async def codex_account(auth: AuthProfile, *, factory: CodexFactory | None = Non
     codex = (factory or _default_factory)(_config(prepare_login_dir(auth)))
     async with codex:
         return _state(await codex.account())
+
+
+def _problem(auth: AuthProfile, text: str) -> str:
+    from arr.backends.codex import login_hint
+
+    if login_hint(auth, text) != text:
+        return "login"
+    return "limit" if "usage limit" in text.lower() or "rate limit" in text.lower() else "other"
+
+
+async def codex_check(
+    auth: AuthProfile, cwd: Path, *, factory: CodexFactory | None = None
+) -> CodexCheck:
+    """One short turn in the profile's login folder: login, model access and limit window.
+
+    Nothing of the turn stays: the thread is ephemeral and `cwd` is the caller's empty folder.
+    Texts of Codex only decide the kind of `problem`, they never leave this function.
+    """
+    from openai_codex import ApprovalMode, Sandbox
+    from openai_codex.generated.v2_all import ReasoningEffort
+
+    limits: list[RateLimitData] = []
+
+    def on_in(message: dict[str, Any]) -> None:
+        if message.get("method") == "account/rateLimits/updated":
+            limit = rate_limit_status(message.get("params") or {})
+            if limit is not None:
+                limits.append(limit)
+
+    codex = (factory or _default_factory)(_config(prepare_login_dir(auth)))
+    async with codex:
+        state = _state(await codex.account())
+        if not state.logged_in:
+            return CodexCheck(account=state, problem="login")
+        if internals_available(codex):
+            install_message_hooks(codex, on_in=on_in)
+        try:
+            thread = await codex.thread_start(
+                approval_mode=ApprovalMode.deny_all,
+                cwd=str(cwd),
+                ephemeral=True,
+                model=TEST_MODEL,
+                sandbox=Sandbox.read_only,
+            )
+            turn = await thread.run(TEST_PROMPT, effort=ReasoningEffort.low)
+        except Exception as exc:  # noqa: BLE001 - classified, the text stays here
+            return CodexCheck(account=state, problem=_problem(auth, str(exc)))
+    limit = limits[-1] if limits else None
+    error = getattr(turn, "error", None)
+    if error is not None:
+        text = str(getattr(error, "message", "")) + str(getattr(error, "codex_error_info", ""))
+        return CodexCheck(account=state, problem=_problem(auth, text), limit=limit)
+    status = getattr(getattr(turn, "status", None), "value", None)
+    return CodexCheck(
+        account=state, problem=None if status == "completed" else "other", limit=limit
+    )
 
 
 async def codex_login(
