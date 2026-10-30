@@ -30,7 +30,7 @@ from service_kit import (
 from test_policy import env, req  # noqa: F401
 
 from arr.errors import ConfigError
-from arr.models import Decider, Effort, RunStatus, RunVenvMode
+from arr.models import Decider, Effort, Provider, RunStatus, RunVenvMode
 from arr.permissions.policy import PermissionRules, PolicyEngine
 from arr.permissions.types import DecisionAction
 from arr.runs.manager import set_run_status
@@ -632,7 +632,7 @@ async def test_settings_land_in_arr_yaml_with_comments_and_nothing_else_changes(
     limits = info.limits.model_copy(update={"wall_time_s": 5400, "budget_usd": 2.5})
     retention = info.retention.model_copy(update={"slim_after_days": 7})
     defaults = {
-        "claude": ProviderDefaultsInfo(
+        Provider.CLAUDE: ProviderDefaultsInfo(
             auth="fake-auth", model="claude-haiku-5-5", effort=Effort.LOW
         )
     }
