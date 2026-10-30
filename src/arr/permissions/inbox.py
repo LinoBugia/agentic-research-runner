@@ -6,9 +6,11 @@ in Welle 1/2 `TerminalDecider` for `arr run`, from W3-03 the GUI inbox (it calls
 `ApprovalInbox.resolve`), from W4-04 the gatekeeper. Without a decision until the deadline
 the request counts as denied with a hint (docs/07-berechtigungen-und-freigaben.md §3 ③).
 
-Equal open requests of an agent (same grey-zone items) become one item with a `count`, one
-decision answers all of them. An allowed installation also covers the package hosts it needs
-for a short time, so `pip install` asks once (W2-01 §7, review W2-01.1 N1).
+Equal open requests of an agent become one item with a `count`, one decision answers all of
+them. Equal means the card of the first one says everything about the others (`_merge_key`):
+a click grants what the user sees, nothing more. An allowed installation also covers the
+package hosts it needs for a short time, so `pip install` asks once (W2-01 §7, review W2-01.1
+N1).
 
 Items live in memory; every step is appended to `approvals.jsonl` (docs/02 §4).
 See docs/07-berechtigungen-und-freigaben.md §3-§6.
@@ -36,6 +38,7 @@ from arr.permissions.policy import (
     Assessment,
     LogEvent,
     PolicyEngine,
+    is_codex_escalation,
     redact,
 )
 from arr.permissions.types import (
@@ -152,7 +155,7 @@ class ApprovalInbox:
         self._items: dict[str, ApprovalItem] = {}
         self._waiters: dict[str, asyncio.Future[Decision | None]] = {}
         self._waiting: dict[str, int] = {}
-        self._merge_keys: dict[str, tuple[str, frozenset[Any]]] = {}
+        self._merge_keys: dict[str, tuple[Any, ...]] = {}
         self._decider_tasks: dict[str, asyncio.Task[None]] = {}
         self._install_passes: dict[str, tuple[float, frozenset[str], str]] = {}
         self._counters: dict[str, int] = {}
@@ -193,9 +196,9 @@ class ApprovalInbox:
     async def ask(self, assessment: Assessment) -> Decision:
         """Open an item for an `ask`, or join the equal open one, and wait for its decision.
 
-        Equal means same agent and same grey-zone items. A join shares item, deadline and
-        decision. Never raises because of the decider; when the last waiting caller is
-        cancelled, the item becomes obsolete.
+        Equal is what `_merge_key` says. A join shares item, deadline and decision. Never
+        raises because of the decider; when the last waiting caller is cancelled, the item
+        becomes obsolete.
         """
         loop = asyncio.get_running_loop()
         with self._lock:
@@ -298,11 +301,11 @@ class ApprovalInbox:
             self._write(LogEvent.DECIDED, item, note=remembered.note)
             if decision.action is DecisionAction.ALLOW and not _high_risk(item.risk):
                 self._grant_install_pass(item.request, item.id)
+        self._wake(item.id, decision)  # first: a broken `on_rule` must not leave the agent waiting
         if remembered.rule is not None and self.on_rule is not None:
             self.on_rule(remembered.rule)
         if remembered.note is not None:
             self._notify(remembered.note)
-        self._wake(item.id, decision)
         return item
 
     def _decide_escalation(self, item: ApprovalItem, decision: Decision) -> ApprovalItem:
@@ -361,7 +364,8 @@ class ApprovalInbox:
         """Withdraw a decision (docs/07 §4); later requests ask again.
 
         Scope agent/run: the grant is removed. A one-time decision of the gatekeeper only
-        applied to its request; it is marked revoked without further effect.
+        applied to its request; it is marked revoked without further effect. Withdrawing an
+        installation also ends the host passes, so the package hosts ask again.
         """
         with self._lock:
             item = self.get(item_id)
@@ -379,6 +383,8 @@ class ApprovalInbox:
                     self.engine.revoke(item_id)  # logs the revocation
                 except ArrError:
                     note = "Die Entscheidung war nicht mehr aktiv (z. B. nach einem Neustart)."
+            if item.request is not None and install_hosts(item.request):
+                self._install_passes.clear()
             item = self._update(item, ApprovalStatus.REVOKED, item.decision)
             if note is not None:
                 self._write(LogEvent.REVOKED, item, note=note)
@@ -403,10 +409,10 @@ class ApprovalInbox:
                 await task
 
     def _equal_open(self, assessment: Assessment) -> ApprovalItem | None:
-        key = (assessment.request.agent_id, assessment.items)
+        key = _merge_key(assessment)
         for item_id, known in self._merge_keys.items():
             item = self._items[item_id]
-            if known == key and item.status is ApprovalStatus.OPEN and assessment.items:
+            if known == key and item.status is ApprovalStatus.OPEN:
                 return item
         return None
 
@@ -415,6 +421,7 @@ class ApprovalInbox:
         self._write(
             LogEvent.DECISION,
             item,
+            request=assessment.request,
             decision=assessment.decision,
             note="Gleiche Anfrage, mit der offenen zusammengefasst.",
         )
@@ -431,7 +438,7 @@ class ApprovalInbox:
         """The answer for a host request an allowed installation covers, else None.
 
         Only plain host requests of the sandbox qualify (Claude's `SandboxNetworkAccess`),
-        never a shell request; a high risk always asks.
+        never a shell request or one that names URLs; a high risk always asks.
         """
         request, risk = assessment.request, assessment.decision.risk
         with self._lock:
@@ -442,6 +449,7 @@ class ApprovalInbox:
         if (
             time.time() >= until
             or request.tool not in NETWORK_TOOLS
+            or request.urls
             or not wanted
             or not wanted <= hosts
             or _high_risk(risk)
@@ -486,7 +494,9 @@ class ApprovalInbox:
             summary=assessment.decision.reason,
         )
         self._items[item.id] = item
-        self._merge_keys[item.id] = (request.agent_id, assessment.items)
+        key = _merge_key(assessment)
+        if key is not None:
+            self._merge_keys[item.id] = key
         self._write(LogEvent.OPEN, item, decision=assessment.decision)
         return item
 
@@ -567,6 +577,7 @@ class ApprovalInbox:
         event: LogEvent,
         item: ApprovalItem,
         *,
+        request: PermissionRequest | None = None,
         decision: Decision | None = None,
         note: str | None = None,
     ) -> None:
@@ -576,7 +587,7 @@ class ApprovalInbox:
             ApprovalLogEntry(
                 event=event,
                 item_id=item.id,
-                request=item.request,
+                request=request or item.request,
                 decision=decision or item.decision,
                 note=note,
             )
@@ -615,7 +626,7 @@ _CHOICES = (
     "  einmal  – nur diese Anfrage erlauben\n"
     "  agent   – für diesen Agenten im Run erlauben\n"
     "  run     – für den ganzen Run erlauben\n"
-    "  immer   – immer erlauben (wird eine feste Regel in arr.yaml)\n"
+    "  immer   – feste Regel bis zum Ende dieses Runs, für alle Agenten (nicht in arr.yaml)\n"
     "  nein    – ablehnen"
 )
 _RULE = "─" * 72
@@ -784,7 +795,8 @@ class TerminalDecider:
             scope = _ANSWERS.get(answer)
             if scope is DecisionScope.ALWAYS:
                 confirm = await self._read(
-                    "„Immer“ wird eine feste Regel für alle künftigen Runs. Zum Bestätigen "
+                    "„Immer“ gilt bis zum Ende dieses Runs für alle Agenten, bei Netzwerk für den "
+                    "ganzen Host. arr run speichert die Regel nicht in arr.yaml. Zum Bestätigen "
                     "„ja immer“ eingeben: "
                 )
                 if (confirm or "").strip().casefold() != "ja immer":
@@ -840,6 +852,38 @@ def _stdio_is_tty() -> bool:
         return sys.stdin.isatty() and sys.stdout.isatty()
     except (AttributeError, ValueError):
         return False
+
+
+def _merge_key(assessment: Assessment) -> tuple[Any, ...] | None:
+    """What makes two requests one card, None for a request that always gets its own.
+
+    Plain host requests of the sandbox are equal by agent and host. Anything else must match in
+    all the card says about the action; line breaks stay, they separate shell commands. A high
+    risk, a Codex escalation and a request the card cannot describe are never merged.
+    """
+    request = assessment.request
+    if (
+        not assessment.items
+        or assessment.no_rules
+        or is_codex_escalation(request)
+        or _high_risk(assessment.decision.risk)
+        or not (request.command or request.paths or request.urls or request.hosts)
+    ):
+        return None
+    urls = frozenset(request.urls)
+    if request.tool in NETWORK_TOOLS and not request.command:
+        return (request.agent_id, request.tool, assessment.items, urls)
+    command = tuple(" ".join(line.split()) for line in (request.command or "").splitlines())
+    return (
+        request.agent_id,
+        request.tool,
+        command,
+        frozenset(request.paths),
+        frozenset(request.hosts),
+        urls,
+        request.work_dir,
+        assessment.items,
+    )
 
 
 def _high_risk(risk: Risk | None) -> bool:

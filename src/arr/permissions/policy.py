@@ -395,6 +395,10 @@ _R_CODEX_ONCE = (
     "Eine Codex-Eskalation läuft ohne Sandbox. Deshalb gilt die Entscheidung nur für diese "
     "eine Anfrage."
 )
+_R_RISKY_ONCE = (
+    "Hohes Risiko wird nie zu einer „Immer“-Regel. Deshalb gilt die Entscheidung nur für diese "
+    "eine Anfrage."
+)
 _R_SECRET_IN_RULE = (
     "Die Anfrage enthält ein Geheimnis, deshalb wird daraus keine „Immer“-Regel (sie stünde "
     "in arr.yaml). Die Entscheidung gilt nur für diesen Run."
@@ -488,6 +492,9 @@ class AlwaysRule(StrictModel):
     covered when it matches one of `paths` (folder and everything below), `hosts` (exact or
     `*.domain`), `commands` (exact, or a prefix ending in ` *` for commands without shell
     operators) or, for unknown tools, `tools` alone. Allow rules never lift hard bans.
+
+    `exact` marks a rule made from a decision: its hosts and commands are literal, because the
+    agent wrote them. Patterns are only for rules the user writes by hand in `arr.yaml`.
     """
 
     action: Literal["allow", "deny"]
@@ -496,6 +503,7 @@ class AlwaysRule(StrictModel):
     hosts: list[str] = Field(default_factory=list)
     commands: list[str] = Field(default_factory=list)
     reason: str = ""
+    exact: bool = False
 
 
 class PermissionRules(StrictModel):
@@ -1789,6 +1797,7 @@ class ApprovalLog:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.Lock()
+        self._item_lines: list[dict[str, Any]] = []
 
     def write(self, entry: ApprovalLogEntry) -> None:
         """Append one entry as a JSON line."""
@@ -1798,6 +1807,13 @@ class ApprovalLog:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
+            if data.get("item_id"):
+                self._item_lines.append(data)
+
+    def item_lines(self) -> list[dict[str, Any]]:
+        """The item lines this object wrote; unlike the file, nobody else can add to them."""
+        with self._lock:
+            return list(self._item_lines)
 
     def entries(self) -> list[dict[str, Any]]:
         """Read all entries as plain dicts (empty if the file does not exist)."""
@@ -1844,6 +1860,7 @@ class Assessment:
     decision: Decision
     request: PermissionRequest
     items: frozenset[ItemKey]
+    no_rules: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1901,16 +1918,16 @@ def is_codex_escalation(request: PermissionRequest | Mapping[str, Any]) -> bool:
     )
 
 
-def _host_matches(pattern: str, host: str) -> bool:
+def _host_matches(pattern: str, host: str, *, exact: bool = False) -> bool:
     pattern = pattern.rstrip(".").lower()
-    if pattern.startswith("*."):
+    if pattern.startswith("*.") and not exact:
         return host.endswith(pattern[1:])
     return host == pattern
 
 
-def _command_matches(pattern: str, command: str) -> bool:
+def _command_matches(pattern: str, command: str, *, exact: bool = False) -> bool:
     pattern = _normalize_command(pattern)
-    if pattern.endswith(" *"):
+    if pattern.endswith(" *") and not exact:
         prefix = pattern[:-1]
         return not (set(command) & _METACHARS) and command.startswith(prefix)
     return command == pattern
@@ -1993,7 +2010,8 @@ class PolicyEngine:
         a sandbox).
         `always` (user only, enforced by `Decision`) becomes an `AlwaysRule` in `self.rules`,
         returned so the caller can store it in `arr.yaml`. If an item of the request contains
-        a secret, no always rule is made; the decision is kept with scope `run` instead.
+        a secret, no always rule is made; the decision is kept with scope `run` instead. A
+        high risk never becomes a rule either; that decision counts for this request only.
         """
         if decision.action not in (DecisionAction.ALLOW, DecisionAction.DENY):
             return Remembered(decision)
@@ -2009,9 +2027,13 @@ class PolicyEngine:
         if analysis.no_rules:
             once = decision.model_copy(update={"scope": DecisionScope.ONCE})
             return Remembered(once, note=_R_CODEX_ONCE)
+        if analysis.risky and decision.scope is DecisionScope.ALWAYS:
+            once = decision.model_copy(update={"scope": DecisionScope.ONCE})
+            return Remembered(once, note=_R_RISKY_ONCE)
         note = None
         if decision.scope is DecisionScope.ALWAYS:
-            rule = _rule_from_items(analysis, decision)
+            action = "allow" if decision.action is DecisionAction.ALLOW else "deny"
+            rule = _rule_from_items(analysis, action, decision.reason)
             if not _contains_secret(rule):
                 self.rules.always.append(rule)
                 self._write(LogEvent.RULE, request, decision, item_id=item_id, rule=rule)
@@ -2023,6 +2045,17 @@ class PolicyEngine:
         grant = Grant(item_id, request.run_id, agent_id, decision, items, redact_request(request))
         self._grants[item_id] = grant
         return Remembered(decision, grant=grant, note=note)
+
+    def rule_for(self, request: PermissionRequest) -> "AlwaysRule | None":
+        """The rule „Immer“ would make of this request, None if `remember` makes no rule."""
+        profile = self._profiles.get(request.agent_id)
+        if profile is None:
+            return None
+        analysis = self._analyze(request, profile)
+        if not analysis.grey or analysis.no_rules or analysis.risky:
+            return None
+        rule = _rule_from_items(analysis, "allow", "")
+        return None if _contains_secret(rule) else rule
 
     def revoke(self, item_id: str) -> Grant:
         """Withdraw a decision with scope agent/run; it no longer applies (docs/07 §4).
@@ -2070,7 +2103,8 @@ class PolicyEngine:
         categories = sorted(set(request.categories) | analysis.categories)
         request = request.model_copy(update={"categories": categories})
         items = frozenset(analysis.grey)
-        return Assessment(self._decide(request, profile, analysis), request, items)
+        decision = self._decide(request, profile, analysis)
+        return Assessment(decision, request, items, analysis.no_rules)
 
     def _decide(
         self, request: PermissionRequest, profile: SandboxProfile, analysis: _Analysis
@@ -2353,9 +2387,9 @@ def _rule_covers(
     if kind in ("read", "write"):
         return any(_key_within(value, _rule_path_key(p, profile)) for p in rule.paths)
     if kind == "host":
-        return any(_host_matches(p, value) for p in rule.hosts)
+        return any(_host_matches(p, value, exact=rule.exact) for p in rule.hosts)
     if kind == "command":
-        return any(_command_matches(p, value) for p in rule.commands)
+        return any(_command_matches(p, value, exact=rule.exact) for p in rule.commands)
     return False
 
 
@@ -2367,17 +2401,20 @@ def _rule_path_key(raw: str, profile: SandboxProfile) -> str:
         return "\x00"
 
 
-def _rule_from_items(analysis: _Analysis, decision: Decision) -> AlwaysRule:
+def _rule_from_items(
+    analysis: _Analysis, action: Literal["allow", "deny"], reason: str
+) -> AlwaysRule:
     # Paths keep their real spelling; the comparison key may be case folded.
     items = analysis.grey
     tools = [v for k, v in items if k == "tool"]
     return AlwaysRule(
-        action="allow" if decision.action is DecisionAction.ALLOW else "deny",
+        action=action,
         tools=tools,
         paths=sorted(analysis.labels.get((k, v), v) for k, v in items if k == "read"),
         hosts=sorted(v for k, v in items if k == "host"),
         commands=sorted(v for k, v in items if k == "command"),
-        reason=decision.reason,
+        reason=reason,
+        exact=True,
     )
 
 

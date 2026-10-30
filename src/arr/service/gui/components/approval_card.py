@@ -183,6 +183,8 @@ class ApprovalCard:
         """Take over a new count of equal requests (live); the decision stays as it is."""
         self.item = item
         self.head.set_content(self._head(now))
+        if item.type is ApprovalType.PERMISSION:
+            self.body.set_content(self._permission_html())
 
     def show_decided(self, message: str, note: str, *, positive: bool) -> None:
         """Replace the content by a confirmation of the same height, without buttons (N1).
@@ -232,7 +234,7 @@ class ApprovalCard:
 
     # --- permission ---------------------------------------------------------------------
 
-    def _permission_body(self) -> None:
+    def _permission_html(self) -> str:
         item = self.item
         agent = item.agent
         assert agent is not None
@@ -284,11 +286,16 @@ class ApprovalCard:
                 )
             )
         links.append(link_html("Vollmacht ansehen", "/einstellungen#vollmacht"))
-        raw(
+        return (
             f'<span class="cmd">{esc(what)}</span><dl class="kv" style="margin-top:12px">{kv}</dl>'
-            f'<div class="row small" style="margin-top:8px">{" · ".join(links)}</div>',
-            classes="ab",
+            f'<div class="row small" style="margin-top:8px">{" · ".join(links)}</div>'
         )
+
+    def _permission_body(self) -> None:
+        item = self.item
+        agent = item.agent
+        assert agent is not None
+        self.body = raw(self._permission_html(), classes="ab")
         if item.terminal:
             self._terminal_foot()
             return
@@ -303,9 +310,7 @@ class ApprovalCard:
                     .classes("seg")
                     .props(f'role="radiogroup" aria-labelledby="{label_id}"')
                 ):
-                    # a Codex escalation runs without a sandbox: only this one request (W3-03)
-                    scopes = [DecisionScope.ONCE] if item.no_sandbox else list(DecisionScope)
-                    for scope in scopes:
+                    for scope in self._scopes():
                         text = scope_label(scope, agent.id) + (
                             " …" if scope is DecisionScope.ALWAYS else ""
                         )
@@ -332,16 +337,25 @@ class ApprovalCard:
                     ).mark("allow")
                 )
 
+    def _scopes(self) -> list[DecisionScope]:
+        # a Codex escalation runs without a sandbox: only this one request (W3-03); „immer“ only
+        # where a rule can come of it, and the dialog names that rule
+        if self.item.no_sandbox:
+            return [DecisionScope.ONCE]
+        if self.item.rule_label is None:
+            return [s for s in DecisionScope if s is not DecisionScope.ALWAYS]
+        return list(DecisionScope)
+
     def _set_scope(self, scope: DecisionScope) -> None:
         self.scope = scope
 
     async def _allow(self) -> None:
         item = self.item
         if self.scope is DecisionScope.ALWAYS:
-            rule = item.rule_label or item.command or "diese Anfrage"
             self.dialog.show(
-                f"{rule} immer erlauben?",
+                f"{item.rule_label} immer erlauben?",
                 [
+                    *item.rule_effects,
                     f"Wird feste Regel für alle Runs in „{self.workfolder}“.",
                     "Diese Anfrage wird sofort erlaubt.",
                     "Du entfernst die Regel unter Einstellungen → Feste Regeln.",
@@ -647,7 +661,8 @@ def compact_card(
     """Compact card for the run detail overview (K5 „kompakt“, W1-07).
 
     Permissions show command, agent's reason, „Warum bei dir“, risk as word and deadline, with
-    „Erlauben (einmalig)“; run starts and escalations are never decided here, only linked.
+    „Erlauben (einmalig)“; run starts and escalations are never decided here, only linked. So is
+    a card that answers several requests or reaches further hosts: only the full card says so.
     With `prefix` the card gets the DOM id `<prefix><approval id>` and its heading
     `<prefix><approval id>-ch`, so the same request can be shown twice on one page.
     """
@@ -662,6 +677,8 @@ def compact_card(
     with element:
         head = [badge_html(_WAIT, word=APPROVAL_TYPE[item.type])]
         if item.type is ApprovalType.PERMISSION:
+            if item.count > 1:
+                head.append(f'<span class="tag">{item.count} gleiche Anfragen</span>')
             head += [risk_html(item), deadline_html(item, now)]
         elif item.type is ApprovalType.RUN_START:
             starter = STARTER.get(item.requested_by, "dir") if item.requested_by else "dir"
@@ -687,10 +704,17 @@ def compact_card(
             if item.terminal:
                 raw(esc(TERMINAL_HINT), classes="af small muted")
                 return element
+            only_there = ""
             if compact_lines(what) > COMPACT_MAX_LINES:
                 # too long to be read whole in the narrow column: decide on the Freigaben page
+                only_there = "Zu lang für die kompakte Karte."
+            elif item.count > 1:
+                only_there = f"Das beantwortet {item.count} gleiche Anfragen."
+            elif item.also_hosts:
+                only_there = f"Die Erlaubnis reicht auch bis {' und '.join(item.also_hosts)}."
+            if only_there:
                 raw(
-                    '<span class="small muted">Zu lang für die kompakte Karte. Entscheide auf der '
+                    f'<span class="small muted">{esc(only_there)} Entscheide auf der '
                     "Freigaben-Seite.</span>"
                     f'<div class="decide"><a class="btn btn-sm primary" href="{esc(details)}">'
                     "Details</a></div>",

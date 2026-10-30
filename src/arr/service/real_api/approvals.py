@@ -1,9 +1,11 @@
 """Area `approvals`: the approval inbox of the service (W3-03, docs/07 §6, docs/08 §5.2).
 
-Reading: `ApprovalReader` builds the `ApprovalItem`s of a run from its `approvals.jsonl`, the
-same way for runs of this service and of `arr run`. Only lines with an `item_id` are items, so
-`allow` of fixed rules (one line per tool call) never shows. A run that is not running any
-more has no open items: what is left open counts as obsolete.
+Reading: `ApprovalReader` builds the `ApprovalItem`s of a run from lines of `approvals.jsonl`.
+For a run of `arr run` and a finished run these come from the file. For a run this service
+executes they come from its `ApprovalLog` in memory, the same source `decide_approval` acts on:
+a line somebody else adds to the file changes no card and blocks none. Only lines with an
+`item_id` are items, so `allow` of fixed rules (one line per tool call) never shows. A run that
+is not running any more has no open items: what is left open counts as obsolete.
 
 Deciding: the only way to a granted item is `decide_approval`, which the GUI calls after a
 click behind the guard of W3-01; it puts a decision of `user` into the `ApprovalInbox` of the
@@ -21,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
 from arr.errors import ArrError
 from arr.models import Provider, TopologyKind
@@ -76,6 +79,14 @@ TERMINAL_HINT = (
 NOT_RUNNING = "Der Run läuft nicht mehr."
 EXPIRE_TEXT = "Ohne Entscheidung gilt die Anfrage nach der Frist als abgelehnt."
 DENY_REASON = "Der User hat abgelehnt. Arbeite ohne weiter oder frage im Chat nach."
+NO_RULE = (
+    "Aus dieser Anfrage wird keine feste Regel: Sie hat ein hohes Risiko, enthält ein Geheimnis "
+    "oder lässt sich nicht als Regel fassen. Entscheide sie einmalig oder für diesen Run."
+)
+RULE_NOT_STORED = (
+    "Die Regel ließ sich nicht in arr.yaml speichern. Sie gilt nur für die laufenden Runs. "
+    "Prüfe die Datei arr.yaml."
+)
 _UNKNOWN_RISK = RiskInfo(level=RiskLevel.MEDIUM, text="Das Risiko ist nicht bekannt.")
 _ACTIONS = {
     ApprovalType.PERMISSION: {DecisionAction.ALLOW, DecisionAction.DENY},
@@ -121,7 +132,7 @@ def _item_lines(entries: Sequence[Mapping[str, Any]]) -> dict[str, _Lines]:
     escalations = 0
     for entry in entries:
         item_id = entry.get("item_id")
-        if not item_id:
+        if not item_id or not isinstance(item_id, str):
             continue
         event = entry.get("event")
         if event == "open":
@@ -139,25 +150,43 @@ def _item_lines(entries: Sequence[Mapping[str, Any]]) -> dict[str, _Lines]:
     return items
 
 
-def _rule_label(request: Mapping[str, Any]) -> str | None:
-    hosts = request.get("hosts") or []
-    if hosts:
-        return "Netzwerk zu " + ", ".join(hosts)
-    paths = request.get("paths") or []
-    if paths:
-        return "Lesen in " + ", ".join(paths)
-    return request.get("command")
+def _rule_text(rule: AlwaysRule) -> tuple[str, list[str]]:
+    """Name of a rule and what it allows, from the rule itself, not from the request."""
+    labels: list[str] = []
+    effects: list[str] = []
+    if rule.hosts:
+        hosts = ", ".join(rule.hosts)
+        labels.append(f"Netzwerk zu {hosts}")
+        effects.append(
+            f"Gilt für jede Anfrage an {hosts}, nicht nur für diesen Befehl: von allen Agenten, "
+            "in allen Runs, auch zum Hochladen."
+        )
+    if rule.paths:
+        paths = ", ".join(rule.paths)
+        labels.append(f"Lesen in {paths}")
+        effects.append(f"Alle Agenten dürfen in allen Runs alles in {paths} lesen.")
+    if rule.commands:
+        labels.append(", ".join(rule.commands))
+        effects.append("Gilt nur für genau diesen Befehl, aber von allen Agenten, in allen Runs.")
+    if rule.tools:
+        tools = ", ".join(rule.tools)
+        labels.append(f"Werkzeug {tools}")
+        effects.append(f"Alle Agenten dürfen {tools} in allen Runs ohne Frage nutzen.")
+    return " und ".join(labels), effects
+
+
+def _package_hosts(request: Mapping[str, Any]) -> list[str]:
+    """The hosts `ApprovalInbox` lets an allowed installation reach."""
+    try:
+        return sorted(install_hosts(PermissionRequest.model_validate(request)), reverse=True)
+    except ValueError:
+        return []
 
 
 def _install_note(request: Mapping[str, Any]) -> str:
     """„ und darf dafür pypi.org … erreichen“ for what `ApprovalInbox` lets an install reach."""
-    try:
-        hosts = install_hosts(PermissionRequest.model_validate(request))
-    except ValueError:
-        return ""
-    if not hosts:
-        return ""
-    return f" und darf dafür {' und '.join(sorted(hosts, reverse=True))} erreichen"
+    hosts = _package_hosts(request)
+    return f" und darf dafür {' und '.join(hosts)} erreichen" if hosts else ""
 
 
 def _consequences(request: Mapping[str, Any], agent: str) -> Consequences:
@@ -200,6 +229,14 @@ def _clock(ts: float) -> str:
     return time.strftime("%H:%M", time.localtime(ts))
 
 
+def live_inbox(state: ServiceState, run_id: str) -> ApprovalInbox | None:
+    """The inbox of a run this service executes (None for runs of `arr run`)."""
+    handle = state.registry.get(run_id)
+    if handle is None or handle.done or handle.manager is None:
+        return None
+    return handle.manager.inbox
+
+
 @dataclass
 class _Cached:
     key: tuple[Any, ...]
@@ -216,7 +253,9 @@ class ApprovalReader:
 
     def items(self, record: RunRecord) -> dict[str, ApprovalItem]:
         """All items of a run by ID (`approvals.jsonl` of the record must be fresh)."""
-        entries = record.approvals.entries
+        inbox = live_inbox(self.state, record.run_id)
+        log_of_run = inbox.log if inbox is not None else None
+        entries = log_of_run.item_lines() if log_of_run is not None else record.approvals.entries
         if not entries:
             return {}
         lines = _item_lines(entries)
@@ -233,7 +272,7 @@ class ApprovalReader:
         for item_id, item_lines in lines.items():
             try:
                 items[item_id] = self._build(record, item_id, item_lines, alive, owned)
-            except (ArrError, ValueError):  # a damaged line must not hide the rest
+            except (ArrError, ValueError, TypeError):  # a damaged line must not hide the rest
                 log.warning("Freigabe %s in %s nicht lesbar", item_id, record.run_id)
         self._cache[record.run_id] = _Cached(key, items)
         return items
@@ -353,6 +392,8 @@ class ApprovalReader:
             common["deadline"] = common["created_at"] + self._timeout(record)
         urls = [*(request.get("urls") or []), *(request.get("hosts") or [])]
         reason = assessment.get("reason") or "Braucht eine Freigabe."
+        rule = self._rule(record.run_id, common["id"])
+        label, effects = _rule_text(rule) if rule is not None else (None, [])
         return ApprovalItem(
             type=ApprovalType.PERMISSION,
             title=item_title(lines.opened),
@@ -368,10 +409,20 @@ class ApprovalReader:
             why=f"{reason} Feste Regeln entscheiden das nicht allein, darum fragt arr dich.",
             consequences=_consequences(request, agent.id),
             content_to=[agent.vendor] if RequestCategory.READ_OUTSIDE in categories else [],
-            rule_label=_rule_label(request),
+            rule_label=label,
+            rule_effects=effects,
+            also_hosts=_package_hosts(request),
             no_sandbox=is_codex_escalation(request),
             **common,
         )
+
+    def _rule(self, run_id: str, item_id: str) -> AlwaysRule | None:
+        """The rule „immer“ would make; only a run of this service can make one."""
+        inbox = live_inbox(self.state, run_id)
+        if inbox is None:
+            return None
+        request = inbox.get(item_id).request
+        return inbox.engine.rule_for(request) if request is not None else None
 
     @staticmethod
     def _timeout(record: RunRecord) -> float:
@@ -462,6 +513,7 @@ class ApprovalsArea:
         self.state = state
         self.decider = GuiDecider()
         self.reader = ApprovalReader(state)
+        self._rule_stored = True
 
     def _fresh_items(self, record: RunRecord) -> dict[str, ApprovalItem]:
         if record.status.is_active:
@@ -510,10 +562,7 @@ class ApprovalsArea:
 
     def _inbox(self, run_id: str) -> ApprovalInbox | None:
         """The inbox of a run this service executes (None for runs of `arr run`)."""
-        handle = self.state.registry.get(run_id)
-        if handle is None or handle.done or handle.manager is None:
-            return None
-        inbox = handle.manager.inbox
+        inbox = live_inbox(self.state, run_id)
         if inbox is not None:
             inbox.on_rule = self._keep_rule
         return inbox
@@ -523,8 +572,9 @@ class ApprovalsArea:
         try:
             store_always_rule(self.state.workfolder, rule)
             self.state.reload_settings()
-        except (OSError, ValueError, ArrError):
+        except (OSError, ValueError, ArrError, YAMLError):
             log.exception("Feste Regel konnte nicht in arr.yaml geschrieben werden")
+            self._rule_stored = False
         for handle in self.state.registry.active():
             inbox = handle.manager.inbox if handle.manager is not None else None
             if inbox is not None and rule not in inbox.engine.rules.always:
@@ -549,10 +599,13 @@ class ApprovalsArea:
             raise not_allowed(
                 "Diese Anfrage läuft ohne Sandbox. Du kannst sie nur einmalig erlauben."
             )
+        if request.scope is DecisionScope.ALWAYS and item.rule_label is None:
+            raise not_allowed(NO_RULE)
         inbox = self._inbox(item.run.id)
         if inbox is None:
             raise not_allowed(TERMINAL_HINT)
         decision = _decision(item, request)
+        self._rule_stored = True
         try:
             inbox.resolve(approval_id, decision)
         except ArrError as exc:
@@ -563,9 +616,10 @@ class ApprovalsArea:
         decided = self._fresh_items(record).get(approval_id) if record is not None else None
         if decided is None:
             raise not_found("Freigabe", approval_id)
-        return DecisionResponse(
-            item=decided, run_id=item.run.id, message=_message(decided, request)
-        )
+        message = _message(decided, request)
+        if not self._rule_stored:
+            message = f"{message}. {RULE_NOT_STORED}"
+        return DecisionResponse(item=decided, run_id=item.run.id, message=message)
 
     async def revoke_approval(self, approval_id: str) -> ApprovalItem:
         """Withdraw a decision of a running run; later equal requests ask again (docs/07 §4)."""

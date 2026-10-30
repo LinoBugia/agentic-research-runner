@@ -1186,7 +1186,15 @@ class ApprovalItem(ApiModel):
     escalated_by: EscalatedByInfo | None = None
     consequences: Consequences | None = None
     content_to: list[Vendor] = Field(default_factory=list, description="read_outside (E19)")
-    rule_label: str | None = Field(default=None, description="Rule that „immer“ would create")
+    rule_label: str | None = Field(
+        default=None, description="Rule that „immer“ would create; None: „immer“ is not offered"
+    )
+    rule_effects: list[str] = Field(
+        default_factory=list, description="What that rule allows, for the „immer“ dialog"
+    )
+    also_hosts: list[str] = Field(
+        default_factory=list, description="Package hosts an allowed installation may reach too"
+    )
     transcript_seq: int | None = None
     why: str | None = Field(default=None, description="„Warum bei dir“ without `escalated_by`")
     no_sandbox: bool = Field(

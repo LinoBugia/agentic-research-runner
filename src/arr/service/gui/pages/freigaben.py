@@ -411,6 +411,7 @@ class FreigabenPage:
         if event.type == "approval.updated":
             if item.id in self.cards:
                 self.cards[item.id].update(item, self.api.now())
+                self.frame.js("arr.disarmAll()")  # the card now answers more than was seen
             return
         if item.id in self.own_decisions and event.type == "approval.decided":
             return

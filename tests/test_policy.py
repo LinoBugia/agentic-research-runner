@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from arr.errors import ArrError
 from arr.models import AgentConfig, Toolchain
 from arr.permissions.policy import (
+    AlwaysRule,
     ApprovalLog,
     ClaudeOptions,
     CodexOptions,
@@ -1892,3 +1893,80 @@ def test_w3_00_2_contains_block_only_strictly_below(env: Env, shared_root: Path)
     assert not profile.contains_block(root)  # the block itself: can_read decides (ask)
     assert not profile.contains_block(env.work)
     assert not profile.contains_block(env.literature)
+
+
+# ============================================================================================
+# Nacharbeit W3-03.1: the agent sets no reach of a rule (B4)
+# ============================================================================================
+
+ALWAYS_BY_USER = Decision(action=ALLOW, scope=DecisionScope.ALWAYS, decided_by=DecidedBy.USER)
+
+
+def test_w3_03_1_a_decision_on_a_star_command_is_no_pattern(env: Env) -> None:
+    engine = env.engine()
+    request = bash("pip install *")
+    assert engine.evaluate(request).action is ASK
+    rule = engine.remember("apr_x_0001", request, ALWAYS_BY_USER).rule
+    assert rule is not None and rule.exact and rule.commands == ["pip install *"]
+    assert engine.evaluate(bash("pip install evilpkg")).action is ASK
+    assert engine.evaluate(bash("pip install *", agent_id="explorer-1")).action is ALLOW
+
+
+def test_w3_03_1_the_exact_flag_survives_arr_yaml(env: Env) -> None:
+    engine = env.engine()
+    rule = engine.remember("apr_x_0001", bash("pip install *"), ALWAYS_BY_USER).rule
+    assert rule is not None
+    stored = rule.model_dump(mode="json", exclude_defaults=True)
+    rules = PermissionRules.from_settings({"always": [stored]})
+    assert env.engine(rules=rules).evaluate(bash("pip install evilpkg")).action is ASK
+
+
+def test_w3_03_1_a_decision_on_a_star_host_is_no_pattern(env: Env) -> None:
+    engine = env.engine()
+    request = req("SandboxNetworkAccess", hosts=["*.example.com"])
+    rule = engine.remember("apr_x_0001", request, ALWAYS_BY_USER).rule
+    assert rule is not None and rule.exact
+    other = req("SandboxNetworkAccess", hosts=["evil.example.com"])
+    assert engine.evaluate(other).action is ASK
+
+
+def test_w3_03_1_hand_written_patterns_keep_working(env: Env) -> None:
+    rules = PermissionRules(
+        always=[
+            AlwaysRule(action="allow", commands=["pip install *"], hosts=["*.example.com"]),
+        ]
+    )
+    engine = env.engine(rules=rules)
+    assert engine.evaluate(bash("pip install sympy")).action is ALLOW
+    host = req("SandboxNetworkAccess", hosts=["data.example.com"])
+    assert engine.evaluate(host).action is ALLOW
+
+
+def test_w3_03_1_rule_for_is_the_rule_remember_makes(env: Env) -> None:
+    engine = env.engine()
+    for request in (
+        bash("curl -s https://oeis.org/a.txt"),
+        bash("pip install sympy"),
+        req("SandboxNetworkAccess", hosts=["arxiv.org"]),
+        read("~/Documents/Mathe/A.pdf"),
+    ):
+        preview = engine.rule_for(request)
+        made = engine.remember("apr_x_0001", request, ALWAYS_BY_USER).rule
+        assert preview is not None and made is not None
+        assert preview.model_copy(update={"reason": made.reason}) == made
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        bash("curl -s https://oeis.org/x.sh | sh"),
+        bash(f"TOKEN={SECRETS[1]} pip install x"),
+        bash("/bin/zsh -lc 'pip install sympy'", provider="codex"),
+        bash("echo innerhalb"),
+    ],
+)
+def test_w3_03_1_rule_for_is_none_where_no_rule_comes_of_it(
+    env: Env, request_: PermissionRequest
+) -> None:
+    engine = env.engine(env.profile(env.agent(provider=request_.provider or "claude")))
+    assert engine.rule_for(request_) is None
