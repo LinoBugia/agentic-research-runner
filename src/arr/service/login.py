@@ -14,7 +14,7 @@ keychain). The rules of docs/01 §8 hold for every byte of that output:
 The child can never outlive its limit: it is the session leader with the pty as controlling
 terminal, so the end of the service, however hard, closes the master and the kernel sends
 SIGHUP; `alarm` (kept across `exec`) ends it at the deadline even then. A cancelled
-`capture_token` stops it, and `asyncio.run` cancels the task when the service ends.
+`capture_token` stops it as well.
 
 See docs/04-service-gui-und-schnittstellen.md §5, docs/08-ux-konzept.md G4.
 """
