@@ -38,8 +38,9 @@ from arr.resolve import load_yaml_model
 from arr.room.store import RoomStore
 from arr.room.types import Message as RoomMessage
 from arr.runs.inspect import describe_checkpoint, open_approvals, run_lock_held, run_reason
-from arr.runs.launch import describe_entry
+from arr.runs.launch import ORPHAN_MIN_AGE_S, describe_entry
 from arr.runs.prepare import AgentFile, RunMeta, load_agent_file, load_run_meta
+from arr.runs.slim import SLIM_MARKER
 from arr.service.api_models import (
     Action,
     Activity,
@@ -285,7 +286,8 @@ class RoomReader:
     """Read-only view of `groupchats/room.sqlite` (docs/02 §5) for the GUI.
 
     Typed rows come from `RoomStore`'s public readers; counts and the newest IDs from small
-    read-only queries. A missing or locked database gives empty answers, never an error.
+    read-only queries. A missing, locked or broken database gives empty answers, never an
+    error.
     """
 
     def __init__(self, run_dir: Path) -> None:
@@ -297,9 +299,23 @@ class RoomReader:
     def available(self) -> bool:
         return self.db_path.is_file()
 
+    def _intact(self) -> bool:
+        """False for a file that is no database: `RoomStore` readers would raise."""
+        try:
+            con = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=1.0)
+            try:
+                con.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            finally:
+                con.close()
+        except sqlite3.OperationalError:
+            return True  # locked for the moment
+        except sqlite3.Error:
+            return False
+        return True
+
     @property
     def store(self) -> RoomStore | None:
-        if self._store is None and self.available:
+        if self._store is None and self.available and self._intact():
             try:
                 self._store = RoomStore(self.run_dir)
             except ArrError:
@@ -439,6 +455,7 @@ class RunRecord:
         self._usage: _Cached[RunUsage] = _Cached(run_dir / USAGE_FILE)
         self._summary_md: _Cached[str] = _Cached(run_dir / SUMMARY_FILE)
         self._task_md: _Cached[str] = _Cached(run_dir / "task.md")
+        self._slim_mark: _Cached[bool] = _Cached(run_dir / SLIM_MARKER)
         self.room = RoomReader(run_dir)
         self._size: SizeInfo | None = None
         self._size_at = 0.0
@@ -572,6 +589,10 @@ class RunRecord:
     @property
     def task_md(self) -> str | None:
         return self._task_md.get(lambda p: p.read_text("utf-8"))
+
+    @property
+    def slimmed(self) -> bool:
+        return bool(self._slim_mark.get(lambda _path: True))
 
     @property
     def status(self) -> RunStatus:
@@ -882,6 +903,20 @@ def last_message(record: RunRecord) -> LastMessage | None:
     )
 
 
+def counts_as_active(record: RunRecord, now: float) -> bool:
+    """„Aktiv“ of docs/08 §8.3, without a reservation nobody took (W3-01 review G5).
+
+    A `queued` folder older than `ORPHAN_MIN_AGE_S` whose `run.lock` nobody holds was left by a
+    process that died after `reserve_run`; it stays until the next start clears it.
+    """
+    meta = record.meta
+    if meta is None or not meta.status.is_active:
+        return False
+    if meta.status is RunStatus.QUEUED and now - meta.created >= ORPHAN_MIN_AGE_S:
+        return run_lock_held(record.run_dir)
+    return True
+
+
 def run_error(record: RunRecord, base_url: str) -> RunError | None:
     meta = record.meta
     assert meta is not None
@@ -952,7 +987,7 @@ def run_summary(
         topology=topology,
         status=meta.status,
         status_since=status_since(entries, meta),
-        active=meta.status.is_active,
+        active=counts_as_active(record, now),
         open_approvals=len(items),
         open_escalation=open_escalation,
         starter=meta.starter,
@@ -967,6 +1002,7 @@ def run_summary(
         cost_usd=round(cost, 4) if cost is not None else None,
         cost_kind=kind if cost is not None else None,
         size=record.size(),
+        slimmed=record.slimmed,
         best_result=best,
         last_message=last,
         error=run_error(record, base_url),
@@ -1042,11 +1078,13 @@ def stage_infos(record: RunRecord, resolved: ResolvedRun | None) -> list[StageIn
     return out
 
 
-def actions_allowed(status: RunStatus, *, owned: bool, foreign_process: bool) -> list[RunAction]:
+def actions_allowed(
+    status: RunStatus, *, owned: bool, foreign_process: bool, slimmed: bool = False
+) -> list[RunAction]:
     """Actions the GUI may offer (W3-01 §3.5): own runs pause, resume, stop; runs of another
-    process only stop; finished runs nothing yet (archive, delete, pin come with W5-01)."""
+    process only stop; finished runs can be slimmed once (archive, delete, pin: W5-01)."""
     if status.is_final:
-        return []
+        return [] if slimmed else [RunAction.SLIM]
     if owned:
         if status is RunStatus.RUNNING:
             return [RunAction.PAUSE, RunAction.STOP]
@@ -1096,7 +1134,9 @@ def run_detail(
         open_approvals_top=top,
         questions_to_user=questions,
         decider=resolved.approvals.decider if resolved is not None else Decider.USER,
-        actions_allowed=actions_allowed(summary.status, owned=owned, foreign_process=foreign),
+        actions_allowed=actions_allowed(
+            summary.status, owned=owned, foreign_process=foreign, slimmed=summary.slimmed
+        ),
         stages=stage_infos(record, resolved),
         handoff_text=handoff_text(record),
         run_dir=str(record.run_dir),

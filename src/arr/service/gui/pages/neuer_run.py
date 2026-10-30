@@ -182,6 +182,7 @@ class NeuerRunPage:
         self.fields: dict[str, Field] = {}
         self.param_fields: dict[str, Any] = {}
         self.agent_cells: dict[str, dict[str, ui.element]] = {}
+        self.agent_errors: dict[str, ui.html] = {}
         self._agents_signature: tuple[Any, ...] = ()
         self._timer: ui.timer | None = None
         self._checking = False
@@ -833,6 +834,7 @@ class NeuerRunPage:
                                 tag="span",
                                 classes="info",
                             ).props(f'id="profile-{esc(agent.id)}"')
+                        self.agent_errors[agent.id] = raw("", tag="span")
                         raw(
                             esc(WORKSPACE.get(agent.workspace_mode.value, "Kopie")), tag="td"
                         ).classes("wrap")
@@ -870,7 +872,7 @@ class NeuerRunPage:
             f'aria-label="Modell von {esc(agent.id)}" id="model-{esc(agent.id)}"'
         )
         with select:
-            for value, label in MODELS:
+            for value, label in self._model_choices(agent).items():
                 option = ui.element("option").props(f'value="{value}"')
                 if value == agent.model:
                     option.props("selected")
@@ -882,6 +884,16 @@ class NeuerRunPage:
             self._set_agent(aid, "model", str(event.args))
 
         select.on("change", changed, js_handler="(e) => emit(e.target.value)")
+
+    def _model_choices(self, agent: RunStartAgent) -> dict[str, str]:
+        """The usual models, the standards of `arr.yaml` and what the agent has now."""
+        assert self.settings is not None
+        choices = dict(MODELS)
+        for standard in self.settings.defaults.values():
+            if standard.model:
+                choices.setdefault(standard.model, standard.model)
+        choices.setdefault(agent.model, agent.model_label)
+        return choices
 
     def _dirs_editor(self, agent: RunStartAgent) -> None:
         for folder in agent.read_dirs:
@@ -999,6 +1011,11 @@ class NeuerRunPage:
             self.input["limits"][key] = value
         self._schedule()
 
+    def _limits_invalid(self) -> bool:
+        """A limit field holds no valid value: the check saw its last good one, so this is
+        the only place that keeps „Run starten“ locked."""
+        return any(self._limit_input_error(key) for key in LIMIT_KEYS)
+
     def _limit_input_error(self, key: str) -> str | None:
         """Error of the limit input itself, before any check („Gib eine Dauer an …“)."""
         if _limit_value(key, self.fields[key].value):
@@ -1037,6 +1054,13 @@ class NeuerRunPage:
         if not task_has_content(data["task_md"]):
             data["task_md"] = ""
         data["skill"] = data["skill"] or None
+        if self.adjust or self.settings is None:
+            return data
+        # only what you changed: limits of the skill and of `arr.yaml` keep their order (02 §3.3)
+        std = self.settings.limits
+        data["limits"] = {k: v for k, v in data["limits"].items() if v != getattr(std, k)}
+        if data["decider"] == self.settings.approvals.decider.value:
+            del data["decider"]
         return data
 
     async def _check(self) -> None:
@@ -1058,12 +1082,15 @@ class NeuerRunPage:
             return
         self.result = result
         self._checking = False
-        if self._agents_changed(result.agents):
-            self._render_agents(result.agents)
-        else:
-            self._update_agent_marks(result.agents)
-        self._render_channels(result)
-        self.yaml_box.set_content(esc(result.resolved_run_yaml))
+        if result.agents or not result.errors:  # an error in the form keeps the last table
+            if self._agents_changed(result.agents):
+                self._render_agents(result.agents)
+            else:
+                self._update_agent_marks(result.agents)
+            self._render_channels(result)
+        self.yaml_box.set_content(
+            esc(result.resolved_run_yaml or "Die Vorschau erscheint, sobald alle Angaben passen.")
+        )
         self._render_field_errors(result)
         self._render_summary(result)
         self._render_deviations(result)
@@ -1138,6 +1165,11 @@ class NeuerRunPage:
         for name, field in self.param_fields.items():
             if isinstance(field, Field):
                 self._show_error(field, by_path.get(f"params.{name}"))
+        for agent_id, slot in self.agent_errors.items():
+            message = next(
+                (m for p, m in by_path.items() if p.startswith(f"agents.{agent_id}.")), None
+            )
+            slot.set_content(f'<span class="error">{esc(message)}</span>' if message else "")
         skill_error = by_path.get("skill")
         self.skill_error.set_content(
             f'<span class="error">{esc(skill_error)}</span>' if skill_error else ""
@@ -1355,13 +1387,15 @@ class NeuerRunPage:
             )
         if not any(i.path.startswith("agents.") for i in errors):
             tested = [p.last_test.ts for p in self.profiles if p.last_test and p.last_test.ok]
-            when = f" ({fmt.when(max(tested), self.api.now())})" if tested else ""
+            word = "Profile vorhanden"
+            if tested:
+                word = f"Profile getestet ({fmt.when(max(tested), self.api.now())})"
             lines.append(
                 '<div class="check"><span class="st ok" aria-hidden="true">✓</span>'
-                f'<span class="txt small">Profile getestet{esc(when)}</span></div>'
+                f'<span class="txt small">{esc(word)}</span></div>'
             )
         self.checks_box.set_content("".join(lines))
-        set_disabled(self.start_button, bool(errors))
+        set_disabled(self.start_button, bool(errors) or self._limits_invalid())
 
     # --- start ---------------------------------------------------------------------------------
 
@@ -1373,7 +1407,7 @@ class NeuerRunPage:
                 self._timer.cancel()
                 self._timer = None
             await self._check()
-        if self.result is None or self.result.errors:
+        if self.result is None or self.result.errors or self._limits_invalid():
             if self.result is not None:
                 self._render_field_errors(self.result)
             return
@@ -1433,6 +1467,8 @@ def _anchor(path: str) -> str:
     """Field anchor of a check path: `limits.budget_usd` → `f-limits.budget_usd`."""
     if path.startswith("agents."):
         return f"agent-{path.split('.')[1]}"
+    if path.startswith("agents"):
+        return "s4"
     if path == "skill":
         return "s1"
     return f"f-{path}"

@@ -555,6 +555,54 @@ async def test_hints_at_most_one_per_interval_or_five_tool_calls(workfolder: Pat
     assert [e["data"]["messages"] for e in log_entries(manager.run_dir, "hint")] == [[2], [3]]
 
 
+def test_hint_gate_lets_an_urgent_hint_through_the_window() -> None:
+    now = [0.0]
+    gate = HintGate(interval_s=60, tool_calls=5, clock=lambda: now[0])
+    gate.delivered(0)
+    assert not gate.allows(1)
+    assert gate.allows(1, urgent=True)
+    gate.delivered(1)
+    assert not gate.allows(2), "an urgent hint starts a new window"
+
+
+def _question_run(workfolder: Path, to: str) -> Any:
+    """`a` works; `b` posts a note (first hint at once) and then a question to `to`."""
+
+    async def topology(ctx: RunContext) -> None:
+        await ctx.turns([("a", "arbeite"), ("b", "schreibe")])
+
+    scripts = {
+        "a": turns([wait(0.5)]),
+        "b": turns(
+            [
+                wait(0.05),
+                post("main", "eins"),
+                wait(0.1),
+                post("main", "?", kind="question", to=[to]),
+            ]
+        ),
+        "c": turns([say("still")]),
+    }
+    return make_manager(
+        workfolder, topology, scripts, groupchats=[channel("main", ["a", "b", "c"])]
+    )
+
+
+async def test_question_to_the_agent_skips_the_hint_window(workfolder: Path) -> None:
+    """W2-05 §7: the question reaches `a` in the same turn, not through its own inbox()."""
+    manager = _question_run(workfolder, "a")
+    assert await manager.run() is RunStatus.DONE
+    assert [e["data"]["messages"] for e in log_entries(manager.run_dir, "hint")] == [[2], [3]]
+    second = hints(manager.run_dir, "a")[1]
+    assert "1 Frage an dich in #main" in second["data"]["text"]
+
+
+async def test_question_to_someone_else_stays_in_the_hint_window(workfolder: Path) -> None:
+    manager = _question_run(workfolder, "c")
+    assert await manager.run() is RunStatus.DONE
+    assert len(hints(manager.run_dir, "a")) == 1
+
+
 async def test_user_messages_wake_or_hint_and_record_the_delivery(workfolder: Path) -> None:
     ids: dict[str, int] = {}
     results: list[DiscussionOutcome] = []

@@ -584,7 +584,8 @@ class RunSummary(ApiModel):
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
-        if self.active != self.status.is_active:
+        # a reservation nobody took stays `queued` but is not active (W3-01 review G5)
+        if self.active != self.status.is_active and self.status is not RunStatus.QUEUED:
             raise ValueError(f"active={self.active} passt nicht zu status={self.status}")
         if self.open_escalation and self.status is not RunStatus.PAUSED:
             raise ValueError("open_escalation nur bei pausierten Runs")

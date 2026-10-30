@@ -50,6 +50,7 @@ from arr.runs.pacing import (
     HintGate,
     PacingSettings,
     compose_hint,
+    is_question_to,
     render_turn_prompt,
     run_discussion,
 )
@@ -863,7 +864,8 @@ class Orchestrator(RunContext):
                 active.delivery = None
             if not active.pending or active.blocked or active.tool_calls < active.retry_at_calls:
                 continue
-            if not active.gate.allows(active.tool_calls):
+            urgent = any(is_question_to(m, agent_id) for m in active.pending)
+            if not active.gate.allows(active.tool_calls, urgent=urgent):
                 continue
             messages = list(active.pending)
             active.delivery = asyncio.create_task(self._deliver(agent_id, active, messages))

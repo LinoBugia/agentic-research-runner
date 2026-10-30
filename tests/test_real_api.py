@@ -153,7 +153,6 @@ async def test_empty_areas_raise_unavailable_with_german_message(wf: Path) -> No
         (api.list_approvals(status=[ApprovalStatus.OPEN]), "W3-03"),
         (api.get_approval("apr_1"), "W3-03"),
         (api.get_app_settings(), "W3-04"),
-        (api.get_workfolder_settings(), "W3-04"),
         (api.get_setup_state(), "W3-04"),
         (api.test_profile("fake-auth"), "W3-05"),
         (api.start_login("fake-auth"), "W3-05"),
@@ -166,10 +165,9 @@ async def test_empty_areas_raise_unavailable_with_german_message(wf: Path) -> No
         assert error.value.error.code is ErrorCode.UNAVAILABLE
         assert order in error.value.error.message and "noch nicht" in error.value.error.message
     run_dir = make_run_folder(wf, status=RunStatus.DONE)
-    for action, order in [(RunAction.SLIM, "W3-02"), (RunAction.ARCHIVE, "W5-01")]:
-        with pytest.raises(ApiException) as error:
-            await api.run_action(run_dir.name, action)
-        assert error.value.error.code is ErrorCode.UNAVAILABLE and order in str(error.value)
+    with pytest.raises(ApiException) as error:
+        await api.run_action(run_dir.name, RunAction.ARCHIVE)
+    assert error.value.error.code is ErrorCode.UNAVAILABLE and "W5-01" in str(error.value)
 
 
 # --- A4: a run started in the service ---------------------------------------------------------
@@ -203,7 +201,7 @@ async def test_run_started_in_the_service_is_mapped_everywhere(wf: Path) -> None
 
         detail = await api.get_run(run_id)
         assert [(s.key, s.status) for s in detail.stages] == [("diskussion", StageStatus.DONE)]
-        assert detail.actions_allowed == [] and detail.run_dir.endswith(run_id)
+        assert detail.actions_allowed == [RunAction.SLIM] and detail.run_dir.endswith(run_id)
         assert detail.task_md == "Teste arr." and run_id in detail.handoff_text
         assert detail.run.agents_by_state.done == 2
 

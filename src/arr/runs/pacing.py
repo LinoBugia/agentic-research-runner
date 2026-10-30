@@ -6,7 +6,8 @@ How agents learn about new messages (docs/06-gruppenchats.md §4):
   unread messages of `user` (in full, marked as having priority, docs/06 §10) and the number
   of new messages per channel in front of the assignment.
 - **Hints mid-turn:** `compose_hint` builds the short text for `AgentBackend.deliver_hint`;
-  `HintGate` allows at most one hint per 60 s or per 5 tool calls of a turn.
+  `HintGate` allows at most one hint per 60 s or per 5 tool calls of a turn; a question with
+  `to` to the agent (`is_question_to`) skips that window (W2-05 §7, W3-02).
 
 Who is when on turn (docs/06 §5.1, §5.2) is a *discussion phase*: `Orchestrator.discuss`
 (implemented by `run_discussion`). `rounds` gives all members a turn per round; `event` gives
@@ -39,6 +40,7 @@ __all__ = [
     "PacingSettings",
     "PingPongTracker",
     "compose_hint",
+    "is_question_to",
     "render_turn_prompt",
     "run_discussion",
 ]
@@ -131,6 +133,11 @@ def render_turn_prompt(
 # --------------------------------------------------------------------------------------------
 
 
+def is_question_to(msg: Message, agent_id: str) -> bool:
+    """True for a question that names `agent_id` in `to`."""
+    return msg.kind is MessageKind.QUESTION and agent_id in msg.to
+
+
 def compose_hint(agent_id: str, messages: Iterable[Message]) -> str:
     """Short hint such as „📨 1 Frage an dich in #main · 2 neue Nachrichten in #main“.
 
@@ -141,7 +148,7 @@ def compose_hint(agent_id: str, messages: Iterable[Message]) -> str:
     others: dict[str, int] = {}
     users: dict[str, int] = {}
     for msg in messages:
-        if msg.kind is MessageKind.QUESTION and agent_id in msg.to:
+        if is_question_to(msg, agent_id):
             questions[msg.channel] = questions.get(msg.channel, 0) + 1
         else:
             others[msg.channel] = others.get(msg.channel, 0) + 1
@@ -164,7 +171,9 @@ class HintGate:
     """At most one hint per `interval_s` or per `tool_calls` tool calls in a turn (docs/06 §4).
 
     The first hint of a turn may go at once. After that a hint needs either `interval_s`
-    seconds or `tool_calls` tool calls since the previous one, whichever comes first.
+    seconds or `tool_calls` tool calls since the previous one, whichever comes first. A hint
+    with a question to this agent (`urgent`) goes at once: otherwise the agent finds the
+    question only through its own `inbox()` at the end of the turn (W2-05 §7).
     """
 
     interval_s: float = 60.0
@@ -173,9 +182,9 @@ class HintGate:
     _last_at: float | None = None
     _last_calls: int = 0
 
-    def allows(self, tool_calls: int) -> bool:
+    def allows(self, tool_calls: int, *, urgent: bool = False) -> bool:
         """True if a hint may be delivered now, given the tool calls of the turn so far."""
-        if self._last_at is None:
+        if urgent or self._last_at is None:
             return True
         waited = self.clock() - self._last_at >= self.interval_s
         return waited or tool_calls - self._last_calls >= self.tool_calls

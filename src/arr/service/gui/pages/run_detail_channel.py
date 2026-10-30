@@ -13,7 +13,13 @@ from nicegui import ui
 
 from arr.models import ChannelMode, RunStatus
 from arr.room.types import MessageKind
-from arr.service.api_models import ApiException, ChannelInfo, Message, PostMessageRequest
+from arr.service.api_models import (
+    ApiException,
+    ChannelInfo,
+    Message,
+    PostMessageRequest,
+    RunAction,
+)
 from arr.service.gui import format as fmt
 from arr.service.gui.components.banner import empty_state_html
 from arr.service.gui.components.base import esc, icon, raw
@@ -219,6 +225,13 @@ class ChannelView:
                 classes="composer-off small muted",
             )
             return
+        if self._in_terminal():
+            raw(
+                f"{icon('info', small=True)} Der Run läuft im Terminal. Nachrichten gehen nur "
+                "an Runs, die du in arr gestartet hast.",
+                classes="composer-off small muted",
+            )
+            return
         options = [f'<option value="">alle in #{esc(info.name)}</option>'] + [
             f'<option value="{esc(m.agent)}">{esc(m.alias or m.agent)}</option>'
             for m in info.members
@@ -271,6 +284,12 @@ class ChannelView:
                 js_handler="(e) => { const f = e.target.closest('form'); emit({to: "
                 "f.to.value, kind: f.kind.value, body: f.body.value}); }",
             )
+
+    def _in_terminal(self) -> bool:
+        """A run of `arr run`: this service can stop it, but neither pause it nor write to it."""
+        detail = self.page.detail
+        steer = {RunAction.PAUSE, RunAction.RESUME}
+        return not detail.run.open_escalation and not steer & set(detail.actions_allowed)
 
     async def _send(self, event: Any) -> None:
         args = event.args or {}
