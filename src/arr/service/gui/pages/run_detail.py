@@ -962,6 +962,7 @@ class RunDetailPage:
 
     async def _flush(self) -> None:
         dirty, self.dirty = self.dirty, set()
+        new_stage = "stages" in dirty
         if "run" in dirty:
             await self._refresh_run()
             dirty -= {"meters", "stages", "attention"}
@@ -979,6 +980,7 @@ class RunDetailPage:
             self._render_meters()
         if "stages" in dirty:
             self.stagebar.set_content(stage_bar_html(self.detail.stages, self.detail.run.topology))
+        if new_stage:
             await self._sync_opened_channels()
         if "log" in dirty and isinstance(self.view, LogView):
             await self.view.refresh()

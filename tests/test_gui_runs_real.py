@@ -543,8 +543,12 @@ async def test_channel_opens_on_the_page_when_its_stage_begins(wf: Path) -> None
             RoomStore(folder).open_channel("spaeter")
             start = {**checkpoint, "data": {"stage": "zwei", "phase": "stage_start"}}
             append(log, json.dumps(start) + "\n")
-            await see(user, "Steckbrief #spaeter", retries=200)
-            assert "öffnet in Stufe" not in page_html(user)
+
+            async def opened() -> bool:
+                return "öffnet in Stufe" not in page_html(user)
+
+            await until(opened, within=10, what="channel opened")
+            await see(user, "Live folgen")
     finally:
         lock.release()
 
