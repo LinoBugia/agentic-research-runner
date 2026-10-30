@@ -680,7 +680,8 @@ async def test_reserved_run_that_cannot_be_prepared_fails_and_keeps_meta(workfol
     )
     with pytest.raises(ConfigError):
         await manager.run()
-    assert [p.name for p in folder.iterdir()] == ["meta.json"]
+    # `run.lock` is the manager's own mark on the reserved folder (W3-01, G7); it stays
+    assert {p.name for p in folder.iterdir()} == {"meta.json", "run.lock"}
     assert load_run_meta(folder).status is RunStatus.FAILED
 
 

@@ -57,6 +57,7 @@ from arr.runs.inspect import (
     STATUS_TEXT,
     STOP_REQUEST,
     TURN_TEXT,
+    RunLock,
     describe_checkpoint,
     run_lock_held,
     run_reason,
@@ -64,11 +65,6 @@ from arr.runs.inspect import (
 from arr.runs.manager import Finalizer, RunManager, mark_interrupted_runs, set_run_status
 from arr.runs.orchestrator import ORCHESTRATOR_LOG, OrchestratorLog
 from arr.runs.prepare import PreparedAgent, RunMeta, load_run_meta, new_run_id
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows: no flock
-    fcntl = None  # type: ignore[assignment]
 from arr.runs.secret_scan import (
     SCAN_KIND,
     ScanReport,
@@ -92,6 +88,7 @@ __all__ = [
     "EXIT_FAILED",
     "EXIT_OK",
     "EXIT_STOPPED",
+    "ORPHAN_MIN_AGE_S",
     "PROFILES_FILE",
     "REPEAT_WINDOW_S",
     "STOP_REQUEST",
@@ -103,6 +100,7 @@ __all__ = [
     "StopControl",
     "build_manager",
     "describe_approval",
+    "discard_orphaned_reservations",
     "describe_entry",
     "exit_code",
     "find_workfolder",
@@ -111,6 +109,7 @@ __all__ = [
     "load_profiles",
     "parse_params",
     "plan_launch",
+    "plan_run_input",
     "request_stop",
     "reserve_run",
     "run_launch",
@@ -205,9 +204,13 @@ def load_profiles(path: str | Path | None = None) -> ProfilesFile:
 
 @dataclass(frozen=True, slots=True)
 class Launch:
-    """Everything `run_launch` needs, checked before any folder is created."""
+    """Everything `run_launch` needs, checked before any folder is created.
 
-    run_file: Path
+    `run_file` is the `run.yaml` of `arr run`; a run given as data (the service, W3-01) has
+    none, its task is inline.
+    """
+
+    run_file: Path | None
     workfolder: Path
     settings: WorkfolderSettings
     profiles: ProfilesFile
@@ -218,8 +221,8 @@ class Launch:
 
     @property
     def task_base(self) -> Path:
-        """`task_file` of the `run.yaml` is relative to the file's folder."""
-        return self.run_file.parent
+        """`task_file` of the `run.yaml` is relative to the file's folder (else the workfolder)."""
+        return self.run_file.parent if self.run_file is not None else self.workfolder
 
     def used_profiles(self) -> list[AuthProfile]:
         """The auth profiles of the run's agents."""
@@ -264,9 +267,33 @@ def plan_launch(
         if workfolder is not None:
             raise
         root = find_workfolder(start=file.parent)
+    return plan_run_input(
+        load_run_input(file),
+        workfolder=root,
+        params=params,
+        profiles=profiles,
+        run_file=file,
+        source=str(file),
+    )
+
+
+def plan_run_input(
+    run_input: RunInput,
+    *,
+    workfolder: str | Path,
+    params: Mapping[str, Any] | None = None,
+    profiles: ProfilesFile | None = None,
+    run_file: Path | None = None,
+    source: str = "run.yaml",
+) -> Launch:
+    """Check a run given as data (the service's `start_run`, W3-01) like `plan_launch`.
+
+    `arr.yaml` → group skill → project → resolve with `params` → `check_topology` →
+    `profiles.yaml`; nothing is created. `source` names the origin in error messages.
+    """
+    root = Path(workfolder).expanduser().absolute()
     settings = load_workfolder_settings(root)
-    run_input = load_run_input(file)
-    group_spec = _group_spec(root, run_input, str(file))
+    group_spec = _group_spec(root, run_input, source)
     project = project_dir(root, run_input.project)
     resolved = resolve_run(
         run_input,
@@ -277,7 +304,7 @@ def plan_launch(
     )
     check_topology(resolved)
     return Launch(
-        run_file=file,
+        run_file=run_file,
         workfolder=root,
         settings=settings,
         profiles=profiles if profiles is not None else load_profiles(),
@@ -360,9 +387,14 @@ def build_manager(
     decider: ApprovalDecider | None,
     builders: Mapping[Provider, BackendBuilder] | None = None,
     finalizer: Finalizer = finalize_run,
+    starter: Starter = Starter.CLI,
     **kwargs: Any,
 ) -> RunManager:
-    """The RunManager of a planned run: topology, backend factory, finalizer, profiles."""
+    """The RunManager of a planned run: topology, backend factory, finalizer, profiles.
+
+    `starter` is who starts the run (`cli` for `arr run`, `gui` for the service, W3-01);
+    further keyword arguments go to the `RunManager` (e.g. `run_id`, `gates`, `lock`).
+    """
     factory = LiveFactory(launch.profiles, launch.resolved.limits, builders)
     manager = RunManager(
         launch.workfolder,
@@ -373,7 +405,7 @@ def build_manager(
         settings=launch.settings,
         decider=decider,
         finalizer=finalizer,
-        starter=Starter.CLI,
+        starter=starter,
         task_base=launch.task_base,
         profiles=launch.profiles,
         **kwargs,
@@ -383,57 +415,23 @@ def build_manager(
 
 
 # --------------------------------------------------------------------------------------------
-# Run folder: reservation and lock (W2-05.1 M1)
+# Run folder: reservation and lock (W2-05.1 M1; `RunLock` lives in `arr.runs.inspect`)
 # --------------------------------------------------------------------------------------------
 
-
-class RunLock:
-    """Owner mark of the run this process executes: `fcntl.flock` on `<run>/run.lock`.
-
-    Taken right after the run folder is reserved and held until `run_launch` returns, the
-    secret scan included. Other processes see it with `run_lock_held`: a second `arr run`
-    leaves the run alone when it marks crashed runs, and `arr runs stop` tells when no process
-    executes a run any more. The lock falls with the process (also after `os._exit` and a
-    crash); the file stays. Without `fcntl` (Windows) nothing is locked.
-    """
-
-    def __init__(self, run_dir: str | Path) -> None:
-        self.path = Path(run_dir) / RUN_LOCK
-        self._handle: Any = None
-
-    @property
-    def held(self) -> bool:
-        return self._handle is not None
-
-    def acquire(self) -> None:
-        """Take the lock; `ArrError` if another process holds it."""
-        if fcntl is None or self._handle is not None:
-            return
-        handle = self.path.open("ab")
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            handle.close()
-            raise ArrError(
-                f"Den Run {self.path.parent.name} führt schon ein anderer arr-run-Prozess aus."
-            ) from None
-        self._handle = handle
-
-    def release(self) -> None:
-        handle, self._handle = self._handle, None
-        if handle is None:
-            return
-        with contextlib.suppress(OSError):
-            fcntl.flock(handle, fcntl.LOCK_UN)
-        handle.close()
+ORPHAN_MIN_AGE_S = 30.0
+"""A `queued` folder without lock and without prepared parts is removed only when it is at
+least this old: a process that reserved it a moment ago may not have taken the lock yet."""
 
 
-def reserve_run(launch: Launch, *, now: datetime | None = None) -> Path:
+def reserve_run(
+    launch: Launch, *, now: datetime | None = None, starter: Starter = Starter.CLI
+) -> Path:
     """Create the run folder with a `meta.json` in status `queued` and return it.
 
     `prepare_run(run_id=…)` takes such a reserved folder over (docs/02 §7, W2-03). Reserving
     first lets `run_launch` hold the lock before the run ever is `preparing`, so no other
-    process can take it for a crashed run in between.
+    process can take it for a crashed run in between. `starter` is kept by `prepare_run`
+    (`gui` for the service, W3-01).
     """
     moment = now or datetime.now()
     runs = launch.workfolder / "runs"
@@ -449,7 +447,7 @@ def reserve_run(launch: Launch, *, now: datetime | None = None) -> Path:
         meta = RunMeta(
             run_id=run_id,
             status=RunStatus.QUEUED,
-            starter=Starter.CLI,
+            starter=starter,
             project=resolved.project,
             skill=resolved.skill,
             name=resolved.name,
@@ -461,12 +459,48 @@ def reserve_run(launch: Launch, *, now: datetime | None = None) -> Path:
     raise ArrError("Es konnte keine freie Run-ID gefunden werden. Versuche es noch einmal.")
 
 
+def _unprepared(folder: Path) -> bool:
+    """True for a folder that holds nothing but the reservation (`meta.json`, `run.lock`)."""
+    try:
+        return {p.name for p in folder.iterdir()} <= {"meta.json", RUN_LOCK}
+    except OSError:
+        return False
+
+
 def _discard_unprepared(folder: Path) -> None:
     """Remove a reserved folder that `prepare_run` never filled (a configuration error): a
     run that could not be prepared leaves no folder behind, as before the reservation."""
-    with contextlib.suppress(OSError):
-        if {p.name for p in folder.iterdir()} <= {"meta.json", RUN_LOCK}:
-            shutil.rmtree(folder, ignore_errors=True)
+    if _unprepared(folder):
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def discard_orphaned_reservations(
+    workfolder: str | Path, *, min_age_s: float = ORPHAN_MIN_AGE_S, now: float | None = None
+) -> list[str]:
+    """Remove `queued` run folders that no process holds and that were never prepared.
+
+    They stay behind when a process dies between `reserve_run` and the preparation (W2-05.1
+    review N2). A folder counts as orphaned when its `meta.json` says `queued`, nobody holds
+    its `run.lock`, it holds nothing but `meta.json` and `run.lock`, and it is at least
+    `min_age_s` old (so a reservation made a moment ago by another process survives). Called
+    at the start of `arr run` and of the service; returns the IDs of the removed folders.
+    """
+    runs_dir = Path(workfolder).expanduser() / "runs"
+    moment = time.time() if now is None else now
+    removed = []
+    for meta_path in sorted(runs_dir.glob("*/meta.json")):
+        folder = meta_path.parent
+        try:
+            meta = load_run_meta(folder)
+        except (OSError, ValueError):
+            continue
+        if meta.status is not RunStatus.QUEUED or moment - meta.created < min_age_s:
+            continue
+        if run_lock_held(folder) or not _unprepared(folder):
+            continue
+        shutil.rmtree(folder, ignore_errors=True)
+        removed.append(meta.run_id)
+    return removed
 
 
 # --------------------------------------------------------------------------------------------
@@ -844,6 +878,9 @@ async def run_launch(
     signals: bool = True,
     scan: bool = True,
     secret_reader: SecretReader | None = None,
+    run_dir: Path | None = None,
+    starter: Starter = Starter.CLI,
+    on_manager: Callable[[RunManager], None] | None = None,
     **manager_kwargs: Any,
 ) -> RunResult:
     """Run a planned run to its end: crash recovery, reservation and lock, RunManager,
@@ -853,13 +890,20 @@ async def run_launch(
     removed again); everything later ends in a final status. With `signals` Ctrl-C goes to a
     `StopControl` (needs the main thread) until the secret scan is over, so a Ctrl-C after the
     end only says „schon beendet“ and the exit code still follows the status.
+
+    The service (W3-01) passes a folder it reserved itself (`run_dir`, from `reserve_run`
+    with `starter=gui`), `signals=False`, and gets the `RunManager` through `on_manager` as
+    soon as it exists, for pause, resume and stop.
     """
     for run_id in mark_interrupted_runs(launch.workfolder):
         report(
             f"Run {run_id} war beim letzten Mal noch aktiv und gilt jetzt als unterbrochen "
             "(interrupted)."
         )
-    run_dir = reserve_run(launch)
+    for run_id in discard_orphaned_reservations(launch.workfolder):
+        report(f"Verwaister Run-Ordner {run_id} entfernt (reserviert, aber nie vorbereitet).")
+    if run_dir is None:
+        run_dir = reserve_run(launch, starter=starter)
     lock = RunLock(run_dir)
     lock.acquire()
     manager = build_manager(
@@ -867,9 +911,13 @@ async def run_launch(
         decider=decider,
         builders=builders,
         finalizer=finalizer,
+        starter=starter,
         run_id=run_dir.name,
+        lock=lock,
         **manager_kwargs,
     )
+    if on_manager is not None:
+        on_manager(manager)
     control = StopControl(manager, report, hard_exit=hard_exit)
     remove = _no_signals
     if signals:

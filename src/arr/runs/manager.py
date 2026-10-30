@@ -27,7 +27,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -53,8 +53,15 @@ from arr.permissions.policy import (
 from arr.room.store import RoomStore
 from arr.runs.context import RunContext
 from arr.runs.eventlog import EventLogger
-from arr.runs.inspect import run_lock_held
-from arr.runs.orchestrator import PLAN_STAGE, LimitKind, Orchestrator, OrchestratorLog, StopReason
+from arr.runs.inspect import RunLock, run_lock_held
+from arr.runs.orchestrator import (
+    PLAN_STAGE,
+    LimitKind,
+    Orchestrator,
+    OrchestratorLog,
+    ProfileGate,
+    StopReason,
+)
 from arr.runs.pacing import PacingSettings
 from arr.runs.prepare import (
     RESERVED_STATUSES,
@@ -238,6 +245,11 @@ class RunManager:
     W2-05). The factory is called after room, PolicyEngine (with all profiles) and inbox are
     set up; `manager.inbox` and `manager.room` are available to it then. `stages` are the
     planned stages for the checkpoint `plan` (default: the names of `run.yaml stages`).
+    `gates` are the `ProfileGate`s shared by all runs of a process (the service, W3-01):
+    missing profiles are added, so concurrency and rate-limit pauses of a profile hold across
+    runs. `lock` is the `RunLock` the caller already holds; without one the manager takes the
+    lock of a reserved folder (`run_id`) itself before the folder is prepared, so two
+    processes with the same `run_id` never prepare the same folder (W2-03 review G7).
     The other arguments are passed to `prepare_run`.
 
     `stop()`, `pause()` and `resume()` may be called from the event loop at any time.
@@ -264,6 +276,8 @@ class RunManager:
         pacing: PacingSettings | None = None,
         stop_grace_s: float = STOP_GRACE_S,
         venv_with_pip: bool = True,
+        gates: MutableMapping[str, ProfileGate] | None = None,
+        lock: RunLock | None = None,
     ) -> None:
         self.workfolder = Path(workfolder).expanduser().absolute()
         self.run_input = run_input
@@ -277,6 +291,9 @@ class RunManager:
         self.pacing = pacing or PacingSettings()
         self.stop_grace_s = stop_grace_s
         self.venv_with_pip = venv_with_pip
+        self.gates = gates
+        self._lock = lock
+        self._own_lock = False
         self._prepare_args: Mapping[str, object] = {
             "starter": starter,
             "task_base": task_base,
@@ -352,11 +369,44 @@ class RunManager:
         if self._started:
             raise RuntimeError("RunManager.run() can only be called once")
         self._started = True
+        self._take_lock()  # another process holds the folder: ArrError, nothing is touched
         try:
             self.prepared = await asyncio.to_thread(self._prepare)
         except BaseException:
             self._fail_reserved()
+            self._drop_lock()
             raise
+        try:
+            return await self._run_prepared()
+        finally:
+            self._drop_lock()
+
+    def _take_lock(self) -> None:
+        """Hold `run.lock` of a reserved folder before anything in it changes (G7).
+
+        A lock passed by the caller is used as is. Otherwise, for a reserved `run_id` whose
+        folder exists, the lock is taken now and released when `run()` returns; another
+        process holding it means the run is already being prepared there (`ArrError`).
+        """
+        if self._lock is not None:
+            return
+        run_id = self._prepare_args.get("run_id")
+        if not isinstance(run_id, str):
+            return
+        run_dir = self.workfolder / "runs" / run_id
+        if not run_dir.is_dir():
+            return
+        lock = RunLock(run_dir)
+        lock.acquire()
+        self._lock, self._own_lock = lock, True
+
+    def _drop_lock(self) -> None:
+        if self._own_lock and self._lock is not None:
+            self._lock.release()
+            self._lock, self._own_lock = None, False
+
+    async def _run_prepared(self) -> RunStatus:
+        assert self.prepared is not None
         self.log = OrchestratorLog(self.prepared.run_dir)
         self._status = RunStatus.PREPARING
         self.log.write("status", status=RunStatus.PREPARING.value)
@@ -469,6 +519,7 @@ class RunManager:
             pacing=self.pacing,
             log=self.log,
             on_pause=self._on_pause,
+            gates=self.gates,
         )
 
     async def _run_topology(self) -> None:

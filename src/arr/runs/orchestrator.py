@@ -22,7 +22,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -267,6 +267,7 @@ class Orchestrator(RunContext):
         pacing: PacingSettings | None = None,
         log: OrchestratorLog | None = None,
         on_pause: Callable[[bool], None] | None = None,
+        gates: MutableMapping[str, ProfileGate] | None = None,
     ) -> None:
         self.prepared = prepared
         self.room = room
@@ -283,9 +284,15 @@ class Orchestrator(RunContext):
         self._handles = {a.id: AgentHandle(a) for a in prepared.resolved.agents}
         self._locks = {agent_id: asyncio.Lock() for agent_id in self._handles}
         concurrency = concurrency or {}
-        self._gates = {
-            a.auth: ProfileGate(a.auth, concurrency.get(a.auth)) for a in prepared.resolved.agents
-        }
+        # `gates` shared by all runs of a process (the service, W3-01): a profile's
+        # concurrency and rate-limit pauses then hold across runs (W2-03 review G6).
+        shared = gates if gates is not None else {}
+        self._gates: dict[str, ProfileGate] = {}
+        for agent in prepared.resolved.agents:
+            gate = shared.get(agent.auth)
+            if gate is None:
+                gate = shared[agent.auth] = ProfileGate(agent.auth, concurrency.get(agent.auth))
+            self._gates[agent.auth] = gate
         rubric = prepared.resolved.rubric or Rubric()
         self._views: dict[str, AgentRoom] = {
             agent_id: room.for_agent(agent_id, agent.work_dir, rubric=rubric)

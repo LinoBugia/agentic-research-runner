@@ -19,6 +19,7 @@ from nicegui.testing.general import nicegui_reset_globals, prepare_simulation
 from nicegui.testing.user import User
 from nicegui.testing.user_interaction import UserInteraction
 
+from arr.errors import ArrError
 from arr.permissions.types import ApprovalStatus
 from arr.service.gui import format as fmt
 from arr.service.gui.app import setup
@@ -267,7 +268,7 @@ def test_run_mock_opens_the_browser_on_localhost(monkeypatch: pytest.MonkeyPatch
     assert run_kwargs["host"] == "127.0.0.1" and run_kwargs["port"] == 8765
     assert run_kwargs["show"] is True and run_kwargs["reload"] is False
     assert calls["api"].base_url == "http://127.0.0.1:8765"
-    with pytest.raises(NotImplementedError, match="W3-01"):
+    with pytest.raises(ArrError, match="arr serve"):
         gui.run(mock=False)
 
 
