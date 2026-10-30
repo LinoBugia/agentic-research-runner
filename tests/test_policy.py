@@ -53,6 +53,7 @@ class Env:
     literature: Path
     venv: Path
     run_paths: RunPaths
+    run_venv: Path
 
     def agent(self, agent_id: str = "explorer-1", **fields: Any) -> AgentConfig:
         data: dict[str, Any] = {
@@ -100,7 +101,6 @@ def env(tmp_path: Path, arr_home: Path) -> Env:
         run / "output",
         run / "groupchats" / "attachments" / "main" / "17",
         run / "tmp",
-        run / ".venv",
         arr_home,
     ]
     for directory in dirs:
@@ -113,6 +113,9 @@ def env(tmp_path: Path, arr_home: Path) -> Env:
         "home = /opt/pybase/bin\ninclude-system-site-packages = false\n"
     )
     toolchain = Toolchain(python="~/.venvs/mathe", extra_path=["/Library/TeX/texbin"])
+    run_paths = RunPaths(workfolder, run, toolchain)
+    run_venv = Path(os.path.realpath(run_paths.venv_dir))  # outside ~ (W3-00)
+    run_venv.mkdir(parents=True)
     return Env(
         home=home,
         workfolder=workfolder,
@@ -120,7 +123,8 @@ def env(tmp_path: Path, arr_home: Path) -> Env:
         work=run / "agents" / "explorer-1" / "work",
         literature=home / "Literatur",
         venv=venv,
-        run_paths=RunPaths(workfolder, run, toolchain),
+        run_paths=run_paths,
+        run_venv=run_venv,
     )
 
 
@@ -168,7 +172,7 @@ def test_row_write_in_work_dir_and_released_run_folders_is_allowed(env: Env) -> 
         write(env.work / "solve.py"),
         write("sub/dir/result.txt", tool="Edit"),
         write(env.run / "tmp" / "x.bin"),
-        write(env.run / ".venv" / "lib" / "site.py", tool="fileChange"),
+        write(env.run_venv / "lib" / "site.py", tool="fileChange"),
     ]:
         assert engine.evaluate(request).action is ALLOW, request.paths
 
@@ -299,7 +303,7 @@ def test_install_outside_run_venv_is_denied(env: Env) -> None:
     assert engine.evaluate(bash("uv tool install ruff")).action is DENY
     no_venv = RunPaths(env.workfolder, env.run, Toolchain(run_venv="off"))
     profile = profile_for(env.agent(), no_venv, home=env.home)
-    assert env.run / ".venv" not in profile.write_roots
+    assert env.run_venv not in profile.write_roots
     decision = PolicyEngine([profile]).evaluate(bash("pip install sympy"))
     assert decision.action is DENY
     assert "Run-venv" in decision.reason
@@ -596,7 +600,7 @@ def test_l10_toolchain(views: Views, env: Env) -> None:
     assert "/opt/pybase" in views.claude.sandbox["filesystem"]["allowRead"]
     texbin = normalize_path("/Library/TeX/texbin", base=env.home, home=env.home)
     assert str(texbin) in views.claude.sandbox["filesystem"]["allowRead"]
-    run_venv = env.run / ".venv" / "lib" / "x.py"
+    run_venv = env.run_venv / "lib" / "x.py"
     assert views.shell_reads(run_venv) and claude_sandbox_writes(views.claude, str(run_venv))
     assert views.engine.evaluate(bash("python3 -c 'import sympy'")).action is ALLOW
 
@@ -613,7 +617,7 @@ def test_l11_system_paths(views: Views) -> None:
 def test_claude_translation_is_complete(views: Views, env: Env) -> None:
     claude = views.claude
     assert claude.cwd == str(env.work)
-    assert claude.add_dirs == [str(env.run / "tmp"), str(env.run / ".venv")]
+    assert claude.add_dirs == [str(env.run / "tmp"), str(env.run_venv)]
     assert claude.permission_mode == "acceptEdits"
     assert claude.env == {"TMPDIR": str(env.run / "tmp")}
     assert claude.allowed_tools[0] == "mcp__arr-room__*"
@@ -634,7 +638,7 @@ def test_claude_translation_is_complete(views: Views, env: Env) -> None:
     assert sandbox["failIfUnavailable"] is True
     assert sandbox["network"] == {"allowedDomains": []}
     fs = sandbox["filesystem"]
-    assert fs["allowWrite"] == [str(env.work), str(env.run / "tmp"), str(env.run / ".venv")]
+    assert fs["allowWrite"] == [str(env.work), str(env.run / "tmp"), str(env.run_venv)]
     assert {str(env.home), "/Volumes", str(env.workfolder)} <= set(fs["denyRead"])
     assert str(env.home / ".ssh") in fs["denyRead"]
     assert str(env.literature) in fs["allowRead"]
@@ -646,7 +650,7 @@ def test_codex_translation_is_complete(views: Views, env: Env) -> None:
     assert codex.sandbox == "workspace_write"
     assert codex.approvals_reviewer == "user"
     assert codex.sandbox_workspace_write == {
-        "writable_roots": [str(env.run / "tmp"), str(env.run / ".venv")],
+        "writable_roots": [str(env.run / "tmp"), str(env.run_venv)],
         "network_access": False,
         "exclude_slash_tmp": True,
         "exclude_tmpdir_env_var": True,
@@ -1681,3 +1685,207 @@ def test_w2012_write_to_dev_stderr_with_tmp_as_process_temp(
     assert normalize_path("/tmp", base=env.home, home=env.home) not in profile.read_deny
     decision = env.engine(profile).evaluate(bash("echo hi > /dev/stderr"))
     assert decision.action is ALLOW, decision.reason
+
+
+# --------------------------------------------------------------------------------------------
+# W3-00: the run venv lives outside ~ and outside the run folder
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_w3_00_run_venv_is_a_write_root_outside_home(env: Env, provider: str) -> None:
+    profile = env.profile(env.agent(provider=provider))
+    assert env.run_venv in profile.write_roots and env.run_venv in profile.read_allow
+    assert env.run / ".venv" not in profile.write_roots
+    assert not env.run_venv.is_relative_to(env.home)
+    assert env.run_venv.name == env.run.name  # <venv root>/runs/<run-id>
+    assert profile.can_write(env.run_venv / "lib" / "x.py")
+    assert not profile.can_write(env.run / ".venv" / "lib" / "x.py")
+
+
+def test_w3_00_shadowing_a_program_in_the_run_venv_is_denied(env: Env) -> None:
+    cat = env.run_venv / "bin" / "cat"
+    command = f"printf x > {cat}; chmod +x {cat}; cat sudo ls"
+    assert env.engine().evaluate(bash(command)).action is DENY
+
+
+# --------------------------------------------------------------------------------------------
+# W3-00 §12 / A10: Claude reads below the venv root only its run venv, base venv, toolchain
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def venv_env(env: Env, venv_root: Path) -> tuple[Env, Path, SandboxProfile]:
+    """`env` with the base venv below `<venv root>/venvs/` and a tool folder there."""
+    root = Path(os.path.realpath(venv_root))
+    base = root / "venvs" / "mathe"
+    (base / "lib" / "python3.12" / "site-packages" / "sympy").mkdir(parents=True)
+    (base / "pyvenv.cfg").write_text("home = /opt/pybase/bin\n")
+    tools = root / "venvs" / "tools" / "bin"
+    tools.mkdir(parents=True)
+    toolchain = Toolchain(python=str(base / "bin" / "python"), extra_path=[str(tools)])
+    (base / "bin").mkdir()
+    (base / "bin" / "python").write_text("#!/bin/sh\n")
+    paths = RunPaths(env.workfolder, env.run, toolchain)
+    agent = env.agent(read_dirs=[str(root / "runs"), str(root / "venvs" / "other")])
+    profile = profile_for(agent, paths, home=env.home, case_insensitive=True)
+    return env, root, profile
+
+
+def test_w3_00_a10_profile_denies_the_venv_root(venv_env) -> None:
+    env, root, profile = venv_env
+    assert root in profile.read_deny
+    assert profile.venv_dir == env.run_venv and profile.base_venv == root / "venvs" / "mathe"
+    assert profile.can_read(env.run_venv / "lib" / "x.py")
+    assert profile.can_read(root / "venvs" / "mathe" / "lib" / "python3.12" / "site-packages")
+    assert profile.can_read(root / "venvs" / "tools" / "bin" / "tool")  # extra_path
+    for path in (
+        root / "runs" / "20261029-1200_other_custom_beef" / "c.txt",  # parallel run
+        root / "runs" / (env.run.name + "x") / "c.txt",  # longer ID
+        root / "runs" / env.run.name[:-1] / "c.txt",  # shorter ID
+        root / "venvs" / "other" / "c.txt",  # foreign base venv, although a read folder
+        root / "c.txt",
+    ):
+        assert not profile.can_read(path), path
+    # read folders inside the venv root are dropped (only the three exceptions stay open)
+    assert root / "runs" not in profile.read_allow
+    assert root / "venvs" / "other" not in profile.read_allow
+
+
+def test_w3_00_a10_claude_sandbox_and_file_tools_follow(venv_env) -> None:
+    env, root, profile = venv_env
+    claude = claude_options(profile)
+    fs = claude.sandbox["filesystem"]
+    assert str(root) in fs["denyRead"]
+    open_in_root = sorted(p for p in fs["allowRead"] if p.startswith(str(root)))
+    assert open_in_root == sorted(
+        [str(env.run_venv), str(root / "venvs" / "mathe"), str(root / "venvs" / "tools" / "bin")]
+    )
+    assert fs["allowWrite"] == [str(env.work), str(env.run / "tmp"), str(env.run_venv)]
+    other = root / "runs" / "20261029-1200_other_custom_beef" / "c.txt"
+    assert not claude_sandbox_reads(claude, str(other))
+    assert claude_sandbox_reads(claude, str(env.run_venv / "bin" / "python"))
+    assert not claude_rule(claude.allowed_tools, "Read", str(other))
+    assert str(env.run_venv) in claude.add_dirs  # write roots come as add_dirs, no Read rule
+    engine = PolicyEngine([profile])
+    assert engine.evaluate(read(other)).action is not ALLOW
+    assert engine.evaluate(read(env.run_venv / "x.py")).action is ALLOW
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_w3_00_base_venv_is_read_only_for_both_backends(venv_env, provider: str) -> None:
+    env, root, _ = venv_env
+    base = root / "venvs" / "mathe"
+    paths = RunPaths(env.workfolder, env.run, Toolchain(python=str(base)))
+    profile = profile_for(env.agent(provider=provider), paths, home=env.home)
+    assert not profile.can_write(base / "lib" / "x.py")
+    assert profile.can_read(base / "lib" / "x.py")
+    assert base not in profile.write_roots and base in profile.read_only
+    engine = PolicyEngine([profile])
+    tool = "Write" if provider == "claude" else "fileChange"
+    assert engine.evaluate(write(base / "lib" / "x.py", tool=tool)).action is DENY
+    assert engine.evaluate(write(env.run_venv / "lib" / "x.py", tool=tool)).action is ALLOW
+    if provider == "claude":
+        claude = claude_options(profile)
+        assert not claude_sandbox_writes(claude, str(base / "lib" / "x.py"))
+        assert claude_rule(claude.disallowed_tools, "Edit", str(base / "lib" / "x.py"))
+
+
+# --------------------------------------------------------------------------------------------
+# W3-00.1 M2: a read folder that contains a read block gets no Read rule
+# --------------------------------------------------------------------------------------------
+
+
+def _m2_views(env: Env, read_dir: Path) -> tuple[SandboxProfile, ClaudeOptions, PolicyEngine]:
+    profile = env.profile(env.agent(read_dirs=[str(read_dir)]))
+    return profile, claude_options(profile), PolicyEngine([profile])
+
+
+@pytest.mark.parametrize("tool", ["Read", "Grep", "Glob"])
+def test_w3_00_1_m2_read_folder_around_the_venv_root(env: Env, venv_root: Path, tool: str) -> None:
+    root = Path(os.path.realpath(venv_root))
+    outer = root.parent  # like /Users/Shared around /Users/Shared/arr-<user>
+    other = root / "runs" / "20261029-1200_other_custom_beef" / "canary.txt"
+    profile, claude, engine = _m2_views(env, outer)
+    assert outer in profile.read_allow
+    assert not any(claude_rule(claude.allowed_tools, "Read", str(p)) for p in (other, outer))
+    assert engine.evaluate(read(other, tool=tool)).action is not ALLOW
+    assert engine.evaluate(read(root / "venvs" / "x" / "c.txt", tool=tool)).action is not ALLOW
+    assert engine.evaluate(read(outer / "paper.md", tool=tool)).action is ALLOW  # still open
+    assert engine.evaluate(read(env.run_venv / "x.py", tool=tool)).action is ALLOW
+    assert not claude_sandbox_reads(claude, str(other))
+    assert claude_sandbox_reads(claude, str(outer / "paper.md"))
+
+
+@pytest.mark.parametrize("tool", ["Read", "Grep", "Glob"])
+def test_w3_00_1_m2_read_folder_around_the_workfolder(env: Env, tool: str) -> None:
+    outer = env.workfolder.parent  # ~/Mathe around ~/Mathe/arr-work (older case, review hint)
+    other_run = env.workfolder / "runs" / "r2" / "agents" / "x" / "work" / "c.txt"
+    other_project = env.workfolder / "projects" / "other" / "canary.txt"
+    profile, claude, engine = _m2_views(env, outer)
+    for path in (other_run, other_project, env.run / "meta.json"):
+        assert not claude_rule(claude.allowed_tools, "Read", str(path)), path
+        assert engine.evaluate(read(path, tool=tool)).action is not ALLOW, path
+        assert not claude_sandbox_reads(claude, str(path)), path
+    assert engine.evaluate(read(outer / "notes.md", tool=tool)).action is ALLOW
+
+
+def test_w3_00_1_m2_plain_read_folders_keep_their_rule(env: Env) -> None:
+    claude = claude_options(env.profile())
+    assert f"Read(/{env.literature}/**)" in claude.allowed_tools
+    assert claude_rule(claude.allowed_tools, "Read", str(env.literature / "paper.pdf"))
+
+
+# --------------------------------------------------------------------------------------------
+# W3-00.2: a search whose root contains a read block is refused (rest of M2)
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def shared_root(env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The venv root in its own parent folder, like `/Users/Shared/arr-<user>`."""
+    shared = Path(os.path.realpath(tmp_path)) / "Shared"
+    root = shared / "arr-u"
+    (root / "runs" / env.run.name).mkdir(parents=True)
+    monkeypatch.setenv("ARR_VENV_ROOT", str(root))
+    return root
+
+
+@pytest.mark.parametrize("tool", ["Grep", "Glob", "LS"])
+def test_w3_00_2_search_over_the_venv_root_is_refused(
+    env: Env, shared_root: Path, tool: str
+) -> None:
+    outer = shared_root.parent
+    profile = env.profile(env.agent(read_dirs=[str(outer)]))
+    assert not profile.contains_sensitive(outer) and profile.contains_block(outer)
+    engine = env.engine(profile)
+    decision = engine.evaluate(read(outer, tool=tool))
+    assert decision.action is DENY, decision
+    assert "enger" in decision.reason and "Unterordner" in decision.reason
+    assert engine.evaluate(read(outer / "paper.md")).action is ALLOW  # a single file: as before
+    assert engine.evaluate(read(outer / "docs", tool=tool)).action is ALLOW  # narrower search
+
+
+@pytest.mark.parametrize("tool", ["Grep", "Glob", "LS"])
+def test_w3_00_2_search_over_the_workfolder_is_refused(env: Env, tool: str) -> None:
+    outer = env.workfolder.parent
+    engine = env.engine(env.profile(env.agent(read_dirs=[str(outer)])))
+    assert engine.evaluate(read(outer, tool=tool)).action is DENY
+    assert engine.evaluate(read(outer / "notes.md")).action is ALLOW
+
+
+@pytest.mark.parametrize("tool", ["Grep", "Glob", "LS"])
+def test_w3_00_2_search_without_a_block_below_stays_free(env: Env, tool: str) -> None:
+    engine = env.engine()
+    for path in (env.work, env.work / "sub", env.literature, env.run / "output"):
+        assert engine.evaluate(read(path, tool=tool)).action is ALLOW, path
+
+
+def test_w3_00_2_contains_block_only_strictly_below(env: Env, shared_root: Path) -> None:
+    profile = env.profile()
+    root = shared_root
+    assert profile.contains_block(root.parent)
+    assert profile.contains_block(env.workfolder.parent)
+    assert not profile.contains_block(root)  # the block itself: can_read decides (ask)
+    assert not profile.contains_block(env.work)
+    assert not profile.contains_block(env.literature)

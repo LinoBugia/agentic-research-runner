@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -63,6 +64,7 @@ from arr.runs.prepare import (
     load_run_meta,
     prepare_run,
 )
+from arr.venvs import ensure_run_venvs_dir
 from arr.workfolder import load_workfolder_settings
 
 __all__ = [
@@ -181,16 +183,26 @@ def base_interpreter(base_python: str | None) -> Path:
     return Path(sys.executable)
 
 
-def create_run_venv(run_dir: str | Path, base_python: str | None, *, with_pip: bool = True) -> Path:
-    """Create `<run>/.venv` over the base Python, with `--system-site-packages` (docs/07 §2).
+def create_run_venv(paths: RunPaths, base_python: str | None, *, with_pip: bool = True) -> Path:
+    """Create the run venv at `paths.venv_dir` over the base Python (docs/07 §2, W3-00).
 
-    A venv cannot see the packages of another venv through `--system-site-packages` (it is
-    always based on the underlying installation). So when the base is a venv, a
-    `_arr_base_venv.pth` in the run venv adds the base venv's `site-packages` after its own:
-    packages installed in the run see the base packages, and the base venv never changes.
-    Raises `ArrError` if the venv cannot be created.
+    The venv lives outside `~`, below `<venv root>/runs/` (`arr.venvs`; root and `runs/` are
+    created with mode 0700 or checked). The folder is created exclusively: an existing one
+    is an error, never reused. `--system-site-packages` alone cannot see the packages of
+    another venv (it is always based on the underlying installation), so when the base is a
+    venv, a `_arr_base_venv.pth` in the run venv adds the base venv's `site-packages` after
+    its own: packages installed in the run see the base packages, and the base venv never
+    changes. Raises `ArrError` if the venv cannot be created; a half-made folder is removed.
     """
-    target = Path(run_dir) / ".venv"
+    ensure_run_venvs_dir()
+    target = paths.venv_dir
+    try:
+        target.mkdir(mode=0o700)
+    except FileExistsError:
+        raise ArrError(
+            f"Die Run-venv {target} gibt es schon. arr legt für jeden Run eine neue an und "
+            "nutzt keine vorhandene. Entferne den Ordner, wenn er zu keinem Run mehr gehört."
+        ) from None
     python = base_interpreter(base_python)
     command = [str(python), "-m", "venv", "--system-site-packages"]
     if not with_pip:
@@ -199,6 +211,7 @@ def create_run_venv(run_dir: str | Path, base_python: str | None, *, with_pip: b
     try:
         subprocess.run(command, check=True, capture_output=True, text=True, timeout=VENV_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError) as exc:
+        shutil.rmtree(target, ignore_errors=True)
         detail = getattr(exc, "stderr", None) or str(exc)
         raise ArrError(
             f"Die Run-venv konnte nicht angelegt werden (mit {python}): {detail.strip()[-500:]} "
@@ -427,7 +440,7 @@ class RunManager:
         paths.tmp_dir.mkdir(exist_ok=True)
         if self.settings.toolchain.run_venv is RunVenvMode.OVERLAY:
             base = next((a.file.base_python for a in prepared.agents.values()), None)
-            await asyncio.to_thread(create_run_venv, run_dir, base, with_pip=self.venv_with_pip)
+            await asyncio.to_thread(create_run_venv, paths, base, with_pip=self.venv_with_pip)
 
         self.room = room = RoomStore.create(run_dir)
         roles = {a.id: Path(a.role).stem for a in resolved.agents if a.role}

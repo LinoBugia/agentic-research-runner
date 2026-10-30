@@ -2,6 +2,7 @@
 from the S1 fixtures (A6), approval path (A7), secrets (A8), project context (A9), hints."""
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -173,8 +174,41 @@ def test_a5_options_follow_the_architecture(setup: Setup) -> None:
     assert env["PIP_CACHE_DIR"] == str(profile.tmp_dir / "cache" / "pip")
     assert env["MPLCONFIGDIR"].startswith(str(profile.tmp_dir))
     path = env["PATH"].split(os.pathsep)
-    assert path[0] == str(setup.run.run_dir / ".venv" / "bin")
+    venv = RunPaths(setup.run.run_dir.parent.parent, setup.run.run_dir).venv_dir
+    assert path[0] == str(venv / "bin")  # from RunPaths, outside the run folder (W3-00)
+    assert not path[0].startswith(str(setup.run.run_dir))
+    real = os.path.realpath(venv)  # PATH, add_dirs and the sandbox name the same run venv
+    assert real in options.add_dirs and real in options.sandbox["filesystem"]["allowWrite"]
+    assert real in options.sandbox["filesystem"]["allowRead"]
+    assert env["VIRTUAL_ENV"] == str(venv)  # not arr's own venv (W3-00 live check)
+    assert env["PYTHONNOUSERSITE"] == "1"  # no user site folder below ~ (pip list)
+    assert env["PYTHONPATH"] == env["PYTHONHOME"] == ""
     assert path[1 : 1 + len(agent.file.path_prepend)] == agent.file.path_prepend
+
+
+def test_w3_00_no_virtual_env_without_run_venv(setup: Setup, monkeypatch) -> None:
+    monkeypatch.setenv("VIRTUAL_ENV", "/arr/.venv")
+    off = dataclasses.replace(setup, toolchain=Toolchain(run_venv="off"))
+    profile = off.profile()
+    assert profile.venv_dir is None
+    options = build_options(
+        setup.agent(), profile, env=dict(CLAUDE_SWITCHES), can_use_tool=None, hooks=None
+    )
+    assert options.env["VIRTUAL_ENV"] == ""
+    assert not any("venv-root" in p for p in options.env["PATH"].split(os.pathsep))
+
+
+def test_w3_00_1_g4_run_venv_comes_from_the_profile(setup: Setup, monkeypatch) -> None:
+    """One source: a changed `ARR_VENV_ROOT` after the profile was built changes nothing."""
+    profile = setup.profile()
+    monkeypatch.setenv("ARR_VENV_ROOT", "/somewhere/else")
+    options = build_options(
+        setup.agent(), profile, env=dict(CLAUDE_SWITCHES), can_use_tool=None, hooks=None
+    )
+    assert profile.venv_dir is not None
+    assert options.env["PATH"].split(os.pathsep)[0] == str(profile.venv_dir / "bin")
+    assert options.env["VIRTUAL_ENV"] == str(profile.venv_dir)
+    assert str(profile.venv_dir) in options.sandbox["filesystem"]["allowWrite"]
 
 
 def test_a5_system_prompt_is_byte_identical_per_role(setup: Setup) -> None:

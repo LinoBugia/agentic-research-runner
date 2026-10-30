@@ -53,8 +53,11 @@ class DenyAll:
         )
 
 
-def test_codex_live_smoke() -> None:
+def test_codex_live_smoke(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
     auth = AuthProfile(name=AUTH, kind=AuthKind.CODEX_CHATGPT)
+    # The real venv root: below the user's temp folder (the test default) Python would not
+    # start, a denied ancestor of the run venv stops its `realpath` (W3-00).
+    monkeypatch.delenv("ARR_VENV_ROOT")
     if not (codex_home_for(auth) / "auth.json").is_file():
         pytest.skip(f"Profil {AUTH} ist nicht angemeldet (uv run arr auth codex-login {AUTH})")
     # Not below tmp_path: the user's temp folder is denied and would become a passage.
@@ -76,7 +79,9 @@ def test_codex_live_smoke() -> None:
         }
     )
     run = prepare_run(wf, run_input, resolve_run(run_input, None, settings), settings)
-    create_run_venv(run.run_dir, None)
+    paths = RunPaths(wf, run.run_dir, settings.toolchain)
+    create_run_venv(paths, None)
+    request.addfinalizer(lambda: shutil.rmtree(paths.venv_dir, ignore_errors=True))
     RoomStore.create(run.run_dir).setup_channels(run.resolved.groupchats, {})
     (run.run_dir / "tmp").mkdir(exist_ok=True)
     agent = run.agents["gpt-1"]

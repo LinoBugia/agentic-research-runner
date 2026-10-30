@@ -190,3 +190,58 @@ def test_w2_05_2_a_fifo_in_the_work_folder_does_not_block_the_scan(tmp_path: Pat
         ("agents/a/work/notes.txt", 2, "Wert von Profil „max“")
     }
     assert report.files == 3 and report.skipped == []  # the FIFO is neither read nor "unreadable"
+
+
+# -- W3-00: the run venv lives outside the run folder -------------------------------------
+
+
+def _meta(run: Path, run_venv: Path | None) -> None:
+    data = {
+        "run_id": run.name,
+        "status": "done",
+        "starter": "cli",
+        "project": "demo",
+        "created": 1.0,
+        "arr_version": "0.1.0",
+        "run_venv": str(run_venv) if run_venv else None,
+    }
+    _write(run / "meta.json", json.dumps(data) + "\n")
+
+
+def test_w3_00_value_in_the_run_venv_at_its_new_place_is_found(
+    tmp_path: Path, venv_root: Path
+) -> None:
+    run = _run_dir(tmp_path)
+    venv = venv_root / "runs" / run.name
+    _meta(run, venv)
+    _write(venv / "lib/python3.12/site-packages/leak.txt", f"x\n{VALUE}\n")
+    _write(venv / "lib/python3.12/site-packages/pip/x.py", f"KEY = '{ANTHROPIC}'\n")  # no
+    _write(venv / "bin/activate", "harmlos\n")
+
+    report = scan_run_dir(run, {"Profil „max“": VALUE})
+    found = {(f.file, f.line, f.kind) for f in report.findings}
+    assert found == {("run-venv/lib/python3.12/site-packages/leak.txt", 2, "Wert von Profil „max“")}
+    assert report.files == 2 + 3  # meta.json, transcript.jsonl and the three venv files
+    text = format_report(report)
+    assert "run-venv/lib/python3.12/site-packages/leak.txt:2" in text
+    assert str(venv_root) not in text and VALUE not in text
+
+
+def test_w3_00_a_linked_run_venv_is_not_followed(tmp_path: Path) -> None:
+    run = _run_dir(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    _write(elsewhere / "leak.txt", VALUE + "\n")
+    link = tmp_path / "venv-link"
+    link.symlink_to(elsewhere)
+    _meta(run, link)
+    assert scan_run_dir(run, {"Profil „max“": VALUE}).clean
+
+
+def test_w3_00_missing_or_absent_run_venv_scans_the_run_folder_only(
+    tmp_path: Path, venv_root: Path
+) -> None:
+    run = _run_dir(tmp_path)
+    _meta(run, venv_root / "runs" / run.name)  # recorded, but never created
+    assert scan_run_dir(run, {"Profil „max“": VALUE}).files == 2
+    _meta(run, None)
+    assert scan_run_dir(run, {"Profil „max“": VALUE}).files == 2

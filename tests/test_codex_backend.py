@@ -37,8 +37,8 @@ TURN = "turn-1"
 
 @pytest.fixture(autouse=True)
 def no_user_temp_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`tmp_path` lies in the user's temp folder, which `profile_for` denies (W2-01.1). Its
-    other entries would all become siblings; the tests must not depend on the machine."""
+    """`tmp_path` lies in the user's temp folder, which `profile_for` denies (W2-01.1); the
+    tests must not depend on the machine."""
     monkeypatch.setattr(policy, "user_temp_dirs", lambda: [])
 
 
@@ -226,9 +226,11 @@ class Decider:
         return Decision(action=self.action, decided_by=DecidedBy.USER, reason="Nein, bitte nicht.")
 
 
-def make_agent(tmp_path: Path, **changes: Any) -> tuple[PreparedAgent, PolicyEngine]:
+def make_agent(
+    tmp_path: Path, run_id: str = "R", **changes: Any
+) -> tuple[PreparedAgent, PolicyEngine]:
     home = tmp_path / "home"
-    run = home / "wf" / "runs" / "R"
+    run = home / "wf" / "runs" / run_id
     agent_dir = run / "agents" / "gpt-1"
     (agent_dir / "work").mkdir(parents=True)
     (run / "tmp").mkdir()
@@ -377,7 +379,7 @@ async def test_every_turn_restarts_the_app_server_and_resumes(setup) -> None:
     assert all(approvals for _, approvals, _ in kit.starts)
     assert len(kit.codexes) == 2 and all(c.closed for c in kit.codexes)
     assert second[0].turn == 2 and second[1].data["text"] == "zwei"
-    # the permission profile is part of every start (fresh sibling list)
+    # the permission profile is part of every start
     overrides = kit.codexes[1].config.config_overrides
     assert any(o.startswith("permissions.arr.filesystem=") for o in overrides)
 
@@ -735,7 +737,7 @@ async def test_m1_too_many_entries_stop_before_the_app_server(setup, monkeypatch
     await backend.start()
     events = await play(backend)
     assert kinds(events) == ["turn_start", "error", "turn_end"]
-    assert "Archiviere alte Runs" in events[1].data["message"]
+    assert "Lese-Ordner" in events[1].data["message"]
     assert not kit.codexes
 
 
@@ -770,3 +772,43 @@ async def test_m3_channels_come_from_run_yaml(tmp_path: Path, monkeypatch) -> No
     fs = kit.codexes[0].config.filesystem
     secret = run.run_dir / "groupchats" / "attachments" / "secret"
     assert not secret.exists() and fs[str(profile.resolve(secret))] == "deny"
+
+
+async def test_w3_00_1_g1_very_long_run_id_stops_before_the_app_server(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """2 globs per character of the run ID (W3-00): project and skill names of 64 characters
+    make the profile too big. The turn ends before an app-server starts, and the message
+    names the run ID and the long names, not old runs."""
+    from arr.runs.prepare import new_run_id
+
+    run_id = new_run_id("p" * 64, "s" * 64)
+    assert len(run_id) == 148
+    kit = Kit([simple_turn()])
+    monkeypatch.setattr(codex_module, "start_thread", kit.start_thread)
+    monkeypatch.setattr(codex_module, "_codex_config", lambda launch: launch)
+    agent, engine = make_agent(tmp_path, run_id=run_id)
+    backend = CodexBackend(
+        agent,
+        run_id=run_id,
+        inbox=ApprovalInbox(engine, timeout=5.0),
+        auth=make_auth(tmp_path),
+        factory=kit.factory,
+    )
+    await backend.start()
+    events = await play(backend)
+    assert kinds(events) == ["turn_start", "error", "turn_end"]
+    message = events[1].data["message"]
+    assert "Lese-Sperrliste für Codex" in message
+    assert f"„{run_id}“ hat 148 Zeichen" in message
+    assert "Projekt- oder Skill-Namen" in message and "archiv" not in message.casefold()
+    assert not kit.codexes
+
+
+def test_w3_00_1_g1_warning_names_variant_2_causes(caplog) -> None:
+    from arr.backends import codex_config
+
+    caplog.set_level("WARNING")
+    codex_config._check_size(codex_config.ENTRIES_WARN, 100, "R")
+    assert "kürzere Projekt- und Skill-Namen" in caplog.text
+    assert "archiv" not in caplog.text.casefold()

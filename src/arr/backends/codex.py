@@ -2,8 +2,8 @@
 
 One `AsyncCodex` (= one app-server process) per agent, with `CODEX_HOME` = the login folder of
 its auth profile (docs/spikes/S2_codex.md §15). The process is started anew for every turn and
-the thread continued with `thread/resume`, so the sibling list of the read allowlist is fresh
-per turn (variant 1, docs/07 §3 ①, `codex_config`). The backend writes no transcript; it
+the thread continued with `thread/resume`, so `auth.json` and the permission profile are read
+fresh per turn (docs/07 §3 ①, `codex_config`). The backend writes no transcript; it
 yields `AgentEvent`s with the raw notification attached.
 
 - Settings: `codex_config.build_launch` (environment, isolation, permission profile, room

@@ -59,6 +59,7 @@ from arr.permissions.types import (
     RiskLevel,
 )
 from arr.settings import app_dir
+from arr.venvs import run_venv_dir, venv_base_prefix, venv_root
 
 __all__ = [
     "AlwaysRule",
@@ -337,6 +338,11 @@ _R_SEARCH_SENSITIVE = (
     "Dieser Ordner enthält geschützte Pfade und darf nicht als Ganzes durchsucht werden. "
     "Suche gezielt in deinem Arbeitsordner oder einem Lese-Ordner."
 )
+_R_SEARCH_BLOCKED = (
+    "Unter diesem Ordner liegen Ordner, die du nicht lesen darfst (z. B. andere Runs, "
+    "Projekte oder Python-Umgebungen), deshalb darf er nicht als Ganzes durchsucht werden. "
+    "Fasse die Suche enger: Suche gezielt in einem Unterordner, den du lesen darfst."
+)
 _R_WRITE_OUTSIDE = (
     "Schreiben außerhalb des Runs ist nicht erlaubt. Lege die Datei in deinem Arbeitsordner "
     "an und hänge sie im Chat an."
@@ -513,9 +519,10 @@ class PermissionRules(StrictModel):
 class RunPaths:
     """Folders of one run that the profile needs (docs/02 §1, §4).
 
-    Run-tmp is `<run>/tmp`, the run venv `<run>/.venv`, the Claude plugin of an agent
-    `agents/<id>/plugin` (Codex skills live in `work/.agents/skills`). Relative read folders
-    are resolved against the workfolder.
+    Run-tmp is `<run>/tmp`, the run venv `<venv root>/runs/<run-id>/` outside `~`
+    (`arr.venvs`, W3-00), the Claude plugin of an agent `agents/<id>/plugin` (Codex skills
+    live in `work/.agents/skills`). Relative read folders are resolved against the
+    workfolder.
     """
 
     workfolder: Path
@@ -529,8 +536,13 @@ class RunPaths:
 
     @property
     def venv_dir(self) -> Path:
-        """Run venv over the base venv (docs/07 §2)."""
-        return self.run_dir / ".venv"
+        """Run venv over the base venv (docs/07 §2): `<venv root>/runs/<run-id>/`.
+
+        Outside `~`, so Python starts behind the Codex profile that denies `~` (W3-00). The
+        run ID is the name of the run folder. Runs before W3-00 had `<run>/.venv`; see
+        `arr.runs.prepare.run_venv_location` for reading such runs.
+        """
+        return run_venv_dir(self.run_dir.name)
 
     @property
     def output_dir(self) -> Path:
@@ -574,6 +586,8 @@ class SandboxProfile:
     under neither stays readable (system folders outside `~`). Writing: only below
     `write_roots`. `web` switches the web tools on (WebFetch/WebSearch, Codex web search);
     network from the terminal always needs an approval per host (docs/07 §3 ②).
+    `venv_dir` is the run venv (None with `run_venv: off`), `base_venv` the base venv of
+    `toolchain.python` (W3-00).
     """
 
     agent_id: str
@@ -592,6 +606,8 @@ class SandboxProfile:
     sensitive_names: tuple[str, ...] = SENSITIVE_NAME_PATTERNS
     run_venv: bool = True
     case_insensitive: bool = field(default_factory=default_case_insensitive)
+    venv_dir: Path | None = None
+    base_venv: Path | None = None
 
     def resolve(self, raw: str | Path, base: Path | None = None) -> Path:
         """Normalize a path given by the agent (relative to `base` or the work folder)."""
@@ -636,6 +652,12 @@ class SandboxProfile:
                 return True
         return False
 
+    def contains_block(self, path: Path) -> bool:
+        """True if a read block (`read_deny`, e.g. `~`, the workfolder, the venv root) lies
+        strictly below `path`: a search from `path` would walk into it (W3-00.2)."""
+        key = self.key(path)
+        return any(_key_within(self.key(d), key) and self.key(d) != key for d in self.read_deny)
+
     def contains_sensitive(self, path: Path) -> bool:
         """True if a sensitive path lies below `path` (e.g. `~` or `/`)."""
         key = self.key(path)
@@ -664,19 +686,6 @@ class SandboxProfile:
     def read_only(self) -> tuple[Path, ...]:
         """Allowlist entries that are not below a write root (read folders, toolchain)."""
         return tuple(p for p in self.read_allow if self._within_any(p, self.write_roots) < 0)
-
-
-def _venv_base(venv: Path) -> Path | None:
-    """Prefix of the Python installation a venv is built on (`home` in `pyvenv.cfg`)."""
-    try:
-        text = (venv / "pyvenv.cfg").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    for line in text.splitlines():
-        name, _, value = line.partition("=")
-        if name.strip() == "home" and value.strip():
-            return Path(value.strip()).parent
-    return None
 
 
 def _existing_matches(home: Path, patterns: Iterable[str]) -> list[Path]:
@@ -708,9 +717,12 @@ def profile_for(
     `read_dirs`, the Python environment (base venv, its installation prefix, `extra_path`),
     the agent's Claude plugin and paths of always-allow read rules. The run's `skills/`
     snapshot is not on the list (W2-01). Read blocks: `~`, `/Volumes`, the workfolder
-    (other projects, other agents) and the user's temp folders (`temp_dirs`, default
-    `user_temp_dirs()`, except one below Run-tmp). `tools.web` switches the web tools on;
-    always-allow host rules become allowed domains of the Claude sandbox.
+    (other projects, other agents), the user's temp folders (`temp_dirs`, default
+    `user_temp_dirs()`, except one below Run-tmp) and the venv root (`arr.venvs`, W3-00):
+    there only the run venv, the base venv and the toolchain stay open, a read folder or an
+    always rule inside it is dropped. The base venv is never a write root: several runs
+    share it. `tools.web` switches the web tools on; always-allow host rules become allowed
+    domains of the Claude sandbox.
     """
     rules = rules or PermissionRules()
     home = Path(os.path.realpath(home or Path.home()))
@@ -736,13 +748,22 @@ def profile_for(
             read_allow.append(norm(run_dir / entry.removeprefix("run:")))
         else:
             read_allow.append(norm(entry))
+    venv_dir = norm(paths.venv_dir) if run_venv else None
+    base_venv: Path | None = None
+    toolchain = [venv_dir] if venv_dir else []
     if paths.toolchain.python:
-        venv = norm(paths.toolchain.python)
-        read_allow.append(venv)
-        base = _venv_base(venv)
+        text = paths.toolchain.python
+        if text == "~" or text.startswith("~/"):
+            text = str(home) + text[1:]
+        python = Path(text) if Path(text).is_absolute() else workfolder / text
+        # an interpreter such as <venv>/bin/python: the venv is two levels up (`_toolchain`)
+        base_venv = norm(python.parent.parent if python.is_file() else python)
+        toolchain.append(base_venv)
+        base = venv_base_prefix(base_venv)
         if base is not None:
-            read_allow.append(norm(base))
-    read_allow += [norm(p) for p in paths.toolchain.extra_path]
+            toolchain.append(norm(base))
+    toolchain += [norm(p) for p in paths.toolchain.extra_path]
+    read_allow += toolchain[1:] if venv_dir else toolchain
     domains: list[str] = []
     for rule in rules.always:
         if rule.action != "allow" or rule.commands:
@@ -758,7 +779,14 @@ def profile_for(
     sensitive += [norm(p) for p in rules.sensitive_paths]
     sensitive += [norm(p) for p in _existing_matches(home, SENSITIVE_HOME_PATTERNS)]
 
-    read_deny = [home, *(norm(p) for p in READ_BLOCKED_ROOTS), workfolder]
+    # W3-00: the venv root holds the venvs of every run; only this run's venv, the base venv
+    # and the toolchain are readable there, never via a read folder or an always rule.
+    venvs = norm(venv_root())
+    in_venvs = [p for p in read_allow if _key_within(_key(p, ci), _key(venvs, ci))]
+    for path in in_venvs:
+        if not any(_key_within(_key(path, ci), _key(t, ci)) for t in toolchain):
+            read_allow.remove(path)
+    read_deny = [home, *(norm(p) for p in READ_BLOCKED_ROOTS), workfolder, venvs]
     for raw in user_temp_dirs() if temp_dirs is None else temp_dirs:
         temp = norm(raw)
         if not _key_within(_key(temp, ci), _key(tmp_dir, ci)):
@@ -779,6 +807,8 @@ def profile_for(
         allowed_domains=tuple(dict.fromkeys(domains)),
         run_venv=run_venv,
         case_insensitive=ci,
+        venv_dir=venv_dir,
+        base_venv=base_venv,
     )
 
 
@@ -812,13 +842,23 @@ class ClaudeOptions:
 
 
 def claude_options(profile: SandboxProfile) -> ClaudeOptions:
-    """Translate a profile into Claude options (W2-01 checks that the SDK enforces them)."""
+    """Translate a profile into Claude options (W2-01 checks that the SDK enforces them).
+
+    A `Read(//p/**)` rule lets Read, Grep and Glob through without asking `can_use_tool`.
+    So a read folder that contains a read block (`~`, the workfolder, the venv root …) gets
+    no rule: such reads go to the PolicyEngine, which decides by specificity (W3-00.1 M2).
+    """
     writable = [p for p in profile.write_roots if p != profile.work_dir]
+
+    def covers_a_block(path: Path) -> bool:
+        key = profile.key(path)
+        return any(_key_within(profile.key(d), key) for d in profile.read_deny)
+
     allowed = [f"{ROOM_TOOL_PREFIX}*"]
     allowed += [
         f"Read({_claude_path(p, tree=True)})"
         for p in profile.read_allow
-        if p not in profile.write_roots
+        if p not in profile.write_roots and not covers_a_block(p)
     ]
     if profile.web:
         allowed += ["WebFetch", "WebSearch"]
@@ -2155,6 +2195,9 @@ class PolicyEngine:
                 analysis.ban(_R_SENSITIVE, RequestCategory.READ_OUTSIDE)
             elif search and profile.contains_sensitive(path):
                 analysis.ban(_R_SEARCH_SENSITIVE, RequestCategory.READ_OUTSIDE)
+            elif search and profile.contains_block(path):
+                # Grep/Glob/LS in the CLI would walk the blocked folders below (W3-00.2)
+                analysis.ban(_R_SEARCH_BLOCKED, RequestCategory.READ_OUTSIDE)
             elif not profile.can_read(path):
                 analysis.ask(key, RequestCategory.READ_OUTSIDE)
                 analysis.labels[key] = str(path)

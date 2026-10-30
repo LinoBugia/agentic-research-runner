@@ -185,6 +185,34 @@ def test_arr_run_plays_the_m1_scenario(m1: Path) -> None:
     assert f"Der Run {run_dir.name} läuft nicht (Status: abgeschlossen, done)" in stopped.output
 
 
+def test_w3_00_m1_scenario_with_a_run_venv_outside_the_run_folder(
+    m1: Path, venv_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The M1 scenario with `run_venv: overlay`: the venv lies at `<venv root>/runs/<id>/`,
+    `meta.json` names it, and the secret scan covers it (`run-venv/…`)."""
+    from arr.runs import manager as manager_module
+    from arr.runs.prepare import load_run_meta
+
+    real = manager_module.create_run_venv
+
+    def without_pip(paths, base, *, with_pip=True):  # pip makes the test slow, not different
+        return real(paths, base, with_pip=False)
+
+    monkeypatch.setattr(manager_module, "create_run_venv", without_pip)
+    (m1 / "arr.yaml").write_text("version: 1\ntoolchain: {run_venv: overlay}\n", "utf-8")
+    result = runner.invoke(app, ["run", "run.yaml"])
+    assert result.exit_code == 0, result.output
+    [run_dir] = run_dirs(m1)
+    venv = venv_root / "runs" / run_dir.name
+    assert (venv / "bin" / "python").exists() and (venv / "pyvenv.cfg").is_file()
+    assert not (run_dir / ".venv").exists()
+    assert load_run_meta(run_dir).run_venv == str(venv)
+    assert "Secret-Scan: sauber" in result.output
+    [scan] = log_entries(run_dir, "secret_scan")
+    in_run = sum(1 for p in run_dir.rglob("*") if p.is_file() and not p.is_symlink())
+    assert scan["data"]["files"] > in_run  # the venv's files were read as well
+
+
 def test_arr_run_reports_configuration_errors_in_german_without_traceback(m1: Path) -> None:
     text = M1_RUN_YAML.replace("params: {pass_score: 6, max_rework: 1}", "params: {}")
     (m1 / "kaputt.yaml").write_text(text, encoding="utf-8")

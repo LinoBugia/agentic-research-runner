@@ -859,7 +859,13 @@ class UserAgentRunSettings(StrictModel):
 class Toolchain(StrictModel):
     """Python environment and PATH of the research agents (docs/07 §2)."""
 
-    python: str | None = Field(default=None, description="Base venv, e.g. ~/.venvs/mathe")
+    python: str | None = Field(
+        default=None,
+        description=(
+            "Base venv or interpreter, e.g. /Users/Shared/arr-<user>/venvs/mathe; outside ~ "
+            "for runs with Codex agents (W3-00, arr.venvs)"
+        ),
+    )
     extra_path: list[str] = Field(default_factory=list)
     run_venv: RunVenvMode = RunVenvMode.OVERLAY
 

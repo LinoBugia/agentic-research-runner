@@ -10,14 +10,14 @@ Pure data, no SDK import, so it is testable without the Codex binary. `CodexBack
   once): write roots get `write`, the allowlist `read`, `/Volumes`, the sensitive paths and
   everything else below `~` `deny`. Without `:tmpdir`/`:slash_tmp` entries `/tmp` and `$TMPDIR`
   stay read-only; `TMPDIR` points to Run-tmp. Network is off; the shell asks per command.
-- **Siblings instead of `~` (variant 1, user decision of 28.10., docs/07 §3 ①):** a `deny` on a
-  folder also denies the folder's own metadata, and then no Python below `~` starts
-  (`realpath` needs every parent). So a denied folder that leads to an allowed root stays
-  readable as a folder, and each of its entries that exists now and is not on the way to an
-  allowed root is denied one by one. The list is built when the app-server starts, i.e. per
-  turn. Files arr creates during a run in these folders are denied by glob (`LATE_GLOBS`).
-  Known gap: names in these folders are visible, and an unknown new entry is readable until
-  the next turn.
+- **`~` denied as a whole (variant 2, W3-00, docs/07 §3 ①):** a `deny` on a folder also
+  denies its own metadata, so no Python whose program lies below `~` starts. Base venv and
+  run venv therefore live outside `~` (`arr.venvs`), and `prepare_run` refuses a Codex run
+  whose toolchain lies below `~`. The working folder below `~` stays usable (the allowed
+  root itself is enough). No ancestor of the run venv may be denied: Python's start-up
+  `realpath` of `bin/` fails then (W3-00 lab). The list depends only on the profile
+  (allowlist, channels, rules), never on what lies in `~`, the workfolder or `runs/`: names
+  are not visible, and a file that appears during a turn is denied like everything else.
 - **Shell environment (W2-02.1 H1):** `shell_environment_policy.inherit = "core"` plus `set`
   with what the agent needs; no `CODEX_HOME`, tokens, keys or account data reach a command.
 - **Isolation from the user's Codex config** (S2 §7, §8, §13, §15): own `CODEX_HOME`, no
@@ -46,10 +46,10 @@ from arr.models import AuthKind, AuthProfile, RunVenvMode
 from arr.permissions.policy import RunPaths, SandboxProfile
 from arr.runs.prepare import PreparedAgent
 from arr.settings import app_dir
+from arr.venvs import glob_safe_name, venv_root
 from arr.workfolder import read_template
 
 __all__ = [
-    "LATE_GLOBS",
     "PERMISSION_PROFILE",
     "ROOM_SERVER",
     "CodexLaunch",
@@ -91,23 +91,11 @@ shell, S2 §3)."""
 CACHE_ENV = ("XDG_CACHE_HOME", "MPLCONFIGDIR", "PIP_CACHE_DIR", "UV_CACHE_DIR")
 """Programs that cache in `~` fail behind the read/write block; their caches go to Run-tmp."""
 
-_AGENT_FILES = ("*.json", "*.jsonl", "*.md", "*.log", "*.diff", "blobs", "blobs/**")
-LATE_GLOBS: dict[str, tuple[str, ...]] = {
-    ".": ("*.json", "*.jsonl", "*.yaml", "*.md", "*.log"),
-    "agents/*": _AGENT_FILES + ("plugin", "plugin/**"),
-    "groupchats": ("room.sqlite*", "*.md", "*.jsonl"),
-    "groupchats/attachments": (".staging-*", ".staging-*/**"),
-}
-"""Names arr creates during a run directly in a folder of the run that stays open for traversal
-(docs/02 §4): `orchestrator.jsonl`, `approvals.jsonl`, `usage.json`, the agents' transcripts,
-`session.json`, `stderr.log`, `changes.diff`, `blobs/`, the room database with `-wal`/`-shm`,
-the channel exports and the room's staging copies of new attachments. Keys are folders
-relative to the run (`agents/*` = every agent folder), values Codex globs; `*` does not
-cross `/`, a folder needs `x` and `x/**`. Used only for folders on the way to an allowed
-root: a readable run folder stays readable."""
-
 ENTRIES_WARN = 250
-"""From this many permission entries on, every start logs a warning (W2-02.1 M1, W2-05)."""
+"""From this many permission entries on, every start logs a warning (W2-02.1 M1, W2-05).
+
+With variant 2 a profile has a few dozen entries; the bounds stay as a guard against very
+many read folders, channels or always-allow rules."""
 
 ENTRIES_MAX = 500
 """From this many entries on, the turn is not started. Seatbelt compiles the profile for every
@@ -182,18 +170,19 @@ def _within(profile: SandboxProfile, path: Path, root: Path) -> bool:
     return key == root_key or key.startswith(root_key + "/")
 
 
-def _strict_entries(
+def _entries(
     profile: SandboxProfile,
     run_paths: RunPaths,
     channels: Sequence[str],
     run_channels: Sequence[str],
     hard_deny: Sequence[Path],
 ) -> dict[str, tuple[Path, str]]:
-    """Entries before opening the parents: `key → (path, read|write|deny)`."""
+    """Path entries `key → (path, read|write|deny)`; the most specific one applies."""
     skills = profile.resolve(run_paths.skills_dir)
     attachments = profile.resolve(run_paths.attachments_dir)
     plugin = profile.resolve(run_paths.run_dir / "agents" / profile.agent_id / "plugin")
     hidden = (skills, attachments, plugin)
+    venvs = profile.resolve(venv_root())
 
     entries: dict[str, tuple[Path, str]] = {}
 
@@ -207,7 +196,8 @@ def _strict_entries(
         if not any(_within(profile, path, h) for h in hidden):
             put(path, "read", overwrite=False)
     for path in (*profile.read_deny, *hidden):
-        put(path, "deny")
+        if profile.key(path) != profile.key(venvs):  # `_venv_globs` instead (W3-00)
+            put(path, "deny")
     for channel in channels:
         put(attachments / channel, "read")
     for channel in run_channels:
@@ -224,62 +214,43 @@ def _strict_entries(
     return entries
 
 
-def _governing(profile: SandboxProfile, path: Path, entries: dict[str, tuple[Path, str]]) -> str:
-    """Key of the most specific entry that covers `path` ("" = `:root`)."""
-    best = ""
-    for key, (root, _) in entries.items():
-        if _within(profile, path, root) and len(key) > len(best):
-            best = key
-    return best
+def _others(profile: SandboxProfile, folder: Path, own: Path | None) -> list[str]:
+    """Globs that deny every entry of `folder` except `own` (a direct child) and its tree.
 
-
-def _children(folder: Path) -> list[Path]:
-    try:
-        return sorted(folder.iterdir())
-    except OSError:
-        return []
-
-
-def _open_parents(
-    profile: SandboxProfile, entries: dict[str, tuple[Path, str]]
-) -> tuple[dict[str, tuple[Path, str]], list[Path]]:
-    """Variant 1: open denied folders on the way to an allowed root, deny their other entries.
-
-    Returns the new entries and the folders that stay open for traversal only.
+    A name differs from `own` at some position `i` (`own[:i][!own[i]]*`), is a proper
+    prefix of it (`own[:i]`) or is longer (`own?*`); each glob covers the entry and its
+    tree (`{,/**}`, checked offline: a big `{…}` alternation breaks the Seatbelt profile, a
+    small one works). The globs match names that do not exist yet as well: a run venv that
+    appears during a turn is denied. `2 × len(own)` entries, nothing is listed.
     """
-    allowed = [p for p, a in entries.values() if a != "deny"]
-    opened = {
-        key
-        for key, (path, access) in entries.items()
-        if access == "deny"
-        and any(_within(profile, a, path) and profile.key(a) != key for a in allowed)
-    }
-    passage: dict[str, Path] = {}
-    for root in allowed:
-        for folder in root.parents:
-            if _governing(profile, folder, entries) in opened:
-                passage[profile.key(folder)] = folder
-    result = {k: v for k, v in entries.items() if k not in opened}
-    for folder in passage.values():
-        for child in _children(folder):
-            key = profile.key(child)
-            if key not in entries and key not in passage:
-                result[key] = (child, "deny")
-    return result, sorted(passage.values())
+    base = glob_escape(str(folder))
+    if own is None or profile.key(own.parent) != profile.key(folder):
+        return [f"{base}/*{{,/**}}"]
+    name = own.name
+    if not glob_safe_name(name):  # also checked by `prepare_run` (W3-00.2)
+        raise ArrError(
+            f"Der Name „{name}“ in {folder} enthält ein Zeichen, das Codex in einem Muster "
+            "nicht ausschließen kann (Umlaute, Akzente und andere Nicht-ASCII-Zeichen sowie "
+            "[ ] \\ ! ^ { } * ? ,). Benenne die venv um, z. B. nur mit a–z, 0–9, - und _."
+        )
+    globs = [f"{base}/{name[:i]}[!{ch}]*" for i, ch in enumerate(name)]
+    globs += [f"{base}/{name[:i]}" for i in range(1, len(name))]
+    globs.append(f"{base}/{name}?*")
+    return [g + "{,/**}" for g in globs]
 
 
-def _late_globs(profile: SandboxProfile, run_dir: Path, passage: Sequence[Path]) -> list[str]:
-    open_keys = {profile.key(p) for p in passage}
-    globs = []
-    for folder, patterns in LATE_GLOBS.items():
-        parent = folder.removesuffix("/*")
-        if profile.key(profile.resolve(run_dir / parent)) not in open_keys:
-            continue
-        base = glob_escape(str(profile.resolve(run_dir / parent)))
-        if folder != parent:
-            base += "/*"
-        globs += [f"{base}/{pattern}" for pattern in patterns]
-    return globs
+def _venv_globs(profile: SandboxProfile) -> list[str]:
+    """W3-00: other runs' venvs and other base venvs below the venv root stay closed.
+
+    The root and `runs/` cannot be denied themselves: a denied ancestor of the run venv
+    stops Python (`realpath` of `bin/`). So every other name in `runs/` and `venvs/` is
+    denied by glob; their names stay visible (`ls`), only run IDs and venv names.
+    """
+    root = profile.resolve(venv_root())
+    own_run = profile.venv_dir if profile.run_venv else None
+    return _others(profile, root / "runs", own_run) + _others(
+        profile, root / "venvs", profile.base_venv
+    )
 
 
 def _sensitive_globs(profile: SandboxProfile) -> list[str]:
@@ -297,11 +268,15 @@ def filesystem_entries(
     run_channels: Sequence[str] = (),
     hard_deny: Sequence[Path] = (),
 ) -> dict[str, str]:
-    """Permission profile entries `path → read|write|deny` for one agent (E19, variant 1).
+    """Permission profile entries `path → read|write|deny` for one agent (E19, variant 2).
 
     Codex applies the most specific entry; a glob `deny` beats every path entry. `:root`
-    keeps system folders readable (Python, toolchain; docs/01 §8). Three folders are denied
-    explicitly, so a broader read folder (e.g. `run:`) cannot reopen them:
+    keeps system folders readable (Python, toolchain, the venvs outside `~`; docs/01 §8).
+    Denied as a whole: `~`, `/Volumes`, the workfolder and the user's temp folders
+    (`SandboxProfile.read_deny`). Allowed inside: the write roots (work folder,
+    Run-tmp, run venv), the allowlist (`output/`, read folders, base venv and toolchain …).
+    Three folders are denied explicitly, so a broader read folder (e.g. `run:`) cannot reopen
+    them:
 
     - the run's `skills/` snapshot (L14) and the Claude plugin, which the `SandboxProfile`
       allows: Codex agents read their skills from the copies in `work/.agents/skills/`;
@@ -309,18 +284,15 @@ def filesystem_entries(
       `groupchats/attachments/<channel>/` (L15, docs/02 §6). The folders of the other
       channels of the run (`run_channels`) are denied by name, also before they exist.
 
-    `hard_deny` (the login folder) is denied like a sensitive path: never opened, and an
-    allowed root inside it is dropped.
-
-    Then the denied parents of allowed roots are opened and their other entries denied one
-    by one (module docstring), plus globs for `LATE_GLOBS` and the sensitive patterns. Reads
-    the folders on the way, so call it when the app-server starts.
+    `hard_deny` (the login folder) is denied like a sensitive path: an allowed root inside
+    it is dropped. Globs deny the sensitive patterns (history files, password managers,
+    `*.kdbx` …) also inside allowed roots. Nothing here reads a folder: the entries depend
+    on the profile only, not on what lies in `~`, the workfolder or `runs/`.
 
     Raises `ValueError` for an allowed path with a glob character: Codex would read it as a
     pattern, and patterns can only deny.
     """
-    strict = _strict_entries(profile, run_paths, channels, run_channels, hard_deny)
-    entries, passage = _open_parents(profile, strict)
+    entries = _entries(profile, run_paths, channels, run_channels, hard_deny)
     result: dict[str, str] = {":root": "read"}
     for path, access in entries.values():
         text = str(path)
@@ -333,34 +305,39 @@ def filesystem_entries(
                 f"Der Pfad „{text}“ enthält eines der Zeichen * ? [ ] {{ }}. Codex liest ihn als "
                 "Muster und kann ihn dann nicht freigeben. Benenne den Ordner um."
             )
-    for glob in _late_globs(profile, run_paths.run_dir, passage) + _sensitive_globs(profile):
+    for glob in _venv_globs(profile) + _sensitive_globs(profile):
         result[glob] = "deny"
-    _check_size(len(result), len(toml_value(result).encode("utf-8")))
+    _check_size(len(result), len(toml_value(result).encode("utf-8")), run_paths.run_dir.name)
     return result
 
 
-_TOO_MANY = (
-    "So viele Einträge machen jeden Befehl in der Sandbox sehr langsam oder lassen ihn "
-    "scheitern. Archiviere alte Runs aus „runs/“ oder räume Ordner auf dem Weg zum Workfolder "
-    "auf (z. B. viele Dateien direkt in ~ oder ~/Documents)."
-)
+def _too_many(run_id: str) -> str:
+    """Why the list is big and what helps (variant 2: no folder contents, W3-00.1 G1)."""
+    return (
+        "So viele Einträge machen jeden Befehl in der Sandbox sehr langsam oder lassen ihn "
+        "scheitern. Die Liste wächst mit den Lese-Ordnern („read_dirs“), den Kanälen und den "
+        "Freigaberegeln des Agenten und mit der Länge der Run-ID: Jedes Zeichen kostet zwei "
+        f"Einträge, und die Run-ID „{run_id}“ hat {len(run_id)} Zeichen. Fasse Lese-Ordner "
+        "zusammen oder entferne nicht nötige; bei sehr langen Projekt- oder Skill-Namen "
+        "hilft ein kürzerer Name."
+    )
 
 
-def _check_size(count: int, size: int) -> None:
+def _check_size(count: int, size: int, run_id: str) -> None:
     if count >= ENTRIES_MAX:
         raise ArrError(
             f"Die Lese-Sperrliste für Codex hat {count} Einträge (Grenze {ENTRIES_MAX}). "
-            + _TOO_MANY
+            + _too_many(run_id)
         )
     if size >= PROFILE_MAX_BYTES:
         raise ArrError(
             f"Die Lese-Sperrliste für Codex ist {size} Bytes groß (Grenze {PROFILE_MAX_BYTES} "
-            "Bytes). " + _TOO_MANY
+            "Bytes). " + _too_many(run_id)
         )
     if count >= ENTRIES_WARN:
         logger.warning(
             "Lese-Sperrliste für Codex mit %d Einträgen (Warnung ab %d): jeder Befehl wird "
-            "langsamer. Alte Runs archivieren hilft.",
+            "langsamer. Weniger Lese-Ordner oder kürzere Projekt- und Skill-Namen helfen.",
             count,
             ENTRIES_WARN,
         )
@@ -453,10 +430,11 @@ def build_launch(
 ) -> CodexLaunch:
     """Settings for the agent's own `AsyncCodex` and its thread (S2 §15).
 
-    Reads the folders on the way to the allowed roots (`filesystem_entries`): build it anew
-    for every app-server start, i.e. per turn. `run_channels` are all channels of the run
-    (`run.yaml`); the attachments of the others are denied. `env` is the app-server's
-    environment, `shell_env` the one of the agent's commands (without `CODEX_HOME`).
+    The permission profile comes from `filesystem_entries` (variant 2, no folder is read);
+    the backend still builds it per app-server start, i.e. per turn. `run_channels` are all
+    channels of the run (`run.yaml`); the attachments of the others are denied. `env` is the
+    app-server's environment, `shell_env` the one of the agent's commands (without
+    `CODEX_HOME`).
     """
     environ = os.environ if environ is None else environ
     tmp = profile.tmp_dir
@@ -474,7 +452,7 @@ def build_launch(
     }
     env |= {name: str(tmp / "cache" / name.lower()) for name in CACHE_ENV}
     # arr's own venv must not leak into the agent (`uv run arr` sets VIRTUAL_ENV); uv reads
-    # no config files, the parents on the way may hold a denied `pyproject.toml`.
+    # no config files: it looks for `pyproject.toml`/`uv.toml` in the denied parents.
     overlay = agent.file.run_venv is RunVenvMode.OVERLAY
     env["VIRTUAL_ENV"] = str(run_paths.venv_dir) if overlay else ""
     env |= {"PYTHONPATH": "", "PYTHONHOME": "", "UV_NO_CONFIG": "1"}

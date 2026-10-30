@@ -22,7 +22,7 @@ from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk.types import CanUseTool, SystemPromptPreset
 
 from arr.errors import ArrError
-from arr.models import Effort, RunVenvMode
+from arr.models import Effort
 from arr.permissions.policy import ROOM_TOOL_PREFIX, SandboxProfile, claude_options
 from arr.room.server import AGENT_ID_ENV, RUN_DIR_ENV
 from arr.runs.prepare import PreparedAgent
@@ -80,19 +80,35 @@ def system_prompt(agent: PreparedAgent) -> SystemPromptPreset:
     }
 
 
-def agent_path(agent: PreparedAgent, base_path: str | None = None) -> str:
+def agent_path(agent: PreparedAgent, venv_dir: Path | None, base_path: str | None = None) -> str:
     """`PATH` of the agent: run venv `bin/`, then `path_prepend`, then the inherited `PATH`.
 
-    The run venv comes first so `pip install` lands there and never in the base venv
-    (docs/07 §2); the RunManager creates it before the agents start.
+    The run venv (`SandboxProfile.venv_dir`, outside `~`; None with `run_venv: off`) comes
+    first so `pip install` lands there and never in the base venv (docs/07 §2); the
+    RunManager creates it before the agents start.
     """
     parts: list[str] = []
-    if agent.file.run_venv is RunVenvMode.OVERLAY:
-        parts.append(str(agent.run_dir / ".venv" / "bin"))
+    if venv_dir is not None:
+        parts.append(str(venv_dir / "bin"))
     parts += agent.file.path_prepend
     inherited = os.environ.get("PATH", os.defpath) if base_path is None else base_path
     parts += [p for p in inherited.split(os.pathsep) if p]
     return os.pathsep.join(dict.fromkeys(parts))
+
+
+def python_env(venv_dir: Path | None) -> dict[str, str]:
+    """Python variables of the agent (W3-00 live check): `VIRTUAL_ENV` names the run venv,
+    never arr's own (`uv run arr` sets it), and Python skips the user site folder below `~`.
+
+    The run venv sees the system site packages (`--system-site-packages`), so Python would
+    look for `~/Library/Python/…` and `pip list` fails behind the read block on `~`.
+    """
+    return {
+        "VIRTUAL_ENV": str(venv_dir) if venv_dir is not None else "",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": "",
+        "PYTHONHOME": "",
+    }
 
 
 def tmp_link(target: Path, key: str, root: Path = TMP_LINK_ROOT) -> Path:
@@ -192,7 +208,9 @@ def build_options(
     config = agent.file.config
     perms = claude_options(profile)
     plugin = agent.plugin_dir
-    process_env = {**env, **perms.env, "PATH": agent_path(agent)}
+    # one source for the run venv: the profile (W3-00.1 G4), as for add_dirs and the sandbox
+    process_env = {**env, **perms.env, "PATH": agent_path(agent, profile.venv_dir)}
+    process_env.update(python_env(profile.venv_dir))
     process_env.update(cache_env(Path(perms.env["TMPDIR"])))
     if tmpdir is not None:
         process_env["TMPDIR"] = process_env["CLAUDE_CODE_TMPDIR"] = str(tmpdir)

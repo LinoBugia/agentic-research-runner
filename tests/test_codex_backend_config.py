@@ -1,12 +1,20 @@
-"""Translation SandboxProfile → Codex launch settings (no SDK, no model)."""
+"""Translation SandboxProfile → Codex launch settings (no SDK, no model).
 
+W3-00 (variant 2): `~` is denied as a whole, the venvs live outside `~` (`arr.venvs`), and the
+entries depend on the profile only. The tests of variant 1 (open parents, sibling list,
+`LATE_GLOBS`, known gap) were rewritten for variant 2 or removed.
+"""
+
+import os
 import re
 import tomllib
+import unicodedata
 from pathlib import Path
 
 import pytest
 
 from arr.backends.codex_config import (
+    ENTRIES_WARN,
     PERMISSION_PROFILE,
     ROOM_SERVER,
     SECRET_ENV,
@@ -25,8 +33,8 @@ from arr.runs.prepare import AgentFile, PreparedAgent
 
 @pytest.fixture(autouse=True)
 def no_user_temp_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`tmp_path` lies in the user's temp folder, which `profile_for` denies (W2-01.1). Its
-    other entries would all become siblings; the tests must not depend on the machine."""
+    """`tmp_path` lies in the user's temp folder, which `profile_for` denies (W2-01.1); the
+    tests must not depend on the machine."""
     monkeypatch.setattr(policy, "user_temp_dirs", lambda: [])
 
 
@@ -82,10 +90,10 @@ def layout(tmp_path: Path) -> dict[str, Path]:
     return {"home": home, "wf": wf, "run": run, "work": work}
 
 
-def setup(layout: dict[str, Path], **changes: object):
+def setup(layout: dict[str, Path], toolchain: Toolchain | None = None, **changes: object):
     changes.setdefault("read_dirs", [str(layout["home"] / "readdir")])
     config = agent_config(**changes)
-    paths = RunPaths(layout["wf"], layout["run"], Toolchain())
+    paths = RunPaths(layout["wf"], layout["run"], toolchain or Toolchain())
     profile = profile_for(
         config, paths, PermissionRules(), home=layout["home"], case_insensitive=False
     )
@@ -120,6 +128,8 @@ def _glob_regex(glob: str) -> re.Pattern[str]:
         elif c == "[":
             end = glob.index("]", i + 2)
             out, i = out + "[" + re.escape(glob[i + 1 : end]).replace("!", "^", 1) + "]", end + 1
+        elif glob.startswith("{,/**}", i):  # the only alternation arr writes (W3-00)
+            out, i = out + "(/.*)?", i + 6
         else:
             out, i = out + re.escape(c), i + 1
     return re.compile(out + "$")
@@ -128,11 +138,11 @@ def _glob_regex(glob: str) -> re.Pattern[str]:
 def codex_access(entries: dict[str, str], path: Path) -> str:
     text = str(path)
     for key, access in entries.items():
-        if any(ch in key for ch in "*?[") and access == "deny" and _glob_regex(key).match(text):
+        if any(ch in key for ch in "*?[{") and access == "deny" and _glob_regex(key).match(text):
             return "deny"
     best, access = "", entries[":root"]
     for key, value in entries.items():
-        if any(ch in key for ch in "*?[") or key == ":root":
+        if any(ch in key for ch in "*?[{") or key == ":root":
             continue
         if (text == key or text.startswith(key.rstrip("/") + "/")) and len(key) > len(best):
             best, access = key, value
@@ -143,25 +153,40 @@ def tree(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*"))
 
 
+def run_venv(paths: RunPaths) -> Path:
+    return Path(os.path.realpath(paths.venv_dir))
+
+
 def test_every_existing_entry_follows_profile(layout: dict[str, Path]) -> None:
-    """The sibling list covers everything that exists at start (variant 1)."""
+    """`~` is denied as a whole; only the allowed roots are open (variant 2, W3-00)."""
     _, profile, paths = setup(layout)
     entries = filesystem_entries(profile, paths, ["main"])
     run, home = layout["run"], layout["home"]
     allowed = [layout["work"], run / "tmp", run / "output", home / "readdir"]
     allowed.append(run / "groupchats" / "attachments" / "main")
-    passage = {p for a in allowed for p in a.parents if p == home or home in p.parents}
-    hidden = [run / "skills", run / "groupchats" / "attachments" / "secret"]
+    assert entries[str(home)] == "deny"
     for path in [home, *tree(home)]:
         got = codex_access(entries, path)
-        if path in passage:
-            assert got == "read", path  # open for traversal (Python's realpath)
-        elif path.name.endswith(".kdbx") or any(h == path or h in path.parents for h in hidden):
+        if path.name.endswith(".kdbx"):
             assert got == "deny", path
         elif any(a == path or a in path.parents for a in allowed):
             assert got in ("read", "write"), path
         else:
-            assert got == "deny", path
+            assert got == "deny", path  # also the parents of allowed roots: no names visible
+
+
+def test_entries_come_from_the_profile_only(layout: dict[str, Path], venv_root: Path) -> None:
+    """Every path entry is a root, a block or a sensitive path of the profile, or one of the
+    explicitly denied run folders; nothing is found by listing a folder."""
+    _, profile, paths = setup(layout)
+    entries = filesystem_entries(profile, paths, ["main"])
+    run = layout["run"]
+    known = {*profile.write_roots, *profile.read_allow, *profile.read_deny, *profile.sensitive}
+    known |= {run / "skills", run / "groupchats" / "attachments", Path(os.path.realpath(venv_root))}
+    known |= {run / "agents" / "gpt-1" / "plugin"}
+    plain = {Path(k) for k in entries if k != ":root" and "*" not in k}
+    assert plain <= known, plain - known
+    assert not any(Path(k).parent == run.parent for k in entries)  # no other runs
 
 
 def test_write_roots_and_system(layout: dict[str, Path]) -> None:
@@ -171,16 +196,126 @@ def test_write_roots_and_system(layout: dict[str, Path]) -> None:
     assert entries[":root"] == "read"
     assert codex_access(entries, layout["work"] / "new.py") == "write"
     assert codex_access(entries, run / "tmp" / "x") == "write"
-    assert codex_access(entries, run / ".venv" / "bin" / "python") == "write"
+    assert codex_access(entries, run_venv(paths) / "bin" / "python") == "write"
+    assert codex_access(entries, run / ".venv" / "bin" / "python") == "deny"  # no <run>/.venv
     assert codex_access(entries, layout["home"] / "readdir" / "x.txt") == "read"
     assert codex_access(entries, Path("/usr/lib/libz.dylib")) == "read"
     assert codex_access(entries, Path("/Volumes/USB/x")) == "deny"
 
 
-LATE = [
+RUN_ID = "20261029-1912_demo_custom_b32e"
+
+
+@pytest.fixture
+def venv_layout(layout: dict[str, Path], venv_root: Path) -> dict[str, Path]:
+    """`layout` with a realistic run ID and a base venv below `<venv root>/venvs/`."""
+    run = layout["run"].parent / RUN_ID
+    layout["run"].rename(run)
+    root = Path(os.path.realpath(venv_root))
+    base = root / "venvs" / "mathe"
+    (base / "bin").mkdir(parents=True)
+    (base / "pyvenv.cfg").write_text("home = /opt/pybase/bin\n")
+    return {**layout, "run": run, "work": run / "agents" / "gpt-1" / "work", "root": root}
+
+
+def venv_setup(layout: dict[str, Path], **toolchain: object):
+    toolchain.setdefault("python", str(layout["root"] / "venvs" / "mathe"))
+    return setup(layout, Toolchain.model_validate(toolchain))
+
+
+def test_no_ancestor_of_the_run_venv_is_denied(venv_layout: dict[str, Path]) -> None:
+    """A denied ancestor of the run venv stops Python (`realpath` of `bin/`, W3-00 lab)."""
+    _, profile, paths = venv_setup(venv_layout)
+    entries = filesystem_entries(profile, paths, ["main"])
+    venv = run_venv(paths)
+    for ancestor in venv.parents:
+        assert codex_access(entries, ancestor) == "read", ancestor
+    assert str(venv_layout["root"]) not in entries  # the profile denies it; Codex uses globs
+    assert codex_access(entries, venv / "lib" / "x.py") == "write"
+
+
+def test_w3_00_other_venvs_are_denied_by_glob(venv_layout: dict[str, Path]) -> None:
+    root = venv_layout["root"]
+    _, profile, paths = venv_setup(venv_layout)
+    entries = filesystem_entries(profile, paths, ["main"])
+    base = root / "venvs" / "mathe"
+    assert codex_access(entries, base / "lib" / "sympy.py") == "read"  # never write
+    assert codex_access(entries, Path("/opt/pybase/lib/libpython.dylib")) == "read"
+    for name in (
+        "20261029-1912_demo_custom_b33f",  # parallel run
+        "20261029-2359_new_custom_aaaa",  # appears during the turn
+        RUN_ID + "x",  # longer ID
+        RUN_ID[:-1],  # shorter ID
+        "2",
+        "X",
+    ):
+        for path in (root / "runs" / name, root / "runs" / name / "lib" / "c.txt"):
+            assert codex_access(entries, path) == "deny", path
+    for name in ("other", "math", "mathex", "Mathe2"):
+        assert codex_access(entries, root / "venvs" / name / "c.txt") == "deny", name
+    assert codex_access(entries, root / "runs") == "read"  # names stay visible (report §7)
+    globs = [k for k in entries if k.startswith(str(root)) and k.endswith("{,/**}")]
+    assert len(globs) == 2 * len(RUN_ID) + 2 * len("mathe")
+
+
+def test_w3_00_without_run_venv_or_base_venv_everything_is_denied(
+    venv_layout: dict[str, Path], tmp_path: Path
+) -> None:
+    root = venv_layout["root"]
+    elsewhere = tmp_path / "base-elsewhere"
+    elsewhere.mkdir()
+    _, profile, paths = venv_setup(venv_layout, python=str(elsewhere), run_venv="off")
+    entries = filesystem_entries(profile, paths, ["main"])
+    assert entries[glob_escape(str(root / "runs")) + "/*{,/**}"] == "deny"
+    assert entries[glob_escape(str(root / "venvs")) + "/*{,/**}"] == "deny"
+    assert codex_access(entries, root / "runs" / RUN_ID / "bin" / "python") == "deny"
+    assert codex_access(entries, root / "venvs" / "mathe" / "lib") == "deny"
+
+
+def test_w3_00_venv_name_that_globs_cannot_express_is_refused(
+    venv_layout: dict[str, Path],
+) -> None:
+    odd = venv_layout["root"] / "venvs" / "ma[th]e"
+    (odd / "bin").mkdir(parents=True)
+    with pytest.raises((ArrError, ValueError)):
+        _, profile, paths = venv_setup(venv_layout, python=str(odd))
+        filesystem_entries(profile, paths, ["main"])
+
+
+@pytest.mark.parametrize(
+    "name", ["mäthe", "w3rev-é1", unicodedata.normalize("NFD", "w3rev-é1"), "mathe✓"]
+)
+def test_w3_00_1_m1_non_ascii_base_venv_name_is_refused(
+    venv_layout: dict[str, Path], name: str
+) -> None:
+    """Seatbelt compares in NFD, `[!é]` acts like `[!e]`: such a name would open `e1`."""
+    base = venv_layout["root"] / "venvs" / name
+    (base / "bin").mkdir(parents=True)
+    _, profile, paths = venv_setup(venv_layout, python=str(base))
+    with pytest.raises(ArrError, match="Nicht-ASCII") as info:
+        filesystem_entries(profile, paths, ["main"])
+    assert "Benenne die venv um" in info.value.message
+
+
+def test_w3_00_1_m1_same_message_for_glob_characters(venv_layout: dict[str, Path]) -> None:
+    from arr.backends.codex_config import _others
+
+    _, profile, _ = venv_setup(venv_layout)
+    folder = venv_layout["root"] / "venvs"
+    messages = []
+    for name in ("mä", "m!a"):
+        with pytest.raises(ArrError) as info:
+            _others(profile, folder, folder / name)
+        messages.append(info.value.message.split("“", 1)[1])
+    assert messages[0].replace("mä", "m!a") == messages[1]
+
+
+FILES_ARR_WRITES = [
     "orchestrator.jsonl",
     "approvals.jsonl",
     "usage.json",
+    "meta.json",
+    "late-unknown.txt",
     "agents/gpt-1/transcript.jsonl",
     "agents/gpt-1/raw.jsonl",
     "agents/gpt-1/session.json",
@@ -197,14 +332,16 @@ LATE = [
 ]
 
 
-@pytest.mark.parametrize("name", LATE)
-def test_globs_cover_files_arr_creates_later(layout: dict[str, Path], name: str) -> None:
+@pytest.mark.parametrize("name", FILES_ARR_WRITES)
+def test_files_of_the_run_are_denied_without_globs(layout: dict[str, Path], name: str) -> None:
+    """Variant 1 needed `LATE_GLOBS` for these; now `~` and the workfolder deny them."""
     _, profile, paths = setup(layout)
     entries = filesystem_entries(profile, paths, ["main"])
     assert codex_access(entries, layout["run"] / name) == "deny"
+    assert not [k for k in entries if "*" in k and k.startswith(str(layout["run"]))]
 
 
-def test_globs_keep_own_folders_open(layout: dict[str, Path]) -> None:
+def test_own_folders_stay_open(layout: dict[str, Path]) -> None:
     _, profile, paths = setup(layout)
     entries = filesystem_entries(profile, paths, ["main"])
     run = layout["run"]
@@ -218,17 +355,52 @@ def test_globs_keep_own_folders_open(layout: dict[str, Path]) -> None:
         assert codex_access(entries, path) in ("read", "write"), path
 
 
-def test_known_gap_new_unknown_entry(layout: dict[str, Path]) -> None:
-    """Documented gap (docs/07 §3 ①): a new entry with an unknown name stays readable until
-    the list is rebuilt at the next app-server start."""
+def test_new_entries_during_a_turn_are_denied(layout: dict[str, Path]) -> None:
+    """The gap of variant 1 is closed: a new entry below `~` or in `runs/` is denied by the
+    list built before it existed, and the list does not change."""
     _, profile, paths = setup(layout)
     entries = filesystem_entries(profile, paths, ["main"])
-    assert codex_access(entries, layout["home"] / "new-folder" / "x.txt") == "read"
-    (layout["home"] / "new-folder").mkdir()
-    assert (
-        codex_access(filesystem_entries(profile, paths, ["main"]), layout["home"] / "new-folder")
-        == "deny"
-    )
+    new = [
+        layout["home"] / "new-folder" / "x.txt",
+        layout["run"].parent / "20261029-1200_other_custom_beef" / "meta.json",
+        layout["run"] / "late-unknown.txt",
+        layout["wf"] / "projects" / "new" / "canary.txt",
+    ]
+    for path in new:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+        assert codex_access(entries, path) == "deny", path
+    assert filesystem_entries(profile, paths, ["main"]) == entries
+
+
+@pytest.mark.parametrize("where", ["home", "runs", "venv-runs", "venv-venvs"])
+def test_entries_do_not_depend_on_what_lies_in_home_or_runs(
+    venv_layout: dict[str, Path], where: str
+) -> None:
+    """A3: the same entries with 5 or 2000 entries in `~`, `runs/` or below the venv root."""
+    folder = {
+        "home": venv_layout["home"],
+        "runs": venv_layout["run"].parent,
+        "venv-runs": venv_layout["root"] / "runs",
+        "venv-venvs": venv_layout["root"] / "venvs",
+    }[where]
+    folder.mkdir(parents=True, exist_ok=True)
+    _, profile, paths = venv_setup(venv_layout)
+    for n in range(5):
+        (folder / f"20261029-0000_demo_custom_{n:04x}").mkdir()
+    few = filesystem_entries(profile, paths, ["main"])
+    for n in range(5, 2000):
+        (folder / f"20261029-0000_demo_custom_{n:04x}").mkdir()
+    many = filesystem_entries(profile, paths, ["main"])
+    assert many == few
+    assert len(few) < ENTRIES_WARN
+
+
+def test_variant_1_is_gone() -> None:
+    from arr.backends import codex_config
+
+    for name in ("LATE_GLOBS", "_open_parents", "_late_globs", "_children", "_governing"):
+        assert not hasattr(codex_config, name), name
 
 
 def test_skills_snapshot_and_plugin_denied(layout: dict[str, Path]) -> None:
@@ -245,7 +417,7 @@ def test_only_own_channel_attachments(layout: dict[str, Path]) -> None:
     _, profile, paths = setup(layout)
     entries = filesystem_entries(profile, paths, ["main", "review"])
     att = layout["run"] / "groupchats" / "attachments"
-    assert codex_access(entries, att) == "read"  # on the way to the own channels
+    assert codex_access(entries, att) == "deny"  # variant 2: no folder opened on the way
     assert codex_access(entries, att / "main" / "a.txt") == "read"
     assert codex_access(entries, att / "review" / "c.txt") == "read"
     assert codex_access(entries, att / "secret" / "b.txt") == "deny"
@@ -287,9 +459,16 @@ def test_sensitive_read_dir_is_dropped(layout: dict[str, Path]) -> None:
 
 
 def test_glob_characters_are_escaped(layout: dict[str, Path]) -> None:
-    odd = layout["home"] / "a[1]*.txt"
+    odd = layout["home"] / "readdir" / "a[1]*.txt"  # a denied path inside an allowed root
     odd.write_text("x")
-    _, profile, paths = setup(layout)
+    _, _, paths = setup(layout)
+    profile = profile_for(
+        agent_config(read_dirs=[str(layout["home"] / "readdir")]),
+        paths,
+        PermissionRules(sensitive_paths=[str(odd)]),
+        home=layout["home"],
+        case_insensitive=False,
+    )
     entries = filesystem_entries(profile, paths)
     assert entries[glob_escape(str(odd))] == "deny"
     assert glob_escape("a[1]*?.md") == "a[[]1[]][*][?].md"
@@ -344,7 +523,8 @@ def test_launch_env_and_thread_config(layout: dict[str, Path], tmp_path: Path) -
     assert env["CODEX_HOME"] == str(tmp_path / "ch")
     assert env["TMPDIR"] == str(run / "tmp")
     assert env["HOME"] == str(run / "tmp" / "home" / "gpt-1")
-    assert env["PATH"].split(":") == [str(run / ".venv/bin"), "/opt/base/bin", "/usr/bin"]
+    venv = str(paths.venv_dir / "bin")  # outside the run folder (W3-00)
+    assert env["PATH"].split(":") == [venv, "/opt/base/bin", "/usr/bin"]
     assert env["OPENAI_API_KEY"] == ""
     assert all(env[name] == "" for name in SECRET_ENV if name in environ)
     assert env["MPLCONFIGDIR"].startswith(str(run / "tmp"))
@@ -392,7 +572,7 @@ def test_launch_env_isolates_python(layout: dict[str, Path], tmp_path: Path) -> 
     agent, profile, paths = setup(layout)
     environ = {"PATH": "/usr/bin", "VIRTUAL_ENV": "/arr/.venv", "PYTHONPATH": "/arr/src"}
     env = build_launch(agent, profile, paths, codex_home=tmp_path, environ=environ).env
-    assert env["VIRTUAL_ENV"] == str(layout["run"] / ".venv")  # not arr's own venv
+    assert env["VIRTUAL_ENV"] == str(paths.venv_dir)  # not arr's own venv
     assert env["PYTHONPATH"] == "" and env["PYTHONHOME"] == ""
     assert env["UV_NO_CONFIG"] == "1"  # parents on the way may hold a denied pyproject.toml
 
@@ -441,7 +621,7 @@ def test_m1_limits(layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch, cap
     filesystem_entries(profile, paths, ["main"])
     assert f"{count} Einträgen" in caplog.text
     monkeypatch.setattr(codex_config, "ENTRIES_MAX", count)
-    with pytest.raises(ArrError, match="Archiviere alte Runs"):
+    with pytest.raises(ArrError, match="Lese-Ordner"):
         filesystem_entries(profile, paths, ["main"])
 
 
@@ -463,25 +643,25 @@ def test_w2_05_profile_size_limit_gives_the_german_message(
     assert "65535" not in str(info.value) and "Seatbelt" not in str(info.value)
 
 
-def test_m1_many_old_runs_stop_the_turn(layout: dict[str, Path]) -> None:
-    runs = layout["run"].parent
-    for n in range(1000):
-        (runs / f"20261029-0000_demo_custom_{n:04x}").mkdir()
-    _, profile, paths = setup(layout)
-    with pytest.raises(ArrError, match=r"Lese-Sperrliste für Codex hat 1\d{3} Einträge"):
+def test_m1_many_read_dirs_stop_the_turn(layout: dict[str, Path]) -> None:
+    """The bound stays as a guard: it now grows with read folders, not with `runs/`."""
+    dirs = [layout["home"] / "readdir" / f"d{n:03d}" for n in range(600)]
+    _, profile, paths = setup(layout, read_dirs=[str(d) for d in dirs])
+    with pytest.raises(ArrError, match=r"Lese-Sperrliste für Codex hat \d{3} Einträge"):
         filesystem_entries(profile, paths, ["main"])
 
 
 @pytest.mark.parametrize(
-    "name", ["Rechnung 🧾.pdf", 'zitat "x".txt', "back\\slash", "ctl\x01\x7f\ttab", "äöü ß"]
+    "name", ["Rechnung 🧾", 'zitat "x"', "back\\slash", "ctl\x01\x7f\ttab", "äöü ß"]
 )
 def test_m2_odd_names_give_valid_toml(layout: dict[str, Path], name: str) -> None:
-    (layout["home"] / name).write_text("x")
-    _, profile, paths = setup(layout)
+    folder = layout["home"] / name
+    folder.mkdir()
+    _, profile, paths = setup(layout, read_dirs=[str(folder)])
     overrides = isolation_overrides(profile, paths, model="m", channels=["main"])
     fs = parsed_overrides(overrides)[f"permissions.{PERMISSION_PROFILE}.filesystem"]
     assert fs == filesystem_entries(profile, paths, ["main"])
-    assert fs[str(layout["home"] / name)] == "deny"
+    assert fs[str(folder)] == "read"
 
 
 def test_m2_undecodable_name_is_refused() -> None:
