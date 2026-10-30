@@ -35,6 +35,9 @@ from arr.service.login import (
     login_env,
 )
 
+START_S = 3.0
+"""Deadline of the tests: long enough for a fake CLI to start on a busy machine."""
+
 
 def test_scanner_finds_a_token_split_by_chunks_and_colour_codes() -> None:
     scanner = TokenScanner()
@@ -93,7 +96,7 @@ async def test_cli_without_token_reports_no_text(
 
 async def test_deadline_ends_the_process(tmp_path: Path) -> None:
     cli, facts = fake_cli(tmp_path, HANG)
-    result = await capture_token(lambda t: None, cli=cli, timeout_s=0.5)
+    result = await capture_token(lambda t: None, cli=cli, timeout_s=START_S)
     assert result.outcome is CaptureOutcome.TIMEOUT
     assert not alive(facts_of(facts)["pid"])
 
@@ -111,7 +114,7 @@ async def test_cancel_ends_the_process(tmp_path: Path) -> None:
 
 async def test_a_child_that_ignores_sigterm_is_killed(tmp_path: Path) -> None:
     cli, facts = fake_cli(tmp_path, IGNORE_TERM)
-    result = await capture_token(lambda t: None, cli=cli, timeout_s=1)
+    result = await capture_token(lambda t: None, cli=cli, timeout_s=START_S)
     assert result.outcome is CaptureOutcome.TIMEOUT
     assert not alive(facts_of(facts)["pid"])
 
@@ -157,14 +160,14 @@ def test_killing_the_parent_ends_the_child_by_sighup(tmp_path: Path) -> None:
 
 def test_the_alarm_ends_a_child_that_ignores_sighup_at_the_deadline(tmp_path: Path) -> None:
     cli, facts = fake_cli(tmp_path, IGNORE_HUP)
-    parent = _parent(cli, 1, 1)
+    parent = _parent(cli, int(START_S), 1)
     try:
         assert wait_until(facts.exists)
         pid = facts_of(facts)["pid"]
         os.kill(parent.pid, signal.SIGKILL)
         parent.wait()
         assert alive(pid)
-        assert wait_until(lambda: not alive(pid), 6), "child outlived its deadline"
+        assert wait_until(lambda: not alive(pid), START_S + 6), "child outlived its deadline"
     finally:
         parent.kill()
         parent.wait()

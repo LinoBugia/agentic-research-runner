@@ -505,7 +505,7 @@ async def test_login_deadline_ends_the_process(
     api: RealApi, cli: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     facts = cli(HANG)
-    monkeypatch.setattr("arr.service.login.CLAUDE_LOGIN_TIMEOUT_S", 0.5)
+    monkeypatch.setattr("arr.service.login.CLAUDE_LOGIN_TIMEOUT_S", 3.0)
     await api.start_login("max")
     status = await until_state(api, "max", LoginState.FAILED)
     assert "abgelaufen" in status.message
