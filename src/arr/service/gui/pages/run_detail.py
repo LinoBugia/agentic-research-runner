@@ -128,7 +128,7 @@ class RunDetailPage:
         self._last_verlauf: tuple[str, str] | None = None
         self.deciding: set[str] = set()
         self.compact_elements: dict[str, list[ui.element]] = {}
-        self.rendered_items: tuple[str, ...] | None = None
+        self.rendered_items: tuple[tuple[str, int], ...] | None = None
         self.dirty: set[str] = set()
         self.subscription = None
 
@@ -609,7 +609,7 @@ class RunDetailPage:
     def _render_overview_cards(self) -> None:
         """Rebuild the compact cards only when the open items changed: a rebuilt card is a new
         element and would have to be seen for 1.5 s again (G2); a confirmation stays."""
-        ids = tuple(sorted(self.open_items))
+        ids = tuple(sorted((i.id, i.count) for i in self.open_items.values()))
         if self.deciding or ids == self.rendered_items:
             return
         self.rendered_items = ids
@@ -655,6 +655,18 @@ class RunDetailPage:
             return
         self.deciding.add(item.id)
         try:
+            # a card may be older than the last equal request (transcript, or a quick click):
+            # it never grants more than it showed
+            current = await self.api.get_approval(item.id)
+            if request.action is DecisionAction.ALLOW and current.count != item.count:
+                self.deciding.discard(item.id)
+                self.frame.toast(
+                    f"Inzwischen warten {current.count} gleiche Anfragen. Nichts wurde erlaubt, "
+                    "entscheide unter „Details“.",
+                    error=True,
+                )
+                await self._refresh_approvals()
+                return
             response = await self.api.decide_approval(item.id, request)
         except ApiException as exc:
             self.deciding.discard(item.id)

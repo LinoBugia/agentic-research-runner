@@ -12,10 +12,9 @@ from typing import Any
 import pytest
 from run_kit import FAST, done, fake_builders, post, room, say, turns, wait, write_profiles
 from run_kit import cost as usage_cost
-from service_kit import append, make_run_folder, make_workfolder
+from service_kit import append, hold_lock, make_run_folder, make_workfolder
 
 from arr.models import RunStatus, Starter
-from arr.permissions.types import ApprovalStatus
 from arr.room.types import MessageVia
 from arr.runs.manager import set_run_status
 from arr.service.api_client import ApiClient, count_active, count_runs_waiting
@@ -143,15 +142,13 @@ def test_real_api_satisfies_the_contract_and_is_split_into_areas(wf: Path) -> No
     for name, (module, class_name) in areas.items():
         assert hasattr(module, class_name), name
     assert isinstance(api.runs, runs.RunsArea) and isinstance(api.live, live.LiveArea)
-    assert isinstance(api.approvals.decider, approvals.GuiPendingDecider)
+    assert isinstance(api.approvals.decider, approvals.GuiDecider)
     assert api.now() == pytest.approx(time.time(), abs=2)
 
 
 async def test_empty_areas_raise_unavailable_with_german_message(wf: Path) -> None:
     api = make_api(wf)
     cases = [
-        (api.list_approvals(status=[ApprovalStatus.OPEN]), "W3-03"),
-        (api.get_approval("apr_1"), "W3-03"),
         (api.get_app_settings(), "W3-04"),
         (api.get_workfolder_settings(), "W3-04"),
         (api.get_setup_state(), "W3-04"),
@@ -281,6 +278,7 @@ async def test_run_started_in_the_service_is_mapped_everywhere(wf: Path) -> None
 async def test_counting_rules_match_the_mock(wf: Path) -> None:
     make_run_folder(wf, status=RunStatus.DONE, run_id="20261029-1000_demo_custom_d0e1")
     active = make_run_folder(wf, status=RunStatus.RUNNING, run_id="20261029-1001_demo_custom_ac71")
+    lock = hold_lock(active)  # a process executes the run: its open items count
     api = make_api(wf)
     page = await api.list_runs()
     assert (page.counts.active, page.counts.waiting, page.counts.done) == (1, 0, 1)
@@ -317,6 +315,7 @@ async def test_counting_rules_match_the_mock(wf: Path) -> None:
     # decided: no longer waiting
     append(active / "approvals.jsonl", json.dumps({**item, "event": "decided"}) + "\n")
     assert (await api.get_counts()).waiting == 0
+    lock.release()
 
 
 async def test_pause_resume_and_stop_act_on_own_runs(wf: Path) -> None:

@@ -283,11 +283,14 @@ def run_reason(meta: RunMeta, entries: Sequence[Mapping[str, Any]]) -> str:
 
 
 def open_approvals(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Entries `open` of `approvals.jsonl` that no later event closed, oldest first."""
+    """Entries `open` of `approvals.jsonl` that no later event closed, oldest first.
+
+    Damaged lines are skipped: they must not take down what reads the run.
+    """
     opened: dict[str, dict[str, Any]] = {}
     for entry in entries:
-        item_id = entry.get("item_id")
-        if not item_id:
+        item_id = entry.get("item_id") if isinstance(entry, Mapping) else None
+        if not item_id or not isinstance(item_id, str):
             continue
         if entry.get("event") == "open":
             opened[item_id] = entry
