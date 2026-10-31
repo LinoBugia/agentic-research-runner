@@ -711,6 +711,8 @@ async def test_live_updates_keep_rows_and_the_open_menu(wf: Path) -> None:
         started = await api.start_run(FORM)
         await user.open(f"/runs/{started.run_id}")
         await see(user, "erste", retries=400)
+        # the first lines can beat `running`, and that change redraws the actions for good reason
+        await see(user, "Pausieren", retries=200)
         with user.client:
             menu = next(iter(user.find(marker="menu").elements))
             row_ids = {e.id for e in user.client.elements.values() if e._classes == ["msg-row"]}
