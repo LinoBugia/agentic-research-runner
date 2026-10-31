@@ -31,6 +31,7 @@ from test_gui_real import page_html, see
 from arr.models import RunStatus
 from arr.room.store import RoomStore
 from arr.room.types import DeliveryStatus, MessageKind
+from arr.runs.manager import RunManager
 from arr.service.api_models import (
     ApiException,
     ChannelMessageEvent,
@@ -440,6 +441,100 @@ async def test_detail_opened_at_once_gets_agents_and_channels_live(wf: Path) -> 
         await see(user, "Gestoppt", retries=600)
 
 
+async def test_channel_opened_before_the_room_exists_is_empty_and_fills_itself(
+    wf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review W3-02 H1: the page comes up while `run.yaml` is there and `room.sqlite` is not."""
+    room_may_come = asyncio.Event()
+    setup = RunManager._setup
+
+    async def late_setup(manager: RunManager) -> None:
+        await room_may_come.wait()
+        await setup(manager)
+
+    monkeypatch.setattr(RunManager, "_setup", late_setup)
+    scripts = {
+        "m-1": turns([post("main", "Erste Nachricht"), wait(30)]),
+        "m-2": turns([wait(30)]),
+    }
+    api = make_api(wf, scripts)
+    async with real_user(api) as user:
+        started = await api.start_run(FORM)
+        run_id = started.run_id
+        await until_status(api, run_id, RunStatus.PREPARING)
+        assert not (wf / "runs" / run_id / "groupchats" / "room.sqlite").exists()
+        await user.open(f"/runs/{run_id}?kanal=main")
+        try:
+            html = await see(user, "Noch keine Nachrichten.", retries=200)
+            assert "nicht gefunden" not in html
+        finally:
+            room_may_come.set()
+        html = await see(user, "Erste Nachricht", retries=400)
+        assert "nicht gefunden" not in html and "Noch keine Nachrichten." not in html
+        await see(user, "Senden", retries=400)
+        await api.run_action(run_id, RunAction.STOP)
+        await until_final(api, run_id)
+
+
+async def test_view_that_failed_comes_back_with_the_next_status(
+    wf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source that is broken for a moment does not stay an error once the run moves on."""
+    room_may_come = asyncio.Event()
+    setup = RunManager._setup
+
+    async def late_setup(manager: RunManager) -> None:
+        await room_may_come.wait()
+        await setup(manager)
+
+    monkeypatch.setattr(RunManager, "_setup", late_setup)
+    api = make_api(wf, {"m-1": turns([say("los"), wait(30)]), "m-2": turns([wait(30)])})
+    async with real_user(api) as user:
+        started = await api.start_run(FORM)
+        run_id = started.run_id
+        await until_status(api, run_id, RunStatus.PREPARING)
+        room = wf / "runs" / run_id / "groupchats" / "room.sqlite"
+        room.parent.mkdir(exist_ok=True)
+        room.write_bytes(b"gerade im Entstehen, noch keine Datenbank" * 100)
+        await user.open(f"/runs/{run_id}?kanal=main")
+        try:
+            await see(user, "nicht gefunden", retries=200)
+        finally:
+            room.unlink()
+            room_may_come.set()
+        await see(user, "Senden", retries=400)
+        assert "nicht gefunden" not in page_html(user)
+        await api.run_action(run_id, RunAction.STOP)
+        await until_final(api, run_id)
+
+
+async def test_failure_on_the_open_page_shows_the_flow_at_the_error(
+    wf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review W3-02 G4: like after reloading, „Ablauf“ opens and the agents are not „wartet“."""
+    fail_now = asyncio.Event()
+
+    async def failing_topology(_manager: RunManager) -> None:
+        await fail_now.wait()
+        raise RuntimeError("Topologie kaputt")
+
+    monkeypatch.setattr(RunManager, "_run_topology", failing_topology)
+    api = make_api(wf)
+    async with real_user(api) as user:
+        started = await api.start_run(FORM)
+        run_id = started.run_id
+        await until_status(api, run_id, RunStatus.RUNNING)
+        await user.open(f"/runs/{run_id}?kanal=main")
+        try:
+            html = await see(user, "Steckbrief #main", retries=200)
+            assert "wartet</span>" in html
+        finally:
+            fail_now.set()
+        html = await see(user, 'data-open-at="log-fehler"', retries=600)
+        assert "Topologie kaputt" in html and "Steckbrief #main" not in html
+        assert "wartet</span>" not in html and "fertig</span>" in html
+
+
 async def test_deep_link_opened_too_early_finds_its_agent(wf: Path) -> None:
     scripts = {"m-1": turns([say("vom Agenten"), wait(30)]), "m-2": turns([wait(30)])}
     api = make_api(wf, scripts)
@@ -694,6 +789,34 @@ async def test_message_wakes_an_agent_with_visible_delivery_and_the_answer_appea
         await until_final(api, run_id)
 
 
+async def test_delivery_follows_the_state_past_the_first_hint(wf: Path) -> None:
+    """Review W3-02 M1: `b` gets a hint at once, `a` is woken later; the page must show that."""
+    form = json.loads(json.dumps(EVENT_FORM))
+    form["groupchats"][0]["debounce_s"] = 0.8
+    scripts = {
+        "a": turns([say("bereit")], [done()]),
+        "b": turns([say("los"), wait(4), done()]),
+    }
+    api = make_api(wf, scripts)
+    async with real_user(api) as user:
+        run_id = (await api.start_run(form)).run_id
+        await until_status(api, run_id, RunStatus.RUNNING)
+        await user.open(f"/runs/{run_id}?kanal=main")
+        await see(user, "Senden", retries=200)
+
+        async def only_b_works() -> bool:
+            states = {a.id: a.state.value for a in await api.list_agents(run_id)}
+            return states["b"] == "working" and states["a"] != "working"
+
+        await until(only_b_works, what="only b working")
+        request = PostMessageRequest(body="An beide", to=["a", "b"])
+        await api.post_message(run_id, "main", request)
+        await see(user, "zugestellt als Hinweis mitten im Turn", retries=400)
+        await see(user, "a und b geweckt", retries=400)
+        await api.run_action(run_id, RunAction.STOP)
+        await until_final(api, run_id)
+
+
 async def test_message_during_a_turn_is_delivered_as_a_hint(wf: Path) -> None:
     scripts = {
         "m-1": turns([say("los"), wait(30)]),
@@ -714,6 +837,22 @@ async def test_message_during_a_turn_is_delivered_as_a_hint(wf: Path) -> None:
         await see(user, "zugestellt als Hinweis mitten im Turn", retries=400)
         await api.run_action(run_id, RunAction.STOP)
         await until_final(api, run_id)
+
+
+async def test_channel_head_counts_live_and_in_the_singular(wf: Path) -> None:
+    """Review W3-02 G5."""
+    folder = make_run_folder(wf, status=RunStatus.RUNNING, agents=["a"])
+    lock = hold_lock(folder)
+    try:
+        async with real_user(make_api(wf)) as user:
+            await user.open(f"/runs/{folder.name}?kanal=main")
+            html = await see(user, "1 Mitglied<")
+            assert "1</span> Nachricht" in html  # the channel's profile
+            assert "1</span> Nachrichten" not in html
+            RoomStore(folder).post("main", "Noch eine")
+            await see(user, "2</span> Nachrichten")
+    finally:
+        lock.release()
 
 
 async def test_terminal_run_has_no_input_bar(wf: Path) -> None:
@@ -739,7 +878,8 @@ async def test_slim_from_the_run_detail_in_three_clicks(wf: Path) -> None:
         await see(user, "Verschlanken …")
         user.find(marker="slim").click()  # the ⋯ menu is the first click (<details>)
         html = await see(user, "verschlanken?")
-        assert "Frei werden bis zu" in html and "Es bleiben Transkripte" in html
+        assert "Frei werden bis zu" in html and "Es bleiben Gruppenchats" in html
+        assert "nicht rückgängig" in html
         assert "logische Größe" in html
         user.find(marker="dialog-confirm").click()
         html = await see(user, ">verschlankt<", retries=200)
@@ -747,3 +887,39 @@ async def test_slim_from_the_run_detail_in_three_clicks(wf: Path) -> None:
         assert not (folder / "agents" / "a" / "work").exists()
         await user.open("/runs")
         await see(user, ">verschlankt<")
+
+
+# --- Meldungen der Prüfliste ------------------------------------------------------------------
+
+
+async def test_without_profiles_the_message_links_to_the_profiles_page(
+    wf: Path, arr_home: Path
+) -> None:
+    """Review W3-02 M4: no path, YAML or command (§8.4, E18), and no check mark next to it."""
+    (arr_home / "profiles.yaml").unlink()
+    api = make_api(wf)
+    result = await api.resolve_run(FORM)
+    [issue] = result.errors
+    assert issue.path == "profile" and issue.action is not None
+    assert issue.action.url == "/profile?neu=1"
+    for word in ("profiles.yaml", "version:", "arr auth", str(arr_home)):
+        assert word not in issue.message
+    with pytest.raises(ApiException) as error:
+        await api.start_run(FORM)
+    assert error.value.error.message == issue.message
+    async with real_user(api) as user:
+        await user.open("/neuer-run?skill=runde&projekt=demo")
+        html = await see(user, "Profil anlegen", retries=200)
+        assert 'href="/profile?neu=1"' in html
+        assert "Profile vorhanden" not in html and "Rollen und Skills gefunden" not in html
+
+
+async def test_check_list_has_no_check_mark_next_to_a_missing_role(wf: Path) -> None:
+    """Review W3-02 G1."""
+    (wf / "skills" / "runde" / "group.yaml").write_text(
+        GROUP.replace("{id: m, count: 2}", "{id: m, count: 2, role: roles/fehlt.md}")
+    )
+    async with real_user(make_api(wf)) as user:
+        await user.open("/neuer-run?skill=runde&projekt=demo")
+        html = await see(user, "fehlt.md", retries=200)
+        assert "Rollen und Skills gefunden" not in html

@@ -787,10 +787,20 @@ class Orchestrator(RunContext):
         self.room.add_wakeup(agent_id)
         return count
 
-    def mark_delivered(self, msg_ids: Sequence[int], status: DeliveryStatus) -> None:
-        """Set the delivery state of the `user` messages among `msg_ids` (docs/08 §5.0)."""
+    def mark_delivered(self, msg_ids: Sequence[int], status: DeliveryStatus, agent_id: str) -> None:
+        """Set the delivery state of the `user` messages that reached `agent_id` (docs/08 §5.0).
+
+        The state comes from the addressees: an agent the message is not for changes nothing,
+        and a hint does not take back „geweckt“ of another addressee.
+        """
         for msg_id in msg_ids:
-            if self.sender_of(msg_id) == USER:
+            if self.sender_of(msg_id) != USER:
+                continue
+            msg = self.room.message(msg_id)
+            if msg.to and agent_id not in msg.to:
+                continue
+            woken = msg.delivery is not None and msg.delivery.status is DeliveryStatus.WOKEN
+            if status is not DeliveryStatus.HINT_MID_TURN or not woken:
                 self.room.set_delivery(msg_id, status)
 
     def listen(self, listener: _Listener) -> None:
@@ -886,7 +896,7 @@ class Orchestrator(RunContext):
         del active.pending[: len(messages)]
         ids = [m.id for m in messages]
         self.log.write("hint", agent=agent_id, text=text, messages=ids)
-        self.mark_delivered(ids, DeliveryStatus.HINT_MID_TURN)
+        self.mark_delivered(ids, DeliveryStatus.HINT_MID_TURN, agent_id)
 
     # ----------------------------------------------------------------------------------------
     # Stop, limits, pause

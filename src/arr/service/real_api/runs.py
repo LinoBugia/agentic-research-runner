@@ -25,6 +25,7 @@ from typing import Any
 
 from arr.errors import ArrError, ConfigError, ConfigIssue
 from arr.models import (
+    ProfilesFile,
     Provider,
     ResolvedRun,
     RunInput,
@@ -34,11 +35,13 @@ from arr.models import (
 )
 from arr.resolve import dump_yaml_model, validate_model
 from arr.room.types import DeliveryStatus, MessageVia
+from arr.room.types import Message as RoomMessage
 from arr.runs.launch import Launch, plan_run_input, request_stop, reserve_run, run_launch
 from arr.runs.manager import RunManager, set_run_status
 from arr.runs.prepare import _check_codex_toolchain, _make_plan
 from arr.service.api_client import count_active, count_runs_waiting
 from arr.service.api_models import (
+    Action,
     ActionResult,
     AgentChanges,
     AgentState,
@@ -77,6 +80,7 @@ from arr.service.real_api.rundir import (
     log_entries,
     messages_page,
     model_label,
+    open_escalation_id,
     role_label,
     run_detail,
     run_results,
@@ -95,14 +99,24 @@ TERMINAL_HINT = (
     "Der Run läuft im Terminal („arr run“), nicht in arr selbst. Von hier geht nur Stoppen; "
     "Pausieren, Fortsetzen und Nachrichten gehen bei Runs, die du in arr gestartet hast."
 )
+ESCALATION_HINT = (
+    "Der Run wartet auf eine Entscheidung in der GUI. Weiter geht es nur über die Eskalation."
+)
 FINISHED_HINT = "Der Run ist beendet. {what} geht nur bei einem laufenden Run."
 TASK_MISSING = "Die Aufgabe fehlt. Schreib, woran die Agenten arbeiten sollen."
 TASK_PLACEHOLDER = "(noch keine Aufgabe)"
 """Stands in for an empty task while the form is checked: the rest can already be shown."""
+NO_PROFILE = FieldIssue(
+    path="profile",
+    message="Es gibt noch kein Auth-Profil. Ohne Zugang können keine Agenten starten, das "
+    "Einrichten dauert etwa 2 Minuten.",
+    action=Action(label="Profil anlegen", url="/profile?neu=1"),
+)
+"""`load_profiles` explains a missing file for the terminal; here a link does that (E18)."""
 SOLO_AGENT = "solver"
 """The one agent of a run without a skill (docs/08 §5.4 „Ohne Skill“)."""
 DELIVERY_POLL_S = 0.25
-DELIVERED = (DeliveryStatus.HINT_MID_TURN, DeliveryStatus.WOKEN)
+DELIVERY_POLL_MAX_S = 1.0
 _AGENT_PATH = re.compile(r"agents\[(\d+)\]\.(\w+)")
 _FORM_PATHS = {"task": "task_md", "task_file": "task_md", "limits.wall_time": "limits.wall_time_s"}
 
@@ -212,6 +226,15 @@ def _field_issues(exc: ConfigError) -> list[FieldIssue]:
     return out
 
 
+def _delivery_settled(message: RoomMessage) -> bool:
+    """True if the state cannot change: „geweckt“ stays, a hint to the only addressee too.
+    Otherwise another addressee can still be woken, up to the end of the run."""
+    status = message.delivery.status if message.delivery is not None else None
+    return status is DeliveryStatus.WOKEN or (
+        status is DeliveryStatus.HINT_MID_TURN and len(message.to) == 1
+    )
+
+
 def stored_run(resolved: ResolvedRun) -> ResolvedRun:
     """`resolved` as `prepare_run` writes it to `run.yaml`."""
     return resolved.model_copy(update={"task": None, "task_file": "task.md"})
@@ -228,6 +251,10 @@ def _check_prepared(launch: Launch) -> None:
     catalog = discover_skills(root / "skills")
     _make_plan(root, project, resolved, catalog, None, launch.profiles, False)
     _check_codex_toolchain(root, resolved, launch.settings)
+
+
+class _NoProfile(ArrError):
+    """`profiles.yaml` does not exist yet."""
 
 
 class RunsArea:
@@ -384,6 +411,8 @@ class RunsArea:
         handle = self.state.registry.get(run_id)
         owned = self.state.registry.owns(run_id)
         if owned and handle is not None:
+            if action is RunAction.RESUME:
+                self._refuse_open_escalation(record)
             message = self._own_action(handle, action, status, dry_run=dry_run)
         else:
             message = self._foreign_action(record, action, dry_run=dry_run)
@@ -402,6 +431,18 @@ class RunsArea:
                 )
             )
         return result.model_copy(update={"run": summary})
+
+    def _refuse_open_escalation(self, record: RunRecord) -> None:
+        """Only the card decides an escalation (docs/07 §6, docs/08 §6.7)."""
+        item_id = open_escalation_id(record)
+        if item_id is not None:
+            url = f"/freigaben/{item_id}"
+            raise ApiException.of(
+                ErrorCode.NOT_ALLOWED,
+                ESCALATION_HINT,
+                gui_url=f"{self.state.base_url}{url}",
+                action=Action(label="Eskalation ansehen", url=url),
+            )
 
     def _own_action(
         self, handle: RunHandle, action: RunAction, status: RunStatus, *, dry_run: bool
@@ -475,12 +516,14 @@ class RunsArea:
         return to_message(posted)
 
     async def _follow_delivery(self, handle: RunHandle, msg_id: int) -> None:
-        """Publish a `user` message again when its delivery state changes, until it reached
-        the agents or the run is over. The watcher only reports new message IDs."""
+        """Publish a `user` message again when its delivery state changes, until the state is
+        settled or the run is over. The watcher only reports new message IDs."""
         record = self.state.store.get(handle.run_id)
         shown = None
+        delay = DELIVERY_POLL_S
         while record is not None:
-            await asyncio.sleep(DELIVERY_POLL_S)
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, DELIVERY_POLL_MAX_S)
             store = record.room.store
             try:
                 message = store.message(msg_id) if store is not None else None
@@ -489,6 +532,7 @@ class RunsArea:
             delivery = message.delivery if message is not None else None
             if message is not None and delivery is not None and delivery.status != shown:
                 shown = delivery.status
+                delay = DELIVERY_POLL_S
                 hub = self.state.hub
                 hub.publish(
                     ChannelMessageEvent(
@@ -498,10 +542,18 @@ class RunsArea:
                         message=to_message(message),
                     )
                 )
-            if shown in DELIVERED or handle.done:
+            if (message is not None and _delivery_settled(message)) or handle.done:
                 return
 
     # -- resolving and starting --------------------------------------------------------------
+
+    def _profiles(self) -> ProfilesFile:
+        try:
+            return self.state.profiles()
+        except ConfigError:
+            raise
+        except ArrError as exc:
+            raise _NoProfile(exc.message) from None
 
     def _plan(self, run_input: dict[str, Any]) -> Launch:
         """A `Launch` from a run input; `ConfigError`/`ArrError` for problems."""
@@ -512,7 +564,7 @@ class RunsArea:
                 validate_model(RunInput, data, source="Neuer Run"),
                 workfolder=self.state.workfolder,
                 params=params,
-                profiles=self.state.profiles(),
+                profiles=self._profiles(),
                 source="Neuer Run",
             )
 
@@ -543,6 +595,8 @@ class RunsArea:
             launch = await asyncio.to_thread(self._plan, run_input)
         except ConfigError as exc:
             return ResolveResult(resolved_run_yaml="", errors=[*missing, *_field_issues(exc)])
+        except _NoProfile:
+            return ResolveResult(resolved_run_yaml="", errors=[*missing, NO_PROFILE])
         except ArrError as exc:
             return ResolveResult(
                 resolved_run_yaml="", errors=[FieldIssue(path="", message=exc.message)]
@@ -616,6 +670,10 @@ class RunsArea:
         except ConfigError as exc:
             raise ApiException.of(
                 ErrorCode.CONFIG_INVALID, exc.issues[0].message, issues=_field_issues(exc)
+            ) from None
+        except _NoProfile:
+            raise ApiException.of(
+                ErrorCode.CONFIG_INVALID, NO_PROFILE.message, issues=[NO_PROFILE]
             ) from None
         except ArrError as exc:
             raise ApiException.of(ErrorCode.CONFIG_INVALID, exc.message) from None

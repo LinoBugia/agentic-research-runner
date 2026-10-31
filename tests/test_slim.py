@@ -8,6 +8,7 @@ import pytest
 from run_kit import write_profiles
 from service_kit import hold_lock, make_run_folder, make_workfolder
 
+from arr.errors import ArrError
 from arr.models import RunStatus
 from arr.room.store import RoomStore
 from arr.runs import slim as slim_module
@@ -108,6 +109,81 @@ async def test_slim_removes_copies_and_venv_keeps_protocols_and_stays_readable(
     detail = await api.get_run(run_dir.name)
     assert detail.run.slimmed and RunAction.SLIM not in detail.actions_allowed
     assert any(isinstance(e, RunStatusEvent) and e.run.slimmed for e in sub.drain())
+
+
+async def test_dry_run_is_final_and_names_only_what_is_there(wf: Path, api: RealApi) -> None:
+    run_dir = finished_run(wf)
+    result = await api.run_action(run_dir.name, RunAction.SLIM, dry_run=True)
+    assert "nicht rückgängig" in result.message and "endgültig" not in result.message
+    (run_dir / "usage.json").unlink()
+    result = await api.run_action(run_dir.name, RunAction.SLIM, dry_run=True)
+    assert "Es bleiben Transkripte, Roh-Events, Diffs, Gruppenchats und Output." in result.message
+
+
+async def test_dry_run_warns_when_the_work_is_saved_nowhere_else(wf: Path, api: RealApi) -> None:
+    """Review W3-02 M2: an interrupted run went through no finalizer, so it has no diffs."""
+    run_dir = finished_run(wf, RunStatus.INTERRUPTED)
+    (run_dir / "usage.json").unlink()
+    (run_dir / "output" / "summary.md").unlink()
+    for agent in ("a", "b"):
+        (run_dir / "agents" / agent / "changes.diff").unlink()
+    result = await api.run_action(run_dir.name, RunAction.SLIM, dry_run=True)
+    assert "Die Arbeit der Agenten in den Arbeitskopien ist danach endgültig weg." in result.message
+    assert "nicht rückgängig" in result.message
+    assert "Es bleiben Transkripte, Roh-Events" in result.message
+    assert "Diffs" not in result.message and "Usage" not in result.message
+
+
+async def test_read_only_lock_gives_a_message_not_a_crash(wf: Path, api: RealApi) -> None:
+    """Review W3-02 G2."""
+    run_dir = finished_run(wf)
+    lock = run_dir / "run.lock"
+    lock.write_text("", "utf-8")
+    lock.chmod(0o400)
+    with pytest.raises(ApiException) as error:
+        await api.run_action(run_dir.name, RunAction.SLIM)
+    assert error.value.error.code is ErrorCode.NOT_ALLOWED
+    assert "nichts gelöscht" in error.value.error.message
+    assert (run_dir / "base").is_dir() and not (run_dir / SLIM_MARKER).exists()
+
+
+async def test_unreadable_agents_folder_gives_a_message_in_the_preview(
+    wf: Path, api: RealApi
+) -> None:
+    run_dir = finished_run(wf)
+    agents = run_dir / "agents"
+    agents.chmod(0)
+    try:
+        with pytest.raises(ApiException) as error:
+            await api.run_action(run_dir.name, RunAction.SLIM, dry_run=True)
+        assert "nicht verschlankt" in error.value.error.message
+    finally:
+        agents.chmod(0o755)
+
+
+@pytest.mark.parametrize("name", [SLIM_MARKER, "run.lock"])
+async def test_link_at_marker_or_lock_refuses_the_run(wf: Path, tmp_path: Path, name: str) -> None:
+    """Review W3-02 G3: nothing is written through a link, and nothing goes."""
+    run_dir = finished_run(wf)
+    outside = tmp_path / "draussen.txt"
+    (run_dir / name).unlink(missing_ok=True)
+    (run_dir / name).symlink_to(outside)
+    with pytest.raises(ArrError, match="ist ein Link"):
+        slim_run(run_dir)
+    assert not outside.exists()
+    assert (run_dir / "base").is_dir() and (run_dir / "agents" / "a" / "work").is_dir()
+
+
+def test_marker_never_goes_through_a_link_that_appears_late(
+    wf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = finished_run(wf)
+    outside = tmp_path / "draussen.txt"
+    (run_dir / SLIM_MARKER).symlink_to(outside)
+    monkeypatch.setattr(slim_module, "_refuse_links", lambda folder: None)
+    with pytest.raises(ArrError, match="nicht ganz verschlankt"):
+        slim_run(run_dir)
+    assert not outside.exists()
 
 
 async def test_second_slim_is_refused(wf: Path, api: RealApi) -> None:

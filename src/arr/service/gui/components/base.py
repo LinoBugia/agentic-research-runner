@@ -146,5 +146,7 @@ def markdown_html(source: str) -> str:
         return f"ARRMATH{len(spans) - 1}END"
 
     marked = _MATH_RE.sub(keep, source)
-    rendered = markdown2.markdown(marked, safe_mode="escape", extras=["fenced-code-blocks"])
+    # `_` inside a word is no emphasis: run IDs and snake_case keep their underscores
+    extras = {"fenced-code-blocks": None, "middle-word-em": False}
+    rendered = markdown2.markdown(marked, safe_mode="escape", extras=extras)
     return re.sub(r"ARRMATH(\d+)END", lambda m: spans[int(m.group(1))], rendered)

@@ -10,7 +10,8 @@ chats, output and usage stay. This is the one place of W3-02 that deletes data, 
 - Nothing is followed through a symlink: a link at a target is removed as a link, a linked
   `agents` or `agents/<id>` is left alone, and `rmtree` does not descend into links.
 - Only a finished run without a held `run.lock` is slimmed, and `slim_run` holds that lock
-  while it deletes.
+  while it deletes. A link at `run.lock` or `slimmed.json` refuses the run: nothing is written
+  through a link either.
 
 `slimmed.json` in the run folder marks the end; a slim that failed halfway has no mark and can
 be repeated.
@@ -26,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from arr.errors import ArrError
-from arr.runs.inspect import RunLock, run_lock_held
+from arr.runs.inspect import RUN_LOCK, RunLock, run_lock_held
 from arr.runs.prepare import load_run_meta, run_venv_location
 from arr.venvs import run_venv_dir
 
@@ -39,15 +40,31 @@ _RUN_DIRS = ("base", "shared")
 _AGENTS = "agents"
 _WORK = "work"
 _LEGACY_VENV = ".venv"
+_DIFF = "changes.diff"
+_KEPT = (
+    ("Transkripte", "agents/*/transcript.jsonl"),
+    ("Roh-Events", "agents/*/raw.jsonl"),
+    ("Diffs", f"agents/*/{_DIFF}"),
+    ("Gruppenchats", "groupchats/room.sqlite"),
+    ("Output", "output/*"),
+    ("Usage", "usage.json"),
+)
+"""What stays, with the German name for the dialog; only what is really there is named."""
 
 
 @dataclass(frozen=True, slots=True)
 class SlimPlan:
-    """What `slim_run` would remove; `logical_bytes` is the sum of the file sizes."""
+    """What `slim_run` would remove; `logical_bytes` is the sum of the file sizes.
+
+    `kept` names what stays. `unsaved`: a working copy has no diff, because the run was not
+    finalized, so its work exists nowhere else.
+    """
 
     targets: tuple[Path, ...]
     venv: Path | None
     logical_bytes: int
+    kept: tuple[str, ...] = ()
+    unsaved: bool = False
 
 
 def _real_dir(path: Path) -> bool:
@@ -105,9 +122,26 @@ def _check_state(folder: Path) -> None:
         raise ArrError("Der Run ist schon verschlankt.")
 
 
+def _refuse_links(folder: Path) -> None:
+    for name in (RUN_LOCK, SLIM_MARKER):
+        if (folder / name).is_symlink():
+            raise ArrError(
+                f"Der Run {folder.name} wurde nicht verschlankt: {name} ist ein Link. Vermutlich "
+                "wurde der Ordner außerhalb von arr verändert. Es wurde nichts gelöscht."
+            )
+
+
+def _unreadable(folder: Path, exc: OSError) -> ArrError:
+    return ArrError(
+        f"Der Run {folder.name} wurde nicht verschlankt: {exc.strerror or exc}. Es wurde nichts "
+        "gelöscht. Prüfe die Rechte des Run-Ordners und versuche es noch einmal."
+    )
+
+
 def check_slimmable(run_dir: str | Path) -> None:
     """`ArrError` with the German reason when the run may not be slimmed."""
     folder = Path(run_dir)
+    _refuse_links(folder)
     _check_state(folder)
     if run_lock_held(folder):
         raise ArrError(
@@ -116,14 +150,19 @@ def check_slimmable(run_dir: str | Path) -> None:
 
 
 def plan_slim(run_dir: str | Path) -> SlimPlan:
-    """What would go; nothing changes."""
+    """What would go and what stays; nothing changes."""
     folder = Path(run_dir)
-    targets = _targets(folder)
-    venv = _venv_target(folder)
-    size = sum(_logical_size(p) for p in targets)
-    if venv is not None:
-        size += _logical_size(venv)
-    return SlimPlan(tuple(targets), venv, size)
+    try:
+        targets = _targets(folder)
+        venv = _venv_target(folder)
+        size = sum(_logical_size(p) for p in targets)
+        if venv is not None:
+            size += _logical_size(venv)
+        kept = tuple(name for name, found in _KEPT if next(folder.glob(found), None))
+        unsaved = any(p.name == _WORK and not (p.parent / _DIFF).is_file() for p in targets)
+    except OSError as exc:
+        raise _unreadable(folder, exc) from None
+    return SlimPlan(tuple(targets), venv, size, kept, unsaved)
 
 
 def _open_up(root: Path) -> None:
@@ -147,6 +186,12 @@ def _remove(path: Path) -> None:
     shutil.rmtree(path)
 
 
+def _write_marker(folder: Path, marker: dict[str, object]) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    with os.fdopen(os.open(folder / SLIM_MARKER, flags, 0o644), "w", encoding="utf-8") as file:
+        file.write(json.dumps(marker, indent=1) + "\n")
+
+
 def slim_run(run_dir: str | Path) -> SlimPlan:
     """Slim a finished run; returns what was removed. `ArrError` if it may not or failed."""
     folder = Path(run_dir)
@@ -154,7 +199,10 @@ def slim_run(run_dir: str | Path) -> SlimPlan:
         raise ArrError(f"Der Run-Ordner {folder.name} ist ein Link und wird nicht verschlankt.")
     check_slimmable(folder)
     lock = RunLock(folder)
-    lock.acquire()
+    try:
+        lock.acquire()
+    except OSError as exc:
+        raise _unreadable(folder, exc) from None
     try:
         _check_state(folder)
         plan = plan_slim(folder)
@@ -163,19 +211,21 @@ def slim_run(run_dir: str | Path) -> SlimPlan:
                 _remove(path)
             if plan.venv is not None:
                 _remove(plan.venv)
+            _write_marker(
+                folder,
+                {
+                    "version": 1,
+                    "ts": time.time(),
+                    "logical_bytes": plan.logical_bytes,
+                    "removed": [str(p.relative_to(folder)) for p in plan.targets],
+                    "run_venv": plan.venv is not None,
+                },
+            )
         except OSError as exc:
             raise ArrError(
                 f"Der Run {folder.name} wurde nicht ganz verschlankt: {exc.strerror or exc}. "
                 "Transkripte und Chat sind unverändert, du kannst es noch einmal versuchen."
             ) from None
-        marker = {
-            "version": 1,
-            "ts": time.time(),
-            "logical_bytes": plan.logical_bytes,
-            "removed": [str(p.relative_to(folder)) for p in plan.targets],
-            "run_venv": plan.venv is not None,
-        }
-        (folder / SLIM_MARKER).write_text(json.dumps(marker, indent=1) + "\n", encoding="utf-8")
         return plan
     finally:
         lock.release()

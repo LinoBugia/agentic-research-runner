@@ -20,6 +20,7 @@ from arr.models import Decider
 from arr.permissions.types import ApprovalStatus, ApprovalType, DecisionAction
 from arr.service.api_client import ApiClient
 from arr.service.api_models import (
+    Action,
     ApiException,
     ApprovalItem,
     DecisionRequest,
@@ -72,6 +73,8 @@ DECIDER_CHOICES = [
 ]
 WORKSPACE = {"copy": "Kopie", "shared": "gemeinsam", "empty": "leer · liest Output"}
 NO_SKILL = ""
+NO_FIELD = "profile"
+"""Path of a check whose way out is a link to another page, not a field of this form."""
 EXAMPLE_TASK = (
     "# Aufgabe\n\n## Aussage / Forschungsfrage\nWie verteilen sich die Stoppzeiten der "
     "Collatz-Abbildung für $n < 10^6$?\n\n## Kontext\nnotes/stand.md\n\n"
@@ -481,7 +484,8 @@ class NeuerRunPage:
                     if skill is None:
                         sub = "Ein Agent, Topologie solo. Weitere Agenten kommen später."
                     else:
-                        sub = f"{skill.description} · {skill.agents_count or '?'} Agenten"
+                        n = skill.agents_count or "?"
+                        sub = f"{skill.description} · {n} Agent{'' if n == 1 else 'en'}"
                         if not skill.valid:
                             sub = "⚠ ungültig: " + (
                                 skill.issues[0].message if skill.issues else "Prüfung"
@@ -1367,7 +1371,9 @@ class NeuerRunPage:
                 else ('<span class="st todo" aria-hidden="true">○</span>')
             )
             links = "".join(
-                f'<small><a class="jump{"" if shown else " todo"}" '
+                f"<small>{esc(i.message)} {_action_link(i.action)}</small>"
+                if i.action is not None and i.path == NO_FIELD
+                else f'<small><a class="jump{"" if shown else " todo"}" '
                 f'href="#{esc(_anchor(i.path))}" '
                 f'data-jump="{esc(_anchor(i.path))}">{esc(i.message)}</a></small>'
                 for i in errors
@@ -1380,12 +1386,13 @@ class NeuerRunPage:
                 '<div class="check"><span class="st warn" aria-hidden="true">!</span>'
                 f'<span class="txt small">{esc(warning)}</span></div>'
             )
-        if not any(i.path == "skill" for i in errors):
+        checked = bool(result.resolved_run_yaml)  # without a plan nothing was looked up
+        if checked and not any(_about_skills(i.path) for i in errors):
             lines.append(
                 '<div class="check"><span class="st ok" aria-hidden="true">✓</span>'
                 '<span class="txt small">Rollen und Skills gefunden</span></div>'
             )
-        if not any(i.path.startswith("agents.") for i in errors):
+        if checked and not any(i.path.startswith("agents.") for i in errors):
             tested = [p.last_test.ts for p in self.profiles if p.last_test and p.last_test.ok]
             word = "Profile vorhanden"
             if tested:
@@ -1448,7 +1455,9 @@ class NeuerRunPage:
         self.top.clear()
         issues = exc.error.issues
         links = "".join(
-            f'<li><a href="#{esc(_anchor(i.path))}" data-jump="{esc(_anchor(i.path))}">'
+            f"<li>{esc(i.message)} {_action_link(i.action)}</li>"
+            if i.action is not None and i.path == NO_FIELD
+            else f'<li><a href="#{esc(_anchor(i.path))}" data-jump="{esc(_anchor(i.path))}">'
             f'{esc(i.message)}</a> <span class="mono small faint">{esc(i.path)}</span></li>'
             for i in issues
         )
@@ -1461,6 +1470,15 @@ class NeuerRunPage:
                 + "</div></div>"
             )
         self.frame.js("window.scrollTo({top: 0})")
+
+
+def _action_link(action: Action) -> str:
+    """The „[Aktion]“ of a message (§8.4)."""
+    return f'<a href="{esc(action.url)}">{esc(action.label)}</a>'
+
+
+def _about_skills(path: str) -> bool:
+    return path == "skill" or path.endswith((".role", ".skills"))
 
 
 def _anchor(path: str) -> str:

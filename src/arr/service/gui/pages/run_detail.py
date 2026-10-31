@@ -434,15 +434,21 @@ class RunDetailPage:
         agents = {a.id: a for a in await self.api.list_agents(self.run_id)}
         channels = {c.name: c for c in await self.api.list_channels(self.run_id)}
         if agents.keys() == self.agents.keys() and channels.keys() == self.channels.keys():
-            return
-        self.agents, self.channels = agents, channels
-        self.cards, self.channel_items = {}, {}
-        self.selection.clear()
-        with self.selection:
-            self._build_selection()
-        self._render_overview_rest()
+            self.channels = channels  # from `run.yaml` until the room is there
+            for agent in agents.values():
+                self._update_agent(agent)
+            self._reorder_cards()
+            for name in channels:
+                self._render_channel_item(name)
+        else:
+            self.agents, self.channels = agents, channels
+            self.cards, self.channel_items = {}, {}
+            self.selection.clear()
+            with self.selection:
+                self._build_selection()
+            self._render_overview_rest()
         if self.view is None and self.tab == "verlauf":
-            await self._select_initial()  # a deep link waited for its agent or channel
+            await self._select_initial()  # a deep link waited, or the source was not ready
 
     async def _sync_opened_channels(self) -> None:
         """A new stage may open channels (`open_from`, §6.5)."""
@@ -864,12 +870,19 @@ class RunDetailPage:
         self._render_overview_cards()
         if old is self.status:
             return
-        if isinstance(self.view, ChannelView):
-            self.view.refresh_status()
         # the finalizer wrote the summary: it arrives without a result event
         self.results = await self.api.get_results(self.run_id)
         self._render_tabs()
-        if isinstance(self.view, ResultsView):
+        if self.status is RunStatus.FAILED:
+            self._last_verlauf = self._last_verlauf or ("kanal", self._default_channel())
+            await self.select("ansicht", "ablauf")  # opens at the marked error (§6.7)
+        elif isinstance(self.view, ChannelView):
+            if old in (RunStatus.QUEUED, RunStatus.PREPARING):
+                # built before the room: now aliases and messages are there (§5.5 „leer“)
+                await self.select("msg", self.view.name, msg_id=self.view.jump_to, push=False)
+            else:
+                self.view.refresh_status()
+        elif isinstance(self.view, ResultsView):
             await self.view.refresh()
         self._render_overview_rest()
 
@@ -958,6 +971,7 @@ class RunDetailPage:
         if isinstance(view, ChannelView) and view.name == msg.channel:
             view.info = self.channels[msg.channel]
             view.add_live(msg)
+            view.refresh_head()
         self._render_channel_item(msg.channel)
 
     async def _flush(self) -> None:

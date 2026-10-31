@@ -537,3 +537,10 @@ async def test_waiting_agents_of_generic_runs_have_their_tool_call(load_api: Moc
         assert "wartet auf deine Freigabe" in view
         assert "Noch keine Ereignisse" not in view
         assert html(user, "tc-card-apr_1203")
+
+
+def test_underscores_inside_a_word_are_no_emphasis() -> None:
+    """Review W3-02 G8: run IDs in headings keep their underscores."""
+    out = markdown_html("# Run 20261030-2128_demo_runde_629f\n\n_kursiv_ und snake_case_name")
+    assert "20261030-2128_demo_runde_629f" in out and "snake_case_name" in out
+    assert "<em>kursiv</em>" in out

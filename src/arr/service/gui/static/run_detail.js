@@ -247,6 +247,13 @@
     const box = currentBox();
     if (box && box._rdFollow) box._rdFollow(true);
   };
+  // A chosen addressee makes the message a question, unless you picked the kind yourself (E6).
+  document.addEventListener("change", (e) => {
+    const form = e.target.closest && e.target.closest("form.composer");
+    if (!form) return;
+    if (e.target.name === "kind") form.kind.dataset.chosen = "1";
+    else if (e.target.name === "to" && !form.kind.dataset.chosen) form.kind.value = form.to.value ? "question" : "note";
+  });
   rd.sent = function () {
     const body = document.getElementById("cmp-body");
     if (body) {

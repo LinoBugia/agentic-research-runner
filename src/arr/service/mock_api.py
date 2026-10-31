@@ -5485,7 +5485,8 @@ class MockApi:
             return ActionResult(
                 ok=True,
                 message=f"Frei werden bis zu {_size_text(freed or 0)}: Arbeitskopien und Snapshot."
-                "\nEs bleiben Transkripte, Roh-Events, Diffs, Gruppenchats, Output und Usage.",
+                "\nEs bleiben Transkripte, Roh-Events, Diffs, Gruppenchats, Output und Usage."
+                "\nDas lässt sich nicht rückgängig machen.",
                 freed_bytes=freed,
             )
         if dry_run:

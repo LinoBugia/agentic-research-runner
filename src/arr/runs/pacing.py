@@ -486,7 +486,7 @@ class _EventDiscussion:
             messages=wake.messages,
             count=count,
         )
-        self.orch.mark_delivered(wake.messages, DeliveryStatus.WOKEN)
+        self.orch.mark_delivered(wake.messages, DeliveryStatus.WOKEN, member)
         self._start(tg, member, _WAKE_PROMPT.format(channel=self.config.name, reason=reason))
 
     def _ended(self, now: float) -> DiscussionEnd | None:

@@ -19,7 +19,11 @@ ORDER = "W5-01"
 STORAGE_ACTIONS = frozenset({RunAction.ARCHIVE, RunAction.DELETE, RunAction.PIN, RunAction.UNPIN})
 """Run actions that are `unavailable` until W5-01."""
 
-SLIM_KEEPS = "Transkripte, Roh-Events, Diffs, Gruppenchats, Output und Usage"
+SLIM_UNSAVED = (
+    "Achtung: Dieser Run wurde nicht abgeschlossen, seine Änderungen sind nirgends gesichert. "
+    "Die Arbeit der Agenten in den Arbeitskopien ist danach endgültig weg."
+)
+SLIM_FINAL = "Das lässt sich nicht rückgängig machen."
 SLIM_CLONE_HINT = (
     "Das ist die logische Größe. Arbeitskopien sind APFS-Klone: Bei unverändertem Projekt wird "
     "nur der Platz der geänderten Dateien frei."
@@ -28,6 +32,16 @@ SLIM_CLONE_HINT = (
 
 def _removes(plan: SlimPlan) -> str:
     return "Arbeitskopien, Snapshot und Run-venv" if plan.venv else "Arbeitskopien und Snapshot"
+
+
+def _preview(plan: SlimPlan) -> str:
+    """The lines of the dialog: what goes, what really stays, that it is final (§8.6)."""
+    lines = [f"Frei werden bis zu {fmt.size(plan.logical_bytes)}: {_removes(plan)}."]
+    if plan.unsaved:
+        lines.append(SLIM_UNSAVED)
+    if plan.kept:
+        lines.append(f"Es bleiben {fmt.join_de(list(plan.kept))}.")
+    return "\n".join([*lines, SLIM_FINAL, SLIM_CLONE_HINT])
 
 
 class StorageArea:
@@ -49,11 +63,7 @@ class StorageArea:
             if dry_run:
                 check_slimmable(record.run_dir)
                 plan = await asyncio.to_thread(plan_slim, record.run_dir)
-                return ActionResult(
-                    message=f"Frei werden bis zu {fmt.size(plan.logical_bytes)}: {_removes(plan)}."
-                    f"\nEs bleiben {SLIM_KEEPS}.\n{SLIM_CLONE_HINT}",
-                    freed_bytes=plan.logical_bytes,
-                )
+                return ActionResult(message=_preview(plan), freed_bytes=plan.logical_bytes)
             plan = await asyncio.to_thread(slim_run, record.run_dir)
         except ArrError as exc:
             raise not_allowed(exc.message) from None

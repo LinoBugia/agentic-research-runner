@@ -16,6 +16,7 @@ from service_kit import append, make_run_folder, make_workfolder
 
 from arr.models import RunStatus, Starter
 from arr.permissions.types import ApprovalStatus
+from arr.room.store import RoomStore
 from arr.room.types import MessageVia
 from arr.runs.manager import set_run_status
 from arr.service.api_client import ApiClient, count_active, count_runs_waiting
@@ -346,6 +347,107 @@ async def test_pause_resume_and_stop_act_on_own_runs(wf: Path) -> None:
         assert "beendet" in str(error.value)
     finally:
         await api.close()
+
+
+async def test_resume_is_not_offered_and_refused_while_an_escalation_is_open(wf: Path) -> None:
+    """Only the card decides an escalation (docs/07 §6, docs/08 §6.7)."""
+    scripts = {"a": turns([say("los"), wait(30)]), "b": turns([say("ok"), wait(30)])}
+    api = make_api(wf, scripts)
+    await api.start()
+    try:
+        run_id = (await api.start_run(RUN_INPUT)).run_id
+        await until_status(api, run_id, RunStatus.RUNNING)
+        await api.run_action(run_id, RunAction.PAUSE)
+        await until_status(api, run_id, RunStatus.PAUSED)
+        log = wf / "runs" / run_id / "approvals.jsonl"
+        item = {"ts": time.time(), "event": "open", "item_id": "esc_0001", "request": None}
+        append(log, json.dumps(item) + "\n")
+        detail = await api.get_run(run_id)
+        assert detail.run.open_escalation and detail.actions_allowed == [RunAction.STOP]
+        for dry_run in (True, False):
+            with pytest.raises(ApiException) as error:
+                await api.run_action(run_id, RunAction.RESUME, dry_run=dry_run)
+            assert error.value.error.code is ErrorCode.NOT_ALLOWED
+            assert error.value.error.action is not None
+            assert error.value.error.action.url == "/freigaben/esc_0001"
+        assert (await api.get_run(run_id)).run.status is RunStatus.PAUSED
+        append(log, json.dumps({**item, "event": "decided"}) + "\n")
+        assert RunAction.RESUME in (await api.get_run(run_id)).actions_allowed
+        await api.run_action(run_id, RunAction.RESUME)
+        await until_status(api, run_id, RunStatus.RUNNING)
+        await api.run_action(run_id, RunAction.STOP)
+        await until_final(api, run_id)
+    finally:
+        await api.close()
+
+
+async def test_channel_of_run_yaml_without_a_room_is_empty(wf: Path) -> None:
+    """Review W3-02 H1: not „nicht gefunden“; an unknown channel or a broken room still is."""
+    folder = make_run_folder(wf, status=RunStatus.PREPARING, agents=["a"])
+    room_file = folder / "groupchats" / "room.sqlite"
+    room_file.unlink()
+    api = make_api(wf)
+    [channel] = await api.list_channels(folder.name)
+    page = await api.get_messages(folder.name, channel.name)
+    assert page.items == [] and page.total == 0
+    with pytest.raises(ApiException) as error:
+        await api.get_messages(folder.name, "nirgends")
+    assert error.value.error.code is ErrorCode.NOT_FOUND
+    room_file.write_bytes(b"keine Datenbank" * 200)
+    fresh = make_api(wf)
+    with pytest.raises(ApiException):
+        await fresh.get_messages(folder.name, channel.name)
+
+
+async def test_room_without_channels_yet_still_lists_those_of_run_yaml(wf: Path) -> None:
+    folder = make_run_folder(wf, status=RunStatus.PREPARING, agents=["a"])
+    (folder / "groupchats" / "room.sqlite").unlink()
+    RoomStore.create(folder)
+    api = make_api(wf)
+    assert [c.name for c in await api.list_channels(folder.name)] == ["main"]
+    assert (await api.get_messages(folder.name, "main")).total == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "text"),
+    [
+        (RunStatus.DONE, "ist fertig"),
+        (RunStatus.STOPPED, "wurde gestoppt"),
+        (RunStatus.FAILED, "ist fehlgeschlagen"),
+        (RunStatus.INTERRUPTED, "wurde abgebrochen"),
+    ],
+)
+async def test_text_for_claude_code_follows_the_status(
+    wf: Path, status: RunStatus, text: str
+) -> None:
+    """Review W3-02 G8."""
+    folder = make_run_folder(wf, status=status)
+    assert text in (await make_api(wf).get_run(folder.name)).handoff_text
+
+
+@pytest.mark.parametrize(
+    ("agents", "params", "expected"),
+    [
+        ("{id: m, count: 2}", "", 2),
+        ("{id: m, count: 3}\n  - {id: k}", "", 4),
+        (
+            '{id: m, count: "{{ params.n }}"}',
+            "params:\n  n: {default: 4, min: 1, max: 5, doc: n}\n",
+            4,
+        ),
+    ],
+)
+async def test_skill_card_sums_count(wf: Path, agents: str, params: str, expected: int) -> None:
+    """Review W3-02 G6."""
+    group = wf / "skills" / "zaehlt"
+    group.mkdir(parents=True)
+    (group / "SKILL.md").write_text("---\nname: zaehlt\ndescription: Zählt.\n---\n# Z\n", "utf-8")
+    (group / "group.yaml").write_text(
+        f"kind: research-group\nversion: 1\ntopology: roundtable\n{params}agents:\n  - {agents}\n",
+        "utf-8",
+    )
+    skill = await make_api(wf).get_skill("zaehlt")
+    assert skill.agents_count == expected
 
 
 async def test_messages_go_to_own_runs_only(wf: Path) -> None:

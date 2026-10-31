@@ -674,3 +674,62 @@ async def test_w2_05_slow_hint_delivery_blocks_neither_the_room_nor_other_agents
     assert by_agent["b"]["ts"] - message.ts < 0.5, "b waited for a's slow delivery"
     assert by_agent["a"]["ts"] - message.ts >= 1.0
     assert hints(manager.run_dir, "a") and hints(manager.run_dir, "b")
+
+
+@pytest.mark.parametrize("to", [["a"], ["a", "b"]])
+async def test_delivery_state_comes_from_the_addressee(workfolder: Path, to: list[str]) -> None:
+    """Review W3-02 M1: `a` is woken, the hint to `b` arrives after that and changes nothing."""
+
+    async def topology(ctx: RunContext) -> None:
+        await ctx.discuss("main", "Los.", kickoff=True)
+
+    scripts = {"a": turns([say("bereit")], [done()]), "b": turns([wait(1.0), done()])}
+    manager = make_manager(
+        workfolder,
+        topology,
+        scripts,
+        groupchats=[channel("main", ["a", "b"], mode="event", debounce_s=0.05, quiet_after_s=2)],
+    )
+    original = manager.backend_factory
+
+    def factory(prepared: Any) -> Any:
+        backend = original(prepared)
+        if prepared.id == "b":
+            inner = backend.deliver_hint
+
+            async def slow(text: str) -> bool:
+                await asyncio.sleep(0.3)
+                return await inner(text)
+
+            backend.deliver_hint = slow
+        return backend
+
+    manager.backend_factory = factory
+    running = asyncio.create_task(manager.run())
+    await eventually(
+        lambda: (
+            manager.orchestrator is not None
+            and manager.orchestrator.agent_status("a") is AgentStatus.IDLE
+            and "b" in manager.orchestrator._active
+        )
+    )
+    message = manager.room.post("main", "Bitte melde dich.", sender="user", via="gui", to=to)
+    assert await asyncio.wait_for(running, 10) is RunStatus.DONE
+    assert [e["data"]["agent"] for e in log_entries(manager.run_dir, "hint")] == ["b"]
+    assert manager.room.message(message.id).delivery.status is DeliveryStatus.WOKEN
+
+
+async def test_hint_to_another_agent_is_no_delivery_to_the_addressee(workfolder: Path) -> None:
+    async def topology(ctx: RunContext) -> None:
+        await ctx.turns([("b", "arbeite")])
+
+    scripts = {"a": turns([done()]), "b": turns([wait(0.6), done()])}
+    manager = make_manager(workfolder, topology, scripts, groupchats=[channel("main", ["a", "b"])])
+    running = asyncio.create_task(manager.run())
+    await eventually(
+        lambda: manager.orchestrator is not None and "b" in manager.orchestrator._active
+    )
+    message = manager.room.post("main", "Nur für a.", sender="user", via="gui", to=["a"])
+    assert await asyncio.wait_for(running, 10) is RunStatus.DONE
+    assert log_entries(manager.run_dir, "hint"), "b got the message as a hint"
+    assert manager.room.message(message.id).delivery.status is DeliveryStatus.NEXT_INBOX
