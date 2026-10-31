@@ -374,7 +374,7 @@ class EinstellungenPage:
             with card:
                 with ui.element("table").classes("tbl compact"):
                     raw(
-                        "<tr><th>Aktion</th><th>Regel</th><th>Herkunft</th><th></th></tr>",
+                        "<tr><th>Regel</th><th>Aktion</th><th>Herkunft</th><th></th></tr>",
                         tag="thead",
                     )
                     with ui.element("tbody"):
@@ -532,7 +532,7 @@ class EinstellungenPage:
             return ""
         return (
             f'<div class="banner warn" role="status">{icon("warning")}<div class="txt">'
-            f"{esc(notice)}</div></div>"
+            f"<b>{esc(notice.title)}</b> {esc(notice.text)}</div></div>"
         )
 
     def _python(self) -> None:
@@ -588,6 +588,7 @@ class EinstellungenPage:
                     except ApiException as exc:
                         result.set_content(f'<p class="small">{esc(exc.error.message)}</p>')
                         return
+                    detail = f"{esc(outcome.detail)} " if outcome.detail else ""
                     packages = " · ".join(
                         f"{esc(name)} {'✓' if ok else '✗'}" for name, ok in outcome.packages.items()
                     )
@@ -595,7 +596,8 @@ class EinstellungenPage:
                     result.set_content(
                         f'<div class="check"><span class="st {css}" aria-hidden="true">'
                         f'{"✓" if outcome.ok else "!"}</span><span class="txt"><b>'
-                        f"{esc(outcome.message)}</b><small>Pakete: {packages}</small></span></div>"
+                        f"{esc(outcome.message)}</b><small>{detail}Pakete: {packages}</small>"
+                        "</span></div>"
                     )
 
                 async def save() -> None:

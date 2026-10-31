@@ -5,11 +5,13 @@ process is at the end (`service_child.py`, `ARR_TEST_SWITCH`).
 """
 
 import asyncio
+import errno
 import json
 import os
 import re
 import signal
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -29,7 +31,7 @@ from service_kit import (
 )
 from test_policy import env, req  # noqa: F401
 
-from arr.errors import ConfigError
+from arr.errors import ArrError, ConfigError
 from arr.models import Decider, Effort, Provider, RunStatus, RunVenvMode
 from arr.permissions.policy import PermissionRules, PolicyEngine
 from arr.permissions.types import DecisionAction
@@ -50,21 +52,26 @@ from arr.service.api_models import (
     OpenIn,
     ProviderDefaultsInfo,
     RunStatusEvent,
+    Severity,
     WorkfolderRequest,
 )
 from arr.service.real_api import RealApi, live
 from arr.service.real_api.setup import base_venvs, duration_text, toolchain_notice
 from arr.service.state import (
     ServiceInfo,
+    read_app_settings,
     read_service_info,
     recent_workfolders,
+    remember_workfolder,
+    write_app_settings,
     write_service_info,
 )
 from arr.skills import discover_skills
-from arr.venvs import base_venv_dir
+from arr.venvs import base_venv_dir, venv_root
 from arr.workfolder import (
     init_workfolder,
     load_workfolder_settings,
+    os_reason,
     read_template,
     set_setting,
     update_settings_file,
@@ -907,14 +914,15 @@ def test_notice_when_python_lies_below_home(
     settings = load_workfolder_settings(fresh)
     notice = toolchain_notice(settings, fresh)
     assert notice is not None
-    assert "unter deinem Benutzerordner" in notice and "Codex" in notice
-    assert "Claude-Agenten sind nicht betroffen" in notice
-    assert "noch nicht selbst" in notice
-    assert "arr " not in notice.replace("arr läuft", "").replace("arr sie", "")  # no command
+    assert notice.title == "Das Python von arr startet nicht für Codex-Agenten."
+    assert "unter deinem Benutzerordner" in notice.text and "Codex-Sandbox" in notice.text
+    assert "Claude-Agenten sind nicht betroffen" in notice.text
+    assert "noch nicht selbst" in notice.text
+    assert "arr " not in notice.text.replace("arr sie", "")  # no command
 
     fake_base_venv("mathe")
     notice = toolchain_notice(settings, fresh)
-    assert notice is not None and "Einstellungen → Python-Umgebung" in notice
+    assert notice is not None and "Einstellungen → Python-Umgebung" in notice.text
 
     off = settings.model_copy(
         update={"toolchain": settings.toolchain.model_copy(update={"run_venv": RunVenvMode.OFF})}
@@ -936,7 +944,7 @@ def test_notice_for_a_base_venv_built_on_a_python_below_home(
     update_settings_file(fresh, lambda d: set_setting(d, ("toolchain", "python"), str(venv)))
     settings = load_workfolder_settings(fresh)
     notice = toolchain_notice(settings, fresh)
-    assert notice is not None and str(venv) in notice
+    assert notice is not None and str(venv) in notice.title
     (venv / "pyvenv.cfg").write_text("home = /Library/Frameworks/Python.framework/bin\n")
     assert toolchain_notice(settings, fresh) is None
 
@@ -997,7 +1005,7 @@ async def test_toolchain_test_runs_the_interpreter(fresh: Path) -> None:
     assert result.python == str(venv) and result.python_version == sys.version.split()[0]
     assert set(result.packages) == {"sympy", "numpy"} and result.duration_ms is not None
     assert result.ok is all(result.packages.values())
-    assert "fehlt" in result.message or "funktioniert" in result.message
+    assert "fehl" in result.message or "funktioniert" in result.message
 
     own = await api.test_toolchain(SYSTEM_PYTHON)
     assert own.python == SYSTEM_PYTHON and own.python_version
@@ -1010,3 +1018,395 @@ async def test_toolchain_test_runs_the_interpreter(fresh: Path) -> None:
 
     foreign = await api.test_toolchain("/bin/echo")
     assert not foreign.ok and foreign.python_version is None and "Liste" in foreign.message
+
+
+# --- W3-04.1: findings of the review ----------------------------------------------------------
+
+
+NOT_UTF8 = b"# Projekt\n\xff\xfe\n"
+
+
+async def expect_error(call: Any) -> Any:
+    """The `ApiError` of an awaited call; never a command to type (docs/08 §8.4)."""
+    with pytest.raises(ApiException) as error:
+        await call
+    assert "arr init" not in error.value.error.message
+    return error.value.error
+
+
+@pytest.fixture
+def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A home folder that does not hold the workfolder, the app folder or the venv root."""
+    folder = tmp_path / "benutzer" / "ich"
+    (folder / ".ssh").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(folder))
+    return folder
+
+
+async def test_a_file_that_is_not_utf8_costs_one_check_not_the_page(wf: Path) -> None:
+    (wf / "projects" / "kaputt").mkdir()
+    (wf / "projects" / "kaputt" / "CLAUDE.md").write_bytes(NOT_UTF8)
+    (wf / "projects" / "yaml-kaputt").mkdir()
+    (wf / "projects" / "yaml-kaputt" / "project.yaml").write_bytes(NOT_UTF8)
+    api = make_api(wf)
+    assert [p.name for p in await api.list_projects()] == ["demo", "kaputt", "yaml-kaputt"]
+    project = await api.get_project("kaputt")
+    check = next(c for c in project.checks if c.key == "claude_md")
+    assert not check.ok and check.severity is Severity.ERROR and check.action is None
+    assert check.message == "CLAUDE.md lässt sich nicht lesen"
+    assert check.detail is not None and "UTF-8" in check.detail
+    assert project.title == "kaputt" and not project.setup_ok
+
+    error = await expect_error(api.setup_project("kaputt"))
+    assert "UTF-8" in error.message and "CLAUDE.md" in error.message
+    assert (wf / "projects" / "kaputt" / "CLAUDE.md").read_bytes() == NOT_UTF8
+    error = await expect_error(api.setup_project("yaml-kaputt"))
+    assert "UTF-8" in error.message and "project.yaml" in error.message
+
+
+async def test_a_lone_mark_in_claude_md_is_named_in_the_check(wf: Path) -> None:
+    (wf / "projects" / "demo" / "CLAUDE.md").write_text("<!-- /arr:user-agent -->\n")
+    check = (await make_api(wf).get_project("demo")).checks[0]
+    assert not check.ok and check.detail is not None and "Marke" in check.detail
+
+
+async def test_repair_in_a_folder_arr_may_not_write_to_gives_a_message(wf: Path) -> None:
+    folder = wf / "projects" / "demo"
+    api = make_api(wf)
+    folder.chmod(0o555)
+    try:
+        error = await expect_error(api.setup_project("demo"))
+    finally:
+        folder.chmod(0o755)
+    assert error.code is ErrorCode.INVALID
+    assert "„demo“ ließ sich nicht einrichten (keine Berechtigung)" in error.message
+    assert "Permission denied" not in error.message
+    assert sorted(p.name for p in folder.iterdir()) == ["check.py", "notes.md"]
+
+
+async def test_repair_turns_a_value_error_into_a_message(
+    wf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_args: Any, **_kwargs: Any) -> None:
+        raise ValueError("kaputt")
+
+    monkeypatch.setattr("arr.service.real_api.setup.setup_project", broken)
+    error = await expect_error(make_api(wf).setup_project("demo"))
+    assert "„demo“ ließ sich nicht einrichten" in error.message and "kaputt" not in error.message
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "{wf}/projects/..",
+        "{wf}/projects/../",
+        "{wf}/projects/.",
+        "{wf}/projects/demo/..",
+        "{wf}/projects/../projects/..",
+        "{wf}",
+        "{wf}/projects/demo/notes",
+        "~nutzer-den-es-nicht-gibt/x",
+        "ohne/anfang",
+        "mit\0null",
+    ],
+)
+async def test_existing_path_stays_directly_below_projects(wf: Path, path: str) -> None:
+    (wf / "projects" / "demo" / "notes").mkdir()
+    before = snapshot(wf)
+    request = CreateProjectRequest(name="x", existing_path=path.format(wf=wf))
+    error = await expect_error(make_api(wf).create_project(request))
+    assert error.code is ErrorCode.INVALID and error.field == "path"
+    assert snapshot(wf) == before
+
+
+async def test_existing_path_takes_every_way_to_a_folder_below_projects(wf: Path) -> None:
+    api = make_api(wf)
+    request = CreateProjectRequest(name="x", existing_path=f"{wf}/projects/gibt/../demo/")
+    assert (await api.create_project(request)).project.name == "demo"
+    assert (wf / "projects" / "demo" / ".mcp.json").is_file()
+
+    for name in ("gibt-es-nicht", "a" * 300):
+        request = CreateProjectRequest(name="x", existing_path=f"{wf}/projects/{name}")
+        assert (await expect_error(api.create_project(request))).code is ErrorCode.NOT_FOUND
+
+
+async def test_links_below_projects_are_refused(wf: Path, tmp_path: Path) -> None:
+    foreign = tmp_path / "fremd"
+    foreign.mkdir()
+    (wf / "projects" / "aussen").symlink_to(foreign)
+    (wf / "projects" / "zwilling").symlink_to(wf / "projects" / "demo")
+    (wf / "projects" / "leer").symlink_to(tmp_path / "weg")
+    api = make_api(wf)
+    before = snapshot(wf / "projects" / "demo")
+    for name in ("aussen", "zwilling", "leer"):
+        request = CreateProjectRequest(name="x", existing_path=f"{wf}/projects/{name}")
+        error = await expect_error(api.create_project(request))
+        assert error.code is ErrorCode.INVALID and "symbolischer Link" in error.message
+    for name in ("aussen", "zwilling"):
+        error = await expect_error(api.setup_project(name))
+        assert error.code is ErrorCode.INVALID and "symbolischer Link" in error.message
+    assert not list(foreign.iterdir())
+    assert snapshot(wf / "projects" / "demo") == before
+
+
+async def test_only_the_open_workfolder_names_its_active_runs(wf: Path, tmp_path: Path) -> None:
+    other = init_workfolder(tmp_path / "zweiter")
+    remember_workfolder(other)
+    api = make_api(wf)
+    assert [r.active_runs for r in (await api.get_workfolder()).known] == [0, None]
+    make_run_folder(wf, status=RunStatus.RUNNING)
+    make_run_folder(wf, status=RunStatus.PAUSED)
+    make_run_folder(wf, status=RunStatus.DONE)
+    api.state.store.scan()
+    known = (await api.get_workfolder()).known
+    assert [(r.path, r.active_runs) for r in known] == [(str(wf), 2), (str(other), None)]
+    assert known[0].active_runs == (await api.get_counts()).active
+
+
+def extra_path_cases(tmp_path: Path, home: Path, wf: Path, arr_home: Path) -> dict[str, str]:
+    outside = tmp_path / "outside"
+    outside.mkdir(exist_ok=True)
+    (outside / "zu-ssh").symlink_to(home / ".ssh")
+    (outside / "datei").write_text("")
+    root = venv_root()
+    (root / "venvs" / "mathe").mkdir(parents=True, exist_ok=True)
+    return {
+        "wurzel /": "/",
+        "Elternordner von ~": str(home.parent),
+        "Elternordner weiter oben": str(tmp_path),
+        "~": str(home),
+        "unter ~": str(home / ".ssh"),
+        "Link nach ~/.ssh": str(outside / "zu-ssh"),
+        "mit ..": f"{outside}/../benutzer/ich/.ssh",
+        "App-Ordner": str(arr_home),
+        "unter dem App-Ordner": str(arr_home / "logs"),
+        "Workfolder": str(wf),
+        "unter dem Workfolder": str(wf / ".arr"),
+        "<wurzel>": str(root),
+        "unter <wurzel>": str(root / "venvs" / "mathe"),
+        "fehlt": str(outside / "gibt-es-nicht"),
+        "Datei": str(outside / "datei"),
+        "relativ": "bin",
+        "mit ~": "~/.ssh",
+    }
+
+
+async def save_extra_path(api: RealApi, entries: list[str]) -> Any:
+    settings = await api.get_workfolder_settings()
+    toolchain = settings.toolchain.model_copy(update={"extra_path": entries})
+    return await api.update_workfolder_settings(
+        settings.model_copy(update={"toolchain": toolchain})
+    )
+
+
+async def test_extra_path_refuses_what_opens_a_way_around_the_read_list(
+    fresh: Path, tmp_path: Path, home: Path, arr_home: Path
+) -> None:
+    (arr_home / "logs").mkdir(exist_ok=True)
+    api = make_api(fresh)
+    text = (fresh / "arr.yaml").read_text()
+    for case, entry in extra_path_cases(tmp_path, home, fresh, arr_home).items():
+        error = await expect_error(save_extra_path(api, [entry]))
+        assert error.code is ErrorCode.INVALID, case
+        assert error.field == "toolchain.extra_path", case
+        assert entry in error.message, case
+        assert (fresh / "arr.yaml").read_text() == text, case
+
+
+def second_names(home: Path) -> list[str]:
+    entries = ["/System/Volumes/Data", f"/System/Volumes/Data{home.resolve()}/.ssh"]
+    assert all(Path(entry).is_dir() for entry in entries)
+    return entries
+
+
+@pytest.mark.skipif(not Path("/System/Volumes/Data/Users").exists(), reason="only on macOS")
+async def test_extra_path_sees_through_the_second_name_of_the_data_volume(
+    fresh: Path, home: Path
+) -> None:
+    api = make_api(fresh)
+    for entry in second_names(home):
+        await expect_error(save_extra_path(api, [entry]))
+
+
+def program_folders(tmp_path: Path) -> list[str]:
+    (tmp_path / "programme").mkdir()
+    wanted = [str(tmp_path / "programme"), "/opt/homebrew/bin"]
+    return [entry for entry in wanted if Path(entry).is_dir()]
+
+
+async def test_extra_path_takes_a_program_folder(fresh: Path, tmp_path: Path, home: Path) -> None:
+    entries = program_folders(tmp_path)
+    settings = await save_extra_path(make_api(fresh), entries)
+    assert settings.toolchain.extra_path == entries
+    assert load_workfolder_settings(fresh).toolchain.extra_path == entries
+
+
+async def test_extra_path_keeps_what_the_user_wrote_by_hand(
+    fresh: Path, tmp_path: Path, home: Path
+) -> None:
+    hand = [str(home / ".ssh"), "/gibt/es/nicht"]
+    update_settings_file(fresh, lambda d: set_setting(d, ("toolchain", "extra_path"), hand))
+    api = make_api(fresh)
+    settings = await api.get_workfolder_settings()
+    assert settings.toolchain.extra_path == hand
+
+    limits = settings.limits.model_copy(update={"budget_usd": 7.0})
+    saved = await api.update_workfolder_settings(settings.model_copy(update={"limits": limits}))
+    assert saved.limits.budget_usd == 7.0 and saved.toolchain.extra_path == hand
+
+    programs = tmp_path / "programme"
+    programs.mkdir()
+    assert (await save_extra_path(api, [*hand, str(programs)])).toolchain.extra_path[2:] == [
+        str(programs)
+    ]
+    assert (await save_extra_path(api, hand)).toolchain.extra_path == hand
+    await expect_error(save_extra_path(api, [*hand, str(home)]))
+
+
+@pytest.mark.parametrize("name", ["a" * 300, f"{'a' * 300}/b"])
+async def test_a_path_the_system_refuses_gives_a_message(
+    wf: Path, tmp_path: Path, name: str
+) -> None:
+    path = tmp_path / name
+    error = await expect_error(
+        make_api(wf).select_workfolder(WorkfolderRequest(path=str(path), create=True))
+    )
+    assert error.field == "path" and "der Name ist zu lang" in error.message
+
+
+async def test_a_write_protected_arr_yaml_stays(fresh: Path) -> None:
+    file = fresh / "arr.yaml"
+    text = file.read_text()
+    file.chmod(0o444)
+    api = make_api(fresh)
+    settings = await api.get_workfolder_settings()
+    limits = settings.limits.model_copy(update={"budget_usd": 7.0})
+    error = await expect_error(
+        api.update_workfolder_settings(settings.model_copy(update={"limits": limits}))
+    )
+    assert "schreibgeschützt" in error.message
+    assert file.read_text() == text and not stat.S_IWUSR & file.stat().st_mode
+    with pytest.raises(ArrError, match="schreibgeschützt"):
+        update_settings_file(fresh, lambda d: set_setting(d, ("version",), 1))
+
+
+async def test_app_settings_keep_keys_of_others(fresh: Path, arr_home: Path) -> None:
+    write_app_settings({"open_in": "tab", "kuenftig": {"wert": 1}})
+    api = make_api(fresh)
+    settings = await api.get_app_settings()
+    await api.update_app_settings(settings.model_copy(update={"appearance": Appearance.DARK}))
+    saved = read_app_settings()
+    assert saved["kuenftig"] == {"wert": 1} and saved["appearance"] == "dark"
+
+
+async def test_messages_of_the_service_name_no_command(fresh: Path) -> None:
+    api = make_api(fresh)
+    settings = await api.get_workfolder_settings()
+    (fresh / "arr.yaml").unlink()
+    for call in (
+        api.get_workfolder_settings(),
+        api.update_workfolder_settings(settings),
+        api.list_fixed_rules(),
+    ):
+        error = await expect_error(call)
+        assert "fehlt die arr.yaml" in error.message and error.code is ErrorCode.CONFIG_INVALID
+    error = await expect_error(api.create_project(CreateProjectRequest(name="neu")))
+    assert "fehlt die arr.yaml" in error.message
+    assert not (fresh / "projects" / "neu").exists()
+
+
+async def test_a_failed_new_workfolder_names_no_command(
+    wf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refused(_path: Path, _text: str) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("arr.workfolder._write_new", refused)
+    error = await expect_error(
+        make_api(wf).select_workfolder(WorkfolderRequest(path=str(tmp_path / "neu"), create=True))
+    )
+    assert error.field == "path" and "Kein Schreibrecht" in error.message
+
+
+@pytest.mark.parametrize(
+    ("number", "text"),
+    [
+        (errno.EACCES, "keine Berechtigung"),
+        (errno.EEXIST, "das gibt es schon"),
+        (errno.ENOSPC, "kein Speicherplatz frei"),
+        (errno.ENAMETOOLONG, "der Name ist zu lang"),
+        (errno.EBUSY, f"Systemfehler {errno.EBUSY}"),
+    ],
+)
+def test_os_errors_have_a_german_cause(number: int, text: str) -> None:
+    assert os_reason(OSError(number, os.strerror(number))) == text
+
+
+async def test_new_project_and_folder_errors_are_in_german(
+    wf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = make_api(wf)
+    closed = tmp_path / "gesperrt"
+    closed.mkdir()
+    closed.chmod(0o300)
+    try:
+        error = await expect_error(
+            api.select_workfolder(WorkfolderRequest(path=str(closed), create=True))
+        )
+    finally:
+        closed.chmod(0o700)
+    assert "keine Berechtigung" in error.message and "Permission" not in error.message
+
+    def taken(*_args: Any, **_kwargs: Any) -> None:
+        raise FileExistsError(errno.EEXIST, "File exists")
+
+    monkeypatch.setattr("arr.service.real_api.setup.create_project", taken)
+    error = await expect_error(api.create_project(CreateProjectRequest(name="neu")))
+    assert "das gibt es schon" in error.message and "File exists" not in error.message
+
+
+@pytest.mark.parametrize(
+    ("packages", "text"),
+    [
+        ({"sympy": False, "numpy": True}, "aber sympy fehlt."),
+        ({"sympy": False, "numpy": False}, "aber sympy und numpy fehlen."),
+    ],
+)
+async def test_missing_packages_read_right(
+    fresh: Path, monkeypatch: pytest.MonkeyPatch, packages: dict[str, bool], text: str
+) -> None:
+    def probe(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        output = json.dumps({"version": "3.12.0", "packages": packages})
+        return subprocess.CompletedProcess([], 0, stdout=output)
+
+    monkeypatch.setattr("arr.service.real_api.setup.subprocess.run", probe)
+    result = await make_api(fresh).test_toolchain(SYSTEM_PYTHON)
+    assert not result.ok and result.message.endswith(text)
+    assert result.detail is not None and "Run-venv" in result.detail
+
+
+async def test_toolchain_test_splits_the_notice(
+    fresh: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "uv"))
+    monkeypatch.setattr(
+        "arr.service.real_api.setup.subprocess.run",
+        lambda *_a, **_k: subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({"version": "3.12.0", "packages": {"sympy": True}})
+        ),
+    )
+    result = await make_api(fresh).test_toolchain(SYSTEM_PYTHON)
+    assert not result.ok and result.message.startswith("Das Python von arr startet nicht")
+    assert result.detail is not None and "Codex-Sandbox" in result.detail
+
+
+async def test_an_arr_yaml_that_is_not_utf8_gives_a_message(wf: Path, tmp_path: Path) -> None:
+    other = init_workfolder(tmp_path / "zweiter")
+    (other / "arr.yaml").write_bytes(NOT_UTF8)
+    api = make_api(wf)
+    error = await expect_error(api.select_workfolder(WorkfolderRequest(path=str(other))))
+    assert error.code is ErrorCode.CONFIG_INVALID and "UTF-8" in error.message
+    assert api.state.workfolder == wf
+    (wf / "arr.yaml").write_bytes(NOT_UTF8)
+    assert "UTF-8" in (await expect_error(api.get_workfolder_settings())).message

@@ -28,7 +28,7 @@ from arr.runs.orchestrator import ProfileGate
 from arr.service.api_client import EventHub
 from arr.service.api_models import ApiException, ErrorCode
 from arr.service.real_api.rundir import RunStore
-from arr.workfolder import load_workfolder_settings
+from arr.workfolder import is_workfolder, load_workfolder_settings
 
 log = logging.getLogger("arr.service")
 
@@ -48,6 +48,15 @@ def not_found(what: str, ident: str) -> ApiException:
 
 def not_allowed(message: str, **fields: Any) -> ApiException:
     return ApiException.of(ErrorCode.NOT_ALLOWED, message, **fields)
+
+
+def workfolder_gone(workfolder: Path) -> ArrError:
+    """`arr.yaml` went away while the service runs; the core's text names a command."""
+    return ArrError(
+        f"In {workfolder} fehlt die arr.yaml. Wurde der Ordner verschoben oder die Datei "
+        "gelöscht? Stelle sie wieder her oder wechsle auf der Start-Seite zu einem anderen "
+        "Workfolder."
+    )
 
 
 def from_arr_error(exc: ArrError, code: ErrorCode = ErrorCode.INVALID) -> ApiException:
@@ -156,6 +165,8 @@ class ServiceState:
 
     def reload_settings(self) -> WorkfolderSettings:
         """Read `arr.yaml` again (the service keeps its settings otherwise)."""
+        if not is_workfolder(self.workfolder):
+            raise workfolder_gone(self.workfolder)
         self.settings = load_workfolder_settings(self.workfolder)
         self._sync_gates()
         return self.settings

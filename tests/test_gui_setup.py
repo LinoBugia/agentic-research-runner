@@ -11,12 +11,14 @@ from pathlib import Path
 import pytest
 from nicegui.testing.user import User
 from run_kit import write_profiles
-from service_kit import make_run_folder, make_workfolder
+from service_kit import hold_lock, make_run_folder, make_workfolder
 from test_gui import gui_user
 from test_gui_real import page_html, see
 from test_real_api_setup import fake_base_venv
 
 from arr.models import RunStatus
+from arr.service.api_models import SLUG as API_SLUG
+from arr.service.gui.pages.projekte import SLUG
 from arr.service.mock_api import MockApi
 from arr.service.real_api import RealApi
 from arr.service.real_api import live as live_module
@@ -218,19 +220,136 @@ async def test_notice_stands_on_start_and_settings(
     monkeypatch.setattr(sys, "base_prefix", str(home / "uv"))
     async with real_user(wf) as (user, _api):
         await user.open("/")
-        html = await see(user, "Die Codex-Sandbox sperrt diesen Ordner")
+        html = await see(user, "<b>Das Python von arr startet nicht für Codex-Agenten.</b>")
         assert "/einstellungen#python" in html and "Python-Umgebung wählen" in html
         await user.open("/einstellungen")
-        await see(user, "Die Codex-Sandbox sperrt diesen Ordner")
+        await see(user, "<b>Das Python von arr startet nicht für Codex-Agenten.</b>")
 
 
 async def test_mock_keeps_its_prototype_flow() -> None:
     async with gui_user(MockApi()) as user:
         await user.open("/")
         user.find(marker="switch-workfolder").click()
+        await see(user, "Neuen Workfolder anlegen")
         user.find(marker="new-workfolder").click()
         await see(user, "Ein neuer oder leerer Ordner")
         user.find(marker="field-workfolder-path").trigger("input", "~/Test-UX3")
         user.find(marker="form-confirm").click()
         html = await see(user, "Workfolder „Test-UX3“ geöffnet.")
         assert "Im Prototyp" in html and page_html(user)
+
+
+# --- W3-04.1: findings of the review ----------------------------------------------------------
+
+
+async def test_a_file_that_is_not_utf8_leaves_the_pages_alive(wf: Path) -> None:
+    (wf / "projects" / "kaputt").mkdir()
+    (wf / "projects" / "kaputt" / "CLAUDE.md").write_bytes(b"\xff\xfe")
+    async with real_user(wf) as (user, _api):
+        await user.open("/projekte/kaputt")
+        html = await see(user, "CLAUDE.md lässt sich nicht lesen")
+        assert "UTF-8" in html and "✕" in html and "demo" in html
+        await user.open("/neuer-run")
+        await see(user, "demo")
+        await user.open("/usage")
+        await see(user, "Usage")
+
+
+async def test_repair_shows_why_it_failed(wf: Path) -> None:
+    folder = wf / "projects" / "demo"
+    async with real_user(wf) as (user, _api):
+        await user.open("/projekte/demo")
+        await see(user, "Reparieren")
+        folder.chmod(0o555)
+        try:
+            user.find(marker="repair").click()
+            await see(user, "„demo“ ließ sich nicht einrichten (keine Berechtigung)")
+        finally:
+            folder.chmod(0o755)
+
+
+async def test_switch_dialog_names_only_the_real_number(wf: Path, tmp_path: Path) -> None:
+    other = init_workfolder(tmp_path / "zweiter")
+    remember_workfolder(other)
+    locks = [
+        hold_lock(make_run_folder(wf, status=RunStatus.RUNNING)),
+        hold_lock(make_run_folder(wf, status=RunStatus.RUNNING)),
+    ]
+    try:
+        async with real_user(wf) as (user, _api):
+            await user.open("/")
+            await see(user, "Workfolder wechseln")
+            user.find(marker="switch-workfolder").click()
+            html = await see(user, str(other))
+            assert "2 Runs aktiv" in html and "keine Runs aktiv" not in html
+    finally:
+        for lock in locks:
+            lock.release()
+
+
+async def test_switch_dialog_counts_at_the_moment_it_opens(wf: Path) -> None:
+    async with real_user(wf) as (user, api):
+        await user.open("/")
+        await see(user, "Workfolder wechseln")
+        user.find(marker="switch-workfolder").click()
+        await see(user, "keine Runs aktiv")
+        lock = hold_lock(make_run_folder(wf, status=RunStatus.RUNNING))
+        try:
+            api.state.store.scan()
+            await user.open("/")  # the page keeps no number, so only the dialog is fresh
+            await see(user, "Workfolder wechseln")
+            page = page_html(user)
+            make_run_folder(wf, status=RunStatus.PAUSED)
+            api.state.store.scan()
+            user.find(marker="switch-workfolder").click()
+            await see(user, "2 Runs aktiv")
+            assert "2 Runs aktiv" not in page
+        finally:
+            lock.release()
+
+
+async def test_an_old_message_gives_way_to_the_new_one(wf: Path, tmp_path: Path) -> None:
+    foreign = tmp_path / "doktorarbeit"
+    foreign.mkdir()
+    (foreign / "kapitel.tex").write_text("x")
+    async with real_user(wf) as (user, _api):
+        await user.open("/?workfolder=neu")
+        await see(user, "Ein neuer oder leerer Ordner")
+        user.find(marker="field-workfolder-path").trigger("input", str(foreign))
+        user.find(marker="form-confirm").click()
+        await see(user, "liegen schon andere Dateien")
+        user.find(marker="field-workfolder-path").trigger("input", f"/{'a' * 300}")
+        user.find(marker="form-confirm").click()
+        html = await see(user, "der Name ist zu lang")
+        assert "liegen schon andere Dateien" not in html
+
+
+async def test_project_names_follow_the_api(wf: Path) -> None:
+    assert SLUG.pattern == API_SLUG
+    (wf / "projects" / "mein_ordner").mkdir()
+    async with real_user(wf) as (user, api):
+        await user.open("/projekte?neu=1")
+        await see(user, "arr legt an:")
+        user.find(marker="field-new-name").trigger("input", "neues_projekt")
+        user.find(marker="form-confirm").click()
+        await see(user, "Projekt „neues_projekt“ angelegt.")
+        assert (await api.get_project("neues_projekt")).setup_ok
+        assert (await api.setup_project("mein_ordner")).project.setup_ok
+
+
+async def test_existing_folder_with_underscore_is_set_up_in_the_dialog(wf: Path) -> None:
+    (wf / "projects" / "mein_ordner").mkdir()
+    async with real_user(wf) as (user, api):
+        await user.open("/projekte?neu=ordner")
+        await see(user, "arr ergänzt nur, was fehlt")
+        user.find(marker="field-existing-path").trigger("input", str(wf / "projects/mein_ordner"))
+        user.find(marker="form-confirm").click()
+        await see(user, "„mein_ordner“ repariert.")
+        assert (await api.get_project("mein_ordner")).setup_ok
+
+
+async def test_rule_table_heads_stand_over_their_columns(wf: Path) -> None:
+    async with real_user(wf) as (user, _api):
+        await user.open("/einstellungen")
+        html = await see(user, "<th>Herkunft</th>")
+        assert html.index("<th>Regel</th>") < html.index("<th>Aktion</th>")

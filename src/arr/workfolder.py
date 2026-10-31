@@ -5,6 +5,7 @@ so everything works from an installed package as well.
 See docs/02-workfolder-und-runs.md §1-2.
 """
 
+import errno
 import io
 import json
 import os
@@ -18,6 +19,7 @@ from pathlib import Path
 from string import Template
 from typing import Any
 
+from pydantic import BaseModel
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
@@ -35,6 +37,7 @@ __all__ = [
     "is_workfolder",
     "load_project_settings",
     "load_workfolder_settings",
+    "os_reason",
     "path_within",
     "project_dir",
     "read_template",
@@ -54,8 +57,27 @@ _WORKFOLDER_DIRS = ("projects", "skills", "runs", ".arr", ".arr/logs")
 _WORKFOLDER_FILES = (("arr.yaml", SETTINGS_FILE), ("README.md", "README.md"))
 _PROJECT_FOLDERS = ("notes", "tex", "code", "results")
 
+_OS_REASONS = {
+    errno.EACCES: "keine Berechtigung",
+    errno.EPERM: "keine Berechtigung",
+    errno.EEXIST: "das gibt es schon",
+    errno.EIO: "Fehler beim Zugriff auf den Datenträger",
+    errno.EISDIR: "das ist ein Ordner",
+    errno.ELOOP: "zu viele symbolische Links",
+    errno.ENAMETOOLONG: "der Name ist zu lang",
+    errno.ENOENT: "das gibt es nicht",
+    errno.ENOSPC: "kein Speicherplatz frei",
+    errno.ENOTDIR: "ein Teil des Pfads ist kein Ordner",
+    errno.EROFS: "der Datenträger ist schreibgeschützt",
+}
+
 REMOVE = object()
 """Value for `set_setting`: take the key out of `arr.yaml`."""
+
+
+def os_reason(exc: OSError) -> str:
+    """The cause of an `OSError` in German; `strerror` is English."""
+    return _OS_REASONS.get(exc.errno or 0, f"Systemfehler {exc.errno}")
 
 
 def read_template(*parts: str) -> str:
@@ -83,8 +105,7 @@ def init_workfolder(path: Path) -> Path:
     root = Path(path).expanduser().absolute()
     if root.exists() and not root.is_dir():
         raise ArrError(
-            f"„{root}“ ist kein Ordner. Gib einen Ordner für den Workfolder an, "
-            "z. B. „arr init ~/arr“."
+            f"„{root}“ ist kein Ordner. Gib einen Ordner für den Workfolder an, z. B. ~/arr."
         )
     try:
         for sub in _WORKFOLDER_DIRS:
@@ -94,11 +115,12 @@ def init_workfolder(path: Path) -> Path:
     except PermissionError as exc:
         raise ArrError(
             f"Kein Schreibrecht für „{exc.filename or root}“. Wähle einen Ordner, in dem du "
-            "schreiben darfst, z. B. „arr init ~/arr“."
+            "schreiben darfst, z. B. ~/arr."
         ) from None
     except OSError as exc:
         raise ArrError(
-            f"Der Workfolder „{root}“ ließ sich nicht anlegen ({exc.strerror or exc})."
+            f"Der Workfolder „{root}“ ließ sich nicht anlegen ({os_reason(exc)}). Prüfe die "
+            "Rechte oder wähle einen anderen Ordner."
         ) from None
     return root
 
@@ -113,6 +135,20 @@ def _write_new(path: Path, text: str) -> bool:
     return True
 
 
+def _not_utf8(file: Path) -> ArrError:
+    return ArrError(
+        f"Die Datei {file} ist nicht in UTF-8 gespeichert, deshalb kann arr sie nicht lesen. "
+        "Speichere sie im Editor als UTF-8."
+    )
+
+
+def _load_settings[M: BaseModel](file: Path, model: type[M]) -> M:
+    try:
+        return load_yaml_model(file, model)
+    except UnicodeDecodeError:
+        raise _not_utf8(file) from None
+
+
 def load_workfolder_settings(workfolder: str | Path) -> WorkfolderSettings:
     """Read and validate `<workfolder>/arr.yaml`; raise `ArrError`/`ConfigError` with a hint."""
     root = Path(workfolder)
@@ -121,7 +157,7 @@ def load_workfolder_settings(workfolder: str | Path) -> WorkfolderSettings:
             f"„{root}“ ist kein arr-Workfolder, die Datei {SETTINGS_FILE} fehlt. "
             f"Lege ihn mit „arr init {root}“ an."
         )
-    return load_yaml_model(root / SETTINGS_FILE, WorkfolderSettings)
+    return _load_settings(root / SETTINGS_FILE, WorkfolderSettings)
 
 
 def path_within(path: Path, parent: Path) -> bool:
@@ -163,13 +199,20 @@ def set_setting(data: Any, keys: Sequence[str], value: Any) -> None:
 def update_settings_file(workfolder: str | Path, edit: Callable[[Any], None]) -> WorkfolderSettings:
     """Change `arr.yaml` with `edit` on its round-trip data and return the new settings.
 
-    Comments and the form of untouched values stay. The result is validated before it
-    replaces the file (atomically), so a refused change leaves `arr.yaml` as it was. Raises
-    `ArrError`/`ConfigError` with a hint.
+    Comments, the order of the keys and all values stay, but the round trip rewrites the
+    whole file in one form: `---` goes, lists get indented, `{ a: b }` becomes `{a: b}`. The
+    result is validated before it replaces the file (atomically), so a refused change leaves
+    `arr.yaml` as it was. A write-protected file stays too: `os.replace` needs only the rights
+    of the folder, so the check is here. Raises `ArrError`/`ConfigError` with a hint.
     """
     path = Path(workfolder) / SETTINGS_FILE
     load_workfolder_settings(workfolder)
     target = path.resolve()
+    if not os.access(target, os.W_OK):
+        raise ArrError(
+            f"Die Datei {path} ist schreibgeschützt, deshalb ändert arr sie nicht. Hebe den "
+            "Schreibschutz auf und speichere erneut."
+        )
     yaml = YAML(typ="rt")
     yaml.preserve_quotes = True
     yaml.width = 4096
@@ -186,8 +229,8 @@ def update_settings_file(workfolder: str | Path, edit: Callable[[Any], None]) ->
         os.replace(temp, target)
     except OSError as exc:
         raise ArrError(
-            f"Die Datei {path} ließ sich nicht schreiben ({exc.strerror or exc}). Prüfe die "
-            "Rechte des Ordners."
+            f"Die Datei {path} ließ sich nicht schreiben ({os_reason(exc)}). Prüfe die Rechte "
+            "des Ordners."
         ) from None
     finally:
         temp.unlink(missing_ok=True)
@@ -199,7 +242,7 @@ def load_project_settings(project: str | Path) -> ProjectSettings:
     file = Path(project) / PROJECT_SETTINGS_FILE
     if not file.is_file():
         return ProjectSettings()
-    return load_yaml_model(file, ProjectSettings)
+    return _load_settings(file, ProjectSettings)
 
 
 def project_dir(workfolder: str | Path, name: str) -> Path:
@@ -370,7 +413,10 @@ def setup_project(
                 "oder benenne sie um, dann kann arr den Server „arr“ eintragen."
             ) from None
     claude_file = project / "CLAUDE.md"
-    claude_text = claude_file.read_text(encoding="utf-8") if claude_file.is_file() else None
+    try:
+        claude_text = claude_file.read_text(encoding="utf-8") if claude_file.is_file() else None
+    except UnicodeDecodeError:
+        raise _not_utf8(claude_file) from None
     if claude_text is not None:
         block_span(claude_text, USER_AGENT_BLOCK)  # raises for a lone mark
 

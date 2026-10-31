@@ -12,6 +12,7 @@ import re
 from nicegui import ui
 
 from arr.service.api_client import ApiClient
+from arr.service.api_models import SLUG as API_SLUG
 from arr.service.api_models import (
     ApiException,
     CreateProjectRequest,
@@ -39,7 +40,7 @@ from arr.service.gui.components.page_state import (
 from arr.service.gui.layout import Frame
 from arr.service.gui.texts import Status
 
-SLUG = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+SLUG = re.compile(API_SLUG)
 NEW_FILES = "CLAUDE.md (mit arr-Block), AGENTS.md, .mcp.json, Skill-Links, project.yaml und die "
 NEW_FILES += "Ordner notes/, tex/, code/, results/"
 OK = Status("st-ok", "check", "eingerichtet")
@@ -334,7 +335,7 @@ class ProjektePage:
                 name = value.strip() or "…"
                 path_hint["el"].set_content(
                     f'Wird zu <span class="mono">{esc(self.root)}/{esc(name)}</span>. '
-                    "Kleinbuchstaben, Ziffern und Bindestriche."
+                    "Kleinbuchstaben, Ziffern, Binde- und Unterstriche."
                 )
 
             fields["name"] = Field(
@@ -351,7 +352,8 @@ class ProjektePage:
             name = fields["name"].value.strip()
             if not SLUG.match(name):
                 fields["name"].set_error(
-                    "Nimm Kleinbuchstaben, Ziffern und Bindestriche, z. B. goldbach-schwach."
+                    "Nimm Kleinbuchstaben, Ziffern, Binde- und Unterstriche, höchstens 64 "
+                    "Zeichen, z. B. goldbach-schwach."
                 )
                 return "Der Ordnername passt nicht."
             try:
@@ -391,7 +393,8 @@ class ProjektePage:
             name = path.rsplit("/", 1)[-1].lower()
             if not name or not SLUG.match(name):
                 fields["path"].set_error(
-                    "Der Ordnername muss aus Kleinbuchstaben, Ziffern und Bindestrichen bestehen."
+                    "Der Ordnername muss aus Kleinbuchstaben, Ziffern, Binde- und Unterstrichen "
+                    "bestehen, höchstens 64 Zeichen."
                 )
                 return "Der Ordner passt nicht."
             try:

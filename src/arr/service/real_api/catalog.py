@@ -35,7 +35,7 @@ from arr.service.api_models import (
 from arr.service.real_api.base import ServiceState, not_found
 from arr.service.real_api.rundir import open_items
 from arr.skills import SkillAudience, SkillCatalog, discover_skills, skills_for_user_agent
-from arr.workfolder import USER_AGENT_BLOCK, block_span, load_project_settings
+from arr.workfolder import USER_AGENT_BLOCK, block_span, load_project_settings, os_reason
 
 MAX_FILES = 200
 MAX_FILE_BYTES = 512 * 1024
@@ -142,25 +142,34 @@ class CatalogArea:
     def _project(self, folder: Path, catalog: SkillCatalog) -> ProjectInfo:
         repair = Action(label="Reparieren", url=f"/projekte/{folder.name}")
 
-        def check(key: str, ok: bool, message: str, *, detail: str | None = None) -> ProjectCheck:
+        def check(
+            key: str, ok: bool, message: str, *, detail: str | None = None, repairable: bool = True
+        ) -> ProjectCheck:
             return ProjectCheck(
                 key=key,
                 ok=ok,
-                severity=Severity.INFO if ok else Severity.WARNING,
+                severity=Severity.INFO
+                if ok
+                else (Severity.WARNING if repairable else Severity.ERROR),
                 message=message,
                 detail=detail,
-                action=None if ok else repair,
+                action=repair if repairable and not ok else None,
             )
 
         claude = folder / "CLAUDE.md"
         claude_text = ""
         has_block = False
+        claude_problem = None
         if claude.is_file():
             try:
                 claude_text = claude.read_text("utf-8")
                 has_block = block_span(claude_text, USER_AGENT_BLOCK) is not None
-            except (OSError, ArrError):
-                has_block = False
+            except ArrError as exc:
+                claude_problem = exc.message
+            except UnicodeDecodeError:
+                claude_problem = "Sie ist nicht in UTF-8 gespeichert. Speichere sie im Editor so."
+            except OSError as exc:
+                claude_problem = f"{os_reason(exc).capitalize()}. Prüfe die Rechte der Datei."
         try:
             settings = load_project_settings(folder)
         except ArrError:
@@ -170,6 +179,14 @@ class CatalogArea:
         agents = (folder / "AGENTS.md").is_file()
         checks = [
             check(
+                "claude_md",
+                False,
+                "CLAUDE.md lässt sich nicht lesen",
+                detail=claude_problem,
+                repairable=False,
+            )
+            if claude_problem
+            else check(
                 "claude_md",
                 has_block,
                 "CLAUDE.md mit arr-Block vorhanden"

@@ -52,6 +52,7 @@ from arr.service.api_models import (
     SetupState,
     ToolchainCandidate,
     ToolchainInfo,
+    ToolchainNotice,
     ToolchainTestResult,
     WorkfolderInfo,
     WorkfolderRequest,
@@ -63,6 +64,7 @@ from arr.service.real_api.base import (
     not_allowed,
     not_found,
     unavailable,
+    workfolder_gone,
 )
 from arr.service.real_api.catalog import CatalogArea
 from arr.service.real_api.workfolder import WorkfolderArea
@@ -81,6 +83,7 @@ from arr.workfolder import (
     init_workfolder,
     is_workfolder,
     load_workfolder_settings,
+    os_reason,
     path_within,
     set_setting,
     setup_project,
@@ -99,6 +102,8 @@ _PROBE = (
     "'packages': {p: u.find_spec(p) is not None for p in sys.argv[1:]}}))"
 )
 _IGNORED_ENTRIES = frozenset({".DS_Store"})
+_DATA_VOLUME = "/System/Volumes/Data"
+"""On macOS the same files as `/` under a second name; `realpath` does not see through it."""
 _SECONDS = (("d", 86400), ("h", 3600), ("m", 60), ("s", 1))
 
 
@@ -289,7 +294,7 @@ def _interpreter(python: str, workfolder: Path) -> Path:
     return path if path.is_file() else path / "bin" / "python3"
 
 
-def toolchain_notice(settings: WorkfolderSettings, workfolder: Path) -> str | None:
+def toolchain_notice(settings: WorkfolderSettings, workfolder: Path) -> ToolchainNotice | None:
     """Why Codex agents cannot use this Python (docs/08 §8.4), or None if they can.
 
     The Codex sandbox denies `~` as a whole (W3-00). `prepare_run` checks a set
@@ -306,28 +311,57 @@ def toolchain_notice(settings: WorkfolderSettings, workfolder: Path) -> str | No
         places = [python] if base is None else [python, base]
         if not any(path_within(Path(os.path.realpath(p)), home) for p in places):
             return None
-        what = (
-            f"Die Python-Umgebung {toolchain.python} nutzt ein Python unter deinem Benutzerordner"
-        )
+        title = f"Die Python-Umgebung {toolchain.python} startet nicht für Codex-Agenten."
+        why = "Sie nutzt ein Python unter deinem Benutzerordner"
     elif toolchain.run_venv is RunVenvMode.OVERLAY and path_within(
         Path(os.path.realpath(sys.base_prefix)), home
     ):
-        what = (
-            "arr läuft mit einem Python unter deinem Benutzerordner, und ohne Basis-venv nutzt "
-            "jeder Run dieses Python"
-        )
+        title = "Das Python von arr startet nicht für Codex-Agenten."
+        why = "Es liegt unter deinem Benutzerordner"
     else:
         return None
     way = (
         "Wähle unter „Einstellungen → Python-Umgebung“ eine Basis-venv außerhalb davon."
         if base_venvs()
-        else "Eine Basis-venv außerhalb davon gibt es noch nicht, und anlegen kann arr sie noch "
-        "nicht selbst. Bis dahin laufen Runs nur mit Claude-Agenten."
+        else "Anlegen kann arr sie noch nicht selbst, bis dahin laufen Runs nur mit Claude-Agenten."
     )
-    return (
-        f"{what}. Die Codex-Sandbox sperrt diesen Ordner, deshalb startet Python für "
-        f"Codex-Agenten dort nicht. Claude-Agenten sind nicht betroffen. {way}"
+    return ToolchainNotice(
+        title=title,
+        text=f"{why}, und den sperrt die Codex-Sandbox. Claude-Agenten sind nicht betroffen. {way}",
     )
+
+
+def _comparable(path: str | Path) -> Path:
+    """The resolved path, under the name it has below `/` (`_DATA_VOLUME`)."""
+    real = os.path.realpath(path)
+    if path_within(Path(real), Path(_DATA_VOLUME)):
+        real = real[len(_DATA_VOLUME) :] or "/"
+    return Path(real)
+
+
+def _extra_path_problem(entry: str, workfolder: Path) -> str | None:
+    """Why `entry` must not go to `toolchain.extra_path`, or None.
+
+    The entries land on the read list of the agents, so they must not open a way around the
+    sensitive paths. Resolved paths count: a link to `~/.ssh` is refused like `~/.ssh`.
+    """
+    if not entry.startswith("/") or "\0" in entry:
+        return "Das ist kein vollständiger Pfad. Gib ihn mit / am Anfang an."
+    real, home = _comparable(entry), _comparable(Path.home())
+    if path_within(home, real):
+        return "Dein Benutzerordner liegt darin, die Agenten könnten ihn dann ganz lesen."
+    if path_within(real, home):
+        return "Er liegt in deinem Benutzerordner, den die Agenten nicht lesen sollen."
+    for reserved, what in (
+        (app_dir(), "die eigenen Daten von arr"),
+        (workfolder, "den Workfolder"),
+        (venv_root(), "die Python-Umgebungen"),
+    ):
+        if path_within(real, _comparable(reserved)):
+            return f"Er liegt im Ordner für {what}, und das regelt arr selbst."
+    if not os.path.isdir(entry):
+        return "Diesen Ordner gibt es nicht."
+    return None
 
 
 def fixed_rule_id(rule: AlwaysRule) -> str:
@@ -395,8 +429,14 @@ class SetupArea:
                     "einen anderen Ordner, z. B. ~/Test-UX3."
                 )
         probe = root
-        while not probe.exists():
-            probe = probe.parent
+        try:
+            while not probe.exists():
+                probe = probe.parent
+        except OSError as exc:
+            raise _invalid(
+                f"Den Pfad {text} kann arr nicht prüfen ({os_reason(exc)}). Wähle einen anderen "
+                "Pfad, z. B. ~/Test-UX3."
+            ) from None
         if not probe.is_dir():
             raise _invalid(f"{probe} ist eine Datei, kein Ordner. Wähle einen anderen Pfad.")
         if not os.access(probe, os.W_OK | os.X_OK):
@@ -406,9 +446,12 @@ class SetupArea:
             )
         return root
 
+    @staticmethod
+    def _same_folder(first: Path, second: Path) -> bool:
+        return path_within(first, second) and path_within(second, first)
+
     def _is_current(self, root: Path) -> bool:
-        current = Path(os.path.realpath(self.state.workfolder))
-        return path_within(root, current) and path_within(current, root)
+        return self._same_folder(root, Path(os.path.realpath(self.state.workfolder)))
 
     @staticmethod
     def _check_new_folder(root: Path) -> None:
@@ -416,7 +459,10 @@ class SetupArea:
         try:
             entries = set(os.listdir(root)) - _IGNORED_ENTRIES if root.exists() else set()
         except OSError as exc:
-            raise _invalid(f"Der Ordner {root} ist nicht lesbar ({exc.strerror}).") from None
+            raise _invalid(
+                f"Der Ordner {root} ist nicht lesbar ({os_reason(exc)}). Prüfe die Rechte oder "
+                "wähle einen anderen Ordner."
+            ) from None
         if entries:
             raise _invalid(
                 f"In {root} liegen schon andere Dateien, und eine arr.yaml fehlt. arr legt dort "
@@ -452,10 +498,7 @@ class SetupArea:
                     root, lambda data: set_setting(data, ("toolchain", "python"), python)
                 )
         except ArrError as exc:
-            raise _invalid(
-                f"Der Workfolder {root} ließ sich nicht anlegen. Prüfe die Rechte oder wähle "
-                f"einen anderen Ordner. ({exc.message})"
-            ) from None
+            raise _invalid(exc.message) from None
 
     @staticmethod
     def _recover(root: Path) -> list[str]:
@@ -516,6 +559,12 @@ class SetupArea:
             done = setup_project(folder, workfolder=self.state.workfolder, title=title)
         except ArrError as exc:
             raise from_arr_error(exc) from None
+        except (OSError, ValueError) as exc:
+            reason = os_reason(exc) if isinstance(exc, OSError) else "eine Datei ist nicht lesbar"
+            raise _invalid(
+                f"„{folder.name}“ ließ sich nicht einrichten ({reason}). Prüfe die Rechte des "
+                "Ordners und versuche es erneut."
+            ) from None
         created = [*done.created, *done.updated]
         if done.skill_links:
             created.append(f".claude/skills/ ({len(done.skill_links)} Links)")
@@ -523,17 +572,35 @@ class SetupArea:
         message = f"„{name}“ repariert." if created else f"„{name}“ ist vollständig eingerichtet."
         return await self._result(name, created, " ".join([message, *done.warnings]))
 
+    @staticmethod
+    def _refuse_link(folder: Path) -> None:
+        """arr writes only into real folders below `projects/`, never to where a link points."""
+        if os.path.islink(folder):
+            raise _invalid(
+                f"{folder} ist ein symbolischer Link, arr schreibt nicht in den Ordner dahinter. "
+                "Lege das Projekt als echten Ordner unter projects/ an."
+            )
+
     def _existing_project(self, raw: str) -> Path:
-        """The folder of „Vorhandenen Ordner einrichten“: only directly below `projects/`."""
+        """The folder of „Vorhandenen Ordner einrichten“: only directly below `projects/`.
+
+        The resolved path counts, so `projects/..` is refused before anything is written.
+        """
         projects = self.state.workfolder / "projects"
-        path = Path(raw.strip()).expanduser()
-        if os.path.realpath(path.parent) != os.path.realpath(projects):
+        text = raw.strip()
+        try:
+            path = Path(text).expanduser()
+            real = Path(os.path.realpath(path))
+        except (RuntimeError, ValueError):
+            raise _invalid(f"Den Ordner „{text}“ gibt es nicht. Prüfe den Pfad.") from None
+        self._refuse_link(path)
+        if not self._same_folder(real.parent, Path(os.path.realpath(projects))):
             raise _invalid(
                 f"{path} liegt nicht direkt unter {projects}. arr richtet nur Ordner dort ein. "
                 "Verschiebe den Ordner dorthin und versuche es erneut."
             )
-        folder = projects / path.name
-        if not folder.is_dir():
+        folder = projects / real.name
+        if not os.path.isdir(folder):
             raise ApiException.of(
                 ErrorCode.NOT_FOUND,
                 f"Den Ordner {folder} gibt es nicht. Prüfe den Namen.",
@@ -547,6 +614,8 @@ class SetupArea:
         if request.existing_path:
             return await self._set_up(self._existing_project(request.existing_path), request.title)
         name = request.name
+        if not is_workfolder(self.state.workfolder):
+            raise from_arr_error(workfolder_gone(self.state.workfolder))
         if (self.state.workfolder / "projects" / name).exists():
             raise ApiException.of(
                 ErrorCode.CONFLICT,
@@ -560,8 +629,8 @@ class SetupArea:
         except OSError as exc:
             raise ApiException.of(
                 ErrorCode.INVALID,
-                f"Das Projekt „{name}“ ließ sich nicht anlegen ({exc.strerror}). Prüfe die Rechte "
-                "des Workfolders.",
+                f"Das Projekt „{name}“ ließ sich nicht anlegen ({os_reason(exc)}). Prüfe die "
+                "Rechte des Workfolders.",
             ) from None
         created = sorted(str(p.relative_to(folder)) for p in folder.iterdir())
         return await self._result(folder.name, created, f"Projekt „{name}“ angelegt.")
@@ -570,6 +639,7 @@ class SetupArea:
         folder = self.state.workfolder / "projects" / name
         if "/" in name or name in (".", "..") or not folder.is_dir():
             raise not_found("Projekt", name)
+        self._refuse_link(folder)
         return await self._set_up(folder, None)
 
     # -- app settings ------------------------------------------------------------------------
@@ -600,6 +670,7 @@ class SetupArea:
         }
         write_app_settings(
             {
+                **read_app_settings(),
                 "open_in": settings.open_in.value,
                 "appearance": settings.appearance.value,
                 "notifications": notifications,
@@ -627,7 +698,12 @@ class SetupArea:
             }
         )
 
-    def _check_update(self, new: WorkfolderSettingsInfo, changes: Mapping[Any, Any]) -> None:
+    def _check_update(
+        self,
+        old: WorkfolderSettingsInfo,
+        new: WorkfolderSettingsInfo,
+        changes: Mapping[Any, Any],
+    ) -> None:
         known = {p.name for p in self.state.profiles_or_empty().profiles}
         for keys in changes:
             if keys[0] == "concurrency" and keys[1] in new.concurrency and keys[1] not in known:
@@ -637,13 +713,24 @@ class SetupArea:
                 )
         if ("toolchain", "python") in changes and new.toolchain.python is not None:
             self._check_python(new.toolchain.python)
+        for entry in new.toolchain.extra_path:
+            problem = None
+            if entry not in old.toolchain.extra_path:  # hand-kept values of `arr.yaml` stay
+                problem = _extra_path_problem(entry, self.state.workfolder)
+            if problem:
+                raise _invalid(
+                    f"„{entry}“ kann nicht in den PATH. {problem} Nimm einen Programmordner "
+                    "außerhalb davon, z. B. /opt/homebrew/bin.",
+                    "toolchain.extra_path",
+                )
 
     async def update_workfolder_settings(
         self, settings: WorkfolderSettingsInfo
     ) -> WorkfolderSettingsInfo:
         settings = WorkfolderSettingsInfo.model_validate(settings.model_dump())
-        changes = _changes(settings_info(self._reload()), settings)
-        self._check_update(settings, changes)
+        old = settings_info(self._reload())
+        changes = _changes(old, settings)
+        self._check_update(old, settings, changes)
         if changes:
 
             def edit(data: Any) -> None:
@@ -767,12 +854,15 @@ class SetupArea:
             ),
             self.state.workfolder,
         )
+        detail = None
         if notice:
-            message = notice
+            message, detail = notice.title, notice.text
         elif missing:
-            message = (
-                f"{shown} läuft mit Python {version}, aber {', '.join(missing)} fehlt. Wähle eine "
-                "venv mit diesen Paketen, oder lass Agenten sie in die Run-venv installieren."
+            verb = "fehlt" if len(missing) == 1 else "fehlen"
+            message = f"{shown} läuft mit Python {version}, aber {' und '.join(missing)} {verb}."
+            detail = (
+                "Wähle eine venv, die alles mitbringt, oder lass Agenten fehlende Pakete in die "
+                "Run-venv installieren."
             )
         else:
             message = f"{shown} funktioniert: Python {version}, {' und '.join(packages)} vorhanden."
@@ -782,5 +872,6 @@ class SetupArea:
             python_version=version,
             packages=packages,
             message=message,
+            detail=detail,
             duration_ms=duration,
         )

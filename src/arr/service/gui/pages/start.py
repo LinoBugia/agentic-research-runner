@@ -24,6 +24,7 @@ from arr.service.api_models import (
     SkillInfo,
     SkillKind,
     ToolchainCandidate,
+    ToolchainNotice,
     UsageTickEvent,
     WarningInfo,
     WorkfolderInfo,
@@ -58,6 +59,13 @@ STAGE_PHRASE = {
     "error": ("mit Fehler", "mit Fehler"),
     "done": ("fertig", "fertig"),
 }
+
+
+def active_text(count: int) -> str:
+    """The active runs of a workfolder for „Workfolder wechseln“."""
+    if not count:
+        return "keine Runs aktiv"
+    return f"{count} Run{'' if count == 1 else 's'} aktiv"
 
 
 def waiting_row_html(item: ApprovalItem, now: float) -> str:
@@ -233,7 +241,7 @@ class StartPage:
         self.frame.on_event(self._on_event)
         ui.timer(1.0, self._flush)
 
-    async def _load_toolchain(self) -> str | None:
+    async def _load_toolchain(self) -> ToolchainNotice | None:
         """Base venvs for a new workfolder and the warning about the current Python (§8.4)."""
         try:
             settings = await self.api.get_workfolder_settings()
@@ -242,11 +250,12 @@ class StartPage:
         self.candidates = settings.toolchain_candidates
         return settings.toolchain_notice
 
-    def _render_notice(self, notice: str | None) -> None:
+    def _render_notice(self, notice: ToolchainNotice | None) -> None:
         if notice:
             raw(
                 '<div class="banner warn" role="status" style="margin-bottom:16px">'
-                f'{icon("warning")}<div class="txt">{esc(notice)}</div>'
+                f'{icon("warning")}<div class="txt"><b>{esc(notice.title)}</b> '
+                f"{esc(notice.text)}</div>"
                 '<a class="btn btn-sm" href="/einstellungen#python">Python-Umgebung wählen</a>'
                 "</div>"
             )
@@ -261,9 +270,7 @@ class StartPage:
                 tag="div",
             )
             with ui.element("div").classes("actions"):
-                button("Workfolder wechseln ▾", lambda: self._switch_dialog(wf)).mark(
-                    "switch-workfolder"
-                )
+                button("Workfolder wechseln ▾", self._switch_dialog).mark("switch-workfolder")
                 raw(
                     f'<a class="btn primary" href="/neuer-run">{icon("add")}Neuer Run</a>',
                     tag="span",
@@ -470,8 +477,13 @@ class StartPage:
 
     # --- workfolder ----------------------------------------------------------------------------
 
-    def _switch_dialog(self, wf: WorkfolderInfo) -> None:
+    async def _switch_dialog(self) -> None:
         """„Workfolder wechseln“: known workfolders, „Neuen Workfolder anlegen …“ (wireframe)."""
+        try:
+            wf = await self.api.get_workfolder()  # the figures of this moment, not of the page
+        except ApiException as exc:
+            self.frame.toast(exc.error.message, error=True)
+            return
         options = [(w.path, w) for w in wf.known] or []
         chosen = {"path": wf.path}
 
@@ -505,15 +517,13 @@ class StartPage:
                         )
                         radio.mark(f"workfolder-{ref.name}")
                         radio.on("change", lambda _e, p=path: chosen.__setitem__("path", p))
-                        active = (
-                            f"{ref.active_runs} Runs aktiv"
-                            if ref.active_runs
-                            else "keine Runs aktiv"
-                        )
+                        figures = f"{ref.projects_count} Projekte"
+                        if ref.active_runs is not None:
+                            figures += ", " + active_text(ref.active_runs)
                         raw(
                             f"<span><b>{esc(ref.name)}</b><span class='mono small muted'>"
                             f"{esc(ref.path)}</span> · <span class='small muted'>"
-                            f"{ref.projects_count} Projekte, {active}</span></span>",
+                            f"{figures}</span></span>",
                             tag="span",
                         )
             with ui.element("p").classes("small").style("margin-top:12px"):

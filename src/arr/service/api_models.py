@@ -424,7 +424,8 @@ class WorkfolderRef(ApiModel):
     name: str
     path: str
     projects_count: int = Field(ge=0)
-    active_runs: int = Field(ge=0)
+    active_runs: int | None = Field(default=None, ge=0)
+    """Active runs from the run data; only the open workfolder knows them, else `None`."""
 
 
 class WorkfolderInfo(ApiModel):
@@ -1585,6 +1586,13 @@ class ToolchainCandidate(ApiModel):
     packages: dict[str, bool] = Field(default_factory=dict)
 
 
+class ToolchainNotice(ApiModel):
+    """Why Codex agents cannot use a Python (docs/08 §8.4): what happened, then why and how."""
+
+    title: str
+    text: str
+
+
 class SetupState(ApiModel):
     """State of the setup assistant (docs/08 §5.12 `GET /api/setup/state`)."""
 
@@ -1598,7 +1606,7 @@ class SetupState(ApiModel):
 # Settings, mandate, fixed rules, profiles, projects, skill files, workfolder (W1-08 screens)
 # --------------------------------------------------------------------------------------------
 
-_SLUG = r"^[a-z0-9][a-z0-9_-]{0,63}$"
+SLUG = r"^[a-z0-9][a-z0-9_-]{0,63}$"
 
 
 class OpenIn(StrEnum):
@@ -1700,7 +1708,7 @@ class WorkfolderSettingsInfo(ApiModel):
     user_agent_runs_require_approval: Literal[True] = True
     running_runs: int = Field(default=0, ge=0)
     toolchain_candidates: list[ToolchainCandidate] = Field(default_factory=list)
-    toolchain_notice: str | None = None
+    toolchain_notice: ToolchainNotice | None = None
 
 
 class MandateChecks(ApiModel):
@@ -1774,6 +1782,8 @@ class ToolchainTestResult(ApiModel):
     python_version: str | None = None
     packages: dict[str, bool] = Field(default_factory=dict)
     message: str
+    detail: str | None = None
+    """Why and what to do, after `message` (docs/08 §8.4)."""
     duration_ms: int | None = None
 
 
@@ -1784,7 +1794,7 @@ class CreateProfileRequest(ApiModel):
     (E18), they never take a pasted token.
     """
 
-    name: str = Field(pattern=_SLUG)
+    name: str = Field(pattern=SLUG)
     kind: AuthKind
     concurrency: int = Field(default=2, ge=1, le=16)
     api_key: SecretStr | None = None
@@ -1846,7 +1856,7 @@ class CreateProjectRequest(ApiModel):
     only missing arr files, G8). At most one of both.
     """
 
-    name: str = Field(pattern=_SLUG)
+    name: str = Field(pattern=SLUG)
     title: str | None = None
     template: str | None = None
     existing_path: str | None = None
