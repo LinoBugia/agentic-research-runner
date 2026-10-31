@@ -20,7 +20,7 @@ Vor jedem Commit: `uv run pytest && uv run ruff check && uv run ruff format --ch
 
 ## Regeln
 
-- **Sprache:** Code, Bezeichner, Docstrings und Kommentare auf **Englisch**. Doku, Berichte und **alle Texte der Oberfläche** (CLI-Hilfe, GUI, Meldungen an den User) auf **Deutsch**.
+- **Sprache:** Code, Bezeichner, Docstrings und Kommentare auf **Englisch**. Interne Doku, Berichte und **alle Texte der Oberfläche** (CLI-Hilfe, GUI, Meldungen an den User) auf **Deutsch**. Externe Doku (`README.md`) auf **Englisch**.
 - **Arbeitsweise:** Code-Agenten folgen [umsetzung/Arbeitsweise.md](umsetzung/Arbeitsweise.md) – genau ein Auftrag, eigener Branch, nie in `main` mergen, nie pushen.
 - **Commits** enden mit der Zeile:
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
