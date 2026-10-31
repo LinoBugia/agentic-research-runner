@@ -15,6 +15,7 @@ from run_kit import cost as usage_cost
 from service_kit import append, hold_lock, make_run_folder, make_workfolder, transcript_line
 
 from arr.models import RunStatus, Starter
+from arr.permissions.types import DecisionAction, EscalationOption
 from arr.room.store import RoomStore
 from arr.room.types import MessageVia
 from arr.runs.manager import set_run_status
@@ -24,6 +25,7 @@ from arr.service.api_models import (
     AgentDisplayState,
     ApiException,
     BlockedKind,
+    DecisionRequest,
     ErrorCode,
     PostMessageRequest,
     ResultStatus,
@@ -349,33 +351,62 @@ async def test_pause_resume_and_stop_act_on_own_runs(wf: Path) -> None:
 
 
 async def test_resume_is_not_offered_and_refused_while_an_escalation_is_open(wf: Path) -> None:
-    """Only the card decides an escalation (docs/07 §6, docs/08 §6.7)."""
-    scripts = {"a": turns([say("los"), wait(30)]), "b": turns([say("ok"), wait(30)])}
+    """Only the card decides an escalation (docs/07 §6, docs/08 §6.7). A real waterfall: the first
+    stage fails, the second waits behind the user's own pause, so „Fortsetzen“ comes back."""
+    job = room("get_assignment", save_as="job")
+
+    def rate(score: int) -> dict[str, Any]:
+        rating = room(
+            "submit_rating", result_id="${job.context.result_id}", score=score, comment="Geprüft."
+        )
+        return {"turns": [{"steps": [job, rating, done()]}], "repeat_last": True}
+
+    submit = room("submit_result", kind="sketch", title="Skizze", body="Text.")
+    work = {"turns": [{"steps": [submit, done()]}], "repeat_last": True}
+    scripts = {
+        "w": {"turns": [], "by_stage": {"skizze": work, "beweis": work}},
+        "r": {"turns": [], "by_stage": {"skizze": rate(2), "beweis": rate(8)}},
+    }
     api = make_api(wf, scripts)
     await api.start()
     try:
-        run_id = (await api.start_run(RUN_INPUT)).run_id
-        await until_status(api, run_id, RunStatus.RUNNING)
-        await api.run_action(run_id, RunAction.PAUSE)
+        run_input = {
+            "project": "demo",
+            "task": "Teste arr.",
+            "topology": {
+                "kind": "waterfall",
+                "params": {"on_fail": "escalate", "max_rework": 0, "pass_score": 6},
+            },
+            "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
+            "agents": [{"id": "w"}, {"id": "r"}],
+            "stages": [{"name": "skizze", "agent": "w"}, {"name": "beweis", "agent": "w"}],
+            "raters": ["r"],
+        }
+        run_id = (await api.start_run(run_input)).run_id
         await until_status(api, run_id, RunStatus.PAUSED)
-        log = wf / "runs" / run_id / "approvals.jsonl"
-        item = {"ts": time.time(), "event": "open", "item_id": "esc_0001", "request": None}
-        append(log, json.dumps(item) + "\n")
         detail = await api.get_run(run_id)
         assert detail.run.open_escalation and detail.actions_allowed == [RunAction.STOP]
+        assert detail.open_approvals_top is not None
+        item_id = detail.open_approvals_top.id
         for dry_run in (True, False):
             with pytest.raises(ApiException) as error:
                 await api.run_action(run_id, RunAction.RESUME, dry_run=dry_run)
             assert error.value.error.code is ErrorCode.NOT_ALLOWED
             assert error.value.error.action is not None
-            assert error.value.error.action.url == "/freigaben/esc_0001"
+            assert error.value.error.action.url == f"/freigaben/{item_id}"
         assert (await api.get_run(run_id)).run.status is RunStatus.PAUSED
-        append(log, json.dumps({**item, "event": "decided"}) + "\n")
-        assert RunAction.RESUME in (await api.get_run(run_id)).actions_allowed
+        handle = api.state.registry.get(run_id)
+        assert handle is not None and handle.manager is not None
+        handle.manager.pause()
+        choice = EscalationOption.CONTINUE
+        await api.decide_approval(
+            item_id, DecisionRequest(action=DecisionAction.OPTION, option_key=choice)
+        )
+        detail = await api.get_run(run_id)
+        assert not detail.run.open_escalation and detail.run.status is RunStatus.PAUSED
+        assert RunAction.RESUME in detail.actions_allowed
         await api.run_action(run_id, RunAction.RESUME)
-        await until_status(api, run_id, RunStatus.RUNNING)
-        await api.run_action(run_id, RunAction.STOP)
-        await until_final(api, run_id)
+        assert await until_final(api, run_id) is RunStatus.DONE
     finally:
         await api.close()
 
