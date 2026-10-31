@@ -13,3 +13,9 @@ uv run python spikes/w3_03/live_approvals.py
 ```
 
 Budget: je Lauf `max_budget_usd` 0,30 $, zusammen ≤ 30 min Wandzeit, ein Wachhund stoppt bei 20 Modell-Anfragen je Backend. Es erscheinen echte macOS-Mitteilungen. Ergebnisse stehen im Abschlussbericht W3-03 (lokale Doku).
+
+## B8: Läuft eine freigegebene Codex-Eskalation in der Sandbox? (W3-03.1)
+
+- `live_b8.py [--workfolder ~/arr-m1] [--port N]` – ein Solo-Lauf mit 1 × `gpt-6-luna`. Der Agent führt denselben Test erst in der Sandbox und dann mit Eskalation aus: `getcwd` und Schreiben in einen eigenen leeren Ordner, der lesbar ist, aber außerhalb der Schreibwurzeln liegt. Das Ergebnis kommt aus Dateien, nicht aus der Meldung des Agenten. Der Ordner wird am Ende entfernt.
+
+Budget: 1 Lauf, höchstens 5 Codex-Anfragen, der Wachhund stoppt bei 4. Kein Claude. Ergebnis im Abschlussbericht W3-03 (lokale Doku).

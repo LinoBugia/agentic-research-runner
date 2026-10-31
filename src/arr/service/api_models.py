@@ -1198,7 +1198,7 @@ class ApprovalItem(ApiModel):
     transcript_seq: int | None = None
     why: str | None = Field(default=None, description="„Warum bei dir“ without `escalated_by`")
     no_sandbox: bool = Field(
-        default=False, description="Codex escalation: runs without a sandbox, scope only `once`"
+        default=False, description="Codex escalation: leaves the sandbox, scope only `once`"
     )
     # run start
     requested_by: Starter | None = None

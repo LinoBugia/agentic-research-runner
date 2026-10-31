@@ -167,8 +167,9 @@ async def test_a7_codex_card_says_no_sandbox_and_offers_only_once(wf: Path) -> N
         item = await open_item(api)
         assert item.no_sandbox
         await user.open("/freigaben")
-        html = await see(user, "ohne Sandbox")
-        assert "Läuft ohne Sandbox" in html
+        html = await see(user, "Erhöhte Rechte")
+        assert "nicht in der Sandbox des Agenten" in html and "scheitern" in html
+        assert "ohne Sandbox" not in html
         with user.client:
             assert list(ElementFilter(marker="scope-once"))
             for scope in ("agent", "run", "always"):

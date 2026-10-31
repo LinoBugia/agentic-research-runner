@@ -389,10 +389,10 @@ _R_WEB_OFF = (
     "frage im Chat nach."
 )
 _R_CODEX_ESCALATION = (
-    "Codex will diesen Befehl ohne Sandbox ausführen; das braucht immer eine Freigabe."
+    "Codex will diesen Befehl mit erhöhten Rechten ausführen; das braucht immer eine Freigabe."
 )
 _R_CODEX_ONCE = (
-    "Eine Codex-Eskalation läuft ohne Sandbox. Deshalb gilt die Entscheidung nur für diese "
+    "Eine Codex-Eskalation bekommt erhöhte Rechte. Deshalb gilt die Entscheidung nur für diese "
     "eine Anfrage."
 )
 _R_RISKY_ONCE = (
@@ -1905,9 +1905,11 @@ def _covers(granted: ItemKey, item: ItemKey) -> bool:
 
 
 def is_codex_escalation(request: PermissionRequest | Mapping[str, Any]) -> bool:
-    """True for a Codex shell request: once allowed it runs without any sandbox (H2, S2 §15).
+    """True for a Codex shell request: it leaves the agent's sandbox, for rights arr cannot name.
 
-    Such a decision covers exactly one request. Takes the request or a line of
+    Live under the profile `arr` it stayed restricted and could not even write to its work
+    folder (W3-03.1), so neither „safe“ nor „free“ holds (H2, S2 §15). Such a decision covers
+    exactly one request. Takes the request or a line of
     `approvals.jsonl`, where the adapter has set the provider.
     """
     data = request if isinstance(request, Mapping) else request.model_dump(mode="json")
@@ -2006,8 +2008,8 @@ class PolicyEngine:
         """Keep a final decision according to its scope (docs/07 §3 ④).
 
         `once` is not kept. `agent` and `run` become grants that cover the same items later.
-        A Codex escalation is always kept as `once`, whatever the scope was (it runs without
-        a sandbox).
+        A Codex escalation is always kept as `once`, whatever the scope was (it leaves the
+        agent's sandbox).
         `always` (user only, enforced by `Decision`) becomes an `AlwaysRule` in `self.rules`,
         returned so the caller can store it in `arr.yaml`. If an item of the request contains
         a secret, no always rule is made; the decision is kept with scope `run` instead. A

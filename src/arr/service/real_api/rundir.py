@@ -780,7 +780,7 @@ def item_title(entry: Mapping[str, Any], *, stage: str | None = None, attempts: 
     categories = request.get("categories") or []
     hosts = request.get("hosts") or []
     if is_codex_escalation(request):
-        return f"{agent} möchte einen Befehl ohne Sandbox ausführen"
+        return f"{agent} möchte einen Befehl mit erhöhten Rechten ausführen"
     if RequestCategory.INSTALL.value in categories:
         return f"{agent} möchte etwas installieren"
     if hosts:

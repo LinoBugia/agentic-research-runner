@@ -1036,7 +1036,7 @@ def test_b1_codex_escalation_is_never_allowed_by_a_fixed_rule(env: Env) -> None:
     assert assessment.decision.action is ASK
     assert assessment.decision.decided_by is DecidedBy.FIXED_RULE
     assert RequestCategory.OTHER in assessment.request.categories
-    assert "ohne Sandbox" in assessment.decision.reason
+    assert "erhöhten Rechten" in assessment.decision.reason
     # also without provider in the request: the profile says codex
     assert engine.evaluate(bash(command)).action is ASK
     # only a decision allows it, and only once (W3-03, review W2-02): the scope is lowered

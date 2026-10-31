@@ -338,7 +338,7 @@ class ApprovalCard:
                 )
 
     def _scopes(self) -> list[DecisionScope]:
-        # a Codex escalation runs without a sandbox: only this one request (W3-03); „immer“ only
+        # a Codex escalation leaves the sandbox: only this one request (W3-03); „immer“ only
         # where a rule can come of it, and the dialog names that rule
         if self.item.no_sandbox:
             return [DecisionScope.ONCE]
@@ -638,7 +638,10 @@ class ApprovalCard:
 
 
 TERMINAL_HINT = "Dieser Run läuft im Terminal. Entscheide die Anfrage dort, hier siehst du sie nur."
-NO_SANDBOX = "Läuft ohne Sandbox: Nach der Freigabe schützt nichts Dateien und Netz."
+NO_SANDBOX = (
+    "Erhöhte Rechte: Der Befehl läuft nicht in der Sandbox des Agenten, ist aber auch nicht frei. "
+    "Was er darf, legt Codex fest, arr kann es nicht zusagen. Er kann trotz Freigabe scheitern."
+)
 COMPACT_LINE_CHARS = 32
 """Characters of a command per line in the compact card (300 px column, 12 px monospace)."""
 COMPACT_MAX_LINES = 12

@@ -528,8 +528,9 @@ async def test_a7_codex_escalation_says_no_sandbox_and_takes_only_once(wf: Path)
     async with Service(wf, {"c": asking(ESCALATE)}) as svc:
         started = await svc.api.start_run(run_input(CODEX))
         item = await svc.open_item()
-        assert item.no_sandbox and "ohne Sandbox" in item.title
-        assert "ohne Sandbox" in item.consequences.allow
+        assert item.no_sandbox and "erhöhten Rechten" in item.title
+        assert "nicht zusagen" in item.consequences.allow and "scheitern" in item.consequences.allow
+        assert "ohne Sandbox" not in item.title + item.consequences.allow
         for scope in (DecisionScope.AGENT, DecisionScope.RUN, DecisionScope.ALWAYS):
             with pytest.raises(ApiException) as error:
                 await svc.api.decide_approval(

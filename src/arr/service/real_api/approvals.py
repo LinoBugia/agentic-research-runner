@@ -193,8 +193,8 @@ def _consequences(request: Mapping[str, Any], agent: str) -> Consequences:
     categories = request.get("categories") or []
     if is_codex_escalation(request):
         allow = (
-            "Der Befehl läuft einmal ohne Sandbox, also ohne Schutz für Dateien und Netz. "
-            "Gleiche Befehle fragen wieder."
+            "Der Befehl läuft einmal mit erhöhten Rechten. Was ihn dann noch begrenzt, kann arr "
+            "nicht zusagen, und er kann trotz Freigabe scheitern. Gleiche Befehle fragen wieder."
         )
     elif RequestCategory.INSTALL.value in categories:
         allow = f"Die Installation läuft in der Run-venv{_install_note(request)}."
@@ -597,7 +597,7 @@ class ApprovalsArea:
             raise ApiException.of(ErrorCode.INVALID, "Eskalationen gelten einmalig (E15).")
         if item.no_sandbox and request.scope is not DecisionScope.ONCE:
             raise not_allowed(
-                "Diese Anfrage läuft ohne Sandbox. Du kannst sie nur einmalig erlauben."
+                "Diese Anfrage bekommt erhöhte Rechte. Du kannst sie nur einmalig erlauben."
             )
         if request.scope is DecisionScope.ALWAYS and item.rule_label is None:
             raise not_allowed(NO_RULE)
