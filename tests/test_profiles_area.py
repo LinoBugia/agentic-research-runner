@@ -846,3 +846,91 @@ async def test_default_button_shows_the_message_until_w3_04(api: RealApi) -> Non
         await see(user, "Standard für Claude")
         user.find(marker="default-max").click()
         await see(user, "kommt mit Auftrag W3-04", retries=200)
+
+
+# -- W3-05.1: „Key ersetzen“ -------------------------------------------------------------------
+
+
+NEW_KEY = "sk-ant-api03-NEWMARKER-9876543210"
+
+
+async def rejected_key(prompt: str, options: Any) -> AsyncIterator[Any]:
+    yield AssistantMessage(content=[], model="m", error="authentication_failed")
+    yield ok_result(is_error=True)
+
+
+async def test_replacing_a_key_keeps_the_profile(
+    api: RealApi, keychain: dict, arr_home: Path
+) -> None:
+    keychain[("arr", "api")] = KEY
+    before = (arr_home / "profiles.yaml").read_text()
+    info = await api.create_profile(
+        CreateProfileRequest(
+            name="api", kind=AuthKind.CLAUDE_API_KEY, api_key=SecretStr(NEW_KEY), replace=True
+        )
+    )
+    assert keychain[("arr", "api")] == NEW_KEY and info.secret_present and info.last_test is None
+    assert NEW_KEY not in info.model_dump_json()
+    assert (arr_home / "profiles.yaml").read_text() == before
+
+
+async def test_a_failed_replacement_keeps_the_old_key(
+    api: RealApi, keychain: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    keychain[("arr", "api")] = KEY
+
+    def refuse(*_a: Any) -> None:
+        raise RuntimeError(f"keychain says no to {NEW_KEY}")
+
+    monkeypatch.setattr("arr.auth._keyring_set", refuse)
+    request = CreateProfileRequest(
+        name="api", kind=AuthKind.CLAUDE_API_KEY, api_key=SecretStr(NEW_KEY), replace=True
+    )
+    with pytest.raises(ApiException) as caught:
+        await api.create_profile(request)
+    assert caught.value.error.code is ErrorCode.UNAVAILABLE
+    assert NEW_KEY not in caught.value.error.message
+    assert keychain[("arr", "api")] == KEY
+    assert "api" in [p.name for p in await api.list_profiles()]
+
+
+async def test_replacing_needs_a_matching_profile(api: RealApi, keychain: dict) -> None:
+    for name, kind, code in [
+        ("gibt-es-nicht", AuthKind.CLAUDE_API_KEY, ErrorCode.NOT_FOUND),
+        ("chat", AuthKind.CLAUDE_API_KEY, ErrorCode.INVALID),
+    ]:
+        request = CreateProfileRequest(
+            name=name, kind=kind, api_key=SecretStr(NEW_KEY), replace=True
+        )
+        with pytest.raises(ApiException) as caught:
+            await api.create_profile(request)
+        assert caught.value.error.code is code
+    assert keychain == {}
+    with pytest.raises(ValueError, match="replace"):
+        CreateProfileRequest(name="x", kind=AuthKind.CLAUDE_OAUTH, replace=True)
+
+
+async def test_key_replaced_on_the_page_for_a_profile_without_a_limit(
+    api: RealApi, keychain: dict, monkeypatch: pytest.MonkeyPatch, arr_home: Path
+) -> None:
+    """The profile has no entry in `arr.yaml`, so its limit is 0: the review's H1."""
+    keychain[("arr", "api")] = KEY
+    monkeypatch.setattr("arr.service.profile_check._sdk_query", rejected_key)
+    await api.test_profile("api")
+    assert (await api.list_profiles())[1].concurrency.limit == 0
+
+    async def good(prompt: str, options: Any) -> AsyncIterator[Any]:
+        yield ok_result()
+
+    monkeypatch.setattr("arr.service.profile_check._sdk_query", good)
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile")
+        await see(user, "wurde abgelehnt (401)")
+        user.find(marker="primary-api").click()
+        await see(user, "Neuer API-Key")
+        user.find(marker="field-replace-key").trigger("input", NEW_KEY)
+        user.find(marker="form-confirm").click()
+        html = await see(user, "✓ Key von api ersetzt und getestet.", retries=200)
+        assert "wurde abgelehnt" not in html
+    assert keychain[("arr", "api")] == NEW_KEY
+    assert "api" in (arr_home / "profiles.yaml").read_text()

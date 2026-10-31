@@ -214,7 +214,26 @@ class ProfilesArea:
 
     # -- create, delete ---------------------------------------------------------------------
 
+    async def _replace_key(self, request: CreateProfileRequest) -> ProfileInfo:
+        """„Key ersetzen“: only the keychain item changes; on a failure the old key stays."""
+        profile = self._find(request.name)
+        if profile.kind is not request.kind:
+            raise ApiException.of(
+                ErrorCode.INVALID,
+                f"„{request.name}“ ist kein Profil dieser Art. Lege ein neues Profil an.",
+            )
+        assert request.api_key is not None  # checked by CreateProfileRequest
+        try:
+            value = request.api_key.get_secret_value()
+            await asyncio.to_thread(store_secret, profile, value)
+        except AuthError as exc:
+            raise from_arr_error(exc, ErrorCode.UNAVAILABLE) from None
+        self._update_status(request.name, secret_present=True, last_test=None)
+        return self._info(profile)
+
     async def create_profile(self, request: CreateProfileRequest) -> ProfileInfo:
+        if request.replace:
+            return await self._replace_key(request)
         file = self._load()
         if any(p.name == request.name for p in file.profiles):
             raise ApiException.of(

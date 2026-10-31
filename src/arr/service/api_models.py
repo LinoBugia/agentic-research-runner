@@ -1763,19 +1763,23 @@ class CreateProfileRequest(ApiModel):
     """„Neues Profil“ (docs/08 §5.8, `POST /api/profiles`). The key travels only in the request.
 
     API-key kinds need `api_key`; subscription kinds log in afterwards with `start_login`
-    (E18), they never take a pasted token.
+    (E18), they never take a pasted token. `replace` puts a new key on an existing profile
+    (§8.4 „Key ersetzen“): the profile stays, `concurrency` is ignored.
     """
 
     name: str = Field(pattern=_SLUG)
     kind: AuthKind
     concurrency: int = Field(default=2, ge=1, le=16)
     api_key: SecretStr | None = None
+    replace: bool = False
 
     @model_validator(mode="after")
     def _key_only_for_key_kinds(self) -> Self:
         key_kinds = (AuthKind.CLAUDE_API_KEY, AuthKind.OPENAI_API_KEY)
         if (self.kind in key_kinds) != (self.api_key is not None):
             raise ValueError("api_key gehört genau zu Profilen mit API-Key")
+        if self.replace and self.api_key is None:
+            raise ValueError("replace gibt es nur mit einem neuen api_key")
         return self
 
 

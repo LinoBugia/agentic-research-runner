@@ -399,7 +399,10 @@ class ApiClient(Protocol):
     # --- profiles (docs/08 §5.8) -----------------------------------------------------------
 
     async def create_profile(self, request: CreateProfileRequest) -> ProfileInfo:
-        """Create a profile; API keys go to the keychain (`POST /api/profiles`)."""
+        """Create a profile or, with `replace`, put a new key on it (`POST /api/profiles`).
+
+        API keys go to the keychain. A replaced key leaves the profile as it is.
+        """
         ...
 
     async def delete_profile(self, name: str) -> None:

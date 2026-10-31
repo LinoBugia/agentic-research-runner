@@ -6420,6 +6420,14 @@ class MockApi:
 
     async def create_profile(self, request: CreateProfileRequest) -> ProfileInfo:
         """Create a profile (the key would go to the keychain; the mock keeps only a flag)."""
+        if request.replace:
+            for i, p in enumerate(self.state.profiles):
+                if p.name == request.name:
+                    self.state.profiles[i] = p.model_copy(
+                        update={"secret_present": True, "last_test": None}
+                    )
+                    return self.state.profiles[i]
+            raise _not_found("Profil", request.name)
         if any(p.name == request.name for p in self.state.profiles):
             raise ApiException.of(
                 ErrorCode.CONFLICT,

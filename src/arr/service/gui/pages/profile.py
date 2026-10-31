@@ -608,13 +608,9 @@ class ProfilePage:
                 fields["key"].set_error("Füge den neuen API-Key ein.")
                 return "Der API-Key fehlt."
             try:
-                await self.api.delete_profile(p.name)
                 await self.api.create_profile(
                     CreateProfileRequest(
-                        name=p.name,
-                        kind=p.kind,
-                        concurrency=p.concurrency.limit,
-                        api_key=SecretStr(key),
+                        name=p.name, kind=p.kind, api_key=SecretStr(key), replace=True
                     )
                 )
             except ApiException as exc:
