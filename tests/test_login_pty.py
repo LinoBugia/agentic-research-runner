@@ -151,7 +151,7 @@ async def test_cancel_waits_for_a_running_sink(tmp_path: Path) -> None:
     task = asyncio.create_task(capture_token(sink, cli=cli, timeout_s=10))
     assert await asyncio.to_thread(entered.wait, 10)
     task.cancel()
-    await asyncio.sleep(0.05)
+    await asyncio.wait({task}, timeout=1)
     assert not task.done(), "the cancellation overtook the sink"
     release.set()
     with pytest.raises(asyncio.CancelledError):

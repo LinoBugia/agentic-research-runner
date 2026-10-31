@@ -1,7 +1,8 @@
-"""Live probe W3-05: `test_profile` with the existing logins, create/delete without a request.
+"""Live probe W3-05: `test_profile` with the login of this Mac, create/delete without a request.
 
-Runs on a temporary `ARR_HOME`, so `~/.arr/profiles.yaml` stays as it is; the `codex_chatgpt`
-profile points at its real login folder. Costs one Claude and one Codex request. The API-key
+Runs on a temporary `ARR_HOME`, so `~/.arr/profiles.yaml` stays as it is. Costs one Claude
+request. The `codex_chatgpt` profile points at a login folder outside that `ARR_HOME`, so arr
+must refuse it without a request and without touching the folder (W3-05.1, M7). The API-key
 profile holds a fake value, lives in the keychain for a moment and sends no request.
 
 Usage: uv run python spikes/w3_05/live_profiles.py
@@ -28,15 +29,26 @@ def report(label: str, info: object) -> None:
 
 async def main(root: Path) -> None:
     from arr.models import AuthKind
-    from arr.service.api_models import CreateProfileRequest
+    from arr.service.api_models import ApiException, CreateProfileRequest
     from arr.service.real_api import RealApi
 
     workfolder = root / "wf"
     (workfolder / "runs").mkdir(parents=True)
     (workfolder / "arr.yaml").write_text("version: 1\n")
     api = RealApi(workfolder, base_url="http://127.0.0.1:1", scan=False)
+    claude_projects = Path.home() / ".claude" / "projects"
+    sessions = len(list(claude_projects.iterdir()))
     report("max:", await api.test_profile("max"))
+    print("Neue Sitzungen in ~/.claude/projects:", len(list(claude_projects.iterdir())) - sessions)
+
+    folder = Path.home() / ".arr" / "auth" / CODEX_PROFILE / "codex_home"
+    mode = folder.stat().st_mode
     report(f"{CODEX_PROFILE}:", await api.test_profile(CODEX_PROFILE))
+    try:
+        await api.start_login(CODEX_PROFILE)
+    except ApiException as exc:
+        print("Login abgelehnt:", exc.error.code.value)
+    print("Modus des Ordners unverändert:", folder.stat().st_mode == mode)
     print("Liste:", [p.name for p in await api.list_profiles()])
 
     request = CreateProfileRequest(
