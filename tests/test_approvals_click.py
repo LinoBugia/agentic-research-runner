@@ -38,6 +38,7 @@ from arr.permissions.types import (
     DecisionScope,
     PermissionRequest,
 )
+from arr.runs.inspect import open_approvals
 from arr.service.api_models import ApiException, DecisionRequest, ErrorCode
 from arr.service.real_api import RealApi
 from arr.workfolder import load_workfolder_settings
@@ -138,8 +139,7 @@ async def test_b1_equal_commands_share_a_card_and_the_join_line_holds_the_joined
     async with Service(wf, {"a": asking(HOST)}) as svc:
         run_id, inbox = await keep_alive(svc)
         first = asyncio.create_task(inbox.handle(bash(run_id, READ_ME, reason="Erster Grund")))
-        spaced = READ_ME.replace(" -s ", "  -s  ")
-        second = asyncio.create_task(inbox.handle(bash(run_id, spaced, reason="Zweiter Grund")))
+        second = asyncio.create_task(inbox.handle(bash(run_id, READ_ME, reason="Zweiter Grund")))
         [card] = await cards_for(svc, "example.com", 2)
         assert card.count == 2
         await svc.api.decide_approval(card.id, ALLOW)
@@ -147,19 +147,35 @@ async def test_b1_equal_commands_share_a_card_and_the_join_line_holds_the_joined
         lines = [e for e in log_of(wf, run_id) if e.get("item_id") == card.id]
         [join] = [e for e in lines if e["event"] == "decision"]
         assert join["request"]["reason"] == "Zweiter Grund"
-        assert join["request"]["command"] == spaced
+        assert join["request"]["command"] == READ_ME
 
 
-async def test_b1_a_line_break_is_not_a_space(wf: Path) -> None:
-    """`a\\nb` runs two commands, `a b` one: same words, not the same request."""
+INDENTED = """python3 -c 'import os
+if 0:
+    print(1)
+    os.system("touch boese")' https://example.com/doku"""
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (INDENTED, INDENTED.replace("    os.system", "os.system")),
+        ('curl -d "a  b" https://example.com/', 'curl -d "a b" https://example.com/'),
+        (f"{READ_ME} --fail", f"{READ_ME}\n--fail"),
+        (f"{READ_ME}\n--fail", f"{READ_ME}\x0b--fail"),
+        (f"{READ_ME}\n--fail", f"{READ_ME}\x0c--fail"),
+        (f"{READ_ME}\n--fail", f"{READ_ME}\u2028--fail"),
+        (f"{READ_ME} --fail", f"{READ_ME}\u00a0--fail"),
+        (READ_ME, READ_ME.replace(" -s ", "  -s  ")),
+    ],
+    ids=["indentation", "quotes", "line-break", "vt", "ff", "ls", "nbsp", "spaces"],
+)
+async def test_n1_only_byte_equal_commands_share_a_card(wf: Path, first: str, second: str) -> None:
     async with Service(wf, {"a": asking(HOST)}) as svc:
         run_id, inbox = await keep_alive(svc)
-        tasks = [
-            asyncio.create_task(inbox.handle(bash(run_id, c)))
-            for c in (f"{READ_ME} --fail", f"{READ_ME}\n--fail")
-        ]
-        cards = await cards_for(svc, "example.com", 2)
-        assert len(cards) == 2
+        tasks = [asyncio.create_task(inbox.handle(bash(run_id, c))) for c in (first, second)]
+        await until(lambda: len(inbox.pending()) == 3)
+        assert {i.count for i in inbox.pending()} == {1}
         await finish(*tasks)
 
 
@@ -285,6 +301,32 @@ async def test_b3_no_always_where_no_rule_can_come_of_it(
     assert "always" not in load_workfolder_settings(wf).permissions
 
 
+@pytest.mark.parametrize("host", ["*.example.com", "*"])
+async def test_n2_a_host_pattern_of_an_agent_never_reaches_the_next_sandbox(
+    wf: Path, host: str
+) -> None:
+    command = f"curl -s https://{host}/x"
+    async with Service(wf, {"a": asking(HOST), "b": asking(HOST)}) as svc:
+        run_id, inbox = await keep_alive(svc)
+        task = asyncio.create_task(inbox.handle(bash(run_id, command)))
+        [card] = await cards_for(svc, command, 1)
+        assert card.rule_label is None and card.rule_effects == []
+        with pytest.raises(ApiException) as caught:
+            await svc.api.decide_approval(card.id, ALWAYS)
+        assert caught.value.error.code is ErrorCode.NOT_ALLOWED
+        run_wide = DecisionRequest(action=DecisionAction.ALLOW, scope=DecisionScope.RUN)
+        await svc.api.decide_approval(card.id, run_wide)
+        await task
+        for item in await svc.api.list_approvals(status=OPEN):
+            await svc.api.decide_approval(item.id, DENY)
+        await svc.final(run_id)
+        second = await svc.api.start_run(run_input({"id": "b"}))
+        await svc.open_item()
+        engine = svc.api.state.registry.get(second.run_id).manager.inbox.engine
+        assert engine.profile("b").allowed_domains == ()
+    assert "always" not in (load_workfolder_settings(wf).permissions or {})
+
+
 # --- B5: card and decision come from one source -------------------------------------------------
 
 
@@ -347,6 +389,82 @@ async def test_b5_a_run_of_arr_run_stays_read_from_the_file(wf: Path) -> None:
     assert item.terminal and item.command == "curl x" and item.rule_label is None
 
 
+def forged(wf: Path, run_id: str, **fields: Any) -> None:
+    line = {"ts": time.time(), **fields}
+    append(wf / "runs" / run_id / "approvals.jsonl", json.dumps(line) + "\n")
+
+
+DECIDED_BY_USER = {"action": "allow", "scope": "run", "decided_by": "user", "reason": "x"}
+
+
+async def ticks() -> None:
+    """Long enough for the watcher (every 0.25 s) to have seen what was written."""
+    await asyncio.sleep(0.8)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        {"event": "decided", "decision": DECIDED_BY_USER},
+        {"event": "expired"},
+        {"event": "obsolete", "note": "erfunden"},
+        {"event": "decision"},
+    ],
+    ids=["decided", "expired", "obsolete", "decision"],
+)
+async def test_n3_a_line_in_the_file_sends_no_event_and_moves_no_number(
+    wf: Path, line: dict[str, Any]
+) -> None:
+    async with Service(wf, {"a": asking(HOST)}) as svc:
+        started = await svc.api.start_run(run_input({"id": "a"}))
+        item = await svc.open_item()
+        await svc.event("approval.created")
+        before = len(svc.approval_events("approval.updated"))
+        forged(wf, started.run_id, item_id=item.id, **line)
+        await ticks()
+        for kind in ("approval.decided", "approval.expired", "approval.revoked"):
+            assert not svc.approval_events(kind)
+        assert len(svc.approval_events("approval.updated")) == before
+        assert (await svc.api.get_counts()).waiting == 1
+        assert (await svc.api.get_run(started.run_id)).run.open_approvals == 1
+        response = await svc.api.decide_approval(item.id, DENY)
+        assert response.item.decision.action is DecisionAction.DENY
+        await svc.event("approval.decided")  # the real one still arrives
+        await svc.final(started.run_id)
+
+
+async def test_n3_an_open_line_in_the_file_counts_nowhere(wf: Path) -> None:
+    async with Service(wf, {"a": asking(HOST)}) as svc:
+        started = await svc.api.start_run(run_input({"id": "a"}))
+        item = await svc.open_item()
+        await svc.event("approval.created")
+        request = {"run_id": started.run_id, "agent_id": "a", "tool": "Bash", "command": "echo x"}
+        forged(wf, started.run_id, event="open", item_id="apr_erfunden_0001", request=request)
+        await ticks()
+        assert len(svc.approval_events("approval.created")) == 1
+        assert len(svc.sent) == 1  # no notification either
+        assert (await svc.api.get_counts()).waiting == 1
+        detail = await svc.api.get_run(started.run_id)
+        assert detail.run.open_approvals == 1 and detail.open_approvals_top.id == item.id
+        await svc.api.decide_approval(item.id, DENY)
+        await svc.final(started.run_id)
+
+
+async def test_n3_a_run_of_arr_run_stays_with_the_file(wf: Path) -> None:
+    folder = make_run_folder(wf, status=RunStatus.RUNNING)
+    request = {"run_id": folder.name, "agent_id": "a", "tool": "Bash", "command": "curl x"}
+    forged(wf, folder.name, event="open", item_id="apr_t_0001", request=request)
+    lock = hold_lock(folder)
+    try:
+        async with Service(wf, {}) as svc:
+            assert (await svc.api.get_counts()).waiting == 1
+            forged(wf, folder.name, event="obsolete", item_id="apr_t_0001", note="fertig")
+            await svc.event("approval.expired")
+            assert (await svc.api.get_counts()).waiting == 0
+    finally:
+        lock.release()
+
+
 # --- B6, B7, B9 ---------------------------------------------------------------------------------
 
 
@@ -359,6 +477,19 @@ async def test_b6_a_broken_arr_yaml_does_not_leave_the_agent_waiting(wf: Path) -
         response = await svc.api.decide_approval(item.id, ALWAYS)
         assert "nicht in arr.yaml speichern" in response.message
         assert response.item.status is ApprovalStatus.DECIDED
+        assert await svc.final(started.run_id) is RunStatus.DONE
+        (wf / "arr.yaml").write_text(good, "utf-8")
+
+
+@pytest.mark.parametrize("broken", ["permissions:\n  always: null\n", "permissions: null\n"])
+async def test_n5_an_empty_always_in_arr_yaml_is_told_to_the_user(wf: Path, broken: str) -> None:
+    async with Service(wf, {"a": asking(HOST)}) as svc:
+        started = await svc.api.start_run(run_input({"id": "a"}))
+        item = await svc.open_item()
+        good = (wf / "arr.yaml").read_text("utf-8")
+        (wf / "arr.yaml").write_text(f"version: 1\n{broken}", "utf-8")
+        response = await svc.api.decide_approval(item.id, ALWAYS)
+        assert "nicht in arr.yaml speichern" in response.message
         assert await svc.final(started.run_id) is RunStatus.DONE
         (wf / "arr.yaml").write_text(good, "utf-8")
 
@@ -433,3 +564,36 @@ async def test_b9_a_damaged_line_does_not_hide_the_inbox(wf: Path, line: str) ->
     items = await api.list_approvals(status=OPEN)
     lock.release()
     assert "apr_t_0001" in [i.id for i in items]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '{"event": "open", "item_id": ["x"], "ts": 1}',
+        '{"event": "open", "item_id": {"a": 1}, "ts": 1}',
+        '{"event": "decided", "item_id": ["x"], "ts": 1}',
+        "[1, 2, 3]",
+        '"text"',
+        "17",
+    ],
+)
+async def test_n4_a_damaged_line_takes_no_page_down(wf: Path, line: str) -> None:
+    folder = make_run_folder(wf, status=RunStatus.RUNNING)
+    request = {"run_id": folder.name, "agent_id": "a", "tool": "Bash", "command": "curl x"}
+    good = {"ts": time.time(), "event": "open", "item_id": "apr_t_0001", "request": request}
+    append(folder / "approvals.jsonl", line + "\n" + json.dumps(good) + "\n")
+    lock = hold_lock(folder)
+    api = RealApi(wf, base_url=BASE)
+    try:
+        assert (await api.get_counts()).waiting == 1
+        assert [r.open_approvals for r in (await api.list_runs()).items] == [1]
+        assert (await api.get_run(folder.name)).run.open_approvals == 1
+        await api.list_agents(folder.name)
+    finally:
+        lock.release()
+
+
+def test_n4_open_approvals_skips_damaged_entries() -> None:
+    good = {"event": "open", "item_id": "apr_t_0001"}
+    entries: list[Any] = [{"event": "open", "item_id": ["x"]}, [1], "text", 17, good]
+    assert open_approvals(entries) == [good]

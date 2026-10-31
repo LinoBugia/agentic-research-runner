@@ -858,8 +858,9 @@ def _merge_key(assessment: Assessment) -> tuple[Any, ...] | None:
     """What makes two requests one card, None for a request that always gets its own.
 
     Plain host requests of the sandbox are equal by agent and host. Anything else must match in
-    all the card says about the action; line breaks stay, they separate shell commands. A high
-    risk, a Codex escalation and a request the card cannot describe are never merged.
+    all the card says about the action, the command byte for byte: whitespace can be code
+    (indentation, quotes, what a shell does not count as blank). A high risk, a Codex escalation
+    and a request the card cannot describe are never merged.
     """
     request = assessment.request
     if (
@@ -873,11 +874,10 @@ def _merge_key(assessment: Assessment) -> tuple[Any, ...] | None:
     urls = frozenset(request.urls)
     if request.tool in NETWORK_TOOLS and not request.command:
         return (request.agent_id, request.tool, assessment.items, urls)
-    command = tuple(" ".join(line.split()) for line in (request.command or "").splitlines())
     return (
         request.agent_id,
         request.tool,
-        command,
+        request.command,
         frozenset(request.paths),
         frozenset(request.hosts),
         urls,

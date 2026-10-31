@@ -324,3 +324,23 @@ async def test_b3_no_always_on_a_high_risk_card(wf: Path) -> None:
             assert list(ElementFilter(marker="scope-once"))
             assert list(ElementFilter(marker="scope-run"))
             assert not list(ElementFilter(marker="scope-always"))
+
+
+async def test_n3_a_line_in_the_file_takes_no_card_from_the_open_tab(wf: Path) -> None:
+    async with service(wf, {"a": {**SLOW, "asks": [HOST]}}) as (user, api):
+        item = await _started(api, "a")
+        await user.open("/freigaben")
+        await see(user, item.title)
+        forged = {
+            "ts": time.time(),
+            "event": "decided",
+            "item_id": item.id,
+            "decision": {"action": "allow", "scope": "run", "decided_by": "user", "reason": "x"},
+        }
+        append(wf / "runs" / item.run.id / "approvals.jsonl", json.dumps(forged) + "\n")
+        await asyncio.sleep(0.8)  # the watcher looks every 0.25 s
+        html = page_html(user)
+        assert "In einem anderen Tab entschieden" not in html
+        assert item.title in html and (await api.get_counts()).waiting == 1
+        with user.client:
+            assert list(ElementFilter(marker="allow"))

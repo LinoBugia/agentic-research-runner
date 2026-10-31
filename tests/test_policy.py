@@ -1921,13 +1921,44 @@ def test_w3_03_1_the_exact_flag_survives_arr_yaml(env: Env) -> None:
     assert env.engine(rules=rules).evaluate(bash("pip install evilpkg")).action is ASK
 
 
-def test_w3_03_1_a_decision_on_a_star_host_is_no_pattern(env: Env) -> None:
+@pytest.mark.parametrize("host", ["*.example.com", "*", "ex?mple.com", "[ab].example.com"])
+def test_w3_03_2_a_host_pattern_becomes_no_rule(env: Env, host: str) -> None:
     engine = env.engine()
-    request = req("SandboxNetworkAccess", hosts=["*.example.com"])
-    rule = engine.remember("apr_x_0001", request, ALWAYS_BY_USER).rule
-    assert rule is not None and rule.exact
+    request = req("SandboxNetworkAccess", hosts=[host])
+    assert engine.rule_for(request) is None
+    kept = engine.remember("apr_x_0001", request, ALWAYS_BY_USER)
+    assert kept.rule is None and not engine.rules.always and not engine.grants
+    assert kept.decision.scope is DecisionScope.ONCE and "Muster" in (kept.note or "")
     other = req("SandboxNetworkAccess", hosts=["evil.example.com"])
     assert engine.evaluate(other).action is ASK
+
+
+@pytest.mark.parametrize("command", ["curl https://*.example.com/x", "curl https://*/x"])
+def test_w3_03_2_a_curl_with_a_host_pattern_leaves_the_sandbox_alone(
+    env: Env, command: str
+) -> None:
+    engine = env.engine()
+    request = bash(command)
+    assert engine.evaluate(request).action is ASK
+    engine.remember("apr_x_0001", request, ALWAYS_BY_USER)
+    run_scope = Decision(action=ALLOW, scope=DecisionScope.RUN, decided_by=DecidedBy.USER)
+    engine.remember("apr_x_0002", request, run_scope)
+    profile = env.profile(rules=engine.rules)
+    assert profile.allowed_domains == ()
+    assert claude_options(profile).sandbox["network"]["allowedDomains"] == []
+
+
+def test_w3_03_2_exact_holds_up_to_the_sandbox(env: Env) -> None:
+    exact = AlwaysRule(action="allow", hosts=["*.example.com", "*", "oeis.org"], exact=True)
+    profile = env.profile(rules=PermissionRules(always=[exact]))
+    assert profile.allowed_domains == ("oeis.org",)
+    assert claude_options(profile).sandbox["network"]["allowedDomains"] == ["oeis.org"]
+
+
+def test_w3_03_2_hand_written_host_patterns_reach_the_sandbox(env: Env) -> None:
+    hand = AlwaysRule(action="allow", hosts=["*.example.com"])
+    profile = env.profile(rules=PermissionRules(always=[hand]))
+    assert profile.allowed_domains == ("*.example.com",)
 
 
 def test_w3_03_1_hand_written_patterns_keep_working(env: Env) -> None:

@@ -18,8 +18,9 @@ import os
 import re
 import sqlite3
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -436,6 +437,8 @@ class RunRecord:
         self._final_extras: tuple[BestResult | None, LastMessage | None] | None = None
         self.log = JsonlTail(run_dir / ORCHESTRATOR_LOG)
         self.approvals = JsonlTail(run_dir / APPROVALS_LOG)
+        self.item_lines: Callable[[], list[dict[str, Any]] | None] = lambda: None
+        """Item lines as the run's writer in this process holds them; None: only the file."""
         self.agents: dict[str, AgentRecord] = {}
         self._agents_key: int | None = None
         self._usage: _Cached[RunUsage] = _Cached(run_dir / USAGE_FILE)
@@ -636,6 +639,8 @@ class RunStore:
     def __init__(self, runs_dir: Path) -> None:
         self.runs_dir = Path(runs_dir)
         self.records: dict[str, RunRecord] = {}
+        self.item_lines: Callable[[str], list[dict[str, Any]] | None] = lambda _run_id: None
+        """Set by the approvals area, see `RunRecord.item_lines`."""
         self._dir_key: int | None = None
 
     def scan(self, *, refresh: bool = True) -> list[RunRecord]:
@@ -661,7 +666,7 @@ class RunStore:
             except OSError:
                 names = set()
             for name in names - self.records.keys():
-                self.records[name] = RunRecord(self.runs_dir / name)
+                self._add(name)
             for name in self.records.keys() - names:
                 del self.records[name]
             refresh = True
@@ -669,6 +674,14 @@ class RunStore:
             for record in self.records.values():
                 record.refresh_meta()
         return self.sorted()
+
+    def _add(self, run_id: str) -> RunRecord:
+        record = self.records[run_id] = RunRecord(self.runs_dir / run_id)
+        record.item_lines = partial(self._item_lines_of, run_id)
+        return record
+
+    def _item_lines_of(self, run_id: str) -> list[dict[str, Any]] | None:
+        return self.item_lines(run_id)
 
     def sorted(self) -> list[RunRecord]:
         """Records with a readable `meta.json`, newest first."""
@@ -683,7 +696,7 @@ class RunStore:
         if record is None:
             if not (self.runs_dir / run_id / "meta.json").is_file():
                 return None
-            record = self.records[run_id] = RunRecord(self.runs_dir / run_id)
+            record = self._add(run_id)
         record.refresh_meta()
         return record if record.meta is not None else None
 
@@ -756,11 +769,21 @@ def run_alive(record: RunRecord) -> bool:
     return not record.final and run_lock_held(record.run_dir)
 
 
+def item_entries(record: RunRecord) -> list[dict[str, Any]]:
+    """The lines items are read from: memory for a run of this service, else `approvals.jsonl`.
+
+    Card, decision, events and counters use the same lines, so a line added to the file of such
+    a run changes none of them (W3-03.1, W3-03.2).
+    """
+    own = record.item_lines()
+    return record.approvals.entries if own is None else own
+
+
 def open_items(record: RunRecord) -> list[dict[str, Any]]:
-    """Open entries of `approvals.jsonl`; none for a run that nobody executes any more."""
+    """Open entries of a run (`item_entries`); none for a run nobody executes any more."""
     if record.final:
         return []
-    items = open_approvals(record.approvals.entries)
+    items = open_approvals(item_entries(record))
     return items if items and run_alive(record) else []
 
 

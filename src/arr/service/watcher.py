@@ -82,6 +82,8 @@ class _Seen:
     active: bool
     log_len: int = 0
     approvals_len: int = 0
+    own_len: int = 0
+    """Cursor in the item lines in memory of a run of this service (`RunRecord.item_lines`)."""
     open_ids: set[str] = field(default_factory=set)
     counts_dirty: bool = False
     transcript_lines: dict[str, int] = field(default_factory=dict)
@@ -252,6 +254,10 @@ class RunWatcher:
                     agents_dirty.add(request["agent_id"])
             seen.approvals_len = len(approvals)
             run_dirty = True
+        own = record.item_lines()
+        if own is not None:  # the file of a run of this service is no source of events
+            new_approvals = own[seen.own_len :]
+            seen.own_len = len(own)
         if (new_approvals or seen.open_ids) and self._approval_events(record, seen, new_approvals):
             run_dirty = True
 

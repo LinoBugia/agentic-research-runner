@@ -399,10 +399,15 @@ _R_RISKY_ONCE = (
     "Hohes Risiko wird nie zu einer „Immer“-Regel. Deshalb gilt die Entscheidung nur für diese "
     "eine Anfrage."
 )
+_R_HOST_PATTERN_ONCE = (
+    "Der Host sieht aus wie ein Muster. Daraus wird keine „Immer“-Regel, sie gälte in der Sandbox "
+    "für mehr als diesen Host. Deshalb gilt die Entscheidung nur für diese eine Anfrage."
+)
 _R_SECRET_IN_RULE = (
     "Die Anfrage enthält ein Geheimnis, deshalb wird daraus keine „Immer“-Regel (sie stünde "
     "in arr.yaml). Die Entscheidung gilt nur für diesen Run."
 )
+_PLAIN_HOST_RE = re.compile(r"[\w.:-]+")
 _DEVICE_WRITES = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"})
 _ALTERNATIVE = " Arbeite im Arbeitsordner weiter oder beschreibe im Chat, was du brauchst."
 
@@ -494,7 +499,8 @@ class AlwaysRule(StrictModel):
     operators) or, for unknown tools, `tools` alone. Allow rules never lift hard bans.
 
     `exact` marks a rule made from a decision: its hosts and commands are literal, because the
-    agent wrote them. Patterns are only for rules the user writes by hand in `arr.yaml`.
+    agent wrote them, here and in the sandbox (`profile_for`). Patterns are only for rules the
+    user writes by hand in `arr.yaml`.
     """
 
     action: Literal["allow", "deny"]
@@ -783,7 +789,7 @@ def profile_for(
         if not rule.tools or set(rule.tools) & READ_TOOLS:
             read_allow += [norm(p) for p in rule.paths]
         if not rule.tools or set(rule.tools) & NETWORK_TOOLS:
-            domains += [h.lower() for h in rule.hosts]
+            domains += [h.lower() for h in rule.hosts if not rule.exact or _plain_host(h)]
 
     sensitive = [norm(home / p) for p in SENSITIVE_HOME_PATHS]
     sensitive += [norm(p) for p in SENSITIVE_ABSOLUTE_PATHS]
@@ -1920,6 +1926,11 @@ def is_codex_escalation(request: PermissionRequest | Mapping[str, Any]) -> bool:
     )
 
 
+def _plain_host(host: str) -> bool:
+    """True for a host name or address; `*` and the like mean more to the sandbox (W3-03.2)."""
+    return _PLAIN_HOST_RE.fullmatch(host) is not None
+
+
 def _host_matches(pattern: str, host: str, *, exact: bool = False) -> bool:
     pattern = pattern.rstrip(".").lower()
     if pattern.startswith("*.") and not exact:
@@ -2013,7 +2024,8 @@ class PolicyEngine:
         `always` (user only, enforced by `Decision`) becomes an `AlwaysRule` in `self.rules`,
         returned so the caller can store it in `arr.yaml`. If an item of the request contains
         a secret, no always rule is made; the decision is kept with scope `run` instead. A
-        high risk never becomes a rule either; that decision counts for this request only.
+        high risk or a host that looks like a pattern never becomes a rule either; that
+        decision counts for this request only.
         """
         if decision.action not in (DecisionAction.ALLOW, DecisionAction.DENY):
             return Remembered(decision)
@@ -2029,9 +2041,9 @@ class PolicyEngine:
         if analysis.no_rules:
             once = decision.model_copy(update={"scope": DecisionScope.ONCE})
             return Remembered(once, note=_R_CODEX_ONCE)
-        if analysis.risky and decision.scope is DecisionScope.ALWAYS:
+        if decision.scope is DecisionScope.ALWAYS and (analysis.risky or _host_pattern(analysis)):
             once = decision.model_copy(update={"scope": DecisionScope.ONCE})
-            return Remembered(once, note=_R_RISKY_ONCE)
+            return Remembered(once, note=_R_RISKY_ONCE if analysis.risky else _R_HOST_PATTERN_ONCE)
         note = None
         if decision.scope is DecisionScope.ALWAYS:
             action = "allow" if decision.action is DecisionAction.ALLOW else "deny"
@@ -2054,7 +2066,7 @@ class PolicyEngine:
         if profile is None:
             return None
         analysis = self._analyze(request, profile)
-        if not analysis.grey or analysis.no_rules or analysis.risky:
+        if not analysis.grey or analysis.no_rules or analysis.risky or _host_pattern(analysis):
             return None
         rule = _rule_from_items(analysis, "allow", "")
         return None if _contains_secret(rule) else rule
@@ -2401,6 +2413,10 @@ def _rule_path_key(raw: str, profile: SandboxProfile) -> str:
         return profile.key(profile.resolve(raw, profile.workfolder))
     except ValueError:
         return "\x00"
+
+
+def _host_pattern(analysis: _Analysis) -> bool:
+    return any(kind == "host" and not _plain_host(value) for kind, value in analysis.grey)
 
 
 def _rule_from_items(

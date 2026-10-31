@@ -2,8 +2,9 @@
 
 Reading: `ApprovalReader` builds the `ApprovalItem`s of a run from lines of `approvals.jsonl`.
 For a run of `arr run` and a finished run these come from the file. For a run this service
-executes they come from its `ApprovalLog` in memory, the same source `decide_approval` acts on:
-a line somebody else adds to the file changes no card and blocks none. Only lines with an
+executes they come from its `ApprovalLog` in memory, the same source `decide_approval` acts on,
+and so do its `approval.*` events and counters: a line somebody else adds to the file changes
+no card, blocks none and moves no number. Only lines with an
 `item_id` are items, so `allow` of fixed rules (one line per tool call) never shows. A run that
 is not running any more has no open items: what is left open counts as obsolete.
 
@@ -19,6 +20,7 @@ import os
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +63,7 @@ from arr.service.api_models import (
 from arr.service.real_api.base import ServiceState, not_allowed, not_found
 from arr.service.real_api.rundir import (
     RunRecord,
+    item_entries,
     item_title,
     model_label,
     role_label,
@@ -237,6 +240,12 @@ def live_inbox(state: ServiceState, run_id: str) -> ApprovalInbox | None:
     return handle.manager.inbox
 
 
+def own_lines(state: ServiceState, run_id: str) -> list[dict[str, Any]] | None:
+    """The item lines of a run this service executes, from memory; None for other runs."""
+    inbox = live_inbox(state, run_id)
+    return inbox.log.item_lines() if inbox is not None and inbox.log is not None else None
+
+
 @dataclass
 class _Cached:
     key: tuple[Any, ...]
@@ -253,9 +262,7 @@ class ApprovalReader:
 
     def items(self, record: RunRecord) -> dict[str, ApprovalItem]:
         """All items of a run by ID (`approvals.jsonl` of the record must be fresh)."""
-        inbox = live_inbox(self.state, record.run_id)
-        log_of_run = inbox.log if inbox is not None else None
-        entries = log_of_run.item_lines() if log_of_run is not None else record.approvals.entries
+        entries = item_entries(record)
         if not entries:
             return {}
         lines = _item_lines(entries)
@@ -514,6 +521,7 @@ class ApprovalsArea:
         self.decider = GuiDecider()
         self.reader = ApprovalReader(state)
         self._rule_stored = True
+        state.store.item_lines = partial(own_lines, state)
 
     def _fresh_items(self, record: RunRecord) -> dict[str, ApprovalItem]:
         if record.status.is_active:
@@ -572,7 +580,7 @@ class ApprovalsArea:
         try:
             store_always_rule(self.state.workfolder, rule)
             self.state.reload_settings()
-        except (OSError, ValueError, ArrError, YAMLError):
+        except (OSError, ValueError, TypeError, AttributeError, ArrError, YAMLError):
             log.exception("Feste Regel konnte nicht in arr.yaml geschrieben werden")
             self._rule_stored = False
         for handle in self.state.registry.active():
