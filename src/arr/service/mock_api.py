@@ -6428,6 +6428,14 @@ class MockApi:
 
     async def create_profile(self, request: CreateProfileRequest) -> ProfileInfo:
         """Create a profile (the key would go to the keychain; the mock keeps only a flag)."""
+        if request.replace:
+            for i, p in enumerate(self.state.profiles):
+                if p.name == request.name:
+                    self.state.profiles[i] = p.model_copy(
+                        update={"secret_present": True, "last_test": None}
+                    )
+                    return self.state.profiles[i]
+            raise _not_found("Profil", request.name)
         if any(p.name == request.name for p in self.state.profiles):
             raise ApiException.of(
                 ErrorCode.CONFLICT,
@@ -6487,7 +6495,6 @@ class MockApi:
             return LoginStart(
                 profile=name,
                 method="browser",
-                browser_url="https://claude.ai/oauth/authorize?arr=mock",
                 poll_url=poll,
                 expires_at=now + 600,
                 note="arr führt dafür claude setup-token aus.",
@@ -6496,6 +6503,7 @@ class MockApi:
             return LoginStart(
                 profile=name,
                 method="device_code",
+                browser_url="https://auth.openai.com/codex/device",
                 device_code="ARR-4K7Q",
                 poll_url=poll,
                 expires_at=now + 900,

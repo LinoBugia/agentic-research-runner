@@ -437,7 +437,7 @@ async def test_profile_create_and_login() -> None:
     with pytest.raises(m.ApiException) as exc:
         await api.create_profile(request)
     assert exc.value.error.code is m.ErrorCode.CONFLICT and exc.value.error.field == "name"
-    with pytest.raises(ValidationError):
+    with pytest.raises(m.ApiException):
         m.CreateProfileRequest(name="max-neu", kind="claude_oauth", api_key="x")  # no tokens
     await api.create_profile(m.CreateProfileRequest(name="max-neu", kind="claude_oauth"))
     start = await api.start_login("max-neu")
