@@ -1,8 +1,11 @@
 import logging
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+
+os.environ["ARR_NOTIFY"] = "off"  # no test shows a real notification, child processes inherit it
 
 
 @pytest.fixture

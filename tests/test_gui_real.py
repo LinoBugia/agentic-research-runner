@@ -177,7 +177,6 @@ async def test_every_page_loads_with_real_data(wf: Path, finished: str) -> None:
 async def test_pages_of_later_orders_show_the_message_instead_of_crashing(wf: Path) -> None:
     async with real_user(wf) as (user, _api):
         for path, order in [
-            ("/freigaben", "W3-03"),
             ("/usage", "W5-01"),
             ("/speicher", "W5-01"),
             ("/einstellungen", "W3-04"),

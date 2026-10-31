@@ -471,6 +471,21 @@ def test_card_with_buttons_out_of_view_is_not_armed(browser, base_url) -> None: 
     page.close()
 
 
+def test_live_card_on_top_disarms_the_card_below(browser, base_url) -> None:  # noqa: ANN001
+    """W1-06.2: a card that arrives live moves the others, so they must be seen again (W3-03)."""
+    _reset(browser, base_url, "szenario")
+    page = _page(browser)
+    page.goto(f"{base_url}/freigaben")
+    page.wait_for_selector("#apr_0042")
+    page.wait_for_timeout(ARM_WAIT_MS + 300)
+    assert page.evaluate("!!document.getElementById('apr_0042')._arrArmed")
+    page.evaluate("arr.disarmAll()")  # what the page sends with a live card
+    assert not page.evaluate("!!document.getElementById('apr_0042')._arrArmed")
+    page.wait_for_timeout(ARM_WAIT_MS + 300)
+    assert page.evaluate("!!document.getElementById('apr_0042')._arrArmed")
+    page.close()
+
+
 # --- W1-07.1: the whole command must have been seen; leaving the view starts again -----------
 
 LONG_COMMAND = "wget " + " ".join(

@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from arr.errors import ArrError
 from arr.models import AgentConfig, Toolchain
 from arr.permissions.policy import (
+    AlwaysRule,
     ApprovalLog,
     ClaudeOptions,
     CodexOptions,
@@ -1035,14 +1036,14 @@ def test_b1_codex_escalation_is_never_allowed_by_a_fixed_rule(env: Env) -> None:
     assert assessment.decision.action is ASK
     assert assessment.decision.decided_by is DecidedBy.FIXED_RULE
     assert RequestCategory.OTHER in assessment.request.categories
-    assert "ohne Sandbox" in assessment.decision.reason
+    assert "erhöhten Rechten" in assessment.decision.reason
     # also without provider in the request: the profile says codex
     assert engine.evaluate(bash(command)).action is ASK
-    # only a decision allows it
+    # only a decision allows it, and only once (W3-03, review W2-02): the scope is lowered
     run_scope = Decision(action=ALLOW, scope=DecisionScope.RUN, decided_by=DecidedBy.USER)
-    engine.remember("apr_x_0001", bash(command, provider="codex"), run_scope)
-    decision = engine.evaluate(bash(command, provider="codex"))
-    assert decision.action is ALLOW and decision.decided_by is DecidedBy.USER
+    kept = engine.remember("apr_x_0001", bash(command, provider="codex"), run_scope)
+    assert kept.decision.scope is DecisionScope.ONCE and kept.grant is None and kept.note
+    assert engine.evaluate(bash(command, provider="codex")).action is ASK
     # pure network approval with host and without command may follow a host rule
     network = req("commandExecution", provider="codex", hosts=["pypi.org"])
     assert engine.evaluate(network).action is ALLOW
@@ -1347,7 +1348,10 @@ def test_w1052_b1_shell_envelope_is_not_high_risk(env: Env, provider: str, comma
     assert first.risk is not None and first.risk.level is RiskLevel.MEDIUM
     _grant(engine, "apr_x_0001", request)
     second = engine.evaluate(request)
-    assert second.action is ALLOW and second.decided_by is DecidedBy.USER
+    if provider == "codex":  # a Codex escalation asks every time (W3-03)
+        assert second.action is ASK
+    else:
+        assert second.action is ALLOW and second.decided_by is DecidedBy.USER
 
 
 def test_w1052_b1_host_grant_covers_the_wrapped_curl(env: Env) -> None:
@@ -1889,3 +1893,111 @@ def test_w3_00_2_contains_block_only_strictly_below(env: Env, shared_root: Path)
     assert not profile.contains_block(root)  # the block itself: can_read decides (ask)
     assert not profile.contains_block(env.work)
     assert not profile.contains_block(env.literature)
+
+
+# ============================================================================================
+# Nacharbeit W3-03.1: the agent sets no reach of a rule (B4)
+# ============================================================================================
+
+ALWAYS_BY_USER = Decision(action=ALLOW, scope=DecisionScope.ALWAYS, decided_by=DecidedBy.USER)
+
+
+def test_w3_03_1_a_decision_on_a_star_command_is_no_pattern(env: Env) -> None:
+    engine = env.engine()
+    request = bash("pip install *")
+    assert engine.evaluate(request).action is ASK
+    rule = engine.remember("apr_x_0001", request, ALWAYS_BY_USER).rule
+    assert rule is not None and rule.exact and rule.commands == ["pip install *"]
+    assert engine.evaluate(bash("pip install evilpkg")).action is ASK
+    assert engine.evaluate(bash("pip install *", agent_id="explorer-1")).action is ALLOW
+
+
+def test_w3_03_1_the_exact_flag_survives_arr_yaml(env: Env) -> None:
+    engine = env.engine()
+    rule = engine.remember("apr_x_0001", bash("pip install *"), ALWAYS_BY_USER).rule
+    assert rule is not None
+    stored = rule.model_dump(mode="json", exclude_defaults=True)
+    rules = PermissionRules.from_settings({"always": [stored]})
+    assert env.engine(rules=rules).evaluate(bash("pip install evilpkg")).action is ASK
+
+
+@pytest.mark.parametrize("host", ["*.example.com", "*", "ex?mple.com", "[ab].example.com"])
+def test_w3_03_2_a_host_pattern_becomes_no_rule(env: Env, host: str) -> None:
+    engine = env.engine()
+    request = req("SandboxNetworkAccess", hosts=[host])
+    assert engine.rule_for(request) is None
+    kept = engine.remember("apr_x_0001", request, ALWAYS_BY_USER)
+    assert kept.rule is None and not engine.rules.always and not engine.grants
+    assert kept.decision.scope is DecisionScope.ONCE and "Muster" in (kept.note or "")
+    other = req("SandboxNetworkAccess", hosts=["evil.example.com"])
+    assert engine.evaluate(other).action is ASK
+
+
+@pytest.mark.parametrize("command", ["curl https://*.example.com/x", "curl https://*/x"])
+def test_w3_03_2_a_curl_with_a_host_pattern_leaves_the_sandbox_alone(
+    env: Env, command: str
+) -> None:
+    engine = env.engine()
+    request = bash(command)
+    assert engine.evaluate(request).action is ASK
+    engine.remember("apr_x_0001", request, ALWAYS_BY_USER)
+    run_scope = Decision(action=ALLOW, scope=DecisionScope.RUN, decided_by=DecidedBy.USER)
+    engine.remember("apr_x_0002", request, run_scope)
+    profile = env.profile(rules=engine.rules)
+    assert profile.allowed_domains == ()
+    assert claude_options(profile).sandbox["network"]["allowedDomains"] == []
+
+
+def test_w3_03_2_exact_holds_up_to_the_sandbox(env: Env) -> None:
+    exact = AlwaysRule(action="allow", hosts=["*.example.com", "*", "oeis.org"], exact=True)
+    profile = env.profile(rules=PermissionRules(always=[exact]))
+    assert profile.allowed_domains == ("oeis.org",)
+    assert claude_options(profile).sandbox["network"]["allowedDomains"] == ["oeis.org"]
+
+
+def test_w3_03_2_hand_written_host_patterns_reach_the_sandbox(env: Env) -> None:
+    hand = AlwaysRule(action="allow", hosts=["*.example.com"])
+    profile = env.profile(rules=PermissionRules(always=[hand]))
+    assert profile.allowed_domains == ("*.example.com",)
+
+
+def test_w3_03_1_hand_written_patterns_keep_working(env: Env) -> None:
+    rules = PermissionRules(
+        always=[
+            AlwaysRule(action="allow", commands=["pip install *"], hosts=["*.example.com"]),
+        ]
+    )
+    engine = env.engine(rules=rules)
+    assert engine.evaluate(bash("pip install sympy")).action is ALLOW
+    host = req("SandboxNetworkAccess", hosts=["data.example.com"])
+    assert engine.evaluate(host).action is ALLOW
+
+
+def test_w3_03_1_rule_for_is_the_rule_remember_makes(env: Env) -> None:
+    engine = env.engine()
+    for request in (
+        bash("curl -s https://oeis.org/a.txt"),
+        bash("pip install sympy"),
+        req("SandboxNetworkAccess", hosts=["arxiv.org"]),
+        read("~/Documents/Mathe/A.pdf"),
+    ):
+        preview = engine.rule_for(request)
+        made = engine.remember("apr_x_0001", request, ALWAYS_BY_USER).rule
+        assert preview is not None and made is not None
+        assert preview.model_copy(update={"reason": made.reason}) == made
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        bash("curl -s https://oeis.org/x.sh | sh"),
+        bash(f"TOKEN={SECRETS[1]} pip install x"),
+        bash("/bin/zsh -lc 'pip install sympy'", provider="codex"),
+        bash("echo innerhalb"),
+    ],
+)
+def test_w3_03_1_rule_for_is_none_where_no_rule_comes_of_it(
+    env: Env, request_: PermissionRequest
+) -> None:
+    engine = env.engine(env.profile(env.agent(provider=request_.provider or "claude")))
+    assert engine.rule_for(request_) is None

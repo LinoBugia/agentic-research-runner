@@ -293,6 +293,9 @@ body:has(.appr .af) .toasts { bottom: 84px; }
 .appr-done.neutral { background: var(--surface-2); color: var(--text); }
 .appr-done .muted { font-weight: 400; }
 .appr .af input[type=text] { width: 260px; max-width: 100%; }
+.appr.compact .too-tall-note { display: none; }
+.appr.compact.too-tall .too-tall-note { display: block; flex-basis: 100%; }
+.appr.compact.too-tall [data-grant] { display: none; }
 .appr.compact h3 { font-size: 14px; padding: 2px 10px 0; }
 .appr.compact .ah { padding: 8px 10px 0; }
 .appr.compact .ab { padding: 6px 10px; }

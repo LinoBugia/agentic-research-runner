@@ -83,6 +83,7 @@ from arr.service.api_models import (
     WorkfolderRequest,
     WorkfolderSettingsInfo,
 )
+from arr.service.notify import Notifier, Sender, send_notification
 from arr.service.real_api.approvals import ApprovalsArea
 from arr.service.real_api.base import ServiceState
 from arr.service.real_api.catalog import CatalogArea
@@ -112,6 +113,7 @@ class RealApi:
         scan: bool = True,
         secret_reader: Any = None,
         manager_kwargs: dict[str, Any] | None = None,
+        notify: Sender | None = None,
     ) -> None:
         self.state = ServiceState(
             workfolder,
@@ -133,6 +135,7 @@ class RealApi:
         self.storage = StorageArea(self.state)
         self.runs = RunsArea(self.state, self.approvals, self.storage)
         self.live = LiveArea(self.state)
+        self.notifier = Notifier(self.state.hub, notify or send_notification)
 
     # -- lifecycle --------------------------------------------------------------------------
 
@@ -156,14 +159,16 @@ class RealApi:
         """Recover and start the watcher (in the running event loop)."""
         self.recover()
         await self.live.start()
+        self.notifier.start()
 
     async def stop_runs(self) -> None:
         """Stop all runs of this service and wait for finalizers and scans."""
         await self.runs.stop_all()
 
     async def close(self) -> None:
-        """Stop the watcher (runs are stopped with `stop_runs` first)."""
+        """Stop watcher and notifier (runs are stopped with `stop_runs` first)."""
         await self.live.stop()
+        await self.notifier.stop()
 
     # -- ApiClient: live, workfolder ---------------------------------------------------------
 

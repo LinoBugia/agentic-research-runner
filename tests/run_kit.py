@@ -9,6 +9,7 @@ from typing import Any
 
 from arr.backends.fake import FakeBackend
 from arr.models import RunInput, Toolchain, WorkfolderSettings
+from arr.permissions.types import PermissionRequest
 from arr.resolve import resolve_run, validate_model
 from arr.room.store import RoomStore
 from arr.runs.context import RunContext
@@ -175,22 +176,68 @@ async def eventually(check: Callable[[], bool], within: float = 5.0) -> None:
 # --------------------------------------------------------------------------------------------
 
 
+class AskingBackend(FakeBackend):
+    """A FakeBackend that sends the requests `asks` to the inbox before its turn, like an adapter.
+
+    Each entry of `asks` holds fields of a `PermissionRequest`; with `parallel` they wait
+    together. The decisions land in `answers`, and the answers are posted as turn text.
+    """
+
+    def __init__(self, *args: Any, inbox: Any, asks: list[dict[str, Any]], **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.inbox = inbox
+        self.asks = list(asks)
+        self.answers: list[Any] = []
+
+    async def run_turn(self, *args: Any, **kwargs: Any) -> Any:
+        asks, self.asks = self.asks, []
+        requests = [
+            PermissionRequest(run_id=self.run_id, agent_id=self.config.id, **ask) for ask in asks
+        ]
+        results = await asyncio.gather(*(self.inbox.handle(r) for r in requests))
+        self.answers.extend(results)
+        async for event in super().run_turn(*args, **kwargs):
+            yield event
+
+
 def fake_builders(scripts: Mapping[str, Script]) -> dict[Any, Callable[..., FakeBackend]]:
     """Replacement for `arr.runs.launch.BACKEND_BUILDERS`: a FakeBackend per agent.
 
     Every call is recorded in the returned mapping under the key `"calls"` as
-    `(provider, agent_id, kwargs)`; `kwargs` holds `run_id`, `inbox`, `auth` and `limits`.
+    `(provider, agent_id, kwargs)`; `kwargs` holds `run_id`, `inbox`, `auth` and `limits`. A
+    script with the key `asks` makes an `AskingBackend`.
     """
     from arr.models import Provider
 
     calls: list[tuple[str, str, dict[str, Any]]] = []
-    inner = fake_factory(scripts)
+    asks = {
+        agent_id: script["asks"]
+        for agent_id, script in scripts.items()
+        if isinstance(script, Mapping) and "asks" in script
+    }
+    inner = fake_factory(
+        {
+            agent_id: {k: v for k, v in script.items() if k != "asks"}
+            if isinstance(script, Mapping)
+            else script
+            for agent_id, script in scripts.items()
+        }
+    )
 
     def builder_for(provider: Provider) -> Callable[..., FakeBackend]:
         def build(prepared: PreparedAgent, **kwargs: Any) -> FakeBackend:
             calls.append((provider.value, prepared.id, kwargs))
             backend = inner(prepared)
             backend.run_id = kwargs.get("run_id", backend.run_id)
+            if prepared.id in asks:
+                return AskingBackend(
+                    backend.config,
+                    backend.script,
+                    run_id=backend.run_id,
+                    room=backend.room,
+                    inbox=kwargs["inbox"],
+                    asks=asks[prepared.id],
+                )
             return backend
 
         return build

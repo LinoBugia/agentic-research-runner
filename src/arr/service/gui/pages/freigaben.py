@@ -3,8 +3,9 @@
 `/freigaben` shows the open cards completely (no master/detail), sorted deadline first, then
 oldest, and today's decisions below; `/freigaben?ansicht=verlauf` the whole history.
 `/freigaben/<id>` is the deep link: the card is scrolled into view and its heading focused
-(arr.js), never a button (G2). Live: new cards appear on top, cards decided elsewhere or
-expired move to the history with a toast.
+(arr.js), never a button (G2). Live: new cards appear on top and disarm all cards, so no
+card slides under the pointer unseen (W1-06.2); cards decided elsewhere or expired move to the
+history with a toast.
 """
 
 from datetime import datetime
@@ -183,6 +184,7 @@ class FreigabenPage:
         if top:
             card.element.move(self.cards_box, target_index=0)
             self.cards = {item.id: card, **self.cards}
+            self.frame.js("arr.disarmAll()")
         else:
             self.cards[item.id] = card
 
@@ -405,6 +407,11 @@ class FreigabenPage:
                 self.frame.toast(
                     f"Neue Freigabe: {item.title}", ("Ansehen", f"/freigaben/{item.id}")
                 )
+            return
+        if event.type == "approval.updated":
+            if item.id in self.cards:
+                self.cards[item.id].update(item, self.api.now())
+                self.frame.js("arr.disarmAll()")  # the card now answers more than was seen
             return
         if item.id in self.own_decisions and event.type == "approval.decided":
             return
