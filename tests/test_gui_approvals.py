@@ -261,6 +261,25 @@ async def test_b2_compact_card_with_several_requests_offers_only_details(wf: Pat
         await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_b2_a_compact_card_older_than_the_last_request_grants_nothing(wf: Path) -> None:
+    async with service(wf, {"a": {**SLOW, "asks": [HOST]}}) as (user, api):
+        item = await _started(api, "a")
+        await user.open(f"/runs/{item.run.id}")
+        await see(user, "Erlauben (einmalig)")
+        stale = user.find("Erlauben (einmalig)")  # still the card for 1 request
+        inbox = api.state.registry.get(item.run.id).manager.inbox
+        request = PermissionRequest(run_id=item.run.id, agent_id="a", **HOST)
+        task = asyncio.create_task(inbox.handle(request))
+        await asyncio.sleep(0)
+        assert inbox.get(item.id).count == 2
+        stale.click()
+        await see(user, "Das beantwortet 2 gleiche Anfragen")
+        assert (await api.get_approval(item.id)).status is ApprovalStatus.OPEN
+        assert not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_b2_compact_card_of_an_installation_offers_only_details(wf: Path) -> None:
     async with service(wf, {"a": {**SLOW, "asks": [HOST]}}) as (user, api):
         item = await _started(api, "a")

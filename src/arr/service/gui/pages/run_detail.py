@@ -655,6 +655,18 @@ class RunDetailPage:
             return
         self.deciding.add(item.id)
         try:
+            # a card may be older than the last equal request (transcript, or a quick click):
+            # it never grants more than it showed
+            current = await self.api.get_approval(item.id)
+            if request.action is DecisionAction.ALLOW and current.count != item.count:
+                self.deciding.discard(item.id)
+                self.frame.toast(
+                    f"Inzwischen warten {current.count} gleiche Anfragen. Nichts wurde erlaubt, "
+                    "entscheide unter „Details“.",
+                    error=True,
+                )
+                await self._refresh_approvals()
+                return
             response = await self.api.decide_approval(item.id, request)
         except ApiException as exc:
             self.deciding.discard(item.id)
