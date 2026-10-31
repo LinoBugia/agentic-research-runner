@@ -28,8 +28,22 @@ from urllib.parse import urlsplit
 from pydantic import ValidationError
 
 from arr.errors import ArrError
-from arr.models import BUILTIN_LIMITS, Decider, RunVenvMode, WorkfolderSettings
-from arr.permissions.policy import AlwaysRule, PermissionRules
+from arr.models import (
+    BUILTIN_LIMITS,
+    AgentConfig,
+    Decider,
+    Provider,
+    RunVenvMode,
+    Toolchain,
+    WorkfolderSettings,
+)
+from arr.permissions.policy import (
+    AlwaysRule,
+    PermissionRules,
+    RunPaths,
+    SandboxProfile,
+    profile_for,
+)
 from arr.runs.launch import discard_orphaned_reservations
 from arr.runs.manager import mark_interrupted_runs
 from arr.service.api_models import (
@@ -339,26 +353,29 @@ def _comparable(path: str | Path) -> Path:
     return Path(real)
 
 
-def _extra_path_problem(entry: str, workfolder: Path) -> str | None:
+def _read_profile(workfolder: Path, rules: PermissionRules) -> SandboxProfile:
+    """The read lists of a run in this workfolder, from `profile_for` itself (no agent runs)."""
+    agent = AgentConfig(
+        id="probe", base_id="probe", provider=Provider.CLAUDE, model="probe", auth="probe"
+    )
+    toolchain = Toolchain(run_venv=RunVenvMode.OFF)
+    return profile_for(agent, RunPaths(workfolder, workfolder / "runs" / "probe", toolchain), rules)
+
+
+def _extra_path_problem(entry: str, profile: SandboxProfile) -> str | None:
     """Why `entry` must not go to `toolchain.extra_path`, or None.
 
-    The entries land on the read list of the agents, so they must not open a way around the
-    sensitive paths. Resolved paths count: a link to `~/.ssh` is refused like `~/.ssh`.
+    The entries land on the read list of the agents, where they would open what `profile`
+    blocks, so neither a blocked path nor a folder around one is taken. Resolved paths count:
+    a link to `~/.ssh` is refused like `~/.ssh`.
     """
     if not entry.startswith("/") or "\0" in entry:
         return "Das ist kein vollständiger Pfad. Gib ihn mit / am Anfang an."
-    real, home = _comparable(entry), _comparable(Path.home())
-    if path_within(home, real):
-        return "Dein Benutzerordner liegt darin, die Agenten könnten ihn dann ganz lesen."
-    if path_within(real, home):
-        return "Er liegt in deinem Benutzerordner, den die Agenten nicht lesen sollen."
-    for reserved, what in (
-        (app_dir(), "die eigenen Daten von arr"),
-        (workfolder, "den Workfolder"),
-        (venv_root(), "die Python-Umgebungen"),
-    ):
-        if path_within(real, _comparable(reserved)):
-            return f"Er liegt im Ordner für {what}, und das regelt arr selbst."
+    real = _comparable(entry)
+    if not profile.can_read(real):
+        return "Dort liegen Daten, die Agenten nicht lesen dürfen."
+    if profile.contains_sensitive(real) or profile.contains_block(real):
+        return "Darin liegen Daten, die Agenten nicht lesen dürfen."
     if not os.path.isdir(entry):
         return "Diesen Ordner gibt es nicht."
     return None
@@ -714,10 +731,12 @@ class SetupArea:
                 )
         if ("toolchain", "python") in changes and new.toolchain.python is not None:
             self._check_python(new.toolchain.python)
-        for entry in new.toolchain.extra_path:
-            problem = None
-            if entry not in old.toolchain.extra_path:  # hand-kept values of `arr.yaml` stay
-                problem = _extra_path_problem(entry, self.state.workfolder)
+        added = [e for e in new.toolchain.extra_path if e not in old.toolchain.extra_path]
+        if not added:  # hand-kept values of `arr.yaml` stay
+            return
+        profile = _read_profile(self.state.workfolder, self._rules())
+        for entry in added:
+            problem = _extra_path_problem(entry, profile)
             if problem:
                 raise _invalid(
                     f"„{entry}“ kann nicht in den PATH. {problem} Nimm einen Programmordner "
@@ -746,9 +765,9 @@ class SetupArea:
 
     # -- fixed rules -------------------------------------------------------------------------
 
-    def _user_rules(self) -> list[AlwaysRule]:
+    def _rules(self) -> PermissionRules:
         try:
-            return PermissionRules.from_settings(self._reload().permissions).always
+            return PermissionRules.from_settings(self._reload().permissions)
         except ValidationError:
             raise ApiException.of(
                 ErrorCode.CONFIG_INVALID,
@@ -779,7 +798,7 @@ class SetupArea:
                 ),
                 removable=True,
             )
-            for rule in self._user_rules()
+            for rule in self._rules().always
         ]
         return builtin + own
 
@@ -789,7 +808,7 @@ class SetupArea:
                 "Standardregeln sind fest. Du kannst nur Regeln entfernen, die du mit „immer“ "
                 "angelegt hast."
             )
-        rules = self._user_rules()
+        rules = self._rules().always
         doomed = [i for i, rule in enumerate(rules) if fixed_rule_id(rule) == rule_id]
         if not doomed:
             raise not_found("Regel", rule_id)

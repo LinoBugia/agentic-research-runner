@@ -13,6 +13,8 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -56,6 +58,7 @@ from arr.service.api_models import (
     WorkfolderRequest,
 )
 from arr.service.real_api import RealApi, live
+from arr.service.real_api.runs import RunsArea
 from arr.service.real_api.setup import base_venvs, duration_text, toolchain_notice
 from arr.service.state import (
     ServiceInfo,
@@ -1040,6 +1043,8 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     folder = tmp_path / "benutzer" / "ich"
     (folder / ".ssh").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(folder))
+    (tmp_path / "tempordner").mkdir()  # `tmp_path` itself lies in the temp folder of the user
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tempordner"))
     return folder
 
 
@@ -1410,3 +1415,196 @@ async def test_an_arr_yaml_that_is_not_utf8_gives_a_message(wf: Path, tmp_path: 
     assert api.state.workfolder == wf
     (wf / "arr.yaml").write_bytes(NOT_UTF8)
     assert "UTF-8" in (await expect_error(api.get_workfolder_settings())).message
+
+
+# --- W3-04.2: after the merge of W3-02 and W3-03 --------------------------------------------
+
+
+async def test_extra_path_follows_the_lists_of_the_sandbox_profile(
+    tmp_path: Path, home: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_profiles(arr_home, {"fake-auth": "claude_oauth"})
+    monkeypatch.setenv("ARR_VENV_ROOT", str(tmp_path / "geteilt" / "arr-ich"))
+    (tmp_path / "geteilt" / "arr-ich").mkdir(parents=True)
+    workfolder = init_workfolder(tmp_path / "daten" / "wf")
+    (tmp_path / "frei" / "tresor.keychain").mkdir(parents=True)
+    (tmp_path / "frei" / "geheim").mkdir()
+    (tmp_path / "tempordner" / "unter").mkdir()
+    update_settings_file(
+        workfolder,
+        lambda d: set_setting(
+            d, ("permissions", "sensitive_paths"), [str(tmp_path / "frei" / "geheim")]
+        ),
+    )
+    cases = {
+        "SENSITIVE_ABSOLUTE_PATHS": "/Library/Keychains",
+        "darunter": "/Library/Keychains/System",
+        "Eltern davon": "/Library",
+        "Muster für Namen": str(tmp_path / "frei" / "tresor.keychain"),
+        "sensitive_paths aus arr.yaml": str(tmp_path / "frei" / "geheim"),
+        "Eltern des Workfolders": str(tmp_path / "daten"),
+        "Eltern von <wurzel>": str(tmp_path / "geteilt"),
+        "Temp-Ordner": str(tmp_path / "tempordner"),
+        "unter dem Temp-Ordner": str(tmp_path / "tempordner" / "unter"),
+        "/tmp/claude-<uid>": f"/tmp/claude-{os.getuid()}",
+        "Eltern davon: /tmp": "/tmp",
+        "/Volumes": "/Volumes",
+    }
+    api = make_api(workfolder)
+    text = (workfolder / "arr.yaml").read_text()
+    for case, entry in cases.items():
+        error = await expect_error(save_extra_path(api, [entry]))
+        assert error.field == "toolchain.extra_path", case
+        assert "Agenten nicht lesen dürfen" in error.message, case
+        assert (workfolder / "arr.yaml").read_text() == text, case
+
+
+async def test_a_run_planned_during_a_switch_does_not_start(
+    wf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "zweiter").mkdir()
+    other = make_workfolder(tmp_path / "zweiter")
+    api = make_api(wf)
+    planning, go_on = threading.Event(), threading.Event()
+    plan = RunsArea._plan
+
+    def slow_plan(area: RunsArea, run_input: dict[str, Any]) -> Any:
+        launch = plan(area, run_input)
+        planning.set()
+        assert go_on.wait(10)
+        return launch
+
+    monkeypatch.setattr(RunsArea, "_plan", slow_plan)
+    start = asyncio.create_task(api.start_run(RUN_INPUT))
+    assert await asyncio.to_thread(planning.wait, 10)
+    await api.select_workfolder(WorkfolderRequest(path=str(other)))
+    go_on.set()
+    error = await expect_error(start)
+    assert error.code is ErrorCode.NOT_ALLOWED and "nicht gestartet" in error.message
+    assert not run_dirs(wf) and not run_dirs(other) and not api.state.registry.active()
+    monkeypatch.setattr(RunsArea, "_plan", plan)
+    assert (await api.select_workfolder(WorkfolderRequest(path=str(wf)))).path == str(wf)
+
+
+CODEX_RUN = {
+    **RUN_INPUT,
+    "defaults": {"provider": "codex", "model": "gpt-5.5", "auth": "fake-codex"},
+}
+
+
+@pytest.fixture
+def python_below_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "benutzer"))
+    (tmp_path / "benutzer" / "uv").mkdir(parents=True)
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "benutzer" / "uv"))
+
+
+async def test_a_run_with_codex_agents_is_told_about_python_below_home(
+    fresh: Path, arr_home: Path, python_below_home: None
+) -> None:
+    write_profiles(arr_home, {"fake-auth": "claude_oauth", "fake-codex": "codex_chatgpt"})
+    (fresh / "projects" / "demo").mkdir()
+    api = make_api(fresh)
+    result = await api.resolve_run(CODEX_RUN)
+    assert not result.errors
+    assert [w for w in result.warnings if "startet nicht für Codex-Agenten" in w]
+    assert any("Claude-Agenten sind nicht betroffen" in w for w in result.warnings)
+    claude = {
+        **RUN_INPUT,
+        "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
+    }
+    assert not (await api.resolve_run(claude)).warnings
+
+
+ALONE = {
+    "project": "demo",
+    "skill": "",
+    "name": "",
+    "task_md": "# Aufgabe\n\nFrage",
+    "params": {},
+    "agents": {},
+    "limits": {},
+}
+
+
+async def test_a_new_workfolder_takes_its_standards_from_the_profiles(
+    fresh: Path, arr_home: Path
+) -> None:
+    write_profiles(arr_home, {"mein-claude": "claude_oauth", "zweites": "claude_oauth"})
+    (fresh / "projects" / "demo").mkdir()
+    result = await make_api(fresh).resolve_run(ALONE)
+    assert not result.errors
+    [agent] = result.agents
+    assert (agent.provider, agent.profile) == (Provider.CLAUDE, "mein-claude")
+    assert agent.model == "claude-sonnet-5-5"
+    [warning] = result.warnings
+    assert "Claude Sonnet 5.5" in warning and "„mein-claude“" in warning
+    assert "Einstellungen → Standards und Limits" in warning and "arr.yaml" not in warning
+
+
+async def test_only_a_chatgpt_profile_gives_a_codex_agent(fresh: Path, arr_home: Path) -> None:
+    write_profiles(arr_home, {"chatgpt": "codex_chatgpt"})
+    (fresh / "projects" / "demo").mkdir()
+    [agent] = (await make_api(fresh).resolve_run(ALONE)).agents
+    assert (agent.provider, agent.model, agent.profile) == (Provider.CODEX, "gpt-5.5", "chatgpt")
+
+
+async def test_standards_that_exist_stay_and_only_the_gap_is_filled(
+    fresh: Path, arr_home: Path
+) -> None:
+    write_profiles(arr_home, {"erstes": "claude_oauth", "gewaehlt": "claude_oauth"})
+    (fresh / "projects" / "demo").mkdir()
+    update_settings_file(
+        fresh, lambda d: set_setting(d, ("defaults", "claude", "auth"), "gewaehlt")
+    )
+    result = await make_api(fresh).resolve_run(ALONE)
+    [agent] = result.agents
+    assert (agent.model, agent.profile) == ("claude-sonnet-5-5", "gewaehlt")
+    assert "gewaehlt" not in result.warnings[0] and "Claude Sonnet 5.5" in result.warnings[0]
+
+    update_settings_file(
+        fresh, lambda d: set_setting(d, ("defaults", "claude", "model"), "claude-opus-5-5")
+    )
+    result = await make_api(fresh).resolve_run(ALONE)
+    assert result.agents[0].model == "claude-opus-5-5" and not result.warnings
+
+
+async def test_another_provider_in_the_form_takes_its_first_profile(
+    fresh: Path, arr_home: Path
+) -> None:
+    write_profiles(arr_home, {"mein-claude": "claude_oauth", "chatgpt": "codex_chatgpt"})
+    (fresh / "projects" / "demo").mkdir()
+    api = make_api(fresh)
+    [agent] = (await api.resolve_run(ALONE)).agents
+    changed = {**ALONE, "agents": {agent.id: {"model": "gpt-5.5"}}}
+    [codex] = (await api.resolve_run(changed)).agents
+    assert (codex.provider, codex.profile) == (Provider.CODEX, "chatgpt")
+
+
+async def test_without_a_profile_for_the_provider_the_form_names_no_file(
+    fresh: Path, arr_home: Path
+) -> None:
+    write_profiles(arr_home, {})
+    (arr_home / "profiles.yaml").write_text("version: 1\nprofiles: []\n")
+    (fresh / "projects" / "demo").mkdir()
+    result = await make_api(fresh).resolve_run(ALONE)
+    assert result.errors and not any("arr.yaml" in i.message for i in result.errors)
+
+
+async def test_a_run_file_still_names_what_is_missing_itself(fresh: Path, arr_home: Path) -> None:
+    write_profiles(arr_home, {"mein-claude": "claude_oauth"})
+    (fresh / "projects" / "demo").mkdir()
+    bare = {k: v for k, v in RUN_INPUT.items() if k != "defaults"}
+    result = await make_api(fresh).resolve_run(bare)
+    assert any("defaults.claude" in i.message for i in result.errors)
+
+
+async def test_a_file_without_rights_reads_right_in_the_check(wf: Path) -> None:
+    file = wf / "projects" / "demo" / "CLAUDE.md"
+    file.write_text("x")
+    file.chmod(0o000)
+    try:
+        check = (await make_api(wf).get_project("demo")).checks[0]
+    finally:
+        file.chmod(0o644)
+    assert check.detail == "Keine Berechtigung. Prüfe die Rechte der Datei."

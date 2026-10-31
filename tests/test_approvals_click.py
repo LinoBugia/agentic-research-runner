@@ -39,7 +39,7 @@ from arr.permissions.types import (
     PermissionRequest,
 )
 from arr.runs.inspect import open_approvals
-from arr.service.api_models import ApiException, DecisionRequest, ErrorCode
+from arr.service.api_models import ApiException, DecisionRequest, ErrorCode, WorkfolderRequest
 from arr.service.real_api import RealApi
 from arr.workfolder import load_workfolder_settings
 
@@ -597,3 +597,25 @@ def test_n4_open_approvals_skips_damaged_entries() -> None:
     good = {"event": "open", "item_id": "apr_t_0001"}
     entries: list[Any] = [{"event": "open", "item_id": ["x"]}, [1], "text", 17, good]
     assert open_approvals(entries) == [good]
+
+
+async def test_the_inbox_stays_the_source_after_a_workfolder_switch(
+    wf: Path, tmp_path: Path
+) -> None:
+    (tmp_path / "zweiter").mkdir()
+    other = make_workfolder(tmp_path / "zweiter")
+    async with Service(wf, {"a": asking(HOST)}) as svc:
+        await svc.api.select_workfolder(WorkfolderRequest(path=str(other)))
+        assert svc.api.state.workfolder == other
+        started = await svc.api.start_run(run_input({"id": "a"}))
+        item = await svc.open_item()
+        await svc.event("approval.created")
+        forged(other, started.run_id, event="decided", item_id=item.id, decision=DECIDED_BY_USER)
+        await ticks()
+        assert [c.id for c in await svc.api.list_approvals(status=OPEN)] == [item.id]
+        assert (await svc.api.get_approval(item.id)).status is ApprovalStatus.OPEN
+        assert (await svc.api.get_counts()).waiting == 1
+        assert not svc.approval_events("approval.decided")
+        response = await svc.api.decide_approval(item.id, DENY)
+        assert response.item.decision.action is DecisionAction.DENY
+        await svc.final(started.run_id)

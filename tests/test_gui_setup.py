@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 from nicegui.testing.user import User
-from run_kit import write_profiles
+from run_kit import FAST, done, fake_builders, say, turns, write_profiles
 from service_kit import hold_lock, make_run_folder, make_workfolder
 from test_gui import gui_user
 from test_gui_real import page_html, see
@@ -22,6 +22,7 @@ from arr.service.gui.pages.projekte import SLUG
 from arr.service.mock_api import MockApi
 from arr.service.real_api import RealApi
 from arr.service.real_api import live as live_module
+from arr.service.real_api.runs import SOLO_AGENT
 from arr.service.state import remember_workfolder
 from arr.workfolder import init_workfolder, load_workfolder_settings
 
@@ -353,3 +354,74 @@ async def test_rule_table_heads_stand_over_their_columns(wf: Path) -> None:
         await user.open("/einstellungen")
         html = await see(user, "<th>Herkunft</th>")
         assert html.index("<th>Regel</th>") < html.index("<th>Aktion</th>")
+
+
+# --- W3-04.2: after the merge of W3-02 and W3-03 --------------------------------------------
+
+CLICK_LIMIT_E4 = 6
+
+
+async def test_e4_in_a_workfolder_made_in_the_gui_needs_no_file(wf: Path, tmp_path: Path) -> None:
+    new = tmp_path / "Test-UX3"
+    api = RealApi(
+        wf,
+        base_url="http://test",
+        builders=fake_builders({SOLO_AGENT: turns([say("fertig"), done()])}),
+        manager_kwargs={"pacing": FAST},
+    )
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await api.start()
+        try:
+            await user.open("/?workfolder=neu")
+            await see(user, "Ein neuer oder leerer Ordner")
+            user.find(marker="field-workfolder-path").trigger("input", str(new))
+            user.find(marker="form-confirm").click()
+            for _ in range(200):
+                if api.state.workfolder == new:
+                    break
+                await asyncio.sleep(0.02)
+            assert api.state.workfolder == new
+            await user.open("/projekte?neu=1")
+            await see(user, "arr legt an:")
+            user.find(marker="field-new-name").trigger("input", "ux3-collatz")
+            user.find(marker="form-confirm").click()
+            await see(user, "Projekt „ux3-collatz“ angelegt.")
+            assert "defaults:" not in (new / "arr.yaml").read_text().replace("# defaults:", "")
+
+            clicks = Clicks(user)
+            clicks.count += 1  # navigation „Neuer Run“
+            await user.open("/neuer-run")
+            await see(user, "1 · Projekt und Skill")
+            user.find(marker="radio-skill-").trigger("change")
+            clicks.count += 1
+            await see(user, "Ein Agent, Topologie solo")
+            user.find(marker="field-task_md").trigger("input", "# Aufgabe\n\nFrage")
+            html = await see(user, "In diesem Workfolder fehlen Standards", retries=120)
+            assert "fake-auth" in html and "Claude Sonnet 5.5" in html and "in arr.yaml" not in html
+            assert "Für claude fehlt" not in html
+            await see(user, "Rollen und Skills gefunden", retries=120)
+            clicks.on("start-run")
+            await see(user, 'data-rd="', retries=400)
+            assert clicks.count <= CLICK_LIMIT_E4
+            [run] = list((new / "runs").iterdir())
+            stored = (run / "run.yaml").read_text()
+            assert "model: claude-sonnet-5-5" in stored and "auth: fake-auth" in stored
+        finally:
+            await api.stop_runs()
+            await api.close()
+
+
+async def test_new_run_shows_the_python_notice_for_codex_agents(
+    wf: Path, tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (wf / "arr.yaml").write_text("version: 1\n")
+    write_profiles(arr_home, {"chatgpt": "codex_chatgpt"})
+    home = tmp_path / "home"
+    (home / "uv").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(sys, "base_prefix", str(home / "uv"))
+    async with real_user(wf) as (user, _api):
+        await user.open("/neuer-run?projekt=demo")
+        await see(user, "1 · Projekt und Skill")
+        user.find(marker="radio-skill-").trigger("change")
+        await see(user, "Das Python von arr startet nicht für Codex-Agenten.", retries=120)

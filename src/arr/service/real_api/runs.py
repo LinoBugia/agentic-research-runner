@@ -27,6 +27,7 @@ from arr.errors import ArrError, ConfigError, ConfigIssue
 from arr.models import (
     ProfilesFile,
     Provider,
+    ProviderDefaults,
     ResolvedRun,
     RunInput,
     RunStatus,
@@ -72,6 +73,7 @@ from arr.service.api_models import (
 )
 from arr.service.real_api.approvals import ApprovalsArea
 from arr.service.real_api.base import RunHandle, ServiceState, not_allowed, not_found
+from arr.service.real_api.catalog import _provider_of as _profile_provider
 from arr.service.real_api.rundir import (
     RunRecord,
     agent_changes,
@@ -89,9 +91,10 @@ from arr.service.real_api.rundir import (
     transcript_page,
     vendor_of,
 )
+from arr.service.real_api.setup import toolchain_notice
 from arr.service.real_api.storage import STORAGE_ACTIONS, StorageArea
 from arr.skills import discover_skills
-from arr.workfolder import project_dir
+from arr.workfolder import load_workfolder_settings, project_dir
 
 log = logging.getLogger("arr.service.runs")
 
@@ -113,11 +116,21 @@ NO_PROFILE = FieldIssue(
     action=Action(label="Profil anlegen", url="/profile?neu=1"),
 )
 """`load_profiles` explains a missing file for the terminal; here a link does that (E18)."""
+SWITCHED = (
+    "Der Workfolder wurde gewechselt, während arr den Run vorbereitet hat. Der Run ist nicht "
+    "gestartet. Prüfe die Angaben im neuen Workfolder und starte ihn erneut."
+)
+STANDARDS_PLACE = "„Einstellungen → Standards und Limits“"
+STANDARD_MODELS = {Provider.CLAUDE: "claude-sonnet-5-5", Provider.CODEX: "gpt-5.5"}
+"""Model of a run from the form while `arr.yaml` has no standard for the provider."""
 SOLO_AGENT = "solver"
 """The one agent of a run without a skill (docs/08 §5.4 „Ohne Skill“)."""
 DELIVERY_POLL_S = 0.25
 DELIVERY_POLL_MAX_S = 1.0
 _AGENT_PATH = re.compile(r"agents\[(\d+)\]\.(\w+)")
+_MISSING_STANDARD = re.compile(r"Für (\w+) fehlt ")
+_MISSING_KEY = re.compile(r"agents\[\d+\]\.(model|auth)$")
+_FILE_HINT = re.compile(r"Ergänze „\w+“ .*? fest\.")
 _FORM_PATHS = {"task": "task_md", "task_file": "task_md", "limits.wall_time": "limits.wall_time_s"}
 
 
@@ -165,14 +178,34 @@ def _provider_of(model: str) -> Provider:
     return Provider.CLAUDE if model.startswith("claude") else Provider.CODEX
 
 
+def _first_profiles(profiles: ProfilesFile) -> dict[Provider, str]:
+    """The first profile of each provider, in the order of `profiles.yaml`."""
+    first: dict[Provider, str] = {}
+    for profile in profiles.profiles:
+        first.setdefault(_profile_provider(profile.kind), profile.name)
+    return first
+
+
+def _without_file_hint(exc: ConfigError) -> ConfigError:
+    """The form never sends anyone to `arr.yaml`: the settings page sets the standards."""
+    hint = f"Lege ein Profil an und wähle es unter {STANDARDS_PLACE}."
+    issues = [ConfigIssue(i.path, _FILE_HINT.sub(hint, i.message), i.line) for i in exc.issues]
+    return ConfigError(issues, source=exc.source)
+
+
 def _agent_specs(
-    resolved: ResolvedRun, overrides: Mapping[str, Any], settings: WorkfolderSettings
+    resolved: ResolvedRun,
+    overrides: Mapping[str, Any],
+    settings: WorkfolderSettings,
+    profiles: ProfilesFile,
 ) -> list[dict[str, Any]]:
     """The resolved agents as entries of `run.yaml`, with the changes of the form.
 
     Agents of a run replace those of its skill as a whole (docs/02 §3.3), so all of them are
-    listed. A model of the other provider takes profile and effort from `arr.yaml`.
+    listed. A model of the other provider takes profile and effort from `arr.yaml`, without a
+    standard the first profile of that provider.
     """
+    first = _first_profiles(profiles)
     specs = []
     for agent in resolved.agents:
         spec = agent.model_dump(
@@ -188,8 +221,9 @@ def _agent_specs(
                 spec["provider"] = provider.value
                 spec.pop("auth", None)
                 spec.pop("effort", None)
-                if standard is not None and standard.auth:
-                    spec["auth"] = standard.auth
+                auth = (standard.auth if standard is not None else None) or first.get(provider)
+                if auth:
+                    spec["auth"] = auth
                 if standard is not None and standard.effort:
                     spec["effort"] = standard.effort.value
         if "web" in change:
@@ -555,9 +589,30 @@ class RunsArea:
         except ArrError as exc:
             raise _NoProfile(exc.message) from None
 
+    def _form_standards(self, exc: ConfigError) -> dict[str, str] | None:
+        """What a run of the form takes from the profiles while `arr.yaml` names no standard.
+
+        Only what is missing goes in: run `defaults` rank above `group.yaml`. The providers of
+        the problems come first; a user with only a ChatGPT profile gets a run with it.
+        """
+        missing = {m[1] for i in exc.issues if (m := _MISSING_KEY.search(i.path))}
+        named = [m[1] for i in exc.issues if (m := _MISSING_STANDARD.match(i.message))]
+        if not missing or not named:
+            return None
+        settings = load_workfolder_settings(self.state.workfolder)
+        first = _first_profiles(self._profiles())
+        for provider in dict.fromkeys([*map(Provider, named), *Provider]):
+            standard = settings.defaults.get(provider, ProviderDefaults())
+            auth = standard.auth or first.get(provider)
+            if auth:
+                values = {"model": standard.model or STANDARD_MODELS[provider], "auth": auth}
+                return {"provider": provider.value, **{k: values[k] for k in sorted(missing)}}
+        return None
+
     def _plan(self, run_input: dict[str, Any]) -> Launch:
         """A `Launch` from a run input; `ConfigError`/`ArrError` for problems."""
         data, params, overrides = form_input(run_input)
+        from_form = "task_md" in run_input
 
         def plan() -> Launch:
             return plan_run_input(
@@ -572,12 +627,22 @@ class RunsArea:
             project_dir(self.state.workfolder, str(data.get("project")))
         except ArrError as exc:
             raise ConfigError.single("project", exc.message, source="Neuer Run") from None
-        launch = plan()
+        try:
+            try:
+                launch = plan()
+            except ConfigError as exc:
+                standards = self._form_standards(exc) if from_form else None
+                if standards is None:
+                    raise
+                data["defaults"] = standards
+                launch = plan()
+        except ConfigError as exc:
+            raise (_without_file_hint(exc) if from_form else exc) from None
         ids = [a.id for a in launch.resolved.agents]
         try:
             if overrides:
                 resolved = launch.resolved
-                data["agents"] = _agent_specs(resolved, overrides, launch.settings)
+                data["agents"] = _agent_specs(resolved, overrides, launch.settings, launch.profiles)
                 data["groupchats"] = [c.model_dump(mode="json") for c in resolved.groupchats]
                 data["stages"] = [s.model_dump(mode="json") for s in resolved.stages]
                 data["raters"] = list(resolved.raters)
@@ -625,6 +690,18 @@ class RunsArea:
                     f"{profile}: {free} von {limit} Plätzen frei, der Run braucht {count}. Seine "
                     "Agenten warten, bis Plätze frei werden."
                 )
+        if any(a.provider is Provider.CODEX for a in resolved.agents):
+            notice = toolchain_notice(launch.settings, self.state.workfolder)
+            if notice is not None:
+                warnings.append(f"{notice.title} {notice.text}")
+        standards = launch.run_input.defaults
+        if standards is not None and "task_md" in run_input:
+            chosen = [f"das Modell {model_label(standards.model)}"] if standards.model else []
+            chosen += [f"das Profil „{standards.auth}“"] if standards.auth else []
+            warnings.append(
+                f"In diesem Workfolder fehlen Standards, deshalb nimmt arr {' und '.join(chosen)}. "
+                f"Festlegen kannst du sie unter {STANDARDS_PLACE}."
+            )
         return ResolveResult(
             resolved_run_yaml=dump_yaml_model(stored_run(resolved)),
             errors=missing,
@@ -665,6 +742,7 @@ class RunsArea:
                 TASK_MISSING,
                 issues=[FieldIssue(path="task_md", message=TASK_MISSING)],
             )
+        workfolder = self.state.workfolder
         try:
             launch = await asyncio.to_thread(self._plan, run_input)
         except ConfigError as exc:
@@ -677,6 +755,8 @@ class RunsArea:
             ) from None
         except ArrError as exc:
             raise ApiException.of(ErrorCode.CONFIG_INVALID, exc.message) from None
+        if self.state.workfolder != workfolder:  # the switch sees a run only from here on
+            raise not_allowed(SWITCHED)
         run_dir = reserve_run(launch, starter=Starter.GUI)
         handle = RunHandle(run_id=run_dir.name, run_dir=run_dir, launch=launch)
         handle.task = asyncio.create_task(self._execute(handle), name=f"arr-run-{run_dir.name}")

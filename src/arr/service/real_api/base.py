@@ -187,7 +187,9 @@ class ServiceState:
         """
         self.workfolder = workfolder
         self.settings = settings
-        self.store = RunStore(workfolder / "runs")
+        store = RunStore(workfolder / "runs")
+        store.item_lines = self.store.item_lines  # the inbox of own runs stays the only source
+        self.store = store
         self.registry = RunRegistry()
         self.interrupted_at_start = interrupted
         self._sync_gates()

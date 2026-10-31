@@ -185,7 +185,8 @@ class CatalogArea:
             except UnicodeDecodeError:
                 claude_problem = "Sie ist nicht in UTF-8 gespeichert. Speichere sie im Editor so."
             except OSError as exc:
-                claude_problem = f"{os_reason(exc).capitalize()}. Prüfe die Rechte der Datei."
+                reason = os_reason(exc)
+                claude_problem = f"{reason[0].upper()}{reason[1:]}. Prüfe die Rechte der Datei."
         try:
             settings = load_project_settings(folder)
         except ArrError:
