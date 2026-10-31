@@ -19,6 +19,7 @@ _STATE_WORDS = {
     AgentDisplayState.ERROR: ("mit Fehler", "mit Fehler"),
     AgentDisplayState.IDLE: ("wartet", "warten"),
     AgentDisplayState.DONE: ("fertig", "fertig"),
+    AgentDisplayState.NOT_STARTED: ("nicht gestartet", "nicht gestartet"),
 }
 _PROVIDER = {Provider.CLAUDE: "Claude", Provider.CODEX: "ChatGPT"}
 

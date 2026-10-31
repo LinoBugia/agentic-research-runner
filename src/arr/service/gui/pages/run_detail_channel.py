@@ -13,7 +13,13 @@ from nicegui import ui
 
 from arr.models import ChannelMode, RunStatus
 from arr.room.types import MessageKind
-from arr.service.api_models import ApiException, ChannelInfo, Message, PostMessageRequest
+from arr.service.api_models import (
+    ApiException,
+    ChannelInfo,
+    Message,
+    PostMessageRequest,
+    RunAction,
+)
 from arr.service.gui import format as fmt
 from arr.service.gui.components.banner import empty_state_html
 from arr.service.gui.components.base import esc, icon, raw
@@ -62,6 +68,8 @@ class ChannelView:
         self.older = 0
         self.list: ui.element | None = None
         self.older_line: ui.html | None = None
+        self.empty_note: ui.html | None = None
+        self.head: ui.html | None = None
         self.last_id = info.last_message_id or 0
 
     @property
@@ -70,8 +78,7 @@ class ChannelView:
 
     # --- build ----------------------------------------------------------------------------
 
-    async def build(self) -> None:
-        page = self.page
+    def _head_html(self) -> str:
         info = self.info
         members = ", ".join(m.agent for m in info.members)
         questions = ""
@@ -82,14 +89,27 @@ class ChannelView:
                 f"Frage{'n' if n != 1 else ''}</a>"
             )
         anon = " · anonym" if info.anonymous else ""
-        raw(
-            f'<div class="pane-info"><b class="mono" title="{esc(info.purpose or "")}">'
-            f'#{esc(info.name)}</b> · <span title="{esc(members)}">{len(info.members)} '
-            f"Mitglieder</span> · {_MODE[info.mode]}{anon} · "
-            f'<span data-count="{esc(info.name)}">{fmt.integer(info.message_count)}</span> '
-            f"Nachrichten{questions}</div>" + follow_toggle_html(),
-            classes="pane-head",
+        joined = len(info.members)
+        count = info.message_count
+        return (
+            f'<b class="mono" title="{esc(info.purpose or "")}">#{esc(info.name)}</b> · '
+            f'<span title="{esc(members)}">{joined} Mitglied{"" if joined == 1 else "er"}</span>'
+            f" · {_MODE[info.mode]}{anon} · "
+            f'<span data-count="{esc(info.name)}">{fmt.integer(count)}</span> '
+            f"Nachricht{'' if count == 1 else 'en'}{questions}"
         )
+
+    def refresh_head(self) -> None:
+        html = self._head_html()
+        if self.head is not None and self.head.content != html:
+            self.head.set_content(html)
+
+    async def build(self) -> None:
+        page = self.page
+        info = self.info
+        with ui.element("div").classes("pane-head"):
+            self.head = raw(self._head_html(), classes="pane-info")
+            raw(follow_toggle_html(), tag="span")
         if not info.open:
             stage = info.opens_at_stage or "einer späteren Stufe"
             raw(
@@ -127,7 +147,7 @@ class ChannelView:
             self.list = ui.element("div").classes("msgs rd-list")
             with self.list:
                 if not items:
-                    raw(
+                    self.empty_note = raw(
                         '<p class="muted pad">Noch keine Nachrichten. Die Agenten bekommen '
                         "gerade ihren ersten Auftrag.</p>"
                     )
@@ -219,6 +239,13 @@ class ChannelView:
                 classes="composer-off small muted",
             )
             return
+        if self._in_terminal():
+            raw(
+                f"{icon('info', small=True)} Der Run läuft im Terminal. Nachrichten gehen nur "
+                "an Runs, die du in arr gestartet hast.",
+                classes="composer-off small muted",
+            )
+            return
         options = [f'<option value="">alle in #{esc(info.name)}</option>'] + [
             f'<option value="{esc(m.agent)}">{esc(m.alias or m.agent)}</option>'
             for m in info.members
@@ -272,6 +299,12 @@ class ChannelView:
                 "f.to.value, kind: f.kind.value, body: f.body.value}); }",
             )
 
+    def _in_terminal(self) -> bool:
+        """A run of `arr run`: this service can stop it, but neither pause it nor write to it."""
+        detail = self.page.detail
+        steer = {RunAction.PAUSE, RunAction.RESUME}
+        return not detail.run.open_escalation and not steer & set(detail.actions_allowed)
+
     async def _send(self, event: Any) -> None:
         args = event.args or {}
         body = str(args.get("body") or "").strip()
@@ -303,6 +336,9 @@ class ChannelView:
             self.messages[msg.id] = msg
             self.rows[msg.id].set_content(self._html(msg))
             return
+        if self.empty_note is not None:
+            self.empty_note.delete()
+            self.empty_note = None
         self._add(msg)
         self.last_id = max(self.last_id, msg.id)
         if own:

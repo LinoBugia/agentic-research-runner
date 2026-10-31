@@ -22,6 +22,7 @@ ORDER = {
     AgentDisplayState.WORKING: 3,
     AgentDisplayState.IDLE: 4,
     AgentDisplayState.DONE: 5,
+    AgentDisplayState.NOT_STARTED: 6,
 }
 """Sort order of the cards (§6.5): „wartet auf dich“ always on top."""
 

@@ -25,6 +25,7 @@ from arr.service.api_models import (
     Message,
     TranscriptKind,
 )
+from arr.service.gui.app import STATIC_DIR, STATIC_URL
 from arr.service.gui.components.approval_card import (
     COMPACT_LINE_CHARS,
     COMPACT_MAX_LINES,
@@ -32,7 +33,7 @@ from arr.service.gui.components.approval_card import (
 )
 from arr.service.gui.components.base import markdown_html
 from arr.service.gui.components.stage_bar import stage_bar_html
-from arr.service.gui.pages.run_detail import KATEX_URL, katex_file
+from arr.service.gui.pages.run_detail import KATEX_URL
 from arr.service.mock_api import R_EXPLORE, R_LEMMA, R_RAMSEY, R_SATZ2, Dataset, MockApi, _ev
 
 GOLDBACH = "20261024-1230_collatz_exploration_90aa"
@@ -435,9 +436,20 @@ def test_formulas_carry_tex_and_katex_is_available() -> None:
     out = markdown_html(r"$σ(n) = 4 \iff n ≡ 3 \pmod{16}$ und $$T^4(n) < n$$")
     assert 'data-tex="σ(n) = 4 \\iff n ≡ 3 \\pmod{16}"' in out
     assert 'class="math math-display"' in out
-    path = katex_file()
-    assert path is not None and path.stat().st_size > 100_000, "KaTeX not found in NiceGUI"
-    assert KATEX_URL.endswith(".js")
+
+    # a file of this package (W1-07 review), no longer out of NiceGUI's Mermaid bundle
+    assert f"{STATIC_URL}/katex.mjs" == KATEX_URL
+    module = STATIC_DIR / "katex.mjs"
+    assert module.stat().st_size > 100_000 and "katex as default" in module.read_text("utf-8")
+    assert "MIT License" in (STATIC_DIR / "katex.LICENSE.txt").read_text("utf-8")
+
+
+async def test_katex_file_is_served_as_a_module(api: MockApi) -> None:
+    async with gui_user(api) as user:
+        await user.open(f"/runs/{R_EXPLORE}")
+        response = await user.http_client.get(KATEX_URL)
+    assert response.status_code == 200
+    assert "javascript" in response.headers["content-type"]
 
 
 async def test_generic_run_agents_follow_open_approvals(load_api: MockApi) -> None:
@@ -525,3 +537,10 @@ async def test_waiting_agents_of_generic_runs_have_their_tool_call(load_api: Moc
         assert "wartet auf deine Freigabe" in view
         assert "Noch keine Ereignisse" not in view
         assert html(user, "tc-card-apr_1203")
+
+
+def test_underscores_inside_a_word_are_no_emphasis() -> None:
+    """Review W3-02 G8: run IDs in headings keep their underscores."""
+    out = markdown_html("# Run 20261030-2128_demo_runde_629f\n\n_kursiv_ und snake_case_name")
+    assert "20261030-2128_demo_runde_629f" in out and "snake_case_name" in out
+    assert "<em>kursiv</em>" in out

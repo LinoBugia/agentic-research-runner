@@ -50,6 +50,7 @@ AGENT_STATE = {
     AgentDisplayState.BLOCKED: Status("st-block", "hourglass_top", "blockiert"),
     AgentDisplayState.DONE: Status("st-ok", "check", "fertig"),
     AgentDisplayState.ERROR: Status("st-err", "close", "Fehler"),
+    AgentDisplayState.NOT_STARTED: Status("st-neutral", "remove", "nicht gestartet"),
 }
 
 

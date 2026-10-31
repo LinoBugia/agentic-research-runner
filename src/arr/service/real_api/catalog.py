@@ -13,7 +13,7 @@ from pathlib import Path
 
 from arr.errors import ArrError, ConfigError
 from arr.models import AuthKind, GroupSpec, ParamSpec, Provider
-from arr.resolve import load_group_spec
+from arr.resolve import _count_param, load_group_spec
 from arr.service.api_models import (
     ParamInfo,
     ProfileConcurrency,
@@ -74,6 +74,22 @@ def _param_type(spec: ParamSpec) -> str:
     if isinstance(default, float):
         return "float"
     return "str"
+
+
+def _agents_count(spec: GroupSpec) -> int | None:
+    """Agents a group starts with its defaults; None if a `count` has no default."""
+    total = 0
+    for agent in spec.agents:
+        count = agent.count
+        name = _count_param(agent)
+        if name is not None and name in spec.params:
+            count = spec.params[name].default
+        if count is None:
+            count = 1
+        if not isinstance(count, int) or isinstance(count, bool):
+            return None
+        total += count
+    return total
 
 
 def _provider_of(kind: AuthKind) -> Provider:
@@ -284,7 +300,7 @@ class CatalogArea:
             rubric=spec.rubric.model_dump(mode="json")
             if spec is not None and spec.rubric
             else None,
-            agents_count=len(spec.agents) if spec is not None else None,
+            agents_count=_agents_count(spec) if spec is not None else None,
         )
 
     async def list_skills(self, kind: SkillKind | None = None) -> list[SkillInfo]:

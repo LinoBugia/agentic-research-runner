@@ -41,8 +41,9 @@ from arr.resolve import load_yaml_model
 from arr.room.store import RoomStore
 from arr.room.types import Message as RoomMessage
 from arr.runs.inspect import describe_checkpoint, open_approvals, run_lock_held, run_reason
-from arr.runs.launch import describe_entry
+from arr.runs.launch import ORPHAN_MIN_AGE_S, describe_entry
 from arr.runs.prepare import AgentFile, RunMeta, load_agent_file, load_run_meta
+from arr.runs.slim import SLIM_MARKER
 from arr.service.api_models import (
     Action,
     Activity,
@@ -288,7 +289,8 @@ class RoomReader:
     """Read-only view of `groupchats/room.sqlite` (docs/02 §5) for the GUI.
 
     Typed rows come from `RoomStore`'s public readers; counts and the newest IDs from small
-    read-only queries. A missing or locked database gives empty answers, never an error.
+    read-only queries. A missing, locked or broken database gives empty answers, never an
+    error.
     """
 
     def __init__(self, run_dir: Path) -> None:
@@ -300,9 +302,23 @@ class RoomReader:
     def available(self) -> bool:
         return self.db_path.is_file()
 
+    def _intact(self) -> bool:
+        """False for a file that is no database: `RoomStore` readers would raise."""
+        try:
+            con = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=1.0)
+            try:
+                con.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            finally:
+                con.close()
+        except sqlite3.OperationalError:
+            return True  # locked for the moment
+        except sqlite3.Error:
+            return False
+        return True
+
     @property
     def store(self) -> RoomStore | None:
-        if self._store is None and self.available:
+        if self._store is None and self.available and self._intact():
             try:
                 self._store = RoomStore(self.run_dir)
             except ArrError:
@@ -444,6 +460,7 @@ class RunRecord:
         self._usage: _Cached[RunUsage] = _Cached(run_dir / USAGE_FILE)
         self._summary_md: _Cached[str] = _Cached(run_dir / SUMMARY_FILE)
         self._task_md: _Cached[str] = _Cached(run_dir / "task.md")
+        self._slim_mark: _Cached[bool] = _Cached(run_dir / SLIM_MARKER)
         self.room = RoomReader(run_dir)
         self._size: SizeInfo | None = None
         self._size_at = 0.0
@@ -577,6 +594,10 @@ class RunRecord:
     @property
     def task_md(self) -> str | None:
         return self._task_md.get(lambda p: p.read_text("utf-8"))
+
+    @property
+    def slimmed(self) -> bool:
+        return bool(self._slim_mark.get(lambda _path: True))
 
     @property
     def status(self) -> RunStatus:
@@ -791,6 +812,14 @@ def _item_is_escalation(entry: Mapping[str, Any]) -> bool:
     return entry.get("request") is None
 
 
+def open_escalation_id(record: RunRecord) -> str | None:
+    """The item a paused run waits for, if an escalation paused it."""
+    if record.status is not RunStatus.PAUSED:
+        return None
+    item = next((i for i in open_items(record) if _item_is_escalation(i)), None)
+    return str(item.get("item_id")) if item is not None else None
+
+
 def item_title(entry: Mapping[str, Any], *, stage: str | None = None, attempts: int = 0) -> str:
     """The sentence of an item (title of the card), without the full command (docs/08 R5)."""
     request = entry.get("request") or {}
@@ -938,6 +967,20 @@ def last_message(record: RunRecord) -> LastMessage | None:
     )
 
 
+def counts_as_active(record: RunRecord, now: float) -> bool:
+    """„Aktiv“ of docs/08 §8.3, without a reservation nobody took (W3-01 review G5).
+
+    A `queued` folder older than `ORPHAN_MIN_AGE_S` whose `run.lock` nobody holds was left by a
+    process that died after `reserve_run`; it stays until the next start clears it.
+    """
+    meta = record.meta
+    if meta is None or not meta.status.is_active:
+        return False
+    if meta.status is RunStatus.QUEUED and now - meta.created >= ORPHAN_MIN_AGE_S:
+        return run_lock_held(record.run_dir)
+    return True
+
+
 def run_error(record: RunRecord, base_url: str) -> RunError | None:
     meta = record.meta
     assert meta is not None
@@ -1008,7 +1051,7 @@ def run_summary(
         topology=topology,
         status=meta.status,
         status_since=status_since(entries, meta),
-        active=meta.status.is_active,
+        active=counts_as_active(record, now),
         open_approvals=len(items),
         open_escalation=open_escalation,
         starter=meta.starter,
@@ -1023,6 +1066,7 @@ def run_summary(
         cost_usd=round(cost, 4) if cost is not None else None,
         cost_kind=kind if cost is not None else None,
         size=record.size(),
+        slimmed=record.slimmed,
         best_result=best,
         last_message=last,
         error=run_error(record, base_url),
@@ -1063,9 +1107,7 @@ def stage_infos(record: RunRecord, resolved: ResolvedRun | None) -> list[StageIn
             ended[stage] = str(data.get("outcome"))
     status = record.status
     current = reached[-1] if reached else None
-    paused_escalation = status is RunStatus.PAUSED and any(
-        _item_is_escalation(i) for i in open_items(record)
-    )
+    paused_escalation = open_escalation_id(record) is not None
     agents_of: dict[str, list[str]] = {}
     if resolved is not None:
         for spec in resolved.stages:
@@ -1098,15 +1140,30 @@ def stage_infos(record: RunRecord, resolved: ResolvedRun | None) -> list[StageIn
     return out
 
 
-def actions_allowed(status: RunStatus, *, owned: bool, foreign_process: bool) -> list[RunAction]:
+_HANDOFF_STATE = {
+    RunStatus.DONE: "ist fertig",
+    RunStatus.STOPPED: "wurde gestoppt",
+    RunStatus.FAILED: "ist fehlgeschlagen",
+}
+
+
+def actions_allowed(
+    status: RunStatus,
+    *,
+    owned: bool,
+    foreign_process: bool,
+    slimmed: bool = False,
+    open_escalation: bool = False,
+) -> list[RunAction]:
     """Actions the GUI may offer (W3-01 §3.5): own runs pause, resume, stop; runs of another
-    process only stop; finished runs nothing yet (archive, delete, pin come with W5-01)."""
+    process only stop; finished runs can be slimmed once (archive, delete, pin: W5-01). An open
+    escalation is decided on its card, not with „Fortsetzen“ (docs/07 §6)."""
     if status.is_final:
-        return []
+        return [] if slimmed else [RunAction.SLIM]
     if owned:
         if status is RunStatus.RUNNING:
             return [RunAction.PAUSE, RunAction.STOP]
-        if status is RunStatus.PAUSED:
+        if status is RunStatus.PAUSED and not open_escalation:
             return [RunAction.RESUME, RunAction.STOP]
         return [RunAction.STOP]
     if foreign_process and status in (RunStatus.PREPARING, RunStatus.RUNNING, RunStatus.PAUSED):
@@ -1115,9 +1172,15 @@ def actions_allowed(status: RunStatus, *, owned: bool, foreign_process: bool) ->
 
 
 def handoff_text(record: RunRecord) -> str:
-    if record.final:
+    if record.status is RunStatus.INTERRUPTED:  # no finalizer, so no summary
         return (
-            f"Run {record.run_id} ist fertig. Lies die Zusammenfassung und die Ergebnisse "
+            f"Run {record.run_id} wurde abgebrochen und hat keine Zusammenfassung. Lies die "
+            f"Ergebnisse (read_results). Ordner: {record.run_dir}"
+        )
+    if record.final:
+        state = _HANDOFF_STATE.get(record.status, "ist beendet")
+        return (
+            f"Run {record.run_id} {state}. Lies die Zusammenfassung und die Ergebnisse "
             f"(read_run_summary, read_results). Ordner: {record.run_dir}"
         )
     return f"Run {record.run_id} läuft noch. Schau mit run_status nach, wie weit er ist."
@@ -1152,7 +1215,13 @@ def run_detail(
         open_approvals_top=top,
         questions_to_user=questions,
         decider=resolved.approvals.decider if resolved is not None else Decider.USER,
-        actions_allowed=actions_allowed(summary.status, owned=owned, foreign_process=foreign),
+        actions_allowed=actions_allowed(
+            summary.status,
+            owned=owned,
+            foreign_process=foreign,
+            slimmed=summary.slimmed,
+            open_escalation=summary.open_escalation,
+        ),
         stages=stage_infos(record, resolved),
         handoff_text=handoff_text(record),
         run_dir=str(record.run_dir),
@@ -1253,7 +1322,10 @@ def _display_state(
     final: bool,
     last_turn_error: bool,
     items: Sequence[Mapping[str, Any]],
+    not_started: bool = False,
 ) -> tuple[AgentDisplayState, BlockedBy | None]:
+    if not_started:
+        return AgentDisplayState.NOT_STARTED, None
     if final:
         return (AgentDisplayState.ERROR if last_turn_error else AgentDisplayState.DONE), None
     for item in items:
@@ -1314,6 +1386,8 @@ def agent_states(record: RunRecord, resolved: ResolvedRun | None = None) -> list
             final=final,
             last_turn_error=last_error,
             items=items,
+            not_started=record.status is RunStatus.FAILED
+            and (index is None or not index.max_turn()),
         )
         usage, _turns = index.usage() if index is not None else (Usage(), 0)
         cache_ratio = None
@@ -1385,7 +1459,13 @@ def channel_infos(record: RunRecord, resolved: ResolvedRun | None = None) -> lis
     store = record.room.store
     resolved = resolved or record.load_resolved()
     roles = {a.id: role_label(a.role, a.base_id) for a in resolved.agents} if resolved else {}
-    if store is None:
+    infos = []
+    if store is not None:
+        try:
+            infos = store.channels()
+        except ArrError:
+            return []
+    if not infos:  # the room comes up while the run prepares; until then `run.yaml` tells
         if resolved is None:
             return []
         return [
@@ -1401,10 +1481,6 @@ def channel_infos(record: RunRecord, resolved: ResolvedRun | None = None) -> lis
             )
             for c in resolved.groupchats
         ]
-    try:
-        infos = store.channels()
-    except ArrError:
-        return []
     stats = record.room.channel_stats()
     out = []
     for info in infos:
@@ -1464,18 +1540,22 @@ def messages_page(
     since_id: int | None,
     limit: int,
 ) -> MessagesPage | None:
-    """A page of a channel, oldest first within the page; None if the channel is unknown."""
+    """A page of a channel, oldest first within the page; None if the channel is unknown or
+    the room is broken. A channel of `run.yaml` the room does not hold yet is empty, not gone."""
     room = record.room
     store = room.store
     limit = max(1, min(limit, 500))
-    if store is None:
+    if store is None and room.available:
         return None
     try:
-        names = store.channel_names()
+        names = store.channel_names() if store is not None else []
     except ArrError:
         return None
     if channel not in names:
-        return None
+        resolved = record.load_resolved()
+        if resolved is None or all(c.name != channel for c in resolved.groupchats):
+            return None
+        return MessagesPage(channel=channel, items=[], total=0, older_count=0)
     total = room.count_channel(channel)
     try:
         if since_id is not None:
