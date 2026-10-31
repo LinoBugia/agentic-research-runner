@@ -3,7 +3,8 @@
 // - Cmd+Enter acts only on the card (or dialog) that holds the focus; Space/Enter on a grant
 //   button does nothing (G2)
 // - dialogs: focus on the heading, Esc cancels, focus returns to the trigger (K8)
-// - deadline countdown, copy fields, clickable table rows, filter controls
+// - deadline countdown, copy fields (refused: text marked for ⌘C), clickable table rows, filter
+//   controls
 // - connection banner instead of NiceGUI's own note (§4.2, §8.4)
 (function () {
   "use strict";
@@ -182,6 +183,7 @@
   // seen. Cmd+Enter also needs a fresh key press (no auto-repeat). Dialogs accept granting
   // ARM_MS after they opened.
   const ARM_MS = 1500;
+  const TALL_MARGIN = 48;
   function inView(r, top, bottom) {
     return r.height > 0 && r.top >= top - 1 && r.bottom <= bottom + 1;
   }
@@ -231,6 +233,15 @@
       // bottom edge (CSS .tall); otherwise head and buttons could never be in view together.
       card.classList.toggle("tall", card.offsetHeight > room - 8);
       const [top, bottom] = band(card);
+      if (card.classList.contains("compact")) {
+        // A compact card taller than its column can never be seen whole: it says so and leaves
+        // „Details“ instead of a button that stays locked (W1-07.1). The margin keeps the hint
+        // from flickering, because it changes the height of the card a little.
+        const column = bottom - top;
+        const height = card.offsetHeight;
+        if (height > column) card.classList.add("too-tall");
+        else if (height + TALL_MARGIN < column) card.classList.remove("too-tall");
+      }
       const commands = noteCommands(card, top, bottom);
       if (!seen(card, top, bottom)) {
         card._arrSince = null; // out of view: an armed card has to be seen again
@@ -376,15 +387,40 @@
     true,
   );
 
+  // ---- copying refused: the text stands marked, ⌘C is enough (§8.4) ---------------------------
+  function copyByHand(text) {
+    const box = document.createElement("dialog");
+    const title = document.createElement("b");
+    title.textContent = "Der Text wurde nicht kopiert.";
+    const why = document.createElement("p");
+    why.textContent = "Der Browser hat den Zugriff auf die Zwischenablage abgelehnt. Der Text ist markiert: Drücke ⌘C.";
+    const area = document.createElement("textarea");
+    area.readOnly = true;
+    area.rows = 6;
+    area.style.width = "min(560px, 80vw)";
+    area.value = text;
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "btn";
+    close.textContent = "Schließen";
+    close.addEventListener("click", () => box.close());
+    box.addEventListener("close", () => box.remove());
+    box.append(title, why, area, close);
+    document.body.appendChild(box);
+    box.showModal();
+    area.focus();
+    area.select();
+  }
+
   // ---- clicks: table rows, copy fields ------------------------------------------------------
   document.addEventListener("click", (e) => {
     const copy = e.target.closest && e.target.closest("[data-copy]");
     if (copy) {
       e.preventDefault();
       const text = copy.getAttribute("data-copy");
-      const done = () => arr.toast("Kopiert");
-      if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done, done);
-      else done();
+      const refused = () => copyByHand(text);
+      if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(() => arr.toast("Kopiert"), refused);
+      else refused();
       return;
     }
     const row = e.target.closest && e.target.closest("tr[data-href]");

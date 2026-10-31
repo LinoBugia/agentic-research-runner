@@ -399,6 +399,28 @@ def test_second_cmd_enter_does_not_decide_the_next_card(browser, calm_url) -> No
     page.close()
 
 
+def test_compact_card_taller_than_its_column_says_so(browser, calm_url) -> None:  # noqa: ANN001
+    """W1-07.1 (W3-03): never stuck silently; „Erlauben“ gives way to the hint and „Details“."""
+    page = browser.new_page(viewport={"width": 1280, "height": 420})
+    page.goto(f"{calm_url}{GOLDBACH}")
+    page.wait_for_selector(".rd-right .appr.compact")
+    card = page.locator(".rd-right .appr.compact").first
+    page.wait_for_function(
+        "document.querySelector('.rd-right .appr.compact').classList.contains('too-tall')",
+        timeout=5000,
+    )
+    assert card.locator(".too-tall-note").is_visible()
+    assert not card.locator("[data-grant]").is_visible()
+    assert card.get_by_text("Details").is_visible()
+    page.set_viewport_size({"width": 1280, "height": 1400})
+    page.wait_for_function(
+        "!document.querySelector('.rd-right .appr.compact').classList.contains('too-tall')",
+        timeout=5000,
+    )
+    assert card.locator("[data-grant]").is_visible()
+    page.close()
+
+
 def test_card_scrolled_out_of_its_column_is_not_armed(browser, calm_url) -> None:  # noqa: ANN001
     """The head of the card hidden by scrolling the overview: it must not count as seen."""
     _dataset(browser, calm_url, "last")

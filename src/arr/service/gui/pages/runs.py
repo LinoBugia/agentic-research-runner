@@ -316,6 +316,7 @@ class RunsPageView:
                 old is None
                 or old.status != event.run.status
                 or old.open_approvals != (event.run.open_approvals)
+                or old.slimmed != event.run.slimmed
             ):
                 await self.render()
 

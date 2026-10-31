@@ -389,12 +389,25 @@ _R_WEB_OFF = (
     "frage im Chat nach."
 )
 _R_CODEX_ESCALATION = (
-    "Codex will diesen Befehl ohne Sandbox ausführen; das braucht immer eine Freigabe."
+    "Codex will diesen Befehl mit erhöhten Rechten ausführen; das braucht immer eine Freigabe."
+)
+_R_CODEX_ONCE = (
+    "Eine Codex-Eskalation bekommt erhöhte Rechte. Deshalb gilt die Entscheidung nur für diese "
+    "eine Anfrage."
+)
+_R_RISKY_ONCE = (
+    "Hohes Risiko wird nie zu einer „Immer“-Regel. Deshalb gilt die Entscheidung nur für diese "
+    "eine Anfrage."
+)
+_R_HOST_PATTERN_ONCE = (
+    "Der Host sieht aus wie ein Muster. Daraus wird keine „Immer“-Regel, sie gälte in der Sandbox "
+    "für mehr als diesen Host. Deshalb gilt die Entscheidung nur für diese eine Anfrage."
 )
 _R_SECRET_IN_RULE = (
     "Die Anfrage enthält ein Geheimnis, deshalb wird daraus keine „Immer“-Regel (sie stünde "
     "in arr.yaml). Die Entscheidung gilt nur für diesen Run."
 )
+_PLAIN_HOST_RE = re.compile(r"[\w.:-]+")
 _DEVICE_WRITES = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"})
 _ALTERNATIVE = " Arbeite im Arbeitsordner weiter oder beschreibe im Chat, was du brauchst."
 
@@ -484,6 +497,10 @@ class AlwaysRule(StrictModel):
     covered when it matches one of `paths` (folder and everything below), `hosts` (exact or
     `*.domain`), `commands` (exact, or a prefix ending in ` *` for commands without shell
     operators) or, for unknown tools, `tools` alone. Allow rules never lift hard bans.
+
+    `exact` marks a rule made from a decision: its hosts and commands are literal, because the
+    agent wrote them, here and in the sandbox (`profile_for`). Patterns are only for rules the
+    user writes by hand in `arr.yaml`.
     """
 
     action: Literal["allow", "deny"]
@@ -492,6 +509,7 @@ class AlwaysRule(StrictModel):
     hosts: list[str] = Field(default_factory=list)
     commands: list[str] = Field(default_factory=list)
     reason: str = ""
+    exact: bool = False
 
 
 class PermissionRules(StrictModel):
@@ -771,7 +789,7 @@ def profile_for(
         if not rule.tools or set(rule.tools) & READ_TOOLS:
             read_allow += [norm(p) for p in rule.paths]
         if not rule.tools or set(rule.tools) & NETWORK_TOOLS:
-            domains += [h.lower() for h in rule.hosts]
+            domains += [h.lower() for h in rule.hosts if not rule.exact or _plain_host(h)]
 
     sensitive = [norm(home / p) for p in SENSITIVE_HOME_PATHS]
     sensitive += [norm(p) for p in SENSITIVE_ABSOLUTE_PATHS]
@@ -1785,6 +1803,7 @@ class ApprovalLog:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.Lock()
+        self._item_lines: list[dict[str, Any]] = []
 
     def write(self, entry: ApprovalLogEntry) -> None:
         """Append one entry as a JSON line."""
@@ -1794,6 +1813,13 @@ class ApprovalLog:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
+            if data.get("item_id"):
+                self._item_lines.append(data)
+
+    def item_lines(self) -> list[dict[str, Any]]:
+        """The item lines this object wrote; unlike the file, nobody else can add to them."""
+        with self._lock:
+            return list(self._item_lines)
 
     def entries(self) -> list[dict[str, Any]]:
         """Read all entries as plain dicts (empty if the file does not exist)."""
@@ -1840,6 +1866,7 @@ class Assessment:
     decision: Decision
     request: PermissionRequest
     items: frozenset[ItemKey]
+    no_rules: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1883,16 +1910,37 @@ def _covers(granted: ItemKey, item: ItemKey) -> bool:
     return granted[1] == item[1]
 
 
-def _host_matches(pattern: str, host: str) -> bool:
+def is_codex_escalation(request: PermissionRequest | Mapping[str, Any]) -> bool:
+    """True for a Codex shell request: it leaves the agent's sandbox, for rights arr cannot name.
+
+    Live under the profile `arr` it stayed restricted and could not even write to its work
+    folder (W3-03.1), so neither „safe“ nor „free“ holds (H2, S2 §15). Such a decision covers
+    exactly one request. Takes the request or a line of
+    `approvals.jsonl`, where the adapter has set the provider.
+    """
+    data = request if isinstance(request, Mapping) else request.model_dump(mode="json")
+    return (
+        data.get("provider") == Provider.CODEX.value
+        and data.get("tool") in SHELL_TOOLS
+        and bool(str(data.get("command") or "").strip())
+    )
+
+
+def _plain_host(host: str) -> bool:
+    """True for a host name or address; `*` and the like mean more to the sandbox (W3-03.2)."""
+    return _PLAIN_HOST_RE.fullmatch(host) is not None
+
+
+def _host_matches(pattern: str, host: str, *, exact: bool = False) -> bool:
     pattern = pattern.rstrip(".").lower()
-    if pattern.startswith("*."):
+    if pattern.startswith("*.") and not exact:
         return host.endswith(pattern[1:])
     return host == pattern
 
 
-def _command_matches(pattern: str, command: str) -> bool:
+def _command_matches(pattern: str, command: str, *, exact: bool = False) -> bool:
     pattern = _normalize_command(pattern)
-    if pattern.endswith(" *"):
+    if pattern.endswith(" *") and not exact:
         prefix = pattern[:-1]
         return not (set(command) & _METACHARS) and command.startswith(prefix)
     return command == pattern
@@ -1971,9 +2019,13 @@ class PolicyEngine:
         """Keep a final decision according to its scope (docs/07 §3 ④).
 
         `once` is not kept. `agent` and `run` become grants that cover the same items later.
+        A Codex escalation is always kept as `once`, whatever the scope was (it leaves the
+        agent's sandbox).
         `always` (user only, enforced by `Decision`) becomes an `AlwaysRule` in `self.rules`,
         returned so the caller can store it in `arr.yaml`. If an item of the request contains
-        a secret, no always rule is made; the decision is kept with scope `run` instead.
+        a secret, no always rule is made; the decision is kept with scope `run` instead. A
+        high risk or a host that looks like a pattern never becomes a rule either; that
+        decision counts for this request only.
         """
         if decision.action not in (DecisionAction.ALLOW, DecisionAction.DENY):
             return Remembered(decision)
@@ -1986,9 +2038,16 @@ class PolicyEngine:
         items = frozenset(analysis.grey)
         if not items:
             return Remembered(decision)
+        if analysis.no_rules:
+            once = decision.model_copy(update={"scope": DecisionScope.ONCE})
+            return Remembered(once, note=_R_CODEX_ONCE)
+        if decision.scope is DecisionScope.ALWAYS and (analysis.risky or _host_pattern(analysis)):
+            once = decision.model_copy(update={"scope": DecisionScope.ONCE})
+            return Remembered(once, note=_R_RISKY_ONCE if analysis.risky else _R_HOST_PATTERN_ONCE)
         note = None
         if decision.scope is DecisionScope.ALWAYS:
-            rule = _rule_from_items(analysis, decision)
+            action = "allow" if decision.action is DecisionAction.ALLOW else "deny"
+            rule = _rule_from_items(analysis, action, decision.reason)
             if not _contains_secret(rule):
                 self.rules.always.append(rule)
                 self._write(LogEvent.RULE, request, decision, item_id=item_id, rule=rule)
@@ -2000,6 +2059,17 @@ class PolicyEngine:
         grant = Grant(item_id, request.run_id, agent_id, decision, items, redact_request(request))
         self._grants[item_id] = grant
         return Remembered(decision, grant=grant, note=note)
+
+    def rule_for(self, request: PermissionRequest) -> "AlwaysRule | None":
+        """The rule „Immer“ would make of this request, None if `remember` makes no rule."""
+        profile = self._profiles.get(request.agent_id)
+        if profile is None:
+            return None
+        analysis = self._analyze(request, profile)
+        if not analysis.grey or analysis.no_rules or analysis.risky or _host_pattern(analysis):
+            return None
+        rule = _rule_from_items(analysis, "allow", "")
+        return None if _contains_secret(rule) else rule
 
     def revoke(self, item_id: str) -> Grant:
         """Withdraw a decision with scope agent/run; it no longer applies (docs/07 §4).
@@ -2047,7 +2117,8 @@ class PolicyEngine:
         categories = sorted(set(request.categories) | analysis.categories)
         request = request.model_copy(update={"categories": categories})
         items = frozenset(analysis.grey)
-        return Assessment(self._decide(request, profile, analysis), request, items)
+        decision = self._decide(request, profile, analysis)
+        return Assessment(decision, request, items, analysis.no_rules)
 
     def _decide(
         self, request: PermissionRequest, profile: SandboxProfile, analysis: _Analysis
@@ -2099,10 +2170,14 @@ class PolicyEngine:
                 reason="Erlaubt durch eine feste Regel aus arr.yaml.",
                 risk=_risk(analysis, grey),
             )
+        # A Codex escalation leaves the sandbox: no grant reaches it, not even one for the same
+        # command text given to a Claude agent of the run (review W2-02).
         allow_grants = [
             g
             for g in self._grants.values()
-            if g.decision.action is DecisionAction.ALLOW and g.applies_to(request)
+            if g.decision.action is DecisionAction.ALLOW
+            and g.applies_to(request)
+            and not analysis.no_rules
         ]
         covering = [
             next((g for g in allow_grants if any(_covers(i, key) for i in g.items)), None)
@@ -2326,9 +2401,9 @@ def _rule_covers(
     if kind in ("read", "write"):
         return any(_key_within(value, _rule_path_key(p, profile)) for p in rule.paths)
     if kind == "host":
-        return any(_host_matches(p, value) for p in rule.hosts)
+        return any(_host_matches(p, value, exact=rule.exact) for p in rule.hosts)
     if kind == "command":
-        return any(_command_matches(p, value) for p in rule.commands)
+        return any(_command_matches(p, value, exact=rule.exact) for p in rule.commands)
     return False
 
 
@@ -2340,17 +2415,24 @@ def _rule_path_key(raw: str, profile: SandboxProfile) -> str:
         return "\x00"
 
 
-def _rule_from_items(analysis: _Analysis, decision: Decision) -> AlwaysRule:
+def _host_pattern(analysis: _Analysis) -> bool:
+    return any(kind == "host" and not _plain_host(value) for kind, value in analysis.grey)
+
+
+def _rule_from_items(
+    analysis: _Analysis, action: Literal["allow", "deny"], reason: str
+) -> AlwaysRule:
     # Paths keep their real spelling; the comparison key may be case folded.
     items = analysis.grey
     tools = [v for k, v in items if k == "tool"]
     return AlwaysRule(
-        action="allow" if decision.action is DecisionAction.ALLOW else "deny",
+        action=action,
         tools=tools,
         paths=sorted(analysis.labels.get((k, v), v) for k, v in items if k == "read"),
         hosts=sorted(v for k, v in items if k == "host"),
         commands=sorted(v for k, v in items if k == "command"),
-        reason=decision.reason,
+        reason=reason,
+        exact=True,
     )
 
 

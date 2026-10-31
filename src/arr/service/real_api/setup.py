@@ -67,7 +67,7 @@ from arr.service.real_api.base import (
     workfolder_gone,
 )
 from arr.service.real_api.catalog import CatalogArea
-from arr.service.real_api.workfolder import WorkfolderArea
+from arr.service.real_api.workfolder import WorkfolderArea, active_records
 from arr.service.state import (
     read_app_settings,
     read_service_info,
@@ -689,7 +689,8 @@ class SetupArea:
     async def get_workfolder_settings(self) -> WorkfolderSettingsInfo:
         state = self.state
         settings = self._reload()
-        running = sum(1 for r in state.store.scan(refresh=False) if r.status.is_active)
+        # the registry knows a run of this service before the store has seen its folder
+        running = max(len(active_records(state)), len(state.registry.active()))
         return settings_info(settings).model_copy(
             update={
                 "running_runs": running,

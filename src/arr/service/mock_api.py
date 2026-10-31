@@ -5488,6 +5488,14 @@ class MockApi:
         if action is RunAction.STOP and not run.status.is_active:
             raise ApiException.of(ErrorCode.NOT_ALLOWED, "Der Run ist schon beendet.")
         freed = run.size.work if action is RunAction.SLIM else None
+        if dry_run and action is RunAction.SLIM:
+            return ActionResult(
+                ok=True,
+                message=f"Frei werden bis zu {_size_text(freed or 0)}: Arbeitskopien und Snapshot."
+                "\nEs bleiben Transkripte, Roh-Events, Diffs, Gruppenchats, Output und Usage."
+                "\nDas lässt sich nicht rückgängig machen.",
+                freed_bytes=freed,
+            )
         if dry_run:
             return ActionResult(
                 ok=True, message=f"Vorschau: {action.value} für „{run.name}“", freed_bytes=freed

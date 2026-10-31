@@ -224,6 +224,7 @@ class ApprovalItem(Record):
     summary: str | None = None
     options: list[EscalationOption] = Field(default_factory=list)
     decision: Decision | None = None
+    count: int = Field(default=1, ge=1, description="Equal requests answered by this item")
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:

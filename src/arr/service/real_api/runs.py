@@ -7,30 +7,48 @@ task in the service's event loop through `run_launch` (reservation with `starter
 `RunLock`, backends, finalizer, secret scan); the `RunManager` of such a run is reachable
 through the `RunRegistry` for pause, resume, stop and messages. A run of another process
 (`arr run`) can only be stopped (`stop.request`); pause, resume and messages answer
-`not_allowed` with the hint that it runs in the terminal. W3-02 changes this module (and the
-pages Runs, Run-Detail, Neuer Run) and nothing else of `RealApi`.
+`not_allowed` with the hint that it runs in the terminal.
+
+„Neuer Run“ sends the input of its form (`form_input`), a run file's content stays valid. Both
+are checked like the preparation will (`_check_prepared`), so a problem stands at its field and
+the preview is what `run.yaml` will hold. Delivery states of `user` messages change rows the
+watcher has already seen; `_follow_delivery` publishes them again (W3-02).
 """
 
 import asyncio
 import contextlib
 import logging
-from collections.abc import Iterable
+import re
+import time
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from arr.errors import ArrError, ConfigError
-from arr.models import RunInput, RunStatus, Starter
+from arr.errors import ArrError, ConfigError, ConfigIssue
+from arr.models import (
+    ProfilesFile,
+    Provider,
+    ResolvedRun,
+    RunInput,
+    RunStatus,
+    Starter,
+    WorkfolderSettings,
+)
 from arr.resolve import dump_yaml_model, validate_model
-from arr.room.types import MessageVia
-from arr.runs.launch import plan_run_input, request_stop, reserve_run, run_launch
+from arr.room.types import DeliveryStatus, MessageVia
+from arr.room.types import Message as RoomMessage
+from arr.runs.launch import Launch, plan_run_input, request_stop, reserve_run, run_launch
 from arr.runs.manager import RunManager, set_run_status
+from arr.runs.prepare import _check_codex_toolchain, _make_plan
 from arr.service.api_client import count_active, count_runs_waiting
 from arr.service.api_models import (
+    Action,
     ActionResult,
     AgentChanges,
     AgentState,
     ApiException,
     CapacityInfo,
     ChannelInfo,
+    ChannelMessageEvent,
     ErrorCode,
     FieldIssue,
     LogEntry,
@@ -46,6 +64,7 @@ from arr.service.api_models import (
     RunsPage,
     RunStartAgent,
     RunStartChannel,
+    RunStatusEvent,
     RunSummary,
     StartRunResponse,
     TranscriptKind,
@@ -61,6 +80,7 @@ from arr.service.real_api.rundir import (
     log_entries,
     messages_page,
     model_label,
+    open_escalation_id,
     role_label,
     run_detail,
     run_results,
@@ -70,6 +90,8 @@ from arr.service.real_api.rundir import (
     vendor_of,
 )
 from arr.service.real_api.storage import STORAGE_ACTIONS, StorageArea
+from arr.skills import discover_skills
+from arr.workfolder import project_dir
 
 log = logging.getLogger("arr.service.runs")
 
@@ -77,7 +99,162 @@ TERMINAL_HINT = (
     "Der Run läuft im Terminal („arr run“), nicht in arr selbst. Von hier geht nur Stoppen; "
     "Pausieren, Fortsetzen und Nachrichten gehen bei Runs, die du in arr gestartet hast."
 )
+ESCALATION_HINT = (
+    "Der Run wartet auf eine Entscheidung in der GUI. Weiter geht es nur über die Eskalation."
+)
 FINISHED_HINT = "Der Run ist beendet. {what} geht nur bei einem laufenden Run."
+TASK_MISSING = "Die Aufgabe fehlt. Schreib, woran die Agenten arbeiten sollen."
+TASK_PLACEHOLDER = "(noch keine Aufgabe)"
+"""Stands in for an empty task while the form is checked: the rest can already be shown."""
+NO_PROFILE = FieldIssue(
+    path="profile",
+    message="Es gibt noch kein Auth-Profil. Ohne Zugang können keine Agenten starten, das "
+    "Einrichten dauert etwa 2 Minuten.",
+    action=Action(label="Profil anlegen", url="/profile?neu=1"),
+)
+"""`load_profiles` explains a missing file for the terminal; here a link does that (E18)."""
+SOLO_AGENT = "solver"
+"""The one agent of a run without a skill (docs/08 §5.4 „Ohne Skill“)."""
+DELIVERY_POLL_S = 0.25
+DELIVERY_POLL_MAX_S = 1.0
+_AGENT_PATH = re.compile(r"agents\[(\d+)\]\.(\w+)")
+_FORM_PATHS = {"task": "task_md", "task_file": "task_md", "limits.wall_time": "limits.wall_time_s"}
+
+
+def _task_missing(run_input: Mapping[str, Any]) -> bool:
+    return "task_md" in run_input and not str(run_input["task_md"] or "").strip()
+
+
+def form_input(
+    run_input: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """A run input as `RunInput` data, start parameters and overrides per agent.
+
+    The form of „Neuer Run“ sends `project`, `skill`, `name`, `task_md`, `params`, `agents` (per
+    agent `model`, `web`, `read_dirs`), `limits` (`wall_time_s`, `turns_per_agent`,
+    `budget_usd`) and `decider` (see `MockApi.resolve_run`); only what differs from the
+    standards counts. The content of a run file has no `task_md` and passes as it is.
+    """
+    data = dict(run_input)
+    params = data.pop("params", None)
+    params = dict(params) if isinstance(params, Mapping) else {}
+    if "task_md" not in data:
+        return data, params, {}
+    data["task"] = TASK_PLACEHOLDER if _task_missing(run_input) else data["task_md"]
+    del data["task_md"]
+    overrides = data.pop("agents", None) or {}
+    decider = data.pop("decider", None)
+    if decider:
+        data["approvals"] = {"decider": decider}
+    limits = dict(data.pop("limits", None) or {})
+    if "wall_time_s" in limits:
+        limits["wall_time"] = limits.pop("wall_time_s")
+    if limits:
+        data["limits"] = limits
+    for key in ("name", "skill"):
+        if not data.get(key):
+            data.pop(key, None)
+    if "skill" not in data:
+        data["topology"] = {"kind": "solo"}
+        data["agents"] = [{"id": SOLO_AGENT}]
+        params = {}
+    return data, params, {k: v for k, v in overrides.items() if v}
+
+
+def _provider_of(model: str) -> Provider:
+    return Provider.CLAUDE if model.startswith("claude") else Provider.CODEX
+
+
+def _agent_specs(
+    resolved: ResolvedRun, overrides: Mapping[str, Any], settings: WorkfolderSettings
+) -> list[dict[str, Any]]:
+    """The resolved agents as entries of `run.yaml`, with the changes of the form.
+
+    Agents of a run replace those of its skill as a whole (docs/02 §3.3), so all of them are
+    listed. A model of the other provider takes profile and effort from `arr.yaml`.
+    """
+    specs = []
+    for agent in resolved.agents:
+        spec = agent.model_dump(
+            mode="json", exclude={"base_id", "replica", "channels"}, exclude_none=True
+        )
+        change = overrides.get(agent.id, {})
+        model = change.get("model")
+        if model and model != agent.model:
+            spec["model"] = model
+            provider = _provider_of(model)
+            if provider is not agent.provider:
+                standard = settings.defaults.get(provider)
+                spec["provider"] = provider.value
+                spec.pop("auth", None)
+                spec.pop("effort", None)
+                if standard is not None and standard.auth:
+                    spec["auth"] = standard.auth
+                if standard is not None and standard.effort:
+                    spec["effort"] = standard.effort.value
+        if "web" in change:
+            spec["tools"] = {**spec.get("tools", {}), "web": bool(change["web"])}
+        if "read_dirs" in change:
+            spec["read_dirs"] = list(change["read_dirs"])
+        specs.append(spec)
+    return specs
+
+
+def _named(exc: ConfigError, agents: Sequence[str]) -> ConfigError:
+    """`agents[1].auth` → `agents.<id>.profile`: the paths the fields of the form carry."""
+
+    def path(text: str) -> str:
+        match = _AGENT_PATH.match(text)
+        if match is None or int(match[1]) >= len(agents):
+            return text
+        field = "profile" if match[2] == "auth" else match[2]
+        return f"agents.{agents[int(match[1])]}.{field}"
+
+    issues = [ConfigIssue(path(i.path), i.message, i.line) for i in exc.issues]
+    return ConfigError(issues, source=exc.source)
+
+
+def _field_issues(exc: ConfigError) -> list[FieldIssue]:
+    out = []
+    for issue in exc.issues:
+        path = _FORM_PATHS.get(issue.path, issue.path)
+        out.append(
+            FieldIssue(
+                path="decider" if path.startswith("approvals") else path, message=issue.message
+            )
+        )
+    return out
+
+
+def _delivery_settled(message: RoomMessage) -> bool:
+    """True if the state cannot change: „geweckt“ stays, a hint to the only addressee too.
+    Otherwise another addressee can still be woken, up to the end of the run."""
+    status = message.delivery.status if message.delivery is not None else None
+    return status is DeliveryStatus.WOKEN or (
+        status is DeliveryStatus.HINT_MID_TURN and len(message.to) == 1
+    )
+
+
+def stored_run(resolved: ResolvedRun) -> ResolvedRun:
+    """`resolved` as `prepare_run` writes it to `run.yaml`."""
+    return resolved.model_copy(update={"task": None, "task_file": "task.md"})
+
+
+def _check_prepared(launch: Launch) -> None:
+    """The checks of `prepare_run` before anything exists: roles, skills, profiles, toolchain.
+
+    Later they could only end the task of the run, after the user has left this page.
+    """
+    root = launch.workfolder
+    resolved = launch.resolved
+    project = project_dir(root, resolved.project)
+    catalog = discover_skills(root / "skills")
+    _make_plan(root, project, resolved, catalog, None, launch.profiles, False)
+    _check_codex_toolchain(root, resolved, launch.settings)
+
+
+class _NoProfile(ArrError):
+    """`profiles.yaml` does not exist yet."""
 
 
 class RunsArea:
@@ -87,6 +264,7 @@ class RunsArea:
         self.state = state
         self.approvals = approvals
         self.storage = storage
+        self._followers: set[asyncio.Task[None]] = set()
 
     # -- helpers ----------------------------------------------------------------------------
 
@@ -223,6 +401,8 @@ class RunsArea:
         if action in STORAGE_ACTIONS:
             raise self.storage.action_error(action)
         record = self._record(run_id)
+        if action is RunAction.SLIM:
+            return await self._slim(record, dry_run=dry_run)
         status = record.status
         words = {RunAction.PAUSE: "Pausieren", RunAction.RESUME: "Fortsetzen"}
         what = words.get(action, "Stoppen")
@@ -231,11 +411,38 @@ class RunsArea:
         handle = self.state.registry.get(run_id)
         owned = self.state.registry.owns(run_id)
         if owned and handle is not None:
+            if action is RunAction.RESUME:
+                self._refuse_open_escalation(record)
             message = self._own_action(handle, action, status, dry_run=dry_run)
         else:
             message = self._foreign_action(record, action, dry_run=dry_run)
         record.refresh_meta()
         return ActionResult(ok=True, message=message, run=self._summary(record, with_agents=False))
+
+    async def _slim(self, record: RunRecord, *, dry_run: bool) -> ActionResult:
+        result = await self.storage.slim(record, dry_run=dry_run)
+        summary = self._summary(record, with_agents=False)
+        if not dry_run:
+            # a finished run is not watched any more: tell the open pages here
+            hub = self.state.hub
+            hub.publish(
+                RunStatusEvent(
+                    seq=hub.next_seq(), ts=time.time(), run_id=record.run_id, run=summary
+                )
+            )
+        return result.model_copy(update={"run": summary})
+
+    def _refuse_open_escalation(self, record: RunRecord) -> None:
+        """Only the card decides an escalation (docs/07 §6, docs/08 §6.7)."""
+        item_id = open_escalation_id(record)
+        if item_id is not None:
+            url = f"/freigaben/{item_id}"
+            raise ApiException.of(
+                ErrorCode.NOT_ALLOWED,
+                ESCALATION_HINT,
+                gui_url=f"{self.state.base_url}{url}",
+                action=Action(label="Eskalation ansehen", url=url),
+            )
 
     def _own_action(
         self, handle: RunHandle, action: RunAction, status: RunStatus, *, dry_run: bool
@@ -303,31 +510,93 @@ class RunsArea:
             )
         except ArrError as exc:
             raise ApiException.of(ErrorCode.INVALID, exc.message) from None
+        follower = asyncio.create_task(self._follow_delivery(handle, posted.id))
+        self._followers.add(follower)
+        follower.add_done_callback(self._followers.discard)
         return to_message(posted)
+
+    async def _follow_delivery(self, handle: RunHandle, msg_id: int) -> None:
+        """Publish a `user` message again when its delivery state changes, until the state is
+        settled or the run is over. The watcher only reports new message IDs."""
+        record = self.state.store.get(handle.run_id)
+        shown = None
+        delay = DELIVERY_POLL_S
+        while record is not None:
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, DELIVERY_POLL_MAX_S)
+            store = record.room.store
+            try:
+                message = store.message(msg_id) if store is not None else None
+            except ArrError:
+                message = None
+            delivery = message.delivery if message is not None else None
+            if message is not None and delivery is not None and delivery.status != shown:
+                shown = delivery.status
+                delay = DELIVERY_POLL_S
+                hub = self.state.hub
+                hub.publish(
+                    ChannelMessageEvent(
+                        seq=hub.next_seq(),
+                        ts=time.time(),
+                        run_id=handle.run_id,
+                        message=to_message(message),
+                    )
+                )
+            if (message is not None and _delivery_settled(message)) or handle.done:
+                return
 
     # -- resolving and starting --------------------------------------------------------------
 
-    def _plan(self, run_input: dict[str, Any]) -> Any:
-        """A `Launch` from the GUI's run input; `ConfigError`/`ArrError` for problems."""
-        data = dict(run_input)
-        params = data.pop("params", None)
-        model = validate_model(RunInput, data, source="Neuer Run")
-        return plan_run_input(
-            model,
-            workfolder=self.state.workfolder,
-            params=params if isinstance(params, dict) else None,
-            profiles=self.state.profiles(),
-            source="Neuer Run",
-        )
+    def _profiles(self) -> ProfilesFile:
+        try:
+            return self.state.profiles()
+        except ConfigError:
+            raise
+        except ArrError as exc:
+            raise _NoProfile(exc.message) from None
+
+    def _plan(self, run_input: dict[str, Any]) -> Launch:
+        """A `Launch` from a run input; `ConfigError`/`ArrError` for problems."""
+        data, params, overrides = form_input(run_input)
+
+        def plan() -> Launch:
+            return plan_run_input(
+                validate_model(RunInput, data, source="Neuer Run"),
+                workfolder=self.state.workfolder,
+                params=params,
+                profiles=self._profiles(),
+                source="Neuer Run",
+            )
+
+        try:
+            project_dir(self.state.workfolder, str(data.get("project")))
+        except ArrError as exc:
+            raise ConfigError.single("project", exc.message, source="Neuer Run") from None
+        launch = plan()
+        ids = [a.id for a in launch.resolved.agents]
+        try:
+            if overrides:
+                resolved = launch.resolved
+                data["agents"] = _agent_specs(resolved, overrides, launch.settings)
+                data["groupchats"] = [c.model_dump(mode="json") for c in resolved.groupchats]
+                data["stages"] = [s.model_dump(mode="json") for s in resolved.stages]
+                data["raters"] = list(resolved.raters)
+                launch = plan()
+            _check_prepared(launch)
+        except ConfigError as exc:
+            raise _named(exc, ids) from None
+        return launch
 
     async def resolve_run(self, run_input: dict[str, Any]) -> ResolveResult:
+        missing = []
+        if _task_missing(run_input):
+            missing.append(FieldIssue(path="task_md", message=TASK_MISSING))
         try:
             launch = await asyncio.to_thread(self._plan, run_input)
         except ConfigError as exc:
-            return ResolveResult(
-                resolved_run_yaml="",
-                errors=[FieldIssue(path=i.path, message=i.message) for i in exc.issues],
-            )
+            return ResolveResult(resolved_run_yaml="", errors=[*missing, *_field_issues(exc)])
+        except _NoProfile:
+            return ResolveResult(resolved_run_yaml="", errors=[*missing, NO_PROFILE])
         except ArrError as exc:
             return ResolveResult(
                 resolved_run_yaml="", errors=[FieldIssue(path="", message=exc.message)]
@@ -337,20 +606,29 @@ class RunsArea:
         for agent in resolved.agents:
             needed[agent.auth] = needed.get(agent.auth, 0) + 1
         capacity = []
+        warnings = []
         for profile, count in needed.items():
-            limit = self.state.settings.concurrency.get(profile)
+            limit = launch.settings.concurrency.get(profile)
             gate = self.state.gates.get(profile)
             in_use = gate.active if gate is not None else 0
+            free = max(0, (limit - in_use)) if limit is not None else count
             capacity.append(
                 CapacityInfo(
                     profile=profile,
-                    free=max(0, (limit - in_use)) if limit is not None else count,
+                    free=free,
                     needed=count,
                     limit=limit if limit is not None else count,
                 )
             )
+            if count > free:
+                warnings.append(
+                    f"{profile}: {free} von {limit} Plätzen frei, der Run braucht {count}. Seine "
+                    "Agenten warten, bis Plätze frei werden."
+                )
         return ResolveResult(
-            resolved_run_yaml=dump_yaml_model(resolved),
+            resolved_run_yaml=dump_yaml_model(stored_run(resolved)),
+            errors=missing,
+            warnings=warnings,
             agents=[
                 RunStartAgent(
                     id=a.id,
@@ -381,13 +659,21 @@ class RunsArea:
         )
 
     async def start_run(self, run_input: dict[str, Any]) -> StartRunResponse:
+        if _task_missing(run_input):
+            raise ApiException.of(
+                ErrorCode.CONFIG_INVALID,
+                TASK_MISSING,
+                issues=[FieldIssue(path="task_md", message=TASK_MISSING)],
+            )
         try:
             launch = await asyncio.to_thread(self._plan, run_input)
         except ConfigError as exc:
             raise ApiException.of(
-                ErrorCode.CONFIG_INVALID,
-                exc.issues[0].message,
-                issues=[FieldIssue(path=i.path, message=i.message) for i in exc.issues],
+                ErrorCode.CONFIG_INVALID, exc.issues[0].message, issues=_field_issues(exc)
+            ) from None
+        except _NoProfile:
+            raise ApiException.of(
+                ErrorCode.CONFIG_INVALID, NO_PROFILE.message, issues=[NO_PROFILE]
             ) from None
         except ArrError as exc:
             raise ApiException.of(ErrorCode.CONFIG_INVALID, exc.message) from None
@@ -443,3 +729,5 @@ class RunsArea:
         tasks = [h.task for h in handles if h.task is not None]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        for follower in list(self._followers):
+            follower.cancel()

@@ -77,7 +77,7 @@ def count_waiting(approvals: Iterable[ApprovalItem]) -> int:
 def count_active(runs: Iterable[RunSummary]) -> int:
     """„Aktiv“: runs in `awaiting_approval`, `queued`, `preparing`, `running`, `paused`,
     `finalizing`."""
-    return sum(1 for run in runs if run.status.is_active)
+    return sum(1 for run in runs if run.active)
 
 
 def count_runs_waiting(runs: Iterable[RunSummary]) -> int:

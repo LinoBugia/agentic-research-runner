@@ -6,6 +6,12 @@ in Welle 1/2 `TerminalDecider` for `arr run`, from W3-03 the GUI inbox (it calls
 `ApprovalInbox.resolve`), from W4-04 the gatekeeper. Without a decision until the deadline
 the request counts as denied with a hint (docs/07-berechtigungen-und-freigaben.md §3 ③).
 
+Equal open requests of an agent become one item with a `count`, one decision answers all of
+them. Equal means the card of the first one says everything about the others (`_merge_key`):
+a click grants what the user sees, nothing more. An allowed installation also covers the
+package hosts it needs for a short time, so `pip install` asks once (W2-01 §7, review W2-01.1
+N1).
+
 Items live in memory; every step is appended to `approvals.jsonl` (docs/02 §4).
 See docs/07-berechtigungen-und-freigaben.md §3-§6.
 """
@@ -24,6 +30,7 @@ from typing import Any, Protocol
 
 from arr.errors import ArrError
 from arr.permissions.policy import (
+    NETWORK_TOOLS,
     TIMEOUT_REASON,
     AlwaysRule,
     ApprovalLog,
@@ -31,6 +38,7 @@ from arr.permissions.policy import (
     Assessment,
     LogEvent,
     PolicyEngine,
+    is_codex_escalation,
     redact,
 )
 from arr.permissions.types import (
@@ -45,6 +53,7 @@ from arr.permissions.types import (
     EscalationOption,
     PermissionRequest,
     RequestCategory,
+    Risk,
     RiskLevel,
 )
 
@@ -55,6 +64,7 @@ __all__ = [
     "TerminalDecider",
     "format_escalation",
     "format_item",
+    "install_hosts",
     "item_id_prefix",
 ]
 
@@ -64,13 +74,31 @@ DEFAULT_TIMEOUT = timedelta(minutes=20)
 """Approval timeout without configuration (docs/07 §3 ③)."""
 
 
-def item_id_prefix(run_id: str) -> str:
-    """Run part of an item ID: `apr_<6 hex of sha1(run_id)>`; IDs are `<prefix>_<NNNN>`.
+INSTALL_PASS_S = 300.0
+"""How long an allowed installation covers its package hosts for the same agent."""
 
-    The counter runs per run and continues after a restart from `approvals.jsonl`; the hash
-    keeps IDs of different runs in one workfolder apart (deep links of the GUI inbox).
+PACKAGE_HOSTS = frozenset({"pypi.org", "files.pythonhosted.org"})
+"""Hosts an allowed `pip`/`uv` installation may reach without a second question."""
+
+_PYTHON_INSTALLER_RE = re.compile(r"(?:^|[\s/])(?:pip[0-9.]*|uv)\s")
+
+
+def install_hosts(request: PermissionRequest) -> frozenset[str]:
+    """Package hosts that come with allowing this request (none for anything but pip/uv)."""
+    command = request.command or ""
+    if RequestCategory.INSTALL in request.categories and _PYTHON_INSTALLER_RE.search(command):
+        return PACKAGE_HOSTS
+    return frozenset()
+
+
+def item_id_prefix(run_id: str) -> str:
+    """Run part of an item ID: `apr_<16 hex of sha1(run_id)>`; IDs are `<prefix>_<NNNN>`.
+
+    The counter runs per run and continues after a restart from `approvals.jsonl`. 64 bits of
+    the hash keep IDs of different runs apart (6 hex collided at ≈ 3 % per 1000 runs, W1-05.1
+    N5). Old IDs with 6 hex stay valid: readers take IDs as they stand in `approvals.jsonl`.
     """
-    return "apr_" + hashlib.sha1(run_id.encode("utf-8")).hexdigest()[:6]
+    return "apr_" + hashlib.sha1(run_id.encode("utf-8")).hexdigest()[:16]
 
 
 class DeciderUnavailable(ArrError):
@@ -126,6 +154,10 @@ class ApprovalInbox:
         self._lock = threading.RLock()
         self._items: dict[str, ApprovalItem] = {}
         self._waiters: dict[str, asyncio.Future[Decision | None]] = {}
+        self._waiting: dict[str, int] = {}
+        self._merge_keys: dict[str, tuple[Any, ...]] = {}
+        self._decider_tasks: dict[str, asyncio.Task[None]] = {}
+        self._install_passes: dict[str, tuple[float, frozenset[str], str]] = {}
         self._counters: dict[str, int] = {}
 
     # -- queries ------------------------------------------------------------------------
@@ -153,37 +185,50 @@ class ApprovalInbox:
     async def handle(self, request: PermissionRequest) -> Decision:
         """Decide a request: PolicyEngine first, the inbox only for `ask` (docs/07 §3)."""
         assessment = self.engine.assess(request)
-        if assessment.decision.action is not DecisionAction.ASK:
-            return assessment.decision
-        return await self.ask(assessment)
+        decision = assessment.decision
+        if decision.action is DecisionAction.ASK:
+            covered = self._by_install_pass(assessment)
+            return covered if covered is not None else await self.ask(assessment)
+        if decision.action is DecisionAction.ALLOW and decision.decided_by is DecidedBy.USER:
+            self._grant_install_pass(assessment.request, "aus einer früheren Entscheidung")
+        return decision
 
     async def ask(self, assessment: Assessment) -> Decision:
-        """Open an item for an `ask` and wait for its decision or the timeout.
+        """Open an item for an `ask`, or join the equal open one, and wait for its decision.
 
-        Never raises because of the decider; a cancelled wait marks the item obsolete.
+        Equal is what `_merge_key` says. A join shares item, deadline and decision. Never
+        raises because of the decider; when the last waiting caller is cancelled, the item
+        becomes obsolete.
         """
         loop = asyncio.get_running_loop()
-        waiter: asyncio.Future[Decision | None] = loop.create_future()
         with self._lock:
-            item = self._open(assessment)
-            self._waiters[item.id] = waiter
-        task = asyncio.create_task(self._run_decider(item)) if self.decider else None
+            item = self._equal_open(assessment)
+            if item is None:
+                item = self._open(assessment)
+                waiter: asyncio.Future[Decision | None] = loop.create_future()
+                self._waiters[item.id] = waiter
+                self._waiting[item.id] = 1
+                if self.decider is not None:
+                    self._decider_tasks[item.id] = asyncio.create_task(self._run_decider(item))
+            else:
+                item = self._join(item, assessment)
+                waiter = self._waiters[item.id]
+                self._waiting[item.id] += 1
         try:
-            decision = await asyncio.wait_for(asyncio.shield(waiter), self.timeout)
+            remaining = max(0.0, (item.deadline or 0.0) - time.time())
+            decision = await asyncio.wait_for(asyncio.shield(waiter), remaining)
             assert decision is not None  # only escalations are released without a decision
             return decision
         except TimeoutError:
             return self._expire(item.id)
         except asyncio.CancelledError:
-            self.cancel(item.id, "Die wartende Anfrage wurde abgebrochen.")
+            with self._lock:
+                last = self._waiting.get(item.id) == 1
+            if last:
+                self.cancel(item.id, "Die wartende Anfrage wurde abgebrochen.")
             raise
         finally:
-            with self._lock:
-                self._waiters.pop(item.id, None)
-            if task is not None and not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            await self._leave(item.id)
 
     async def ask_escalation(
         self,
@@ -212,20 +257,17 @@ class ApprovalInbox:
             )
             self._items[item.id] = item
             self._waiters[item.id] = waiter
+            self._waiting[item.id] = 1
             self._write(LogEvent.OPEN, item, note=f"Eskalation in Stufe „{stage}“: {summary}")
-        task = asyncio.create_task(self._run_decider(item)) if self.decider else None
+            if self.decider is not None:
+                self._decider_tasks[item.id] = asyncio.create_task(self._run_decider(item))
         try:
             return await asyncio.shield(waiter)
         except asyncio.CancelledError:
             self.cancel(item.id, "Die wartende Eskalation wurde abgebrochen.")
             raise
         finally:
-            with self._lock:
-                self._waiters.pop(item.id, None)
-            if task is not None and not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            await self._leave(item.id)
 
     def resolve(self, item_id: str, decision: Decision) -> ApprovalItem:
         """Record the decision for an open item and wake the waiting agent (thread-safe).
@@ -257,11 +299,13 @@ class ApprovalInbox:
             decision = remembered.decision
             item = self._update(item, ApprovalStatus.DECIDED, decision)
             self._write(LogEvent.DECIDED, item, note=remembered.note)
+            if decision.action is DecisionAction.ALLOW and not _high_risk(item.risk):
+                self._grant_install_pass(item.request, item.id)
+        self._wake(item.id, decision)  # first: a broken `on_rule` must not leave the agent waiting
         if remembered.rule is not None and self.on_rule is not None:
             self.on_rule(remembered.rule)
         if remembered.note is not None:
             self._notify(remembered.note)
-        self._wake(item.id, decision)
         return item
 
     def _decide_escalation(self, item: ApprovalItem, decision: Decision) -> ApprovalItem:
@@ -320,7 +364,8 @@ class ApprovalInbox:
         """Withdraw a decision (docs/07 §4); later requests ask again.
 
         Scope agent/run: the grant is removed. A one-time decision of the gatekeeper only
-        applied to its request; it is marked revoked without further effect.
+        applied to its request; it is marked revoked without further effect. Withdrawing an
+        installation also ends the host passes, so the package hosts ask again.
         """
         with self._lock:
             item = self.get(item_id)
@@ -338,12 +383,88 @@ class ApprovalInbox:
                     self.engine.revoke(item_id)  # logs the revocation
                 except ArrError:
                     note = "Die Entscheidung war nicht mehr aktiv (z. B. nach einem Neustart)."
+            if item.request is not None and install_hosts(item.request):
+                self._install_passes.clear()
             item = self._update(item, ApprovalStatus.REVOKED, item.decision)
             if note is not None:
                 self._write(LogEvent.REVOKED, item, note=note)
         return item
 
     # -- internals ----------------------------------------------------------------------
+
+    async def _leave(self, item_id: str) -> None:
+        """One caller stopped waiting; the last one takes waiter and decider task with it."""
+        with self._lock:
+            left = self._waiting.get(item_id, 1) - 1
+            self._waiting[item_id] = left
+            if left > 0:
+                return
+            self._waiting.pop(item_id, None)
+            self._waiters.pop(item_id, None)
+            self._merge_keys.pop(item_id, None)
+            task = self._decider_tasks.pop(item_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    def _equal_open(self, assessment: Assessment) -> ApprovalItem | None:
+        key = _merge_key(assessment)
+        for item_id, known in self._merge_keys.items():
+            item = self._items[item_id]
+            if known == key and item.status is ApprovalStatus.OPEN:
+                return item
+        return None
+
+    def _join(self, item: ApprovalItem, assessment: Assessment) -> ApprovalItem:
+        item = self._update(item, ApprovalStatus.OPEN, None, count=item.count + 1)
+        self._write(
+            LogEvent.DECISION,
+            item,
+            request=assessment.request,
+            decision=assessment.decision,
+            note="Gleiche Anfrage, mit der offenen zusammengefasst.",
+        )
+        return item
+
+    def _grant_install_pass(self, request: PermissionRequest | None, source: str) -> None:
+        """Let an allowed pip/uv installation reach its package hosts for a while."""
+        hosts = install_hosts(request) if request is not None else frozenset()
+        if hosts:
+            until = time.time() + INSTALL_PASS_S
+            self._install_passes[request.agent_id] = (until, hosts, source)  # type: ignore[union-attr]
+
+    def _by_install_pass(self, assessment: Assessment) -> Decision | None:
+        """The answer for a host request an allowed installation covers, else None.
+
+        Only plain host requests of the sandbox qualify (Claude's `SandboxNetworkAccess`),
+        never a shell request or one that names URLs; a high risk always asks.
+        """
+        request, risk = assessment.request, assessment.decision.risk
+        with self._lock:
+            until, hosts, source = self._install_passes.get(
+                request.agent_id, (0.0, frozenset(), "")
+            )
+        wanted = {h.rsplit(":", 1)[0].rstrip(".").lower() for h in request.hosts}
+        if (
+            time.time() >= until
+            or request.tool not in NETWORK_TOOLS
+            or request.urls
+            or not wanted
+            or not wanted <= hosts
+            or _high_risk(risk)
+        ):
+            return None
+        decision = Decision(
+            action=DecisionAction.ALLOW,
+            decided_by=DecidedBy.USER,
+            reason=f"Gehört zur erlaubten Installation {source}.",
+            risk=risk,
+        )
+        if self.log is not None:
+            entry = ApprovalLogEntry(event=LogEvent.DECISION, request=request, decision=decision)
+            self.log.write(entry)
+        return decision
 
     def _next_id(self, run_id: str) -> str:
         prefix = item_id_prefix(run_id)
@@ -373,6 +494,9 @@ class ApprovalInbox:
             summary=assessment.decision.reason,
         )
         self._items[item.id] = item
+        key = _merge_key(assessment)
+        if key is not None:
+            self._merge_keys[item.id] = key
         self._write(LogEvent.OPEN, item, decision=assessment.decision)
         return item
 
@@ -453,6 +577,7 @@ class ApprovalInbox:
         event: LogEvent,
         item: ApprovalItem,
         *,
+        request: PermissionRequest | None = None,
         decision: Decision | None = None,
         note: str | None = None,
     ) -> None:
@@ -462,7 +587,7 @@ class ApprovalInbox:
             ApprovalLogEntry(
                 event=event,
                 item_id=item.id,
-                request=item.request,
+                request=request or item.request,
                 decision=decision or item.decision,
                 note=note,
             )
@@ -501,7 +626,7 @@ _CHOICES = (
     "  einmal  – nur diese Anfrage erlauben\n"
     "  agent   – für diesen Agenten im Run erlauben\n"
     "  run     – für den ganzen Run erlauben\n"
-    "  immer   – immer erlauben (wird eine feste Regel in arr.yaml)\n"
+    "  immer   – feste Regel bis zum Ende dieses Runs, für alle Agenten (nicht in arr.yaml)\n"
     "  nein    – ablehnen"
 )
 _RULE = "─" * 72
@@ -670,7 +795,8 @@ class TerminalDecider:
             scope = _ANSWERS.get(answer)
             if scope is DecisionScope.ALWAYS:
                 confirm = await self._read(
-                    "„Immer“ wird eine feste Regel für alle künftigen Runs. Zum Bestätigen "
+                    "„Immer“ gilt bis zum Ende dieses Runs für alle Agenten, bei Netzwerk für den "
+                    "ganzen Host. arr run speichert die Regel nicht in arr.yaml. Zum Bestätigen "
                     "„ja immer“ eingeben: "
                 )
                 if (confirm or "").strip().casefold() != "ja immer":
@@ -726,6 +852,42 @@ def _stdio_is_tty() -> bool:
         return sys.stdin.isatty() and sys.stdout.isatty()
     except (AttributeError, ValueError):
         return False
+
+
+def _merge_key(assessment: Assessment) -> tuple[Any, ...] | None:
+    """What makes two requests one card, None for a request that always gets its own.
+
+    Plain host requests of the sandbox are equal by agent and host. Anything else must match in
+    all the card says about the action, the command byte for byte: whitespace can be code
+    (indentation, quotes, what a shell does not count as blank). A high risk, a Codex escalation
+    and a request the card cannot describe are never merged.
+    """
+    request = assessment.request
+    if (
+        not assessment.items
+        or assessment.no_rules
+        or is_codex_escalation(request)
+        or _high_risk(assessment.decision.risk)
+        or not (request.command or request.paths or request.urls or request.hosts)
+    ):
+        return None
+    urls = frozenset(request.urls)
+    if request.tool in NETWORK_TOOLS and not request.command:
+        return (request.agent_id, request.tool, assessment.items, urls)
+    return (
+        request.agent_id,
+        request.tool,
+        request.command,
+        frozenset(request.paths),
+        frozenset(request.hosts),
+        urls,
+        request.work_dir,
+        assessment.items,
+    )
+
+
+def _high_risk(risk: Risk | None) -> bool:
+    return risk is not None and risk.level is RiskLevel.HIGH
 
 
 def _set_once(future: "asyncio.Future[Any]", value: Any) -> None:

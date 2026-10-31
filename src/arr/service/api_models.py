@@ -146,7 +146,8 @@ class Vendor(StrEnum):
 class AgentDisplayState(StrEnum):
     """State of an agent as the GUI shows it (docs/08 §5.0 `AgentState.state`, §8.3).
 
-    `waiting_user`: `blocked` and the request lies with the user; `error`: the agent failed.
+    `waiting_user`: `blocked` and the request lies with the user; `error`: the agent failed;
+    `not_started`: the run failed before the agent's first turn.
     """
 
     WORKING = "working"
@@ -155,6 +156,7 @@ class AgentDisplayState(StrEnum):
     WAITING_USER = "waiting_user"
     DONE = "done"
     ERROR = "error"
+    NOT_STARTED = "not_started"
 
 
 class StageStatus(StrEnum):
@@ -487,6 +489,7 @@ class AgentsByState(ApiModel):
     waiting_user: int = 0
     done: int = 0
     error: int = 0
+    not_started: int = 0
 
     @property
     def total(self) -> int:
@@ -585,7 +588,8 @@ class RunSummary(ApiModel):
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
-        if self.active != self.status.is_active:
+        # a reservation nobody took stays `queued` but is not active (W3-01 review G5)
+        if self.active != self.status.is_active and self.status is not RunStatus.QUEUED:
             raise ValueError(f"active={self.active} passt nicht zu status={self.status}")
         if self.open_escalation and self.status is not RunStatus.PAUSED:
             raise ValueError("open_escalation nur bei pausierten Runs")
@@ -1187,8 +1191,20 @@ class ApprovalItem(ApiModel):
     escalated_by: EscalatedByInfo | None = None
     consequences: Consequences | None = None
     content_to: list[Vendor] = Field(default_factory=list, description="read_outside (E19)")
-    rule_label: str | None = Field(default=None, description="Rule that „immer“ would create")
+    rule_label: str | None = Field(
+        default=None, description="Rule that „immer“ would create; None: „immer“ is not offered"
+    )
+    rule_effects: list[str] = Field(
+        default_factory=list, description="What that rule allows, for the „immer“ dialog"
+    )
+    also_hosts: list[str] = Field(
+        default_factory=list, description="Package hosts an allowed installation may reach too"
+    )
     transcript_seq: int | None = None
+    why: str | None = Field(default=None, description="„Warum bei dir“ without `escalated_by`")
+    no_sandbox: bool = Field(
+        default=False, description="Codex escalation: leaves the sandbox, scope only `once`"
+    )
     # run start
     requested_by: Starter | None = None
     skill: str | None = None
@@ -1212,6 +1228,9 @@ class ApprovalItem(ApiModel):
     comment_to: ApprovalAgentRef | None = Field(
         default=None, description="Agent who gets the user's comment (escalation: the worker)"
     )
+    # all open items
+    count: int = Field(default=1, ge=1, description="Equal requests this one card answers")
+    terminal: bool = Field(default=False, description="Decided in the terminal of `arr run`")
     # history
     decision: DecisionInfo | None = None
     revocable: bool = False
@@ -1985,10 +2004,17 @@ class ApprovalEvent(LiveEventBase):
     """An inbox item was created, decided (also in another tab), revoked or expired.
 
     See docs/08 §5.0 `approval.created/decided/expired`, §5.2 „live“. `approval.revoked`
-    marks a withdrawn decision in the history.
+    marks a withdrawn decision in the history; `approval.updated` a card that now answers more
+    equal requests. An item that became obsolete comes as `approval.expired`.
     """
 
-    type: Literal["approval.created", "approval.decided", "approval.expired", "approval.revoked"]
+    type: Literal[
+        "approval.created",
+        "approval.updated",
+        "approval.decided",
+        "approval.expired",
+        "approval.revoked",
+    ]
     item: ApprovalItem
 
 
@@ -2053,6 +2079,7 @@ GLOBAL_EVENT_TYPES = frozenset(
         "warnings.changed",
         "run.status",
         "approval.created",
+        "approval.updated",
         "approval.decided",
         "approval.expired",
         "approval.revoked",

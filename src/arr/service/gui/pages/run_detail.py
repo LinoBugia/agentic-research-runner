@@ -4,21 +4,23 @@ Head (fixed): status, name, actions (pause/resume, stop with dialog, ⋯ with �
 kopieren“), the banner „Wartet auf dich“ with „Ansehen“ and the hint „? n Fragen an dich“
 (does not count as waiting, §8.3), progress bar and key figures. Below three columns that
 scroll on their own: selection (channels with „n neu“, agent cards compacted by space),
-view („Verlauf“ of the selected channel or agent, „Ergebnisse“) and, from 1440 px, the
-overview with compact approval cards (K5, same lock as the Freigaben page: static/arr.js).
+view („Verlauf“ of the selected channel or agent, „Ergebnisse“, „Ablauf“) and, from 1440 px,
+the overview with compact approval cards (K5, same lock as the Freigaben page: static/arr.js).
 
 Selecting something changes the view without reloading the page and keeps the URL
-(`?kanal=`, `?agent=`, `&seq=`, `&nachricht=`, `?ansicht=ergebnisse&ergebnis=`). The run's
-live stream is applied at most 10 times a second (§6.6). „gelesen bis“ per channel lives in
-the browser (`ui_seen`, §5.0); static/run_detail.js reports it after loading.
+(`?kanal=`, `?agent=`, `&seq=`, `&nachricht=`, `?ansicht=ergebnisse&ergebnis=`,
+`?ansicht=ablauf`). The run's live stream is applied at most 10 times a second (§6.6). A run
+that was just started has no agents and channels yet: they join the page when the preparation
+made them (`_sync_structure`). „gelesen bis“ per channel lives in the browser (`ui_seen`, §5.0);
+static/run_detail.js reports it after loading.
 """
 
 import json
-from pathlib import Path
+import re
 from typing import Any
 from urllib.parse import urlencode
 
-from nicegui import app, ui
+from nicegui import ui
 
 from arr.models import RunStatus
 from arr.permissions.types import ApprovalStatus, ApprovalType, DecisionAction
@@ -51,17 +53,18 @@ from arr.service.gui.app import STATIC_DIR, STATIC_URL, get_api
 from arr.service.gui.components.agent_card import AgentCard, sort_key
 from arr.service.gui.components.approval_card import compact_card
 from arr.service.gui.components.badge import badge_html
-from arr.service.gui.components.banner import banner
+from arr.service.gui.components.banner import banner, banner_html, empty_state_html
 from arr.service.gui.components.base import esc, icon, raw, set_disabled
 from arr.service.gui.components.copy_field import copy_html
 from arr.service.gui.components.dialog import ConfirmDialog
 from arr.service.gui.components.message import message_dom_id, question_hint_html
 from arr.service.gui.components.meter import run_meters_html
-from arr.service.gui.components.page_state import forced_state
+from arr.service.gui.components.page_state import error_html, forced_state
 from arr.service.gui.components.stage_bar import stage_bar_html
 from arr.service.gui.components.transcript_event import event_dom_id
 from arr.service.gui.layout import Frame
 from arr.service.gui.pages.run_detail_channel import ChannelView, unread_count
+from arr.service.gui.pages.run_detail_log import LogView
 from arr.service.gui.pages.run_detail_overview import (
     agents_html,
     open_questions_html,
@@ -79,20 +82,11 @@ DECIDED_SECONDS = 1.5
 SCAN_MESSAGES = 200
 """Newest messages per channel searched for open questions (overview, K15)."""
 
-KATEX_URL = "/arr-vendor/katex.js"
+KATEX_URL = f"{STATIC_URL}/katex.mjs"
+"""KaTeX as a file of this package (static/katex.mjs, license next to it), for formulas (G7)."""
+_SENTENCE_END = re.compile(r"(?<=[^\d])\. ")
 
-View = ChannelView | TranscriptView | ResultsView
-
-
-def katex_file() -> Path | None:
-    """KaTeX as shipped with NiceGUI (inside its Mermaid bundle, no extra dependency).
-
-    Returns None when a NiceGUI version moves it; formulas then stay readable Unicode text.
-    """
-    import nicegui
-
-    dist = Path(nicegui.__file__).parent / "elements" / "mermaid" / "dist"
-    return next(iter(sorted(dist.glob("katex-*.js"))), None)
+View = ChannelView | TranscriptView | ResultsView | LogView
 
 
 def _icon_button(symbol: str, label: str, handler: Any, *, classes: str = "btn") -> ui.element:
@@ -128,9 +122,10 @@ class RunDetailPage:
         self._last_verlauf: tuple[str, str] | None = None
         self.deciding: set[str] = set()
         self.compact_elements: dict[str, list[ui.element]] = {}
-        self.rendered_items: tuple[str, ...] | None = None
+        self.rendered_items: tuple[tuple[str, int], ...] | None = None
         self.dirty: set[str] = set()
         self.subscription = None
+        self._actions_key: tuple[Any, ...] | None = None
 
     # --- shortcuts -------------------------------------------------------------------------
 
@@ -175,7 +170,7 @@ class RunDetailPage:
                     ui.element("aside")
                     .classes("rd-col rd-left")
                     .props('aria-label="Kanäle und Agenten auswählen"')
-                ):
+                ) as self.selection:
                     self._build_selection()
                 self.center = (
                     ui.element("section").classes("rd-col rd-center").props('aria-label="Ansicht"')
@@ -223,7 +218,8 @@ class RunDetailPage:
     def _render_head(self) -> None:
         run = self.detail.run
         status = run_status(run)
-        self.badge.set_content(badge_html(status, large=True))
+        slimmed = ' <span class="tag">verschlankt</span>' if run.slimmed else ""
+        self.badge.set_content(badge_html(status, large=True) + slimmed)
         starter = STARTER_PHRASE[run.starter]
         if run.status.is_final and run.ended_at:
             started = fmt.clock(run.started_at or run.created_at)
@@ -247,8 +243,20 @@ class RunDetailPage:
         self.meters.set_content(run_meters_html(limits, run.cost_kind))
 
     def _render_actions(self) -> None:
+        """Redrawn only when they change: a live update must not close the open ⋯ menu."""
         allowed = set(self.detail.actions_allowed)
         run = self.detail.run
+        top = self.detail.open_approvals_top
+        key = (
+            tuple(self.detail.actions_allowed),
+            run.status,
+            run.pinned,
+            self.detail.handoff_text,
+            top.id if top else None,
+        )
+        if key == self._actions_key:
+            return
+        self._actions_key = key
         self.actions.clear()
         with self.actions:
             if run.status.is_final:
@@ -264,7 +272,6 @@ class RunDetailPage:
                 ).mark("pause")
             if RunAction.RESUME in allowed:
                 _icon_button("play_arrow", "Fortsetzen", self._resume).mark("resume")
-            top = self.detail.open_approvals_top
             if run.status is RunStatus.AWAITING_APPROVAL and top is not None:
                 # before the start only the run-start card decides (§6.7), not „Stoppen“
                 raw(
@@ -303,9 +310,26 @@ class RunDetailPage:
                     with item:
                         raw(esc(label), tag="span")
                     item.on("click", lambda _e: self._toggle_pin())
+                if RunAction.SLIM in self.detail.actions_allowed:
+                    item = ui.element("button").props('type="button" role="menuitem"').mark("slim")
+                    with item:
+                        raw("Verschlanken …", tag="span")
+                    item.on("click", lambda _e: self._ask_slim())
+
+    def _run_error_html(self) -> str:
+        """Failed or interrupted: what happened and the next step in the head (§6.7, §8.4)."""
+        error = self.detail.run.error
+        if error is None:
+            return ""
+        title, rest = [*_SENTENCE_END.split(error.message, maxsplit=1), ""][:2]
+        action = error.action
+        actions = [(action.label, action.url)] if action is not None and action.url else None
+        title = title if title.endswith((".", "!", "?")) else f"{title}."
+        return banner_html("err", title, f" {rest}" if rest else "", actions, small=True)
 
     def _render_attention(self) -> None:
         """Banner „Wartet auf dich“ (at every width) and the hint „Fragen an dich“ (K13, K15)."""
+        failure = self._run_error_html()
         top = self.detail.open_approvals_top
         questions = self.detail.questions_to_user
         first_q = next((m for m in self.questions.values() if "user" in m.to), None)
@@ -315,11 +339,8 @@ class RunDetailPage:
             hint = hint.replace("<a ", f'<a data-sel="msg:{esc(first_q.channel)}:{first_q.id}" ', 1)
         note = self._paused_note()
         if top is None:
-            self.attn.set_content(
-                f'<div class="rd-qrow">{note}<span class="spacer"></span>{hint}</div>'
-                if hint or note
-                else ""
-            )
+            row = f'<div class="rd-qrow">{note}<span class="spacer"></span>{hint}</div>'
+            self.attn.set_content(failure + (row if hint or note else ""))
             return
         item = self.open_items.get(top.id)
         summary = esc(top.summary)
@@ -343,7 +364,7 @@ class RunDetailPage:
         more = f" · und {top.more} weitere" if top.more else ""
         note_row = f'<div class="rd-qrow">{note}</div>' if note else ""
         self.attn.set_content(
-            note_row + '<div class="rd-attn" role="status">'
+            failure + note_row + '<div class="rd-attn" role="status">'
             f"{badge_html(WAITING_FOR_YOU)}"
             f'<span class="txt">{" · ".join(parts)}{more}</span>{hint}<span class="spacer">'
             f'</span><a class="btn btn-sm primary" href="/freigaben/{esc(top.id)}">Ansehen</a>'
@@ -408,6 +429,38 @@ class RunDetailPage:
         item.set_content(f'<span class="mono">#{esc(name)}</span>{right}')
         item.update()
 
+    async def _sync_structure(self) -> None:
+        """Take in agents and channels the preparation made since the page was built."""
+        agents = {a.id: a for a in await self.api.list_agents(self.run_id)}
+        channels = {c.name: c for c in await self.api.list_channels(self.run_id)}
+        if agents.keys() == self.agents.keys() and channels.keys() == self.channels.keys():
+            self.channels = channels  # from `run.yaml` until the room is there
+            for agent in agents.values():
+                self._update_agent(agent)
+            self._reorder_cards()
+            for name in channels:
+                self._render_channel_item(name)
+        else:
+            self.agents, self.channels = agents, channels
+            self.cards, self.channel_items = {}, {}
+            self.selection.clear()
+            with self.selection:
+                self._build_selection()
+            self._render_overview_rest()
+        if self.view is None and self.tab == "verlauf":
+            await self._select_initial()  # a deep link waited, or the source was not ready
+
+    async def _sync_opened_channels(self) -> None:
+        """A new stage may open channels (`open_from`, §6.5)."""
+        for info in await self.api.list_channels(self.run_id):
+            known = self.channels.get(info.name)
+            if known is None or known.open == info.open:
+                continue
+            self.channels[info.name] = info
+            self._render_channel_item(info.name)
+            if isinstance(self.view, ChannelView) and self.view.name == info.name:
+                await self.select("kanal", info.name, push=False)
+
     def _reorder_cards(self) -> None:
         order = sorted(self.agents.values(), key=sort_key)
         children = list(self.agents_box.default_slot.children)
@@ -426,6 +479,11 @@ class RunDetailPage:
             await self.select(
                 "seq" if seq is not None else "agent", p["agent"], seq=seq, push=False
             )
+        elif p.get("ansicht") == "ablauf" or (
+            self.status is RunStatus.FAILED and not p.get("kanal") and not p.get("nachricht")
+        ):
+            self._last_verlauf = ("kanal", self._default_channel())
+            await self.select("ansicht", "ablauf", push=False)
         elif p.get("ansicht") == "ergebnisse" or (
             self.status.is_final and not p.get("kanal") and not p.get("nachricht")
         ):
@@ -438,7 +496,28 @@ class RunDetailPage:
             msg = int(p["nachricht"]) if p.get("nachricht", "").isdigit() else None
             await self.select("msg" if msg else "kanal", p["kanal"], msg_id=msg, push=False)
         else:
-            await self.select("kanal", self._default_channel(), push=False)
+            await self._select_default()
+
+    async def _select_default(self) -> None:
+        """The default channel, the first agent of a run without channels, else „gleich“."""
+        channel = self._default_channel()
+        if channel:
+            await self.select("kanal", channel, push=False)
+        elif self.agents:
+            await self.select("agent", next(iter(self.agents)), push=False)
+        else:
+            self._render_tabs()
+            self.view_box.clear()
+            with self.view_box:
+                raw(
+                    empty_state_html(
+                        "hourglass_empty",
+                        "Der Run wird vorbereitet",
+                        "Agenten und Kanäle erscheinen hier, sobald ihre Arbeitskopien bereit "
+                        "sind. Das dauert meist nur Sekunden.",
+                    ),
+                    classes="rd-scroll pad",
+                )
 
     def _default_channel(self) -> str:
         """Live: the channel with the newest unread message, else the first open one (§6.5)."""
@@ -467,8 +546,15 @@ class RunDetailPage:
         """Show a channel, an agent's transcript or the results; keeps the URL in step."""
         previous = self.selected
         if kind == "ansicht" and value == "verlauf":
-            kind, value = self._last_verlauf or ("kanal", self._default_channel())
-        if kind in ("ansicht", "ergebnis"):
+            if self._last_verlauf is None or not self._last_verlauf[1]:
+                self.tab = "verlauf"
+                await self._select_default()
+                return
+            kind, value = self._last_verlauf
+        if kind == "ansicht" and value == "ablauf":
+            self.tab = "ablauf"
+            query = {"ansicht": "ablauf"}
+        elif kind in ("ansicht", "ergebnis"):
             self.tab = "ergebnisse"
             query = {"ansicht": "ergebnisse"}
             if result_id:
@@ -507,11 +593,18 @@ class RunDetailPage:
         with self.view_box:
             if self.tab == "ergebnisse":
                 self.view = ResultsView(self, result_id=result_id)
+            elif self.tab == "ablauf":
+                self.view = LogView(self)
             elif self.selected[0] == "kanal":
                 self.view = ChannelView(self, self.channels[self.selected[1]], jump_to=msg_id)
             else:
                 self.view = TranscriptView(self, self.agents[self.selected[1]], seq=seq)
-            await self.view.build()
+            try:
+                await self.view.build()
+            except ApiException as exc:  # one broken source: only this view says so (§5.5)
+                self.view_box.clear()
+                self.view = None
+                raw(error_html(exc, retry_href=f"/runs/{self.run_id}"))
         if previous != self.selected and self.subscription is not None:
             self._resubscribe()
         if push:
@@ -520,14 +613,18 @@ class RunDetailPage:
     def _render_tabs(self) -> None:
         n = len(self.results.items)
         count = f' <span class="n">{n}</span>' if n else ""
-        verlauf, ergebnisse = ("active", "") if self.tab == "verlauf" else ("", "active")
-        cur_v = ' aria-current="page"' if verlauf else ""
-        cur_e = ' aria-current="page"' if ergebnisse else ""
+
+        def tab(key: str, label: str) -> str:
+            on = self.tab == key
+            return (
+                f'<a class="{"active" if on else ""}" href="?ansicht={key}" '
+                f'data-sel="ansicht:{key}"{" aria-current=page" if on else ""}>{label}</a>'
+            )
+
         self.tabs.set_content(
-            f'<a class="{verlauf}" href="?ansicht=verlauf" data-sel="ansicht:verlauf"{cur_v}>'
-            "Verlauf</a>"
-            f'<a class="{ergebnisse}" href="?ansicht=ergebnisse" data-sel="ansicht:ergebnisse"'
-            f"{cur_e}>Ergebnisse{count}</a>"
+            tab("verlauf", "Verlauf")
+            + tab("ergebnisse", f"Ergebnisse{count}")
+            + tab("ablauf", "Ablauf")
         )
 
     async def _on_select(self, event: Any) -> None:
@@ -609,7 +706,7 @@ class RunDetailPage:
     def _render_overview_cards(self) -> None:
         """Rebuild the compact cards only when the open items changed: a rebuilt card is a new
         element and would have to be seen for 1.5 s again (G2); a confirmation stays."""
-        ids = tuple(sorted(self.open_items))
+        ids = tuple(sorted((i.id, i.count) for i in self.open_items.values()))
         if self.deciding or ids == self.rendered_items:
             return
         self.rendered_items = ids
@@ -655,6 +752,18 @@ class RunDetailPage:
             return
         self.deciding.add(item.id)
         try:
+            # a card may be older than the last equal request (transcript, or a quick click):
+            # it never grants more than it showed
+            current = await self.api.get_approval(item.id)
+            if request.action is DecisionAction.ALLOW and current.count != item.count:
+                self.deciding.discard(item.id)
+                self.frame.toast(
+                    f"Inzwischen warten {current.count} gleiche Anfragen. Nichts wurde erlaubt, "
+                    "entscheide unter „Details“.",
+                    error=True,
+                )
+                await self._refresh_approvals()
+                return
             response = await self.api.decide_approval(item.id, request)
         except ApiException as exc:
             self.deciding.discard(item.id)
@@ -712,6 +821,20 @@ class RunDetailPage:
     async def _resume(self) -> None:
         await self._run_action(RunAction.RESUME)
 
+    async def _ask_slim(self) -> None:
+        """Say what goes and what stays (T12), then slim: three clicks from the ⋯ menu (E10)."""
+        try:
+            preview = await self.api.run_action(self.run_id, RunAction.SLIM, dry_run=True)
+        except ApiException as exc:
+            self.frame.toast(exc.error.message, error=True)
+            return
+        self.dialog.show(
+            f"Run „{self.detail.run.name}“ verschlanken?",
+            preview.message.splitlines(),
+            "Verschlanken",
+            lambda _v: self._run_action(RunAction.SLIM),
+        )
+
     async def _toggle_pin(self) -> None:
         await self._run_action(RunAction.UNPIN if self.detail.run.pinned else RunAction.PIN)
 
@@ -753,10 +876,27 @@ class RunDetailPage:
         old = self.status
         self.detail = await self.api.get_run(self.run_id)
         await self._load_approvals()
+        if old is not self.status or self.status in (RunStatus.QUEUED, RunStatus.PREPARING):
+            await self._sync_structure()
         self._render_head()
         self._render_overview_cards()
-        if old is not self.status and isinstance(self.view, ChannelView):
-            self.view.refresh_status()
+        if old is self.status:
+            return
+        # the finalizer wrote the summary: it arrives without a result event
+        self.results = await self.api.get_results(self.run_id)
+        self._render_tabs()
+        if self.status is RunStatus.FAILED:
+            self._last_verlauf = self._last_verlauf or ("kanal", self._default_channel())
+            await self.select("ansicht", "ablauf")  # opens at the marked error (§6.7)
+        elif isinstance(self.view, ChannelView):
+            if old in (RunStatus.QUEUED, RunStatus.PREPARING):
+                # built before the room: now aliases and messages are there (§5.5 „leer“)
+                await self.select("msg", self.view.name, msg_id=self.view.jump_to, push=False)
+            else:
+                self.view.refresh_status()
+        elif isinstance(self.view, ResultsView):
+            await self.view.refresh()
+        self._render_overview_rest()
 
     # --- live ---------------------------------------------------------------------------------
 
@@ -786,14 +926,15 @@ class RunDetailPage:
             self.detail.run = self.detail.run.model_copy(update={"limits": limits})
             self.dirty.add("meters")
         elif isinstance(event, RunStatusEvent):
-            self.dirty.add("run")
+            self.dirty.update({"run", "log"})
         elif isinstance(event, StageCheckpointEvent):
             self.detail.stages = [
                 event.stage if s.key == event.stage.key else s for s in self.detail.stages
             ]
-            self.dirty.add("stages")
+            self.dirty.update({"stages", "log"})
         elif isinstance(event, AgentStateEvent):
             self._update_agent(event.agent)
+            self.dirty.add("log")
         elif isinstance(event, AgentActivityEvent):
             agent = self.agents.get(event.agent_id)
             if agent is not None:
@@ -825,8 +966,10 @@ class RunDetailPage:
         info = self.channels.get(msg.channel)
         if info is None:
             return
-        update = {"message_count": info.message_count + 1, "last_message_id": msg.id}
-        if msg.open and msg.kind is MessageKind.QUESTION:
+        # a known ID is a message that changed (its delivery state), not one more
+        new = msg.id > (info.last_message_id or 0)
+        update = {"message_count": info.message_count + 1, "last_message_id": msg.id} if new else {}
+        if new and msg.open and msg.kind is MessageKind.QUESTION:
             update["open_questions"] = info.open_questions + (
                 0 if (msg.channel, msg.id) in self.questions else 1
             )
@@ -840,10 +983,12 @@ class RunDetailPage:
         if isinstance(view, ChannelView) and view.name == msg.channel:
             view.info = self.channels[msg.channel]
             view.add_live(msg)
+            view.refresh_head()
         self._render_channel_item(msg.channel)
 
     async def _flush(self) -> None:
         dirty, self.dirty = self.dirty, set()
+        new_stage = "stages" in dirty
         if "run" in dirty:
             await self._refresh_run()
             dirty -= {"meters", "stages", "attention"}
@@ -861,6 +1006,10 @@ class RunDetailPage:
             self._render_meters()
         if "stages" in dirty:
             self.stagebar.set_content(stage_bar_html(self.detail.stages, self.detail.run.topology))
+        if new_stage:
+            await self._sync_opened_channels()
+        if "log" in dirty and isinstance(self.view, LogView):
+            await self.view.refresh()
         if "attention" in dirty:
             self._render_attention()
         if "order" in dirty:
@@ -892,10 +1041,7 @@ def _js(value: str) -> str:
 
 
 def register() -> None:
-    """Register `/runs/{run_id}` and the KaTeX file for typeset formulas (G7)."""
-    katex = katex_file()
-    if katex is not None:
-        app.add_static_file(local_file=katex, url_path=KATEX_URL)
+    """Register `/runs/{run_id}`."""
 
     @ui.page("/runs/{run_id}")
     async def run_detail(

@@ -1,6 +1,6 @@
 // arr GUI – typeset formulas (docs/08-ux-konzept.md G7, §7.2, §7.7).
 // markdown_html renders `$…$` as <span class="math" data-tex="…"> with readable Unicode text.
-// This script loads KaTeX (shipped with NiceGUI, URL in data-katex) and replaces the text with
+// This script loads KaTeX (static/katex.mjs, URL in data-katex) and replaces the text with
 // MathML, which the browser typesets with its math font; the LaTeX source stays in the MathML
 // annotation for screen readers and copying. Without KaTeX the Unicode text stays.
 (function () {
@@ -41,6 +41,6 @@
       new MutationObserver(queue).observe(document.body, { childList: true, subtree: true });
     })
     .catch(() => {
-      /* NiceGUI without KaTeX: formulas stay as text */
+      /* KaTeX did not load: formulas stay as text */
     });
 })();

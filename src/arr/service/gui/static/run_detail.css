@@ -278,3 +278,8 @@ details.menu > summary::-webkit-details-marker { display: none; }
   .rd-left .agent .top .badge { padding: 0 6px; gap: 2px; }
   .rd-left .agent .top { gap: 4px; }
 }
+
+/* view „Ablauf“ */
+.log-list { list-style: none; margin: 0; padding: 0; }
+.log-row { display: grid; grid-template-columns: 72px 1fr; gap: 8px; padding: 3px 0; }
+.log-row.err { color: var(--err, #b42318); font-weight: 600; }
