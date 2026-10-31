@@ -198,9 +198,10 @@ def test_codex_login_failure(arr_home: Path, login_fake: _LoginFake) -> None:
     assert "Der Login ist fehlgeschlagen: nope" in result.output
 
 
-def test_codex_login_uses_login_dir_from_profiles(
+def test_codex_login_refuses_a_login_dir_outside_of_arr(
     arr_home: Path, login_fake: _LoginFake, tmp_path: Path
 ) -> None:
+    """Since W3-05.1 a login only goes to arr's own login folders: no `~/.codex` by this door."""
     arr_home.mkdir(parents=True)
     (arr_home / "profiles.yaml").write_text(
         "version: 1\nprofiles:\n"
@@ -208,8 +209,9 @@ def test_codex_login_uses_login_dir_from_profiles(
         "  - {name: max-privat, kind: claude_oauth}\n"
     )
     result = runner.invoke(app, ["auth", "codex-login", "chatgpt-x"])
-    assert result.exit_code == 0, result.output
-    assert login_fake.homes[-1] == str(tmp_path / "login")
+    assert result.exit_code == 1
+    assert "Der Login ist fehlgeschlagen" in result.output
+    assert login_fake.homes == [] and not (tmp_path / "login").exists()
     other = runner.invoke(app, ["auth", "codex-login", "max-privat"])
     assert other.exit_code == 1
     assert "kein ChatGPT-Profil" in other.output
