@@ -51,6 +51,14 @@ class AuthError(ArrError):
     """An auth profile cannot be used (wrong kind, missing secret, keychain not reachable)."""
 
 
+class SecretNotReplaced(AuthError):
+    """The new secret is not stored. `present`: what lies there now, None if nobody knows."""
+
+    def __init__(self, message: str, present: bool | None) -> None:
+        super().__init__(message)
+        self.present = present
+
+
 def clean_process_env(environ: MutableMapping[str, str] | None = None) -> list[str]:
     """Remove credential and parent-session variables from the environment (S1 §3.1).
 
@@ -86,9 +94,10 @@ def read_secret(profile: AuthProfile, reader: SecretReader | None = None) -> str
     try:
         secret = (reader or _keyring_get)(ref.service, ref.account)
     except Exception as exc:
+        log.warning("Schlüsselbund, Lesen: %s", type(exc).__name__)
         raise AuthError(
-            f"Der Schlüsselbund ist für das Profil „{profile.name}“ nicht erreichbar "
-            f"({type(exc).__name__})."
+            f"Der Schlüsselbund ist für das Profil „{profile.name}“ nicht erreichbar. Erlaube "
+            "den Zugriff und versuche es erneut."
         ) from None
     return secret or None
 
@@ -158,10 +167,53 @@ def store_secret(profile: AuthProfile, secret: str, writer: SecretWriter | None 
     try:
         (writer or _keyring_set)(ref.service, ref.account, secret)
     except Exception as exc:
+        log.warning("Schlüsselbund, Schreiben: %s", type(exc).__name__)
         raise AuthError(
-            f"Der Schlüsselbund nimmt das Secret von „{profile.name}“ nicht an "
-            f"({type(exc).__name__})."
+            f"Der Schlüsselbund nimmt das Secret von „{profile.name}“ nicht an. Erlaube den "
+            "Zugriff und versuche es erneut."
         ) from None
+
+
+def replace_secret(
+    profile: AuthProfile,
+    secret: str,
+    reader: SecretReader | None = None,
+    writer: SecretWriter | None = None,
+) -> None:
+    """Put a new secret on a profile without ever losing the old one.
+
+    `keyring` deletes on macOS first and adds then (`set_generic_password`), so a failed add
+    leaves nothing. The old secret is read before and written back at once. All of this runs
+    in one call, meant for one worker thread: a cancelled caller cannot stop the way back.
+    Raises `SecretNotReplaced` with what lies in the keychain afterwards.
+    """
+    if not owns_keychain_item(profile):
+        raise AuthError(f"Das Profil „{profile.name}“ verweist auf einen fremden Eintrag.")
+    old = read_secret(profile, reader)
+    try:
+        store_secret(profile, secret, writer)
+        return
+    except AuthError:
+        pass
+    present: bool | None
+    try:
+        if old is not None and read_secret(profile, reader) is None:
+            with contextlib.suppress(AuthError):  # what counts is the read below
+                store_secret(profile, old, writer)
+        present = read_secret(profile, reader) is not None
+    except AuthError:
+        present = None
+    del old  # the traceback of the error below keeps this frame alive
+    name = profile.name
+    text = {
+        True: "Der alte Key liegt weiter im Schlüsselbund. Erlaube den Zugriff und versuche es "
+        "erneut.",
+        False: "Im Schlüsselbund liegt jetzt kein Key. Erlaube den Zugriff und füge den Key "
+        "erneut ein.",
+        None: "Ob noch ein Key im Schlüsselbund liegt, konnte arr nicht prüfen. Erlaube den "
+        "Zugriff und teste das Profil.",
+    }[present]
+    raise SecretNotReplaced(f"Der neue Key von „{name}“ ließ sich nicht ablegen. {text}", present)
 
 
 def delete_secret(profile: AuthProfile, deleter: SecretDeleter | None = None) -> bool:
@@ -173,9 +225,10 @@ def delete_secret(profile: AuthProfile, deleter: SecretDeleter | None = None) ->
     try:
         (deleter or _keyring_delete)(ref.service, ref.account)
     except Exception as exc:
+        log.warning("Schlüsselbund, Löschen: %s", type(exc).__name__)
         raise AuthError(
-            f"Der Schlüsselbund gibt das Secret von „{profile.name}“ nicht frei "
-            f"({type(exc).__name__})."
+            f"Der Schlüsselbund gibt das Secret von „{profile.name}“ nicht frei. Erlaube den "
+            "Zugriff und versuche es erneut."
         ) from None
     return True
 

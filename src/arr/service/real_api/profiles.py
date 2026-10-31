@@ -26,7 +26,14 @@ import tempfile
 import time
 from pathlib import Path
 
-from arr.auth import AuthError, delete_secret, owns_keychain_item, store_secret
+from arr.auth import (
+    AuthError,
+    SecretNotReplaced,
+    delete_secret,
+    owns_keychain_item,
+    replace_secret,
+    store_secret,
+)
 from arr.backends.codex_config import codex_home_for
 from arr.backends.codex_login import own_login_folder
 from arr.errors import ArrError
@@ -224,7 +231,10 @@ class ProfilesArea:
     # -- create, delete ---------------------------------------------------------------------
 
     async def _replace_key(self, request: CreateProfileRequest) -> ProfileInfo:
-        """„Key ersetzen“: only the keychain item changes; on a failure the old key stays."""
+        """„Key ersetzen“: only the keychain item changes, see `replace_secret`.
+
+        A status that cannot be written is another failure: the new key lies there already.
+        """
         profile = self._find(request.name)
         if profile.kind is not request.kind:
             raise ApiException.of(
@@ -232,13 +242,35 @@ class ProfilesArea:
                 f"„{request.name}“ ist kein Profil dieser Art. Lege ein neues Profil an.",
             )
         assert request.api_key is not None  # checked by CreateProfileRequest
+        reader = self.state.secret_reader
         try:
             value = request.api_key.get_secret_value()
-            await asyncio.to_thread(store_secret, profile, value)
+            await asyncio.to_thread(replace_secret, profile, value, reader)
+        except SecretNotReplaced as exc:
+            self._note_failed_replacement(profile, exc.present)
+            raise from_arr_error(exc, ErrorCode.UNAVAILABLE) from None
         except AuthError as exc:
             raise from_arr_error(exc, ErrorCode.UNAVAILABLE) from None
-        self._update_status(request.name, secret_present=True, last_test=None)
+        try:
+            self._update_status(request.name, secret_present=True, last_test=None)
+        except ApiException:
+            raise ApiException.of(
+                ErrorCode.UNAVAILABLE,
+                f"Der neue Key von „{request.name}“ liegt im Schlüsselbund. Nur der Status des "
+                "Profils ließ sich nicht speichern, die Karte zeigt noch den alten Test. Prüfe "
+                "die Rechte im Finder und teste das Profil.",
+            ) from None
         return self._info(profile)
+
+    def _note_failed_replacement(self, profile: AuthProfile, present: bool | None) -> None:
+        """The card shows what really lies in the keychain; the key's error comes first."""
+        if present is None:
+            return
+        changes: dict[str, object] = {"secret_present": present}
+        if not present:
+            changes["last_test"] = None
+        with contextlib.suppress(ApiException):
+            self._update_status(profile.name, **changes)
 
     async def create_profile(self, request: CreateProfileRequest) -> ProfileInfo:
         async with self._lock:

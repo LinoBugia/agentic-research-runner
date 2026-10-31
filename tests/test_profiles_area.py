@@ -621,6 +621,7 @@ class FakeCodex:
         self.succeed = options.get("succeed", True)
         self.hang = options.get("hang", False)
         self.turn_error = options.get("turn_error")
+        self.gate = options.get("gate")
         self.handle = FakeHandle(self)
         self.closed = False
         self.runs: list[tuple[str, str]] = []
@@ -633,6 +634,8 @@ class FakeCodex:
         self.closed = True
 
     async def login_chatgpt_device_code(self) -> FakeHandle:
+        if self.gate is not None:
+            await self.gate.wait()
         return self.handle
 
     async def account(self) -> SimpleNamespace:
@@ -1519,3 +1522,248 @@ async def test_a_status_that_cannot_be_written_is_a_message(
     with pytest.raises(ApiException) as caught:
         await api.test_profile("max")
     assert "ließ sich nicht speichern" in caught.value.error.message
+
+
+# -- W3-05.2: a key is never lost (N1) -----------------------------------------------------------
+
+
+class DeletesFirst:
+    """`keyring` on macOS: delete, then add. `fail` lists the values whose add fails."""
+
+    def __init__(self, store: dict, monkeypatch: pytest.MonkeyPatch, *fail: str) -> None:
+        self.store = store
+        self.fail = fail
+        self.writes: list[str] = []
+        monkeypatch.setattr("arr.auth._keyring_set", self.write)
+
+    def write(self, service: str, account: str, value: str) -> None:
+        self.writes.append(value)
+        self.store.pop((service, account), None)
+        if value in self.fail:
+            raise RuntimeError(f"add failed for {value}")
+        self.store[(service, account)] = value
+
+
+def replacement(name: str = "api") -> CreateProfileRequest:
+    return CreateProfileRequest(
+        name=name, kind=AuthKind.CLAUDE_API_KEY, api_key=SecretStr(NEW_KEY), replace=True
+    )
+
+
+async def card(api: RealApi, name: str = "api") -> Any:
+    return next(p for p in await api.list_profiles() if p.name == name)
+
+
+async def test_a_failed_add_writes_the_old_key_back(
+    api: RealApi,
+    keychain: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    arr_home: Path,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    keychain[("arr", "api")] = KEY
+    await api.test_profile("api")
+    fake = DeletesFirst(keychain, monkeypatch, NEW_KEY)
+    with pytest.raises(ApiException) as caught:
+        await api.create_profile(replacement())
+    assert keychain[("arr", "api")] == KEY and fake.writes == [NEW_KEY, KEY]
+    message = caught.value.error.message
+    assert "Der alte Key liegt weiter im Schlüsselbund." in message
+    assert KEY not in message and NEW_KEY not in message
+    assert KEY not in caplog.text and NEW_KEY not in caplog.text
+    assert (await card(api)).secret_present
+    assert KEY not in tree_text(arr_home)
+
+
+async def test_when_the_way_back_fails_too_the_card_tells_the_truth(
+    api: RealApi, keychain: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    keychain[("arr", "api")] = KEY
+    await api.test_profile("api")
+    assert (await card(api)).secret_present
+    DeletesFirst(keychain, monkeypatch, NEW_KEY, KEY)
+    with pytest.raises(ApiException) as caught:
+        await api.create_profile(replacement())
+    assert "Im Schlüsselbund liegt jetzt kein Key." in caught.value.error.message
+    assert keychain == {}
+    info = await card(api)
+    assert not info.secret_present and info.last_test is None
+
+
+async def test_a_refusal_before_the_delete_writes_nothing_back(
+    api: RealApi, keychain: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A locked keychain fails at the delete: the old key has never gone."""
+    keychain[("arr", "api")] = KEY
+    writes: list[str] = []
+
+    def locked(service: str, account: str, value: str) -> None:
+        writes.append(value)
+        raise RuntimeError("locked")
+
+    monkeypatch.setattr("arr.auth._keyring_set", locked)
+    with pytest.raises(ApiException) as caught:
+        await api.create_profile(replacement())
+    assert "Der alte Key liegt weiter" in caught.value.error.message
+    assert writes == [NEW_KEY] and keychain[("arr", "api")] == KEY
+
+
+async def test_an_unknown_state_is_said_as_such(
+    api: RealApi, keychain: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    keychain[("arr", "api")] = KEY
+    await api.test_profile("api")
+    DeletesFirst(keychain, monkeypatch, NEW_KEY)
+    reads = iter([KEY])
+
+    def reader(service: str, account: str) -> str | None:
+        value = next(reads, None)
+        if value is None:
+            raise RuntimeError("gone")
+        return value
+
+    monkeypatch.setattr("arr.auth._keyring_get", reader)
+    with pytest.raises(ApiException) as caught:
+        await api.create_profile(replacement())
+    assert "konnte arr nicht prüfen" in caught.value.error.message
+    assert (await card(api)).secret_present, "unknown: the card keeps what it knew"
+
+
+async def test_a_status_that_cannot_be_written_does_not_blame_the_key(
+    api: RealApi, keychain: dict, arr_home: Path, read_only: Any
+) -> None:
+    keychain[("arr", "api")] = KEY
+    read_only(arr_home)
+    with pytest.raises(ApiException) as caught:
+        await api.create_profile(replacement())
+    message = caught.value.error.message
+    assert keychain[("arr", "api")] == NEW_KEY
+    assert "Der neue Key von „api“ liegt im Schlüsselbund." in message
+    assert "Nur der Status" in message and "ließ sich nicht ablegen" not in message
+
+
+async def test_the_card_shows_the_truth_after_a_failed_replacement(
+    api: RealApi, keychain: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    keychain[("arr", "api")] = KEY
+    monkeypatch.setattr("arr.service.profile_check._sdk_query", rejected_key)
+    await api.test_profile("api")  # the card offers „Key ersetzen“, the entry is known
+    DeletesFirst(keychain, monkeypatch, NEW_KEY, KEY)
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile")
+        await see(user, "wurde abgelehnt (401)")
+        user.find(marker="primary-api").click()
+        await see(user, "Neuer API-Key")
+        user.find(marker="field-replace-key").trigger("input", NEW_KEY)
+        user.find(marker="form-confirm").click()
+        html = await see(user, "Im Schlüsselbund liegt jetzt kein Key.", retries=200)
+        html = await see(user, "noch keins – melde dich an", retries=200)
+        assert "wurde abgelehnt (401)" not in html
+
+
+# -- W3-05.2: page (N3, N4, N6) ------------------------------------------------------------------
+
+
+async def test_a_double_click_on_the_login_button_starts_one_login(api: RealApi, cli: Any) -> None:
+    cli(HANG)
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile?neu=1")
+        await see(user, "Neues Auth-Profil")
+        user.find(marker="field-new-profile-name").trigger("input", "abo-neu")
+        user.find(marker="form-confirm").click()
+        await see(user, "arr führt dafür claude setup-token aus.", retries=200)
+        user.find(marker="form-confirm").click()  # the second click of the double click
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+        assert "gibt es schon" not in page_html(user)
+        await api.cancel_login("abo-neu")
+
+
+async def test_esc_during_the_chatgpt_start_cancels_the_login(api: RealApi, codexes: Any) -> None:
+    release = asyncio.Event()
+    built = codexes(gate=release, hang=True)  # like a real login: it waits for the user
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile")
+        await see(user, "Mit ChatGPT anmelden")
+        user.find(marker="primary-chat").click()
+        await see(user, "chat neu anmelden")
+        user.find(marker="form-confirm").click()
+        for _ in range(200):
+            if built:
+                break
+            await asyncio.sleep(0.01)
+        assert built, "the start did not begin"
+        await asyncio.sleep(0.05)
+        user.find(marker="form-dialog").trigger("close")
+        await asyncio.sleep(0.05)
+        release.set()
+        for _ in range(300):
+            if (await api.get_login_status("chat")).state is not LoginState.WAITING:
+                break
+            await asyncio.sleep(0.01)
+    assert (await api.get_login_status("chat")).state is LoginState.CANCELLED
+    assert built[0].closed
+
+
+async def test_esc_while_the_profile_is_created_starts_no_login(
+    api: RealApi, cli: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cli(HANG)
+    release = asyncio.Event()
+    created = asyncio.Event()
+    original = api.profiles.create_profile
+
+    async def slow(create: CreateProfileRequest) -> Any:
+        created.set()
+        await release.wait()
+        return await original(create)
+
+    monkeypatch.setattr(api.profiles, "create_profile", slow)
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile?neu=1")
+        await see(user, "Neues Auth-Profil")
+        user.find(marker="field-new-profile-name").trigger("input", "abo-neu")
+        user.find(marker="form-confirm").click()
+        await asyncio.wait_for(created.wait(), 5)
+        user.find(marker="form-dialog").trigger("close")
+        await asyncio.sleep(0.05)
+        release.set()
+        await see(user, "abo-neu", retries=200)
+    assert api.profiles.logins.jobs == {}
+
+
+@pytest.mark.parametrize("call", ["read", "write", "delete"])
+async def test_keychain_messages_name_the_next_step_not_a_python_type(
+    api: RealApi,
+    keychain: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    call: str,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    class PasswordSetError(Exception):
+        pass
+
+    def refuse(*_a: Any) -> None:
+        raise PasswordSetError(f"said {KEY}")
+
+    keychain[("arr", "api")] = KEY
+    monkeypatch.setattr(
+        {"read": "arr.auth._keyring_get", "write": "arr.auth._keyring_set"}.get(
+            call, "arr.auth._keyring_delete"
+        ),
+        refuse,
+    )
+    with pytest.raises(ApiException) as caught:
+        if call == "read":
+            await api.create_profile(replacement())
+        elif call == "write":
+            await api.create_profile(request("neu-key"))
+        else:
+            await api.delete_profile("api")
+    message = caught.value.error.message
+    assert "Error" not in message and "(" not in message
+    assert "Erlaube den Zugriff" in message and KEY not in message
+    assert "PasswordSetError" in caplog.text and KEY not in caplog.text

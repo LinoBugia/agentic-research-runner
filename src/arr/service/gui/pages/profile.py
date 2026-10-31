@@ -121,6 +121,8 @@ class ProfilePage:
         self.waiting: tuple[str, dict[str, Any]] | None = None
         """The login this page waits for; closing the dialog cancels it."""
         self.submitting = False
+        self.dialog_closed = False
+        """Esc can overtake an action that still runs: it must not go on behind the dialog."""
 
     async def build(self) -> None:
         with self.frame.content:
@@ -365,8 +367,8 @@ class ProfilePage:
         is locked while the action runs, and a key leaves the page with a finished dialog."""
 
         async def guarded() -> str | bool | None:
-            if self.submitting:
-                return False
+            if self.submitting or self.waiting is not None:  # a double click comes after the
+                return False  # first action ended, when its login is already running
             self.submitting = True
             confirm = self.dialog.confirm_button
             confirm.props('disabled aria-busy="true"')
@@ -379,6 +381,7 @@ class ProfilePage:
                 self.dialog.body.clear()
             return result
 
+        self.dialog_closed = False
         self.dialog.open(title, label, build, guarded)
         self.dialog.set_confirm(label)
 
@@ -409,11 +412,19 @@ class ProfilePage:
         *,
         on_done: Callable[[], Any],
     ) -> None:
+        if self.dialog_closed:
+            await self._load()  # „Neues Profil“ has already created the profile
+            return
         try:
             login = await self.api.start_login(name)
         except ApiException as exc:
-            self._login_failed(box, exc.error.message, name, kind, state, on_done)
-            await self._load()  # „Neues Profil“ has already created the profile
+            if not self.dialog_closed:
+                self._login_failed(box, exc.error.message, name, kind, state, on_done)
+            await self._load()
+            return
+        if self.dialog_closed:  # during the start, which can take seconds for ChatGPT
+            await self.api.cancel_login(name)
+            await self._load()
             return
         self.dialog.set_confirm("", visible=False)
         box.clear()
@@ -476,6 +487,7 @@ class ProfilePage:
     async def _dialog_closed(self) -> None:
         """Esc or „Abbrechen“ in the footer: a login never runs on behind a closed dialog, and
         nothing typed into the dialog stays on the page."""
+        self.dialog_closed = True
         waiting, self.waiting = self.waiting, None
         if waiting is not None:
             waiting[1]["timer"].cancel()
@@ -672,6 +684,7 @@ class ProfilePage:
                     )
                 )
             except ApiException as exc:
+                await self._load()  # the card shows what really lies in the keychain
                 return exc.error.message
             await self._test_saved(p.name, f"✓ Key von {p.name} ersetzt und getestet.")
             await self._load()
