@@ -20,9 +20,13 @@ from arr.backends.base import RateLimitData
 from arr.backends.codex_config import SECRET_ENV, codex_home_for
 from arr.backends.codex_events import rate_limit_status
 from arr.backends.codex_sdk import install_message_hooks, internals_available
-from arr.models import AuthProfile
+from arr.errors import ArrError
+from arr.models import AuthKind, AuthProfile
+from arr.settings import app_dir
 
 __all__ = [
+    "ForeignLoginFolder",
+    "own_login_folder",
     "AccountState",
     "CodexCheck",
     "LoginResult",
@@ -36,6 +40,8 @@ logger = logging.getLogger(__name__)
 CodexFactory = Callable[[Any], Any]
 """Builds an `AsyncCodex` from a `CodexConfig`; tests pass a fake."""
 
+LOGIN_ROOTS = ("auth", "codex-homes")
+"""Folders of `app_dir()` that hold login folders, one subfolder per profile."""
 TEST_MODEL = "gpt-6-luna"
 TEST_PROMPT = "Antworte nur mit: ok"
 
@@ -102,8 +108,41 @@ def _state(response: Any) -> AccountState:
     return AccountState(kind=getattr(root, "type", None), plan=str(plan_text) if plan else None)
 
 
+class ForeignLoginFolder(ArrError):
+    """The `login_dir` of a profile lies outside the login folders of arr."""
+
+
+def own_login_folder(auth: AuthProfile) -> Path | None:
+    """The profile's folder in `app_dir()` that holds its login, or None if it is not arr's.
+
+    Only `app_dir()/<root>/<name>` qualifies, compared after `resolve`, so symlinks and a
+    changed `login_dir` cannot lead outside. `~/.codex` never qualifies.
+    """
+    if auth.kind is not AuthKind.CODEX_CHATGPT:
+        return None
+    home = codex_home_for(auth).resolve()
+    codex = (Path.home() / ".codex").resolve()
+    if home == codex or home.is_relative_to(codex):
+        return None
+    base = app_dir().resolve()
+    for root in LOGIN_ROOTS:
+        own = (app_dir() / root / auth.name).resolve()
+        if own.parent == base / root and (home == own or home.is_relative_to(own)):
+            return own
+    return None
+
+
 def prepare_login_dir(auth: AuthProfile) -> Path:
-    """Create the profile's login folder (mode 0700) and return it."""
+    """Create the profile's login folder (mode 0700) and return it.
+
+    Raises `ForeignLoginFolder` outside the folders of arr: neither a login nor the `chmod`
+    may touch a folder of someone else, least of all `~/.codex`.
+    """
+    if own_login_folder(auth) is None:
+        raise ForeignLoginFolder(
+            f"„{auth.name}“ nutzt einen Login-Ordner außerhalb von arr. arr ändert dort nichts. "
+            "Lege für die Anmeldung ein neues Profil an."
+        )
     home = codex_home_for(auth)
     home.mkdir(parents=True, exist_ok=True)
     home.chmod(0o700)

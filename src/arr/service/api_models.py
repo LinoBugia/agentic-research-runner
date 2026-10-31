@@ -128,7 +128,7 @@ class ApiModel(BaseModel):
     See docs/08-ux-konzept.md §5.0.
     """
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, hide_input_in_errors=True)
 
 
 # --------------------------------------------------------------------------------------------
@@ -1775,11 +1775,15 @@ class CreateProfileRequest(ApiModel):
 
     @model_validator(mode="after")
     def _key_only_for_key_kinds(self) -> Self:
+        # Not a ValueError: pydantic would add the whole input, with the key in clear, to
+        # `errors()` and `.json()`; `hide_input_in_errors` only covers `str()`.
         key_kinds = (AuthKind.CLAUDE_API_KEY, AuthKind.OPENAI_API_KEY)
         if (self.kind in key_kinds) != (self.api_key is not None):
-            raise ValueError("api_key gehört genau zu Profilen mit API-Key")
+            raise ApiException.of(
+                ErrorCode.INVALID, "Ein API-Key gehört genau zu Profilen mit API-Key."
+            )
         if self.replace and self.api_key is None:
-            raise ValueError("replace gibt es nur mit einem neuen api_key")
+            raise ApiException.of(ErrorCode.INVALID, "Ersetzen geht nur mit einem neuen API-Key.")
         return self
 
 

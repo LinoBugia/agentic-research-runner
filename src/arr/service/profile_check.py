@@ -17,7 +17,7 @@ from typing import Any
 
 from arr.auth import AuthError, SecretReader, claude_env, clean_process_env
 from arr.backends.codex_login import TEST_MODEL as CODEX_TEST_MODEL
-from arr.backends.codex_login import codex_check
+from arr.backends.codex_login import ForeignLoginFolder, codex_check
 from arr.models import AuthKind, AuthProfile
 from arr.service.api_models import Action, ProfileTest, UsageWindow
 
@@ -28,6 +28,7 @@ TEST_PROMPT = "Antworte nur mit: ok"
 TEST_BUDGET_USD = 0.10
 CHECK_TIMEOUT_S = 30.0
 
+MAC_LOGIN_TEXT = "Nutzt den Claude-Login dieses Macs, kein eigenes Token."
 SECRET_VARIABLES = {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
 WINDOW_LABELS = {
     "five_hour": "5-Stunden-Fenster",
@@ -44,6 +45,7 @@ class CheckFailure(StrEnum):
     NOT_LOGGED_IN = "not_logged_in"
     NO_KEY = "no_key"
     KEYCHAIN = "keychain"
+    FOREIGN_FOLDER = "foreign_folder"
     RATE_LIMITED = "rate_limited"
     BILLING = "billing"
     MODEL = "model"
@@ -100,6 +102,8 @@ async def _claude_turn(profile: AuthProfile, reader: SecretReader | None, cwd: s
     # In a thread: a dialog of the keychain must not stop the service (W3-05 §11).
     env = await asyncio.to_thread(claude_env, profile, reader)
     found = bool(env.keys() & SECRET_VARIABLES)
+    if found:  # only the login of this Mac needs the real folder
+        env["CLAUDE_CONFIG_DIR"] = str(Path(cwd) / "config")
     options = ClaudeAgentOptions(
         model=CLAUDE_TEST_MODEL,
         max_turns=1,
@@ -108,6 +112,7 @@ async def _claude_turn(profile: AuthProfile, reader: SecretReader | None, cwd: s
         setting_sources=[],
         cwd=cwd,
         env=env,
+        extra_args={"no-session-persistence": None},
     )
     failure: CheckFailure | None = None
     window: UsageWindow | None = None
@@ -137,6 +142,8 @@ async def _claude_turn(profile: AuthProfile, reader: SecretReader | None, cwd: s
 async def _codex_turn(profile: AuthProfile, cwd: str) -> CheckResult:
     try:
         check = await codex_check(profile, Path(cwd))
+    except ForeignLoginFolder:
+        return CheckResult(CheckFailure.FOREIGN_FOLDER)
     except Exception as exc:  # noqa: BLE001 - only the type: a message may quote Codex
         log.warning("Profil-Test %s: %s", profile.name, type(exc).__name__)
         return CheckResult(CheckFailure.OTHER)
@@ -178,7 +185,14 @@ def to_profile_test(profile: AuthProfile, result: CheckResult, started: float) -
     now = time.time()
     duration_ms = int((now - started) * 1000)
     if result.failure is None:
-        return ProfileTest(ts=now, ok=True, duration_ms=duration_ms, models=list(result.models))
+        mac = profile.kind is AuthKind.CLAUDE_OAUTH and result.secret_present is False
+        return ProfileTest(
+            ts=now,
+            ok=True,
+            duration_ms=duration_ms,
+            models=list(result.models),
+            message=MAC_LOGIN_TEXT if mac else None,
+        )
     name = profile.name
     url = f"/profile/{name}"
     is_key = profile.kind is AuthKind.CLAUDE_API_KEY
@@ -205,6 +219,11 @@ def to_profile_test(profile: AuthProfile, result: CheckResult, started: float) -
         CheckFailure.KEYCHAIN: (
             f"Der Schlüsselbund ist für „{name}“ nicht erreichbar. Erlaube den Zugriff und "
             "teste erneut.",
+            None,
+        ),
+        CheckFailure.FOREIGN_FOLDER: (
+            f"„{name}“ nutzt einen Login-Ordner außerhalb von arr. arr testet dort nicht. Lege "
+            "für die Anmeldung ein neues Profil an.",
             None,
         ),
         CheckFailure.RATE_LIMITED: (

@@ -7,23 +7,41 @@ import os
 import stat
 import tempfile
 import threading
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from claude_agent_sdk import AssistantMessage, RateLimitEvent, RateLimitInfo, ResultMessage
-from login_kit import FAIL, HANG, MARKER, PRINT_TOKEN, alive, facts_of, fake_cli, wait_until
-from pydantic import SecretStr
+from login_kit import (
+    FAIL,
+    HANG,
+    MARKER,
+    PRINT_TOKEN,
+    alive,
+    facts_of,
+    fake_cli,
+    pids_of,
+    wait_until,
+)
+from pydantic import SecretStr, ValidationError
 from run_kit import write_profiles
 from service_kit import make_workfolder
 from test_gui import gui_user
-from test_gui_real import see
+from test_gui_real import page_html, see
 
 from arr.backends.codex_config import codex_home_for
-from arr.backends.codex_login import AccountState, CodexCheck, codex_check
-from arr.models import AuthKind, AuthProfile, RunStatus
+from arr.backends.codex_login import (
+    AccountState,
+    CodexCheck,
+    ForeignLoginFolder,
+    codex_check,
+    own_login_folder,
+    prepare_login_dir,
+)
+from arr.models import AuthKind, AuthProfile, ProfilesFile, RunStatus
 from arr.resolve import load_yaml_model
 from arr.service.api_models import (
     ApiException,
@@ -33,7 +51,8 @@ from arr.service.api_models import (
 )
 from arr.service.profile_check import CheckFailure, CheckResult, check_profile, to_profile_test
 from arr.service.real_api import RealApi
-from arr.service.real_api.profiles import STATUS_FILE, login_folder_to_delete
+from arr.service.real_api.profiles import STATUS_FILE
+from arr.settings import app_dir
 
 BASE = "http://127.0.0.1:8765"
 KEY = "sk-ant-api03-MARKERKEY-0123456789"
@@ -99,6 +118,11 @@ def request(name: str = "neu", key: str | None = KEY) -> CreateProfileRequest:
 
 def listing(root: Path) -> list[str]:
     return sorted(str(p) for p in root.rglob("*"))
+
+
+def missing(facts: Path) -> None:
+    """Remove the fake CLI that wrote to `facts`."""
+    (facts.parent / "claude").unlink()
 
 
 def tree_text(*roots: Path) -> str:
@@ -221,15 +245,15 @@ def test_login_folder_outside_of_arr_is_never_deleted(
     def chat(login_dir: str | None = None) -> AuthProfile:
         return AuthProfile(name="chat", kind=AuthKind.CODEX_CHATGPT, login_dir=login_dir)
 
-    assert login_folder_to_delete(chat(str(outside))) is None
-    assert login_folder_to_delete(chat(str(arr_home / "auth" / "anderes"))) is None
+    assert own_login_folder(chat(str(outside))) is None
+    assert own_login_folder(chat(str(arr_home / "auth" / "anderes"))) is None
     monkeypatch.setenv("HOME", str(tmp_path))
-    assert login_folder_to_delete(chat("~/.codex")) is None
+    assert own_login_folder(chat("~/.codex")) is None
     (arr_home / "auth").mkdir(parents=True)
     (arr_home / "auth" / "chat").symlink_to(outside)
-    assert login_folder_to_delete(chat()) is None, "a symlink must not lead outside"
+    assert own_login_folder(chat()) is None, "a symlink must not lead outside"
     own = AuthProfile(name="chat2", kind=AuthKind.CODEX_CHATGPT)
-    assert login_folder_to_delete(own) == (arr_home / "auth" / "chat2").resolve()
+    assert own_login_folder(own) == (arr_home / "auth" / "chat2").resolve()
 
 
 async def test_delete_keeps_a_foreign_keychain_item(
@@ -813,8 +837,8 @@ async def test_mac_login_card_and_failed_test_on_the_page(
         await user.open("/profile")
         await see(user, "nicht verbunden")
         user.find(marker="test-max").click()
-        html = await see(user, "Claude-Login dieses Macs", retries=200)
-        assert "funktioniert" in html
+        html = await see(user, "Login dieses Macs", retries=200)
+        assert "Nutzt den Claude-Login dieses Macs, kein eigenes Token." in html
 
         async def rejected(prompt: str, options: Any) -> AsyncIterator[Any]:
             yield AssistantMessage(content=[], model="m", error="authentication_failed")
@@ -906,7 +930,7 @@ async def test_replacing_needs_a_matching_profile(api: RealApi, keychain: dict) 
             await api.create_profile(request)
         assert caught.value.error.code is code
     assert keychain == {}
-    with pytest.raises(ValueError, match="replace"):
+    with pytest.raises(ApiException, match="Ersetzen"):
         CreateProfileRequest(name="x", kind=AuthKind.CLAUDE_OAUTH, replace=True)
 
 
@@ -934,3 +958,571 @@ async def test_key_replaced_on_the_page_for_a_profile_without_a_limit(
         assert "wurde abgelehnt" not in html
     assert keychain[("arr", "api")] == NEW_KEY
     assert "api" in (arr_home / "profiles.yaml").read_text()
+
+
+# -- W3-05.1: login flows (M2, M3, M4, G7) -------------------------------------------------------
+
+
+class SlowKeychain:
+    """The write hangs like a system dialog until `release`; the entry appears only then."""
+
+    def __init__(self, store: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.store = store
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        monkeypatch.setattr("arr.auth._keyring_set", self.write)
+
+    def write(self, service: str, account: str, value: str) -> None:
+        self.entered.set()
+        assert self.release.wait(10)
+        self.store[(service, account)] = value
+
+
+async def test_cancel_during_the_keychain_write_leaves_no_token(
+    api: RealApi, cli: Any, keychain: dict, monkeypatch: pytest.MonkeyPatch, calls: list
+) -> None:
+    slow = SlowKeychain(keychain, monkeypatch)
+    cli(PRINT_TOKEN)
+    await api.start_login("max")
+    assert await asyncio.to_thread(slow.entered.wait, 10)
+    cancelling = asyncio.create_task(api.cancel_login("max"))
+    await asyncio.sleep(0.05)
+    assert not cancelling.done(), "cancel must wait for the write"
+    slow.release.set()
+    status = await cancelling
+    assert status.state is LoginState.CANCELLED and keychain == {}
+    assert calls == [], "no test after a cancelled login"
+    listed = next(p for p in await api.list_profiles() if p.name == "max")
+    assert not listed.secret_present and listed.last_test is None
+
+
+async def test_delete_during_the_keychain_write_leaves_no_token(
+    api: RealApi, cli: Any, keychain: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slow = SlowKeychain(keychain, monkeypatch)
+    cli(PRINT_TOKEN)
+    await api.start_login("max")
+    assert await asyncio.to_thread(slow.entered.wait, 10)
+    deleting = asyncio.create_task(api.delete_profile("max"))
+    await asyncio.sleep(0.05)
+    slow.release.set()
+    await deleting
+    await asyncio.sleep(0.1)  # nothing may come in after the delete
+    assert keychain == {}
+    assert "max" not in [p.name for p in await api.list_profiles()]
+
+
+async def test_cancel_during_the_test_after_the_login_takes_the_token_back(
+    api: RealApi, cli: Any, keychain: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = asyncio.Event()
+
+    async def slow_test(prompt: str, options: Any) -> AsyncIterator[Any]:
+        started.set()
+        await asyncio.sleep(30)
+        yield ok_result()
+
+    monkeypatch.setattr("arr.service.profile_check._sdk_query", slow_test)
+    cli(PRINT_TOKEN)
+    await api.start_login("max")
+    await asyncio.wait_for(started.wait(), 10)
+    assert (await api.get_login_status("max")).message == "Testen …"
+    status = await api.cancel_login("max")
+    assert status.state is LoginState.CANCELLED and keychain == {}
+    listed = next(p for p in await api.list_profiles() if p.name == "max")
+    assert not listed.secret_present and listed.last_test is None
+
+
+async def test_a_token_that_cannot_be_taken_back_is_named(
+    api: RealApi, cli: Any, keychain: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slow = SlowKeychain(keychain, monkeypatch)
+
+    def refuse(*_a: Any) -> None:
+        raise RuntimeError("no")
+
+    monkeypatch.setattr("arr.auth._keyring_delete", refuse)
+    cli(PRINT_TOKEN)
+    await api.start_login("max")
+    assert await asyncio.to_thread(slow.entered.wait, 10)
+    cancelling = asyncio.create_task(api.cancel_login("max"))
+    slow.release.set()
+    status = await cancelling
+    assert "Das Token liegt noch im Schlüsselbund." in status.message
+    assert next(p for p in await api.list_profiles() if p.name == "max").secret_present
+
+
+async def test_any_error_of_the_login_ends_the_job(
+    api: RealApi, cli: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Not only `OSError` of the start: nothing may stay on „Warte auf die Anmeldung“."""
+    caplog.set_level(logging.DEBUG)
+    cli(PRINT_TOKEN)
+
+    def broken(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError(f"temp is broken: {MARKER}")
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", broken)
+    await api.start_login("max")
+    status = await until_state(api, "max", LoginState.FAILED)
+    assert status.message.startswith("Die Claude-Anmeldung ließ sich nicht starten.")
+    assert "RuntimeError" in caplog.text and MARKER not in caplog.text
+
+
+async def test_missing_cli_says_it_could_not_start(api: RealApi, cli: Any, tmp_path: Path) -> None:
+    missing(cli(HANG))
+    await api.start_login("max")
+    status = await until_state(api, "max", LoginState.FAILED)
+    assert status.message.startswith("Die Claude-Anmeldung ließ sich nicht starten.")
+
+
+async def test_parallel_starts_leave_one_login_that_cancel_reaches(api: RealApi, cli: Any) -> None:
+    facts = cli(HANG)
+    await asyncio.gather(*(api.start_login("max") for _ in range(3)))
+    assert await asyncio.to_thread(wait_until, facts.exists)
+    await api.cancel_login("max")
+    assert await asyncio.to_thread(wait_until, lambda: all(not alive(p) for p in pids_of(facts)))
+    assert len(api.profiles.logins.jobs) == 1
+
+
+async def test_close_of_the_api_ends_logins_and_refuses_new_ones(api: RealApi, cli: Any) -> None:
+    facts = cli(HANG)
+    await asyncio.gather(*(api.start_login("max") for _ in range(2)))
+    assert await asyncio.to_thread(wait_until, facts.exists)
+    await api.close()
+    assert await asyncio.to_thread(wait_until, lambda: all(not alive(p) for p in pids_of(facts)))
+    with pytest.raises(ApiException) as caught:
+        await api.start_login("max")
+    assert caught.value.error.code is ErrorCode.UNAVAILABLE
+
+
+# -- W3-05.1: M1, parallel writes ----------------------------------------------------------------
+
+
+async def test_parallel_creates_keep_every_profile(
+    api: RealApi, keychain: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def slow(service: str, account: str, value: str) -> None:
+        time.sleep(0.02)
+        keychain[(service, account)] = value
+
+    monkeypatch.setattr("arr.auth._keyring_set", slow)
+    await asyncio.gather(*(api.create_profile(request(f"neu-{i}")) for i in range(4)))
+    names = [p.name for p in await api.list_profiles()]
+    assert {f"neu-{i}" for i in range(4)} <= set(names)
+    fresh = load_yaml_model(app_dir() / "profiles.yaml", ProfilesFile)
+    assert {p.name for p in fresh.profiles} >= {f"neu-{i}" for i in range(4)}
+    assert len(keychain) == 4
+
+
+async def test_parallel_creates_of_one_name_leave_no_orphan(
+    api: RealApi, keychain: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def slow(service: str, account: str, value: str) -> None:
+        time.sleep(0.02)
+        keychain[(service, account)] = value
+
+    monkeypatch.setattr("arr.auth._keyring_set", slow)
+    results = await asyncio.gather(
+        *(api.create_profile(request("neu", key=f"{KEY}-{i}")) for i in range(3)),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(r, ApiException) for r in results) == 2
+    assert len(keychain) == 1
+
+
+async def test_the_file_is_read_again_after_the_keychain_dialog(
+    api: RealApi, keychain: dict, arr_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def edited_by_hand_meanwhile(service: str, account: str, value: str) -> None:
+        keychain[(service, account)] = value
+        path = arr_home / "profiles.yaml"
+        path.write_text(path.read_text() + "  - {name: von-hand, kind: claude_oauth}\n")
+
+    monkeypatch.setattr("arr.auth._keyring_set", edited_by_hand_meanwhile)
+    await api.create_profile(request())
+    assert {"neu", "von-hand"} <= {p.name for p in await api.list_profiles()}
+
+
+# -- W3-05.1: M7, foreign login folders ----------------------------------------------------------
+
+
+@pytest.fixture
+def foreign(wf: Path, arr_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A profile with `login_dir: ~/.codex` of a test HOME; returns that folder (mode 0755)."""
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    os.chmod(home / ".codex", 0o755)
+    monkeypatch.setenv("HOME", str(home))
+    (arr_home / "profiles.yaml").write_text(
+        "version: 1\nprofiles:\n  - {name: fremd, kind: codex_chatgpt, login_dir: ~/.codex}\n"
+    )
+    return home / ".codex"
+
+
+async def test_no_login_and_no_chmod_in_a_foreign_folder(
+    foreign: Path, wf: Path, keychain: dict
+) -> None:
+    api = RealApi(wf, base_url=BASE, scan=False)
+    with pytest.raises(ApiException) as caught:
+        await api.start_login("fremd")
+    assert caught.value.error.code is ErrorCode.NOT_ALLOWED
+    assert "außerhalb von arr" in caught.value.error.message
+    info = await api.test_profile("fremd")
+    assert not info.last_test.ok and "außerhalb von arr" in info.last_test.message
+    assert stat.S_IMODE(os.stat(foreign).st_mode) == 0o755
+    assert api.profiles.logins.jobs == {}
+
+
+def test_prepare_login_dir_only_in_arrs_folders(tmp_path: Path, arr_home: Path) -> None:
+    outside = tmp_path / "anderswo"
+    profile = AuthProfile(name="c", kind=AuthKind.CODEX_CHATGPT, login_dir=str(outside))
+    with pytest.raises(ForeignLoginFolder, match="außerhalb von arr"):
+        prepare_login_dir(profile)
+    assert not outside.exists()
+    own = AuthProfile(name="c", kind=AuthKind.CODEX_CHATGPT)
+    assert prepare_login_dir(own) == arr_home / "auth" / "c" / "codex_home"
+
+
+# -- W3-05.1: Mac login (point 6), G8 ------------------------------------------------------------
+
+
+async def test_the_mac_login_is_named_and_is_no_login_of_the_profile(
+    api: RealApi, keychain: dict, calls: list
+) -> None:
+    test = (await api.test_profile("max")).last_test
+    assert test.ok and test.message == "Nutzt den Claude-Login dieses Macs, kein eigenes Token."
+    keychain[("arr", "max")] = MARKER
+    assert (await api.test_profile("max")).last_test.message is None
+
+
+async def test_a_cancelled_login_does_not_appear_as_logged_in(
+    api: RealApi, cli: Any, calls: list
+) -> None:
+    facts = cli(HANG)
+    await api.create_profile(request("abo", key=None))
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await api.start_login("abo")
+        assert await asyncio.to_thread(wait_until, facts.exists)
+        await api.cancel_login("abo")
+        await user.open("/profile/abo")
+        html = await see(user, "nicht verbunden")
+        assert "noch keins – melde dich an" in html
+        user.find(marker="test-abo").click()
+        html = await see(user, "Login dieses Macs", retries=200)
+        assert "kein eigenes Token" in html and "funktioniert" not in html
+        assert "Mit Claude anmelden" in html
+
+
+async def test_a_test_with_a_token_stays_out_of_the_claude_folder(
+    api: RealApi, keychain: dict, calls: list
+) -> None:
+    keychain[("arr", "api")] = KEY
+    keychain[("arr", "max")] = MARKER
+    await api.test_profile("api")
+    await api.test_profile("max")
+    assert all("CLAUDE_CONFIG_DIR" in options.env for options in calls)
+    assert all("no-session-persistence" in options.extra_args for options in calls)
+    keychain.clear()
+    await api.test_profile("max")
+    assert "CLAUDE_CONFIG_DIR" not in calls[-1].env, "the Mac login needs its real folder"
+    assert "no-session-persistence" in calls[-1].extra_args
+
+
+# -- W3-05.1: page (M5, M6, G1, G5, G6, G7) ------------------------------------------------------
+
+
+def confirm_of(user: Any) -> Any:
+    return next(iter(user.find(marker="form-confirm").elements))
+
+
+async def test_every_dialog_has_its_confirm_button_after_a_login(
+    api: RealApi, cli: Any, keychain: dict
+) -> None:
+    cli(FAIL)
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile")
+        await see(user, "Mit Claude anmelden")
+        user.find(marker="primary-max").click()
+        await see(user, "max neu anmelden")
+        user.find(marker="form-confirm").click()
+        await see(user, "Erneut versuchen", retries=200)
+        assert "display" in confirm_of(user)._style
+        user.find(marker="form-dialog").trigger("close")
+        await see(user, "Bearbeiten", retries=200)  # the list is loaded again
+        for marker, title in [
+            ("edit-max", "max bearbeiten"),
+            ("primary-max", "max neu anmelden"),
+            ("primary-api", "Key ersetzen"),
+        ]:
+            user.find(marker=marker).click()
+            await see(user, title)
+            assert "display" not in confirm_of(user)._style, title
+
+
+async def test_closing_the_dialog_shows_the_profile_of_the_cancelled_login(
+    api: RealApi, cli: Any
+) -> None:
+    facts = cli(HANG)
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile")
+        await see(user, "Neues Profil")
+        user.find(marker="new-profile").click()
+        await see(user, "Neues Auth-Profil")
+        user.find(marker="field-new-profile-name").trigger("input", "abo-neu")
+        user.find(marker="form-confirm").click()
+        await see(user, "arr führt dafür claude setup-token aus.", retries=200)
+        assert await asyncio.to_thread(wait_until, facts.exists)
+        assert "profil-abo-neu" not in page_html(user)
+        user.find(marker="form-dialog").trigger("close")
+        await see(user, "abo-neu", retries=200)
+    assert (await api.get_login_status("abo-neu")).state is LoginState.CANCELLED
+
+
+async def test_confirm_is_locked_while_the_action_runs(
+    api: RealApi, cli: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cli(HANG)
+    created: list[str] = []
+    release = asyncio.Event()
+    original = api.profiles.create_profile
+
+    async def slow(create: CreateProfileRequest) -> Any:
+        created.append(create.name)
+        await release.wait()
+        return await original(create)
+
+    monkeypatch.setattr(api.profiles, "create_profile", slow)
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile?neu=1")
+        await see(user, "Neues Auth-Profil")
+        user.find(marker="field-new-profile-name").trigger("input", "abo-neu")
+        user.find(marker="form-confirm").click()
+        for _ in range(100):
+            if created:
+                break
+            await asyncio.sleep(0.01)
+        assert "disabled" in confirm_of(user)._props
+        user.find(marker="form-confirm").click()
+        await asyncio.sleep(0.05)
+        release.set()
+        html = await see(user, "arr führt dafür claude setup-token aus.", retries=200)
+        assert "gibt es schon" not in html
+        await api.cancel_login("abo-neu")
+    assert created == ["abo-neu"]
+
+
+async def test_the_key_leaves_the_page_with_the_dialog(
+    api: RealApi, keychain: dict, calls: list
+) -> None:
+    def everything(user: Any) -> str:
+        with user.client:
+            return " ".join(f"{e._props} {e._text}" for e in user.client.elements.values())
+
+    keychain[("arr", "api")] = KEY
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile?neu=1")
+        await see(user, "Neues Auth-Profil")
+        user.find(marker="radio-kind-claude_api_key").trigger("change")
+        await see(user, "Speichern und testen")
+        user.find(marker="field-new-profile-name").trigger("input", "api-neu")
+        user.find(marker="field-new-key").trigger("input", NEW_KEY)
+        user.find(marker="form-confirm").click()
+        await see(user, "api-neu", retries=200)
+        for _ in range(100):
+            if NEW_KEY not in everything(user):
+                break
+            await asyncio.sleep(0.01)
+        assert NEW_KEY not in everything(user)
+        user.find(marker="test-api").click()
+        await see(user, "funktioniert", retries=200)
+        user.find(marker="new-profile").click()
+        await see(user, "Neues Auth-Profil")
+        user.find(marker="radio-kind-claude_api_key").trigger("change")
+        await see(user, "Speichern und testen")
+        user.find(marker="field-new-key").trigger("input", "typed-and-then-left-alone")
+        user.find(marker="form-dialog").trigger("close")
+        for _ in range(100):
+            if "typed-and-then-left-alone" not in everything(user):
+                break
+            await asyncio.sleep(0.01)
+        assert "typed-and-then-left-alone" not in everything(user)
+
+
+async def test_help_text_fits_the_kind(api: RealApi) -> None:
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile?neu=1")
+        await see(user, "übernimmt das Token und legt es im Schlüsselbund ab")
+        user.find(marker="radio-kind-codex_chatgpt").trigger("change")
+        html = await see(user, "zeigt dir einen Link und einen Code")
+        assert "im Ordner des Profils ab" in html
+        assert "Anmeldung mit Link und Code." in html and "oder per Code" not in html
+
+
+async def test_api_key_button_after_a_failed_login_logs_no_error(
+    api: RealApi, cli: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    cli(FAIL)
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile")
+        await see(user, "Mit Claude anmelden")
+        user.find(marker="primary-max").click()
+        await see(user, "max neu anmelden")
+        user.find(marker="form-confirm").click()
+        await see(user, "Claude-API-Key verwenden", retries=200)
+        caplog.clear()
+        user.find(marker="use-api-key").click()
+        await see(user, "Neues Auth-Profil", retries=200)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+
+
+async def test_page_says_testing_after_the_token_and_reports_a_failed_test(
+    api: RealApi, cli: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = asyncio.Event()
+
+    async def slow_test(prompt: str, options: Any) -> AsyncIterator[Any]:
+        await release.wait()
+        yield AssistantMessage(content=[], model="m", error="authentication_failed")
+        yield ok_result(is_error=True)
+
+    monkeypatch.setattr("arr.service.profile_check._sdk_query", slow_test)
+    monkeypatch.setattr("arr.service.gui.pages.profile.LOGIN_POLL_S", 0.05)
+    cli(PRINT_TOKEN)
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile")
+        await see(user, "Mit Claude anmelden")
+        user.find(marker="primary-max").click()
+        await see(user, "max neu anmelden")
+        user.find(marker="form-confirm").click()
+        html = await see(user, "<b>Testen …</b>", retries=200)
+        assert "Warte auf die Anmeldung" not in html
+        release.set()
+        html = await see(user, "Die Anmeldung von „max“ ist abgelaufen", retries=200)
+        assert "angemeldet und getestet" not in html
+
+
+async def test_a_login_whose_test_breaks_does_not_claim_a_test(
+    api: RealApi, cli: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def broken(profile: AuthProfile, reader: Any = None) -> CheckResult:
+        raise RuntimeError("no test")
+
+    monkeypatch.setattr("arr.service.real_api.profiles.check_profile", broken)
+    monkeypatch.setattr("arr.service.gui.pages.profile.LOGIN_POLL_S", 0.05)
+    cli(PRINT_TOKEN)
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile")
+        await see(user, "Mit Claude anmelden")
+        user.find(marker="primary-max").click()
+        await see(user, "max neu anmelden")
+        user.find(marker="form-confirm").click()
+        html = await see(user, "Angemeldet. Teste das Profil auf seiner Karte.", retries=200)
+        assert "angemeldet und getestet" not in html
+
+
+# -- W3-05.1: small points (G2, G3, G4) ----------------------------------------------------------
+
+
+def test_a_wrong_combination_never_returns_the_key() -> None:
+    raw_request = {"name": "x", "kind": "claude_oauth", "api_key": KEY}
+    with pytest.raises(ApiException) as caught:
+        CreateProfileRequest.model_validate(raw_request)
+    assert KEY not in caught.value.error.message and KEY not in str(caught.value)
+
+
+def test_validation_errors_of_a_request_hide_the_key() -> None:
+    raw_request = {"name": "UNGÜLTIG", "kind": "claude_api_key", "api_key": KEY}
+    with pytest.raises(ValidationError) as caught:
+        CreateProfileRequest.model_validate(raw_request)
+    assert KEY not in str(caught.value) and KEY not in repr(caught.value)
+    assert KEY not in caught.value.json() and KEY not in repr(caught.value.errors())
+
+
+def test_str_of_a_validation_error_hides_a_key_in_a_wrong_field() -> None:
+    raw_request = {"name": "x", "kind": "claude_oauth", "token": KEY}
+    with pytest.raises(ValidationError) as caught:
+        CreateProfileRequest.model_validate(raw_request)
+    assert KEY not in str(caught.value)
+
+
+@pytest.mark.parametrize("content", ["[]", "null", "1", '"text"', '{"max": 1}', '{"max": []}'])
+async def test_damaged_status_files_are_empty(api: RealApi, arr_home: Path, content: str) -> None:
+    (arr_home / STATUS_FILE).write_text(content)
+    assert all(p.last_test is None for p in await api.list_profiles())
+    assert (await api.test_profile("max")).last_test.ok
+
+
+async def test_profiles_file_with_broken_bytes_is_a_message(
+    wf: Path, arr_home: Path, keychain: dict
+) -> None:
+    (arr_home / "profiles.yaml").write_bytes(b"version: 1\nprofiles: \xff\xfe\n")
+    api = RealApi(wf, base_url=BASE, scan=False)
+    for call in (api.list_profiles(), api.create_profile(request()), api.delete_profile("max")):
+        with pytest.raises(ApiException) as caught:
+            await call
+        assert "profiles.yaml ließ sich nicht lesen" in caught.value.error.message
+    assert keychain == {}
+
+
+@pytest.fixture
+def read_only(arr_home: Path) -> Iterator[Any]:
+    locked: list[Path] = []
+
+    def lock(path: Path) -> None:
+        path.chmod(0o500)
+        locked.append(path)
+
+    yield lock
+    for path in locked:
+        path.chmod(0o700)
+
+
+async def test_delete_in_a_read_only_folder_keeps_everything(
+    api: RealApi, keychain: dict, arr_home: Path, read_only: Any
+) -> None:
+    keychain[("arr", "api")] = KEY
+    read_only(arr_home)
+    with pytest.raises(ApiException) as caught:
+        await api.delete_profile("api")
+    assert "ließ sich nicht speichern" in caught.value.error.message
+    assert keychain == {("arr", "api"): KEY}
+    assert "api" in (arr_home / "profiles.yaml").read_text()
+
+
+async def test_a_login_folder_that_stays_is_named_and_the_profile_stays(
+    api: RealApi, keychain: dict, arr_home: Path, read_only: Any
+) -> None:
+    home = codex_home_for(AuthProfile(name="chat", kind=AuthKind.CODEX_CHATGPT))
+    home.mkdir(parents=True)
+    (home / "auth.json").write_text("{}")
+    read_only(home)
+    with pytest.raises(ApiException) as caught:
+        await api.delete_profile("chat")
+    assert "auth.json" in caught.value.error.message
+    assert "chat" in [p.name for p in await api.list_profiles()]
+    assert "chat" in (arr_home / "profiles.yaml").read_text()
+
+
+async def test_a_keychain_item_that_stays_keeps_the_profile(
+    api: RealApi, keychain: dict, arr_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    keychain[("arr", "api")] = KEY
+
+    def refuse(*_a: Any) -> None:
+        raise RuntimeError("no")
+
+    monkeypatch.setattr("arr.auth._keyring_delete", refuse)
+    with pytest.raises(ApiException) as caught:
+        await api.delete_profile("api")
+    assert "Schlüsselbund" in caught.value.error.message
+    assert "api" in (arr_home / "profiles.yaml").read_text()
+
+
+async def test_a_status_that_cannot_be_written_is_a_message(
+    api: RealApi, calls: list, arr_home: Path, read_only: Any
+) -> None:
+    read_only(arr_home)
+    with pytest.raises(ApiException) as caught:
+        await api.test_profile("max")
+    assert "ließ sich nicht speichern" in caught.value.error.message

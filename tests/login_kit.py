@@ -29,6 +29,8 @@ facts = dict(
 )
 with open({facts!r}, "w") as file:
     json.dump(facts, file)
+with open({facts!r} + ".pids", "a") as file:
+    print(os.getpid(), file=file)
 """
 
 PRINT_TOKEN = f"""
@@ -62,6 +64,11 @@ def fake_cli(folder: Path, body: str) -> tuple[Path, Path]:
 
 def facts_of(path: Path) -> dict:
     return json.loads(path.read_text("utf-8"))
+
+
+def pids_of(facts: Path) -> list[int]:
+    """Every process the fake CLI ever was."""
+    return [int(line) for line in Path(f"{facts}.pids").read_text("utf-8").split()]
 
 
 def gone(path: str) -> bool:

@@ -37,11 +37,10 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from functools import partial
 from pathlib import Path
 from typing import Any
 
-from arr.auth import clean_process_env, store_secret
+from arr.auth import AuthError, clean_process_env, delete_secret, store_secret
 from arr.backends.codex_login import codex_login
 from arr.models import AuthKind, AuthProfile
 from arr.service.api_models import (
@@ -59,6 +58,7 @@ log = logging.getLogger("arr.service")
 SETUP_TOKEN_NOTE = "arr führt dafür claude setup-token aus."
 CODEX_NOTE = "arr meldet Codex im Login-Ordner des Profils an."
 WAITING_TEXT = "Warte auf die Anmeldung im Browser …"
+TESTING_TEXT = "Testen …"
 CLAUDE_LOGIN_TIMEOUT_S = 300.0
 CODEX_LOGIN_TIMEOUT_S = 900.0
 """Codex lets a device code expire after 15 minutes."""
@@ -233,6 +233,26 @@ async def stop_process(process: subprocess.Popen[bytes]) -> None:
     _signal_group(process, signal.SIGKILL)
 
 
+async def _to_the_end[**P](function: Callable[P, None], *args: P.args, **kwargs: P.kwargs) -> None:
+    """Run `function` in a thread and always wait for its end.
+
+    Threads cannot be cancelled: a cancelled caller would go on while the function still
+    writes to the keychain. So the cancellation comes after the end, and only then does the
+    caller know what lies there. Without a cancellation an error of `function` is raised.
+    """
+    task = asyncio.ensure_future(asyncio.to_thread(function, *args, **kwargs))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        task.exception()  # retrieved: the caller was cancelled, it no longer asks
+        raise asyncio.CancelledError
+    task.result()
+
+
 async def capture_token(
     sink: Callable[[str], None],
     *,
@@ -243,17 +263,20 @@ async def capture_token(
     """Run `claude setup-token` in a pty and pass the token to `sink` in a worker thread.
 
     A keychain dialog in `sink` therefore never blocks the event loop. Cancelling the call
-    stops the child; `sink` is not called after that.
+    stops the child. A `sink` that already runs is waited for, so `sink` has ended when the
+    cancellation arrives at the caller; it does not start after that.
     """
     loop = asyncio.get_running_loop()
     scanner = TokenScanner()
     closed = asyncio.Event()
     found: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="arr-login-") as workdir:
+    program = cli or claude_cli()
+    if not os.access(program, os.X_OK):
+        log.warning("Claude-Anmeldung: Die CLI fehlt.")
+        return CaptureResult(CaptureOutcome.START_FAILED)
+    with tempfile.TemporaryDirectory(prefix="arr-login-", ignore_cleanup_errors=True) as workdir:
         try:
-            process, master = _spawn(
-                cli or claude_cli(), args, workdir, login_env(workdir), timeout_s
-            )
+            process, master = _spawn(program, args, workdir, login_env(workdir), timeout_s)
         except OSError as exc:
             log.warning("Claude-Anmeldung: Start fehlgeschlagen (%s)", type(exc).__name__)
             return CaptureResult(CaptureOutcome.START_FAILED)
@@ -302,7 +325,7 @@ async def capture_token(
                 return CaptureResult(CaptureOutcome.NO_TOKEN, exit_code=process.poll())
             token = found.pop()
             try:
-                await asyncio.to_thread(sink, token)
+                await _to_the_end(sink, token)
             except Exception as exc:  # noqa: BLE001 - the type only, a message could quote it
                 log.warning("Claude-Anmeldung: Ablage fehlgeschlagen (%s)", type(exc).__name__)
                 return CaptureResult(CaptureOutcome.STORE_FAILED)
@@ -353,13 +376,17 @@ class LoginJob:
 
 AfterLogin = Callable[[AuthProfile], Awaitable[ProfileInfo]]
 """Called after a successful login: notes the secret, tests and returns the profile."""
+Undone = Callable[[AuthProfile, bool], None]
+"""Called after a cancelled login took its token back; False if the token still lies there."""
 
 
 class LoginService:
     """Runs one login per profile as a task with a deadline (docs/08 §5.8, E18).
 
-    A new start replaces a running login of the profile. Every message is a fixed text: no
-    output of the CLI or Codex reaches the page.
+    A new start replaces a running login of the profile, one at a time, so there is never
+    more than one per profile and `cancel` and `close` reach it. A cancelled login leaves no
+    token behind: it waits for a running keychain write and removes the entry. Every message
+    is a fixed text: no output of the CLI or Codex reaches the page.
     """
 
     def __init__(
@@ -367,17 +394,33 @@ class LoginService:
         after: AfterLogin,
         *,
         poll_url: Callable[[str], str],
+        undone: Undone | None = None,
         codex_factory: Any = None,
     ) -> None:
         self.after = after
         self.poll_url = poll_url
+        self.undone = undone
         self.codex_factory = codex_factory
         self.jobs: dict[str, LoginJob] = {}
+        self.locks: dict[str, asyncio.Lock] = {}
+        self.closed = False
+
+    def _lock(self, name: str) -> asyncio.Lock:
+        return self.locks.setdefault(name, asyncio.Lock())
 
     async def start(self, profile: AuthProfile) -> LoginStart:
-        await self.cancel(profile.name)
-        if profile.kind is AuthKind.CODEX_CHATGPT:
-            return await self._start_codex(profile)
+        async with self._lock(profile.name):
+            if self.closed:
+                raise ApiException.of(
+                    ErrorCode.UNAVAILABLE,
+                    "arr wird gerade beendet. Starte die Anmeldung, wenn arr wieder läuft.",
+                )
+            await self.cancel(profile.name)
+            if profile.kind is AuthKind.CODEX_CHATGPT:
+                return await self._start_codex(profile)
+            return self._start_claude(profile)
+
+    def _start_claude(self, profile: AuthProfile) -> LoginStart:
         now = time.time()
         job = LoginJob(profile, expires_at=now + CLAUDE_LOGIN_TIMEOUT_S)
         self.jobs[profile.name] = job
@@ -402,22 +445,51 @@ class LoginService:
     def _retry(self, job: LoginJob, service: str) -> Action:
         return Action(label=f"Erneut mit {service} anmelden", url=f"/profile/{job.profile.name}")
 
+    async def _take_back(self, job: LoginJob) -> str:
+        """Remove the token of an ended login; returns what the message has to add."""
+        try:
+            await _to_the_end(delete_secret, job.profile)
+        except AuthError:
+            log.warning("Claude-Anmeldung %s: Token blieb im Schlüsselbund", job.profile.name)
+            if self.undone:
+                self.undone(job.profile, False)
+            return " Das Token liegt noch im Schlüsselbund. Lösche das Profil, um es zu entfernen."
+        if self.undone:
+            self.undone(job.profile, True)
+        return ""
+
     async def _claude(self, job: LoginJob) -> None:
-        store = partial(store_secret, job.profile)
+        stored = False
+
+        def store(token: str) -> None:
+            nonlocal stored
+            store_secret(job.profile, token)
+            stored = True
+
         try:
             result = await capture_token(store, timeout_s=CLAUDE_LOGIN_TIMEOUT_S)
+            log.info("Claude-Anmeldung %s: %s", job.profile.name, result.outcome.value)
+            if result.outcome is CaptureOutcome.TOKEN:
+                job.message = TESTING_TEXT
+                await self._after(job)
+                return
+            job.finish(
+                LoginState.FAILED,
+                CLAUDE_FAILURES[result.outcome],
+                action=self._retry(job, "Claude"),
+            )
         except asyncio.CancelledError:
-            job.finish(LoginState.CANCELLED, cancelled_text(AuthKind.CLAUDE_OAUTH))
+            text = cancelled_text(AuthKind.CLAUDE_OAUTH)
+            job.finish(LoginState.CANCELLED, text)
+            if stored:
+                job.finish(LoginState.CANCELLED, text + await self._take_back(job))
             raise
-        log.info("Claude-Anmeldung %s: %s", job.profile.name, result.outcome.value)
-        if result.outcome is CaptureOutcome.TOKEN:
-            await self._after(job)
-            return
-        job.finish(
-            LoginState.FAILED,
-            CLAUDE_FAILURES[result.outcome],
-            action=self._retry(job, "Claude"),
-        )
+        except Exception as exc:  # noqa: BLE001 - the type only; no job stays on `waiting`
+            log.warning("Claude-Anmeldung %s: %s", job.profile.name, type(exc).__name__)
+            text = CLAUDE_FAILURES[CaptureOutcome.START_FAILED]
+            if stored:
+                text += await self._take_back(job)
+            job.finish(LoginState.FAILED, text, action=self._retry(job, "Claude"))
 
     async def _start_codex(self, profile: AuthProfile) -> LoginStart:
         now = time.time()
@@ -497,5 +569,10 @@ class LoginService:
         return self.status(name)
 
     async def close(self) -> None:
+        """End every login. A start that was waiting for its turn is refused or ended here."""
+        self.closed = True
         for name in list(self.jobs):
             await self.cancel(name)
+        for name, lock in list(self.locks.items()):
+            async with lock:
+                await self.cancel(name)

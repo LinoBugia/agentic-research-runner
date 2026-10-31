@@ -163,6 +163,7 @@ class RealApi:
 
     async def close(self) -> None:
         """Stop the watcher (runs are stopped with `stop_runs` first)."""
+        await self.profiles.close()
         await self.live.stop()
 
     # -- ApiClient: live, workfolder ---------------------------------------------------------

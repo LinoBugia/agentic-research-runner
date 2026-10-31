@@ -29,7 +29,7 @@ from arr.service.api_models import (
     SkillUsage,
 )
 from arr.service.real_api.base import ServiceState, not_found
-from arr.service.real_api.profiles import load_status, profile_info
+from arr.service.real_api.profiles import load_status, profile_info, unreadable_profiles
 from arr.service.real_api.rundir import open_items
 from arr.skills import SkillAudience, SkillCatalog, discover_skills
 from arr.workfolder import USER_AGENT_BLOCK, block_span, load_project_settings
@@ -318,7 +318,8 @@ class CatalogArea:
     async def list_profiles(self) -> list[ProfileInfo]:
         """Profiles from `profiles.yaml` with the remembered test: no call, no keychain."""
         status = load_status()
-        return [
-            profile_info(self.state, profile, status.get(profile.name))
-            for profile in self.state.profiles_or_empty().profiles
-        ]
+        try:
+            profiles = self.state.profiles_or_empty().profiles
+        except (UnicodeDecodeError, OSError):
+            raise unreadable_profiles() from None
+        return [profile_info(self.state, profile, status.get(profile.name)) for profile in profiles]

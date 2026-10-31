@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -134,7 +135,28 @@ async def test_a_failing_sink_is_reported_without_its_text(
 
 async def test_cli_that_cannot_start(tmp_path: Path) -> None:
     result = await capture_token(lambda t: None, cli=tmp_path / "missing", timeout_s=2)
-    assert result.outcome in (CaptureOutcome.NO_TOKEN, CaptureOutcome.START_FAILED)
+    assert result.outcome is CaptureOutcome.START_FAILED
+
+
+async def test_cancel_waits_for_a_running_sink(tmp_path: Path) -> None:
+    """A thread cannot be cancelled: the caller must not go on while it still writes."""
+    cli, _ = fake_cli(tmp_path, PRINT_TOKEN)
+    entered, release, ended = threading.Event(), threading.Event(), threading.Event()
+
+    def sink(token: str) -> None:
+        entered.set()
+        release.wait(10)
+        ended.set()
+
+    task = asyncio.create_task(capture_token(sink, cli=cli, timeout_s=10))
+    assert await asyncio.to_thread(entered.wait, 10)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done(), "the cancellation overtook the sink"
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert ended.is_set()
 
 
 def _parent(cli: Path, limit: int, grace: int) -> subprocess.Popen[bytes]:
