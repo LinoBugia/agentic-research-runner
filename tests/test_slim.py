@@ -5,13 +5,16 @@ import os
 from pathlib import Path
 
 import pytest
-from run_kit import write_profiles
+from run_kit import make_run_input, make_settings, write_profiles
 from service_kit import hold_lock, make_run_folder, make_workfolder
 
 from arr.errors import ArrError
 from arr.models import RunStatus
+from arr.resolve import resolve_run
 from arr.room.store import RoomStore
 from arr.runs import slim as slim_module
+from arr.runs.manager import set_run_status
+from arr.runs.prepare import prepare_run
 from arr.runs.slim import SLIM_MARKER, plan_slim, slim_run
 from arr.service.api_models import ApiException, ErrorCode, RunAction, RunStatusEvent
 from arr.service.real_api import RealApi
@@ -134,8 +137,51 @@ async def test_dry_run_warns_when_the_work_is_saved_nowhere_else(wf: Path, api: 
     assert "Diffs" not in result.message and "Usage" not in result.message
 
 
+def shared_run(wf: Path, status: RunStatus) -> Path:
+    """A run prepared for real, both agents in the shared folder `shared/team/`."""
+    agents = [
+        {"id": agent, "workspace": {"mode": "shared", "name": "team"}} for agent in ("a", "b")
+    ]
+    run_input = make_run_input(agents, [{"name": "main", "members": ["a", "b"]}])
+    settings = make_settings()
+    prepared = prepare_run(wf, run_input, resolve_run(run_input, None, settings), settings)
+    (prepared.run_dir / "shared" / "team" / "beweis.lean").write_text("theorem\n", "utf-8")
+    set_run_status(prepared.run_dir, status)
+    return prepared.run_dir
+
+
+async def test_interrupted_run_warns_for_a_shared_folder_too(wf: Path, api: RealApi) -> None:
+    """Review W3-02.1 N1: the work lies in `shared/<name>/`, no `agents/*/work` exists."""
+    run_dir = shared_run(wf, RunStatus.INTERRUPTED)
+    assert not list(run_dir.glob("agents/*/work"))
+    result = await api.run_action(run_dir.name, RunAction.SLIM, dry_run=True)
+    assert "endgültig weg" in result.message
+
+
+async def test_shared_folder_needs_a_diff_of_every_member(wf: Path, api: RealApi) -> None:
+    run_dir = shared_run(wf, RunStatus.DONE)
+    (run_dir / "agents" / "a" / "changes.diff").write_text("diff\n", "utf-8")
+    result = await api.run_action(run_dir.name, RunAction.SLIM, dry_run=True)
+    assert "endgültig weg" in result.message
+    (run_dir / "agents" / "b" / "changes.diff").write_text("diff\n", "utf-8")
+    result = await api.run_action(run_dir.name, RunAction.SLIM, dry_run=True)
+    assert "endgültig weg" not in result.message
+
+
+async def test_empty_output_is_not_named(wf: Path, api: RealApi) -> None:
+    """Review W3-02.1 N2: only files count; a real interrupted run holds the empty `results/`."""
+    run_dir = finished_run(wf, RunStatus.INTERRUPTED)
+    (run_dir / "output" / "summary.md").unlink()
+    (run_dir / "output" / "results").mkdir(exist_ok=True)
+    result = await api.run_action(run_dir.name, RunAction.SLIM, dry_run=True)
+    assert "Output" not in result.message
+    (run_dir / "output" / "results" / "1.md").write_text("x", "utf-8")
+    result = await api.run_action(run_dir.name, RunAction.SLIM, dry_run=True)
+    assert "Output" in result.message
+
+
 async def test_read_only_lock_gives_a_message_not_a_crash(wf: Path, api: RealApi) -> None:
-    """Review W3-02 G2."""
+    """Review W3-02 G2; the reason is German (W3-02.1 N4)."""
     run_dir = finished_run(wf)
     lock = run_dir / "run.lock"
     lock.write_text("", "utf-8")
@@ -144,6 +190,8 @@ async def test_read_only_lock_gives_a_message_not_a_crash(wf: Path, api: RealApi
         await api.run_action(run_dir.name, RunAction.SLIM)
     assert error.value.error.code is ErrorCode.NOT_ALLOWED
     assert "nichts gelöscht" in error.value.error.message
+    assert "keine Berechtigung" in error.value.error.message
+    assert "Permission" not in error.value.error.message
     assert (run_dir / "base").is_dir() and not (run_dir / SLIM_MARKER).exists()
 
 

@@ -1266,7 +1266,10 @@ def _display_state(
     final: bool,
     last_turn_error: bool,
     items: Sequence[Mapping[str, Any]],
+    not_started: bool = False,
 ) -> tuple[AgentDisplayState, BlockedBy | None]:
+    if not_started:
+        return AgentDisplayState.NOT_STARTED, None
     if final:
         return (AgentDisplayState.ERROR if last_turn_error else AgentDisplayState.DONE), None
     for item in items:
@@ -1327,6 +1330,8 @@ def agent_states(record: RunRecord, resolved: ResolvedRun | None = None) -> list
             final=final,
             last_turn_error=last_error,
             items=items,
+            not_started=record.status is RunStatus.FAILED
+            and (index is None or not index.max_turn()),
         )
         usage, _turns = index.usage() if index is not None else (Usage(), 0)
         cache_ratio = None

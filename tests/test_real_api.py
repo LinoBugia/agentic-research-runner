@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from run_kit import FAST, done, fake_builders, post, room, say, turns, wait, write_profiles
 from run_kit import cost as usage_cost
-from service_kit import append, make_run_folder, make_workfolder
+from service_kit import append, make_run_folder, make_workfolder, transcript_line
 
 from arr.models import RunStatus, Starter
 from arr.permissions.types import ApprovalStatus
@@ -379,6 +379,21 @@ async def test_resume_is_not_offered_and_refused_while_an_escalation_is_open(wf:
         await until_final(api, run_id)
     finally:
         await api.close()
+
+
+async def test_agent_without_a_turn_in_a_failed_run_is_not_started(wf: Path) -> None:
+    """Review W3-02.1 N5, decided by the lead; only `failed`, and only without a turn."""
+    folder = make_run_folder(wf, status=RunStatus.FAILED, agents=["a", "b"])
+    line = transcript_line(1, "a", folder.name, "turn_start", {}) + "\n"
+    append(folder / "agents" / "a" / "transcript.jsonl", line)
+    agents = {a.id: a for a in await make_api(wf).list_agents(folder.name)}
+    assert agents["a"].state is AgentDisplayState.DONE
+    assert agents["b"].state is AgentDisplayState.NOT_STARTED
+    summary = (await make_api(wf).get_run(folder.name)).run
+    assert summary.agents_by_state.not_started == 1
+    stopped = make_run_folder(wf, status=RunStatus.STOPPED, agents=["c"])
+    [agent] = await make_api(wf).list_agents(stopped.name)
+    assert agent.state is AgentDisplayState.DONE
 
 
 async def test_channel_of_run_yaml_without_a_room_is_empty(wf: Path) -> None:

@@ -17,6 +17,7 @@ chats, output and usage stay. This is the one place of W3-02 that deletes data, 
 be repeated.
 """
 
+import errno
 import json
 import logging
 import os
@@ -46,18 +47,23 @@ _KEPT = (
     ("Roh-Events", "agents/*/raw.jsonl"),
     ("Diffs", f"agents/*/{_DIFF}"),
     ("Gruppenchats", "groupchats/room.sqlite"),
-    ("Output", "output/*"),
+    ("Output", "output/**/*"),
     ("Usage", "usage.json"),
 )
-"""What stays, with the German name for the dialog; only what is really there is named."""
+"""What stays, with the German name for the dialog; only files that are really there count."""
+_REASONS = {
+    errno.EACCES: "keine Berechtigung",
+    errno.EPERM: "keine Berechtigung",
+    errno.EROFS: "das Laufwerk ist schreibgeschützt",
+}
 
 
 @dataclass(frozen=True, slots=True)
 class SlimPlan:
     """What `slim_run` would remove; `logical_bytes` is the sum of the file sizes.
 
-    `kept` names what stays. `unsaved`: a working copy has no diff, because the run was not
-    finalized, so its work exists nowhere else.
+    `kept` names what stays. `unsaved`: a working copy or a shared folder goes without a diff,
+    because the run was not finalized, so its work exists nowhere else.
     """
 
     targets: tuple[Path, ...]
@@ -131,11 +137,26 @@ def _refuse_links(folder: Path) -> None:
             )
 
 
+def _reason(exc: OSError) -> str:
+    return _REASONS.get(exc.errno or 0, "der Zugriff auf eine Datei ging nicht")
+
+
 def _unreadable(folder: Path, exc: OSError) -> ArrError:
     return ArrError(
-        f"Der Run {folder.name} wurde nicht verschlankt: {exc.strerror or exc}. Es wurde nichts "
+        f"Der Run {folder.name} wurde nicht verschlankt: {_reason(exc)}. Es wurde nichts "
         "gelöscht. Prüfe die Rechte des Run-Ordners und versuche es noch einmal."
     )
+
+
+def _unsaved(folder: Path, targets: list[Path]) -> bool:
+    """True if work goes that no `changes.diff` holds; members of a shared folder share it."""
+    if any(p.name == _WORK and not (p.parent / _DIFF).is_file() for p in targets):
+        return True
+    shared = folder / "shared"
+    if not _real_dir(shared) or not any(shared.iterdir()):
+        return False
+    agents = [p for p in (folder / _AGENTS).glob("*") if _real_dir(p)]
+    return not agents or any(not (p / _DIFF).is_file() for p in agents)
 
 
 def check_slimmable(run_dir: str | Path) -> None:
@@ -158,8 +179,8 @@ def plan_slim(run_dir: str | Path) -> SlimPlan:
         size = sum(_logical_size(p) for p in targets)
         if venv is not None:
             size += _logical_size(venv)
-        kept = tuple(name for name, found in _KEPT if next(folder.glob(found), None))
-        unsaved = any(p.name == _WORK and not (p.parent / _DIFF).is_file() for p in targets)
+        kept = tuple(name for name, found in _KEPT if any(p.is_file() for p in folder.glob(found)))
+        unsaved = _unsaved(folder, targets)
     except OSError as exc:
         raise _unreadable(folder, exc) from None
     return SlimPlan(tuple(targets), venv, size, kept, unsaved)
@@ -223,7 +244,7 @@ def slim_run(run_dir: str | Path) -> SlimPlan:
             )
         except OSError as exc:
             raise ArrError(
-                f"Der Run {folder.name} wurde nicht ganz verschlankt: {exc.strerror or exc}. "
+                f"Der Run {folder.name} wurde nicht ganz verschlankt: {_reason(exc)}. "
                 "Transkripte und Chat sind unverändert, du kannst es noch einmal versuchen."
             ) from None
         return plan

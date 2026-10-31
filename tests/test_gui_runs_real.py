@@ -476,6 +476,37 @@ async def test_channel_opened_before_the_room_exists_is_empty_and_fills_itself(
         await until_final(api, run_id)
 
 
+async def test_channel_built_before_the_room_is_chosen_again_with_its_aliases(
+    wf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review W3-02.1 N3: only the room knows the aliases; messages alone do not bring them to
+    the input bar, so the view is built anew when the run leaves the preparation."""
+    (wf / "skills" / "runde" / "group.yaml").write_text(
+        GROUP.replace("members: [m-*]", "members: [m-*], anonymous: true")
+    )
+    room_may_come = asyncio.Event()
+    setup = RunManager._setup
+
+    async def late_setup(manager: RunManager) -> None:
+        await room_may_come.wait()
+        await setup(manager)
+
+    monkeypatch.setattr(RunManager, "_setup", late_setup)
+    api = make_api(wf, {"m-1": turns([wait(30)]), "m-2": turns([wait(30)])})
+    async with real_user(api) as user:
+        run_id = (await api.start_run(FORM)).run_id
+        await until_status(api, run_id, RunStatus.PREPARING)
+        await user.open(f"/runs/{run_id}?kanal=main")
+        try:
+            await see(user, "Noch keine Nachrichten.", retries=200)
+        finally:
+            room_may_come.set()
+        html = await see(user, "Senden", retries=400)
+        assert '<option value="m-1">Mitglied A</option>' in html
+        await api.run_action(run_id, RunAction.STOP)
+        await until_final(api, run_id)
+
+
 async def test_view_that_failed_comes_back_with_the_next_status(
     wf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -532,7 +563,7 @@ async def test_failure_on_the_open_page_shows_the_flow_at_the_error(
             fail_now.set()
         html = await see(user, 'data-open-at="log-fehler"', retries=600)
         assert "Topologie kaputt" in html and "Steckbrief #main" not in html
-        assert "wartet</span>" not in html and "fertig</span>" in html
+        assert "wartet</span>" not in html and "nicht gestartet</span>" in html
 
 
 async def test_deep_link_opened_too_early_finds_its_agent(wf: Path) -> None:
