@@ -1088,7 +1088,6 @@ _HANDOFF_STATE = {
     RunStatus.DONE: "ist fertig",
     RunStatus.STOPPED: "wurde gestoppt",
     RunStatus.FAILED: "ist fehlgeschlagen",
-    RunStatus.INTERRUPTED: "wurde abgebrochen",
 }
 
 
@@ -1117,6 +1116,11 @@ def actions_allowed(
 
 
 def handoff_text(record: RunRecord) -> str:
+    if record.status is RunStatus.INTERRUPTED:  # no finalizer, so no summary
+        return (
+            f"Run {record.run_id} wurde abgebrochen und hat keine Zusammenfassung. Lies die "
+            f"Ergebnisse (read_results). Ordner: {record.run_dir}"
+        )
     if record.final:
         state = _HANDOFF_STATE.get(record.status, "ist beendet")
         return (

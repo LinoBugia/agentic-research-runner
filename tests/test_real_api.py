@@ -422,7 +422,9 @@ async def test_text_for_claude_code_follows_the_status(
 ) -> None:
     """Review W3-02 G8."""
     folder = make_run_folder(wf, status=status)
-    assert text in (await make_api(wf).get_run(folder.name)).handoff_text
+    handoff = (await make_api(wf).get_run(folder.name)).handoff_text
+    assert text in handoff
+    assert ("read_run_summary" in handoff) is (status is not RunStatus.INTERRUPTED)
 
 
 @pytest.mark.parametrize(
