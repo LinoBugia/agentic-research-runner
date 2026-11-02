@@ -12,6 +12,7 @@ import re
 from nicegui import ui
 
 from arr.service.api_client import ApiClient
+from arr.service.api_models import SLUG as API_SLUG
 from arr.service.api_models import (
     ApiException,
     CreateProjectRequest,
@@ -39,7 +40,7 @@ from arr.service.gui.components.page_state import (
 from arr.service.gui.layout import Frame
 from arr.service.gui.texts import Status
 
-SLUG = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+SLUG = re.compile(API_SLUG)
 NEW_FILES = "CLAUDE.md (mit arr-Block), AGENTS.md, .mcp.json, Skill-Links, project.yaml und die "
 NEW_FILES += "Ordner notes/, tex/, code/, results/"
 OK = Status("st-ok", "check", "eingerichtet")
@@ -176,7 +177,7 @@ class ProjektePage:
                     finder = button(
                         "Im Finder öffnen",
                         lambda: self.frame.toast(
-                            f"Im Finder geöffnet: {project.path} (im Prototyp nur angezeigt)"
+                            f"Im Finder öffnen kommt mit der fertigen App. Pfad: {project.path}"
                         ),
                         classes="btn btn-sm",
                     )
@@ -271,8 +272,8 @@ class ProjektePage:
                         button(
                             action.label,
                             lambda: self.frame.toast(
-                                "Im Prototyp gibt es keinen Ordnerdialog. arr sucht den Ordner "
-                                "über „Ordner wählen …“."
+                                "Einen Ordnerdialog gibt es noch nicht. Lege den Ordner wieder "
+                                "unter projects/ ab."
                             ),
                             classes="btn btn-sm",
                         )
@@ -334,7 +335,7 @@ class ProjektePage:
                 name = value.strip() or "…"
                 path_hint["el"].set_content(
                     f'Wird zu <span class="mono">{esc(self.root)}/{esc(name)}</span>. '
-                    "Kleinbuchstaben, Ziffern und Bindestriche."
+                    "Kleinbuchstaben, Ziffern, Binde- und Unterstriche."
                 )
 
             fields["name"] = Field(
@@ -351,7 +352,8 @@ class ProjektePage:
             name = fields["name"].value.strip()
             if not SLUG.match(name):
                 fields["name"].set_error(
-                    "Nimm Kleinbuchstaben, Ziffern und Bindestriche, z. B. goldbach-schwach."
+                    "Nimm Kleinbuchstaben, Ziffern, Binde- und Unterstriche, höchstens 64 "
+                    "Zeichen, z. B. goldbach-schwach."
                 )
                 return "Der Ordnername passt nicht."
             try:
@@ -382,8 +384,8 @@ class ProjektePage:
                 "Ordner",
                 name="existing-path",
                 value=f"{self.root}/",
-                help_text="Im Prototyp tippst du den Pfad. Die fertige App öffnet dafür den "
-                "Ordnerdialog von macOS.",
+                help_text="Tippe den Pfad. Die fertige App öffnet dafür den Ordnerdialog von "
+                "macOS.",
             )
 
         async def submit() -> str | None:
@@ -391,7 +393,8 @@ class ProjektePage:
             name = path.rsplit("/", 1)[-1].lower()
             if not name or not SLUG.match(name):
                 fields["path"].set_error(
-                    "Der Ordnername muss aus Kleinbuchstaben, Ziffern und Bindestrichen bestehen."
+                    "Der Ordnername muss aus Kleinbuchstaben, Ziffern, Binde- und Unterstrichen "
+                    "bestehen, höchstens 64 Zeichen."
                 )
                 return "Der Ordner passt nicht."
             try:
@@ -402,8 +405,10 @@ class ProjektePage:
                 fields["path"].set_error(exc.error.message)
                 return "Der Ordner lässt sich so nicht einrichten."
             added = ", ".join(result.created)
-            self.frame.toast(f"{result.message} arr hat ergänzt: {added}.")
-            await self._reload(name)
+            self.frame.toast(
+                f"{result.message} arr hat ergänzt: {added}." if added else result.message
+            )
+            await self._reload(result.project.name)
             return None
 
         self.dialog.open("Vorhandenen Ordner einrichten", "Einrichten", build, submit)

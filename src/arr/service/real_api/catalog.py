@@ -4,17 +4,20 @@ docs/08-ux-konzept.md §5.4, §5.6, §5.7).
 Projects come from `projects/` with their setup checks, skills from `discover_skills` with
 the parameters of their `group.yaml`, profiles from `profiles.yaml` only: no test, no secret
 (W3-05 adds testing and logins in `profiles`; W3-04 adds creating projects in `setup`;
-W4-02 the skill editor).
+W4-02 the skill editor). The checks show what `setup_project` would still do; arr has no
+`arr mcp` before W4-01, so the `.mcp.json` check looks at the file only.
 """
 
+import json
 import os
 import time
 from pathlib import Path
 
 from arr.errors import ArrError, ConfigError
-from arr.models import GroupSpec, ParamSpec
+from arr.models import GroupSpec, ParamSpec, ProjectSettings
 from arr.resolve import _count_param, load_group_spec
 from arr.service.api_models import (
+    Action,
     ParamInfo,
     ProfileInfo,
     ProjectCheck,
@@ -31,8 +34,8 @@ from arr.service.api_models import (
 from arr.service.real_api.base import ServiceState, not_found
 from arr.service.real_api.profiles import load_status, profile_info, unreadable_profiles
 from arr.service.real_api.rundir import open_items
-from arr.skills import SkillAudience, SkillCatalog, discover_skills
-from arr.workfolder import USER_AGENT_BLOCK, block_span, load_project_settings
+from arr.skills import SkillAudience, SkillCatalog, discover_skills, skills_for_user_agent
+from arr.workfolder import USER_AGENT_BLOCK, block_span, load_project_settings, os_reason
 
 MAX_FILES = 200
 MAX_FILE_BYTES = 512 * 1024
@@ -76,6 +79,25 @@ def _param_type(spec: ParamSpec) -> str:
     return "str"
 
 
+def _project_title(claude_text: str, fallback: str) -> str:
+    """The title from the first line of the template's `CLAUDE.md`, „# Projekt: <title>“."""
+    first = claude_text.split("\n", 1)[0]
+    return first.removeprefix("# Projekt:").strip() if first.startswith("# Projekt:") else fallback
+
+
+def _mcp_state(file: Path) -> tuple[bool, str]:
+    """Whether the `.mcp.json` of a project names the server `arr`, with the check's text."""
+    if not file.is_file():
+        return False, ".mcp.json fehlt"
+    try:
+        servers = json.loads(file.read_text("utf-8")).get("mcpServers")
+    except (OSError, ValueError, AttributeError):
+        return False, ".mcp.json ist kein gültiges JSON"
+    if isinstance(servers, dict) and "arr" in servers:
+        return True, ".mcp.json vorhanden"
+    return False, ".mcp.json ohne Server „arr“"
+
+
 def _agents_count(spec: GroupSpec) -> int | None:
     """Agents a group starts with its defaults; None if a `count` has no default."""
     total = 0
@@ -112,49 +134,87 @@ class CatalogArea:
                     waiting += 1
         return ProjectRuns(total=total, active=active, waiting=waiting)
 
-    def _project(self, folder: Path) -> ProjectInfo:
-        checks = []
+    def _skill_links(
+        self, folder: Path, settings: ProjectSettings, catalog: SkillCatalog
+    ) -> tuple[bool, str]:
+        """Links in `.claude/skills/` against the skills offered to the user agent."""
+        try:
+            wanted = skills_for_user_agent(catalog, settings)
+        except ArrError as exc:
+            return False, exc.message
+        links = folder / ".claude" / "skills"
+        found = sum(
+            1 for s in wanted if (links / s.name).is_symlink() and (links / s.name).exists()
+        )
+        if not wanted:
+            return True, "Skill-Links: keine Skills für Claude Code im Workfolder"
+        return found == len(wanted), f"Skill-Links: {found} von {len(wanted)}"
+
+    def _project(self, folder: Path, catalog: SkillCatalog) -> ProjectInfo:
+        repair = Action(label="Reparieren", url=f"/projekte/{folder.name}")
+
+        def check(
+            key: str, ok: bool, message: str, *, detail: str | None = None, repairable: bool = True
+        ) -> ProjectCheck:
+            return ProjectCheck(
+                key=key,
+                ok=ok,
+                severity=Severity.INFO
+                if ok
+                else (Severity.WARNING if repairable else Severity.ERROR),
+                message=message,
+                detail=detail,
+                action=repair if repairable and not ok else None,
+            )
+
         claude = folder / "CLAUDE.md"
+        claude_text = ""
         has_block = False
+        claude_problem = None
         if claude.is_file():
             try:
-                has_block = block_span(claude.read_text("utf-8"), USER_AGENT_BLOCK) is not None
-            except (OSError, ArrError):
-                has_block = False
-        checks.append(
-            ProjectCheck(
-                key="claude_md",
-                ok=has_block,
-                severity=Severity.INFO if has_block else Severity.WARNING,
-                message="CLAUDE.md mit arr-Block vorhanden"
-                if has_block
-                else "CLAUDE.md ohne arr-Block: Claude Code kennt arr in diesem Projekt nicht",
-            )
-        )
-        mcp = (folder / ".mcp.json").is_file()
-        checks.append(
-            ProjectCheck(
-                key="mcp_json",
-                ok=mcp,
-                severity=Severity.INFO if mcp else Severity.WARNING,
-                message=".mcp.json vorhanden" if mcp else ".mcp.json fehlt",
-            )
-        )
-        agents = (folder / "AGENTS.md").is_file()
-        checks.append(
-            ProjectCheck(
-                key="agents_md",
-                ok=agents,
-                severity=Severity.INFO,
-                message="AGENTS.md vorhanden" if agents else "AGENTS.md fehlt (für Codex)",
-            )
-        )
+                claude_text = claude.read_text("utf-8")
+                has_block = block_span(claude_text, USER_AGENT_BLOCK) is not None
+            except ArrError as exc:
+                claude_problem = exc.message
+            except UnicodeDecodeError:
+                claude_problem = "Sie ist nicht in UTF-8 gespeichert. Speichere sie im Editor so."
+            except OSError as exc:
+                reason = os_reason(exc)
+                claude_problem = f"{reason[0].upper()}{reason[1:]}. Prüfe die Rechte der Datei."
         try:
             settings = load_project_settings(folder)
-            copy_exclude = list(settings.copy_exclude)
-            read_dirs = [str(d) for d in settings.read_dirs]
         except ArrError:
-            copy_exclude, read_dirs = [], []
+            settings = ProjectSettings()
+        mcp, mcp_text = _mcp_state(folder / ".mcp.json")
+        links, links_text = self._skill_links(folder, settings, catalog)
+        agents = (folder / "AGENTS.md").is_file()
+        checks = [
+            check(
+                "claude_md",
+                False,
+                "CLAUDE.md lässt sich nicht lesen",
+                detail=claude_problem,
+                repairable=False,
+            )
+            if claude_problem
+            else check(
+                "claude_md",
+                has_block,
+                "CLAUDE.md mit arr-Block vorhanden"
+                if has_block
+                else "CLAUDE.md ohne arr-Block: Claude Code kennt arr in diesem Projekt nicht",
+            ),
+            check("mcp_json", mcp, mcp_text),
+            check("skill_links", links, links_text),
+            check(
+                "agents_md",
+                agents,
+                "AGENTS.md vorhanden" if agents else "AGENTS.md fehlt (für Codex)",
+            ),
+        ]
+        copy_exclude = list(settings.copy_exclude)
+        read_dirs = [str(d) for d in settings.read_dirs]
         folders = []
         try:
             for entry in sorted(folder.iterdir()):
@@ -169,11 +229,9 @@ class CatalogArea:
             modified = time.time()
         return ProjectInfo(
             name=folder.name,
-            title=folder.name,
+            title=_project_title(claude_text, folder.name),
             path=str(folder),
-            setup_ok=all(c.ok for c in checks if c.severity is not Severity.INFO or c.ok)
-            and has_block
-            and mcp,
+            setup_ok=has_block and mcp and links,
             size_bytes=size,
             modified_at=modified,
             runs=self._project_runs(folder.name),
@@ -191,13 +249,14 @@ class CatalogArea:
             )
         except OSError:
             return []
-        return [self._project(folder) for folder in folders]
+        catalog = self._catalog()
+        return [self._project(folder, catalog) for folder in folders]
 
     async def get_project(self, name: str) -> ProjectInfo:
         folder = self.state.workfolder / "projects" / name
         if "/" in name or name in (".", "..") or not folder.is_dir():
             raise not_found("Projekt", name)
-        return self._project(folder)
+        return self._project(folder, self._catalog())
 
     # -- skills -----------------------------------------------------------------------------
 

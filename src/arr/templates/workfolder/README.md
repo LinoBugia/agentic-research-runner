@@ -27,4 +27,4 @@ runs/           ein Ordner pro Run: Konfiguration, Protokolle, Ergebnisse
 
 1. Lege ein Projekt unter `projects/` an (Ordner mit einer `CLAUDE.md`).
 2. Lege eigene Skills unter `skills/` ab.
-3. Starte die Oberfläche mit `arr gui`.
+3. Starte die Oberfläche mit `arr serve`.

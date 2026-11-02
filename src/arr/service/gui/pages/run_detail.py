@@ -479,6 +479,13 @@ class RunDetailPage:
             await self.select(
                 "seq" if seq is not None else "agent", p["agent"], seq=seq, push=False
             )
+        elif p.get("agent") and not self.agents and not self.status.is_final:
+            # a deep link waits for the agents: `_sync_structure` comes back here, also when
+            # the run ends without them
+            self._show_preparing(
+                f"„{p['agent']}“ erscheint hier, sobald die Arbeitskopie bereit ist. Das dauert "
+                "meist nur Sekunden."
+            )
         elif p.get("ansicht") == "ablauf" or (
             self.status is RunStatus.FAILED and not p.get("kanal") and not p.get("nachricht")
         ):
@@ -506,18 +513,19 @@ class RunDetailPage:
         elif self.agents:
             await self.select("agent", next(iter(self.agents)), push=False)
         else:
-            self._render_tabs()
-            self.view_box.clear()
-            with self.view_box:
-                raw(
-                    empty_state_html(
-                        "hourglass_empty",
-                        "Der Run wird vorbereitet",
-                        "Agenten und Kanäle erscheinen hier, sobald ihre Arbeitskopien bereit "
-                        "sind. Das dauert meist nur Sekunden.",
-                    ),
-                    classes="rd-scroll pad",
-                )
+            self._show_preparing(
+                "Agenten und Kanäle erscheinen hier, sobald ihre Arbeitskopien bereit sind. Das "
+                "dauert meist nur Sekunden."
+            )
+
+    def _show_preparing(self, text: str) -> None:
+        self._render_tabs()
+        self.view_box.clear()
+        with self.view_box:
+            raw(
+                empty_state_html("hourglass_empty", "Der Run wird vorbereitet", text),
+                classes="rd-scroll pad",
+            )
 
     def _default_channel(self) -> str:
         """Live: the channel with the newest unread message, else the first open one (§6.5)."""

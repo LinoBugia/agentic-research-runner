@@ -9,7 +9,7 @@ import asyncio
 import json
 import shutil
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -31,7 +31,7 @@ from test_gui_real import page_html, see
 from arr.models import RunStatus
 from arr.room.store import RoomStore
 from arr.room.types import DeliveryStatus, MessageKind
-from arr.runs.manager import RunManager
+from arr.runs.manager import RunManager, set_run_status
 from arr.service.api_models import (
     ApiException,
     ChannelMessageEvent,
@@ -711,6 +711,8 @@ async def test_live_updates_keep_rows_and_the_open_menu(wf: Path) -> None:
         started = await api.start_run(FORM)
         await user.open(f"/runs/{started.run_id}")
         await see(user, "erste", retries=400)
+        # the first lines can beat `running`, and that change redraws the actions for good reason
+        await see(user, "Pausieren", retries=200)
         with user.client:
             menu = next(iter(user.find(marker="menu").elements))
             row_ids = {e.id for e in user.client.elements.values() if e._classes == ["msg-row"]}
@@ -954,3 +956,56 @@ async def test_check_list_has_no_check_mark_next_to_a_missing_role(wf: Path) -> 
         await user.open("/neuer-run?skill=runde&projekt=demo")
         html = await see(user, "fehlt.md", retries=200)
         assert "Rollen und Skills gefunden" not in html
+
+
+# --- W3-04.3: a deep link that is faster than the agents ----------------------------------------
+
+
+@pytest.fixture
+def no_agents_yet(
+    wf: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[RealApi, Path, list]]:
+    """A queued run whose channel is known from `run.yaml` while the agents are not there."""
+    folder = make_run_folder(wf, status=RunStatus.QUEUED)
+    lock = hold_lock(folder)
+    api = make_api(wf)
+    real = api.list_agents
+    ready: list[bool] = []
+
+    async def agents(run_id: str) -> Any:
+        return await real(run_id) if ready else []
+
+    monkeypatch.setattr(api, "list_agents", agents)
+    yield api, folder, ready
+    lock.release()
+
+
+async def test_a_deep_link_waits_for_its_agent(no_agents_yet: tuple[RealApi, Path, list]) -> None:
+    api, folder, ready = no_agents_yet
+    async with real_user(api) as user:
+        await user.open(f"/runs/{folder.name}?agent=a")
+        html = await see(user, "„a“ erscheint hier, sobald die Arbeitskopie bereit ist.")
+        assert "Der Run wird vorbereitet" in html and "Steckbrief" not in html
+        ready.append(True)
+        set_run_status(folder, RunStatus.RUNNING)
+        html = await see(user, "Noch keine Ereignisse", retries=200)
+        assert "· Transkript ·" in html
+        assert "erscheint hier, sobald" not in html
+
+
+@pytest.mark.parametrize("final", [RunStatus.STOPPED, RunStatus.FAILED])
+async def test_a_deep_link_does_not_wait_past_the_end_of_the_run(
+    no_agents_yet: tuple[RealApi, Path, list], final: RunStatus
+) -> None:
+    api, folder, _ready = no_agents_yet
+    async with real_user(api) as user:
+        await user.open(f"/runs/{folder.name}?agent=a")
+        await see(user, "erscheint hier, sobald die Arbeitskopie bereit ist.")
+        set_run_status(folder, final)
+        for _ in range(200):
+            html = page_html(user)
+            if "erscheint hier, sobald" not in html:
+                break
+            await asyncio.sleep(0.05)
+        assert "erscheint hier, sobald" not in html
+        assert "Der Run wird vorbereitet" not in html

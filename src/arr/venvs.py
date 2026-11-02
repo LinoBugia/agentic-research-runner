@@ -127,7 +127,8 @@ def _ensure_private_dir(path: Path) -> Path:
         raise ArrError(
             f"Der Ordner für die Python-Umgebungen {path} ist für Gruppe oder andere "
             f"beschreibbar. Andere Benutzer könnten dort Programme ablegen, die deine Agenten "
-            f"ausführen. Entziehe die Rechte mit „chmod 700 {path}“ und starte den Run neu."
+            "ausführen. Nimm Gruppe und anderen im Finder unter „Informationen“ das Schreibrecht "
+            "und starte den Run neu."
         )
     if problem:
         raise ArrError(

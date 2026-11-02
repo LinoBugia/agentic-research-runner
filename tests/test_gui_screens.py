@@ -326,7 +326,7 @@ async def test_projects_list_detail_repair_and_new(api: MockApi) -> None:
         await see(user, "arr legt an:")
         user.find(marker="field-new-name").trigger("input", "Goldbach Schwach")
         user.find(marker="form-confirm").click()
-        await see(user, "Nimm Kleinbuchstaben, Ziffern und Bindestriche")
+        await see(user, "Nimm Kleinbuchstaben, Ziffern, Binde- und Unterstriche")
         user.find(marker="field-new-name").trigger("input", "goldbach-schwach")
         user.find(marker="form-confirm").click()
         await see(user, "Projekt „goldbach-schwach“ angelegt.")

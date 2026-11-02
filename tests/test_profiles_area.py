@@ -41,7 +41,7 @@ from arr.backends.codex_login import (
     own_login_folder,
     prepare_login_dir,
 )
-from arr.models import AuthKind, AuthProfile, ProfilesFile, RunStatus
+from arr.models import AuthKind, AuthProfile, ProfilesFile, Provider, RunStatus
 from arr.resolve import load_yaml_model
 from arr.service.api_models import (
     ApiException,
@@ -53,6 +53,7 @@ from arr.service.profile_check import CheckFailure, CheckResult, check_profile, 
 from arr.service.real_api import RealApi
 from arr.service.real_api.profiles import STATUS_FILE
 from arr.settings import app_dir
+from arr.workfolder import load_workfolder_settings
 
 BASE = "http://127.0.0.1:8765"
 KEY = "sk-ant-api03-MARKERKEY-0123456789"
@@ -854,7 +855,9 @@ async def test_mac_login_card_and_failed_test_on_the_page(
         assert "Die Anmeldung von „max“ ist abgelaufen" in html and "Neu anmelden" in html
 
 
-async def test_api_key_profile_from_the_page(api: RealApi, keychain: dict, calls: list) -> None:
+async def test_api_key_profile_from_the_page(
+    api: RealApi, keychain: dict, calls: list, wf: Path
+) -> None:
     async with gui_user(api) as user:  # type: ignore[arg-type]
         await user.open("/profile?neu=1")
         await see(user, "Neues Auth-Profil")
@@ -863,17 +866,19 @@ async def test_api_key_profile_from_the_page(api: RealApi, keychain: dict, calls
         user.find(marker="field-new-profile-name").trigger("input", "api-neu")
         user.find(marker="field-new-key").trigger("input", KEY)
         user.find(marker="form-confirm").click()
-        html = await see(user, "kommt mit Auftrag W3-04", retries=200)
-        assert KEY not in html
+        html = await see(user, "✓ api-neu gespeichert und getestet.", retries=200)
+        assert KEY not in html and "W3-04" not in html
     assert keychain[("arr", "api-neu")] == KEY and calls
+    assert "api-neu" in load_workfolder_settings(wf).concurrency
 
 
-async def test_default_button_shows_the_message_until_w3_04(api: RealApi) -> None:
+async def test_default_button_makes_the_profile_the_standard(api: RealApi, wf: Path) -> None:
     async with gui_user(api) as user:  # type: ignore[arg-type]
         await user.open("/profile")
         await see(user, "Standard für Claude")
         user.find(marker="default-max").click()
-        await see(user, "kommt mit Auftrag W3-04", retries=200)
+        await see(user, "max ist jetzt Standard für Claude", retries=200)
+    assert load_workfolder_settings(wf).defaults[Provider.CLAUDE].auth == "max"
 
 
 # -- W3-05.1: „Key ersetzen“ -------------------------------------------------------------------

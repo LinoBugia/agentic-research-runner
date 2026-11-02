@@ -6,11 +6,16 @@ live stream, the registry of the runs this service executes (`RunHandle` with th
 `RunManager`), the `ProfileGate`s shared by all runs, and the base URL for `gui_url`s. The
 helpers below build the uniform errors (docs/08 §8.4) and the German messages of the areas
 that later orders fill in (`unavailable`).
+
+`switch_workfolder` replaces workfolder, settings, store and registry (W3-04), so areas read
+them from the state on every use and never keep them. `hub` and `gates` stay: subscribers
+hang on the hub, and a profile's concurrency and rate-limit state belong to the process.
 """
 
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,7 +28,7 @@ from arr.runs.orchestrator import ProfileGate
 from arr.service.api_client import EventHub
 from arr.service.api_models import ApiException, ErrorCode
 from arr.service.real_api.rundir import RunStore
-from arr.workfolder import load_workfolder_settings
+from arr.workfolder import is_workfolder, load_workfolder_settings
 
 log = logging.getLogger("arr.service")
 
@@ -43,6 +48,15 @@ def not_found(what: str, ident: str) -> ApiException:
 
 def not_allowed(message: str, **fields: Any) -> ApiException:
     return ApiException.of(ErrorCode.NOT_ALLOWED, message, **fields)
+
+
+def workfolder_gone(workfolder: Path) -> ArrError:
+    """`arr.yaml` went away while the service runs; the core's text names a command."""
+    return ArrError(
+        f"In {workfolder} fehlt die arr.yaml. Wurde der Ordner verschoben oder die Datei "
+        "gelöscht? Stelle sie wieder her oder wechsle auf der Start-Seite zu einem anderen "
+        "Workfolder."
+    )
 
 
 def from_arr_error(exc: ArrError, code: ErrorCode = ErrorCode.INVALID) -> ApiException:
@@ -124,6 +138,7 @@ class ServiceState:
         self.store = RunStore(self.workfolder / "runs")
         self.interrupted_at_start: list[str] = []
         self.started = time.time()
+        self.on_switch: list[Callable[[], None]] = []
 
     @staticmethod
     def now() -> float:
@@ -150,5 +165,33 @@ class ServiceState:
 
     def reload_settings(self) -> WorkfolderSettings:
         """Read `arr.yaml` again (the service keeps its settings otherwise)."""
+        if not is_workfolder(self.workfolder):
+            raise workfolder_gone(self.workfolder)
         self.settings = load_workfolder_settings(self.workfolder)
+        self._sync_gates()
         return self.settings
+
+    def _sync_gates(self) -> None:
+        """Existing `ProfileGate`s take the limits of the settings; waiters check again."""
+        for name, gate in self.gates.items():
+            gate.limit = self.settings.concurrency.get(name)
+            gate.kick()
+
+    def switch_workfolder(
+        self, workfolder: Path, settings: WorkfolderSettings, interrupted: list[str]
+    ) -> None:
+        """Go over to `workfolder` in one step; the caller makes sure no own run is active.
+
+        `interrupted`: runs of the new workfolder that its recovery changed. Runs through
+        without yielding to the event loop, so no area sees a half-switched state.
+        """
+        self.workfolder = workfolder
+        self.settings = settings
+        store = RunStore(workfolder / "runs")
+        store.item_lines = self.store.item_lines  # the inbox of own runs stays the only source
+        self.store = store
+        self.registry = RunRegistry()
+        self.interrupted_at_start = interrupted
+        self._sync_gates()
+        for listener in self.on_switch:
+            listener()

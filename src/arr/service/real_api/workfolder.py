@@ -39,17 +39,22 @@ def _projects_count(workfolder: Path) -> int:
         return 0
 
 
-def counts(state: ServiceState) -> GlobalCounts:
-    """The global counters (docs/08 §8.3) from the run store."""
-    records = state.store.scan(refresh=False)
+def active_records(state: ServiceState) -> list[RunRecord]:
+    """The runs that count as „Aktiv“ (docs/08 §8.3), with fresh metadata."""
     now = state.now()
     active = []
-    for record in records:
+    for record in state.store.scan(refresh=False):
         if record.status.is_active:
             record.refresh_meta()
             if counts_as_active(record, now):
                 record.approvals.refresh()
                 active.append(record)
+    return active
+
+
+def counts(state: ServiceState) -> GlobalCounts:
+    """The global counters (docs/08 §8.3) from the run store."""
+    active = active_records(state)
     waiting = sum(len(open_items(r)) for r in active)
     return GlobalCounts(waiting=waiting, active=len(active), warnings=len(warnings(state)))
 
@@ -127,7 +132,7 @@ class WorkfolderArea:
                     name=path.name,
                     path=str(path),
                     projects_count=_projects_count(path),
-                    active_runs=0,
+                    active_runs=len(active_records(self.state)) if path == root else None,
                 )
             )
         return WorkfolderInfo(

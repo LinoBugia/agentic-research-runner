@@ -20,6 +20,7 @@ from arr.service.api_models import (
     ApprovalItem,
     ApprovalRunRef,
     EscalationOptionInfo,
+    NotificationEvent,
     RiskInfo,
     RiskLevel,
     RunStatusEvent,
@@ -33,7 +34,9 @@ from arr.service.notify import (
     message_for,
     osascript_args,
     send_notification,
+    switched_on,
 )
+from arr.service.state import write_app_settings
 
 SECRET = "sk-ant-api03-SECRETSECRETSECRET"
 ATTACK = '" & (do shell script "touch PWNED") & "'
@@ -194,3 +197,49 @@ async def test_a8_a_failing_sender_holds_nothing_up() -> None:
 
 def test_tests_never_show_real_notifications() -> None:
     assert os.environ.get("ARR_NOTIFY") == "off"
+
+
+async def pumped(events: list[Any]) -> list[str]:
+    """What a `Notifier` sends for `events`; a marker behind them shows it has seen all."""
+    hub = EventHub()
+    sent: list[str] = []
+    notifier = Notifier(hub, lambda text, _title: sent.append(text))
+    notifier.start()
+    for event in [*events, created(permission(id="apr_ende", gui_url="http://x/e"))]:
+        hub.publish(event)
+    for _ in range(500):
+        if any("fragt nach" in t for t in sent):
+            break
+        await asyncio.sleep(0.01)
+    await notifier.stop()
+    return sent
+
+
+FINISHED = run_event(RunStatus.DONE, RunStatus.RUNNING)
+
+
+async def test_the_switch_for_finished_runs_is_read_at_every_event(arr_home: Path) -> None:
+    write_app_settings({"notifications": {"run_finished": False}})
+    assert not any(t.startswith("Run fertig") for t in await pumped([FINISHED]))
+    write_app_settings({"notifications": {"run_finished": True}})
+    assert any(t.startswith("Run fertig") for t in await pumped([FINISHED]))
+
+
+async def test_a_missing_switch_means_on(arr_home: Path) -> None:
+    write_app_settings({"notifications": {"storage_low": False}})
+    assert any(t.startswith("Run fertig") for t in await pumped([FINISHED]))
+    write_app_settings({"open_in": "tab"})
+    assert any(t.startswith("Run fertig") for t in await pumped([FINISHED]))
+
+
+async def test_a_new_approval_comes_whatever_the_switches_say(arr_home: Path) -> None:
+    write_app_settings({"notifications": {"approval": False, "run_finished": False}})
+    assert switched_on(created(permission()))
+    assert any("fragt nach" in t for t in await pumped([]))
+
+
+def test_only_finished_runs_have_a_switch_of_their_own(arr_home: Path) -> None:
+    """The others of §5.11 raise nothing here yet; see the report of W3-04.3."""
+    write_app_settings({"notifications": {e.value: False for e in NotificationEvent}})
+    assert not switched_on(FINISHED)
+    assert switched_on(created(permission()))

@@ -426,7 +426,8 @@ class WorkfolderRef(ApiModel):
     name: str
     path: str
     projects_count: int = Field(ge=0)
-    active_runs: int = Field(ge=0)
+    active_runs: int | None = Field(default=None, ge=0)
+    """Active runs from the run data; only the open workfolder knows them, else `None`."""
 
 
 class WorkfolderInfo(ApiModel):
@@ -1661,6 +1662,13 @@ class ToolchainCandidate(ApiModel):
     packages: dict[str, bool] = Field(default_factory=dict)
 
 
+class ToolchainNotice(ApiModel):
+    """Why Codex agents cannot use a Python (docs/08 §8.4): what happened, then why and how."""
+
+    title: str
+    text: str
+
+
 class SetupState(ApiModel):
     """State of the setup assistant (docs/08 §5.12 `GET /api/setup/state`)."""
 
@@ -1674,7 +1682,7 @@ class SetupState(ApiModel):
 # Settings, mandate, fixed rules, profiles, projects, skill files, workfolder (W1-08 screens)
 # --------------------------------------------------------------------------------------------
 
-_SLUG = r"^[a-z0-9][a-z0-9_-]{0,63}$"
+SLUG = r"^[a-z0-9][a-z0-9_-]{0,63}$"
 
 
 class OpenIn(StrEnum):
@@ -1721,6 +1729,10 @@ class AppSettings(ApiModel):
         return self
 
 
+SYSTEM_PYTHON = "System-Python"
+"""Choice „no base venv“ in the settings: the Python arr itself is based on."""
+
+
 class ProviderDefaultsInfo(ApiModel):
     """Standard profile, model and effort of one provider (docs/08 §5.11 „Standards“)."""
 
@@ -1758,7 +1770,9 @@ class WorkfolderSettingsInfo(ApiModel):
     """Settings of the current workfolder (`arr.yaml`, docs/08 §5.11).
 
     `user_agent_runs_require_approval` is shown only and always true (E15). `running_runs`
-    feeds the hint „gilt sofort, auch in n laufenden Runs“.
+    feeds the hint „gilt sofort, auch in n laufenden Runs“. `toolchain_candidates` are the
+    base venvs to choose from, `toolchain_notice` says why Codex agents cannot use the current
+    Python, before a run fails on it (docs/08 §8.4).
     """
 
     defaults: dict[Provider, ProviderDefaultsInfo] = Field(default_factory=dict)
@@ -1769,6 +1783,8 @@ class WorkfolderSettingsInfo(ApiModel):
     retention: RetentionInfo = Field(default_factory=RetentionInfo)
     user_agent_runs_require_approval: Literal[True] = True
     running_runs: int = Field(default=0, ge=0)
+    toolchain_candidates: list[ToolchainCandidate] = Field(default_factory=list)
+    toolchain_notice: ToolchainNotice | None = None
 
 
 class MandateChecks(ApiModel):
@@ -1805,6 +1821,16 @@ class RuleEffect(StrEnum):
     ASK = "ask"
 
 
+BUILTIN_FIXED_RULES = [
+    (RuleEffect.ALLOW, "Lesen und Schreiben im Arbeitsordner, Python in der Sandbox"),
+    (RuleEffect.DENY, "Schreiben außerhalb des Runs (auch Original-Projekt)"),
+    (RuleEffect.DENY, "Sensible Pfade (~/.ssh, ~/.aws, ~/.arr, Schlüsselbund, Browser-Profile)"),
+    (RuleEffect.DENY, "sudo, security, launchctl, ssh, git push"),
+    (RuleEffect.ASK, "Lesen außerhalb des Runs, sonstiges Netzwerk, Paketinstallation"),
+]
+"""The standard rules of docs/07 §3 ② as the settings page shows them."""
+
+
 class FixedRule(ApiModel):
     """A fixed rule (docs/08 §5.11 „Feste Regeln“): standard rules are fixed, own „immer“ rules
     can be removed."""
@@ -1832,6 +1858,8 @@ class ToolchainTestResult(ApiModel):
     python_version: str | None = None
     packages: dict[str, bool] = Field(default_factory=dict)
     message: str
+    detail: str | None = None
+    """Why and what to do, after `message` (docs/08 §8.4)."""
     duration_ms: int | None = None
 
 
@@ -1843,7 +1871,7 @@ class CreateProfileRequest(ApiModel):
     (§8.4 „Key ersetzen“): the profile stays, `concurrency` is ignored.
     """
 
-    name: str = Field(pattern=_SLUG)
+    name: str = Field(pattern=SLUG)
     kind: AuthKind
     concurrency: int = Field(default=2, ge=1, le=16)
     api_key: SecretStr | None = None
@@ -1912,7 +1940,7 @@ class CreateProjectRequest(ApiModel):
     only missing arr files, G8). At most one of both.
     """
 
-    name: str = Field(pattern=_SLUG)
+    name: str = Field(pattern=SLUG)
     title: str | None = None
     template: str | None = None
     existing_path: str | None = None
@@ -1943,11 +1971,15 @@ class SkillFile(ApiModel):
 
 
 class WorkfolderRequest(ApiModel):
-    """Open or create a workfolder (docs/08 §5.12, `POST /api/workfolder`)."""
+    """Open or create a workfolder (docs/08 §5.12, `POST /api/workfolder`).
+
+    `python`: a base venv from `toolchain_candidates` for `toolchain.python` of a new workfolder.
+    """
 
     path: str = Field(min_length=1)
     create: bool = False
     name: str | None = None
+    python: str | None = None
 
 
 class UiSeen(ApiModel):
