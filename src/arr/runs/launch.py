@@ -24,7 +24,7 @@ import shutil
 import signal
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -186,6 +186,34 @@ def parse_params(items: Sequence[str]) -> dict[str, Any]:
     return params
 
 
+def refuse_disabled(names: Iterable[str], known: ProfilesFile) -> None:
+    """The Not-Aus (W3-06): no agent starts with a blocked profile, on any way of starting.
+
+    Reads `profiles.yaml` anew at every start, because a run may be planned long before its
+    agent starts. A file that does not exist says nothing, then `known` counts; a file that
+    cannot be read stops the start (fail closed). Raises `ArrError`.
+    """
+    file = app_dir() / PROFILES_FILE
+    try:
+        file.stat()
+        current = load_yaml_model(file, ProfilesFile)
+    except FileNotFoundError:
+        current = known
+    except (ArrError, OSError, UnicodeDecodeError, YAMLError):
+        raise ArrError(
+            "Der Sperr-Stand der Profile ließ sich nicht lesen (profiles.yaml). Deshalb startet "
+            "kein Agent. Prüfe die Datei und versuche es erneut."
+        ) from None
+    wanted = set(names)
+    blocked = sorted(p.name for p in (*current.profiles, *known.profiles) if p.disabled)
+    for name in blocked:
+        if name in wanted:
+            raise ArrError(
+                f"Das Profil „{name}“ ist gesperrt, der Agent läuft nicht an. Entsperre es auf "
+                "der Seite „Auth-Profile“ oder nimm ein anderes Profil."
+            )
+
+
 def load_profiles(path: str | Path | None = None) -> ProfilesFile:
     """`~/.arr/profiles.yaml` (docs/02 §1); without it a hint how to create it."""
     file = Path(path) if path is not None else app_dir() / PROFILES_FILE
@@ -303,11 +331,13 @@ def plan_run_input(
         project_settings=load_project_settings(project),
     )
     check_topology(resolved)
+    known = profiles if profiles is not None else load_profiles()
+    refuse_disabled((a.auth for a in resolved.agents), known)
     return Launch(
         run_file=run_file,
         workfolder=root,
         settings=settings,
-        profiles=profiles if profiles is not None else load_profiles(),
+        profiles=known,
         run_input=run_input,
         group_spec=group_spec,
         resolved=resolved,
@@ -356,6 +386,7 @@ class LiveFactory:
         limits: Limits,
         builders: Mapping[Provider, BackendBuilder] | None = None,
     ) -> None:
+        self.file = profiles
         self.profiles = {p.name: p for p in profiles.profiles}
         self.limits = limits
         self.builders = dict(BACKEND_BUILDERS if builders is None else builders)
@@ -369,6 +400,7 @@ class LiveFactory:
         auth = self.profiles.get(config.auth)
         if auth is None:  # prepare_run checks this; kept for a factory used on its own
             raise ArrError(f"Das Auth-Profil „{config.auth}“ von „{agent.id}“ gibt es nicht.")
+        refuse_disabled([config.auth], self.file)
         builder = self.builders.get(config.provider)
         if builder is None:
             raise ArrError(f"Für den Anbieter „{config.provider}“ gibt es noch kein Backend.")

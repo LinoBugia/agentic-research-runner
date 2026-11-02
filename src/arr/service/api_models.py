@@ -1365,6 +1365,63 @@ class ProfileInfo(ApiModel):
     last_test: ProfileTest | None = None
     usage_window: UsageWindow | None = None
     models: list[str] = Field(default_factory=list)
+    disabled: bool = Field(default=False, description="Not-Aus: nothing starts with the profile")
+
+
+class ProfileActionResult(ApiModel):
+    """Answer to „Sperren“, „Entsperren“ and „Login entfernen“ (W3-06).
+
+    With `dry_run=True` nothing changes, `runs` then names what would stop. `failed_runs` are
+    runs the Not-Aus could not reach: the page says so instead of a calm message.
+    """
+
+    ok: bool = True
+    message: str
+    runs: list[str] = Field(default_factory=list)
+    failed_runs: list[str] = Field(default_factory=list)
+    removable: bool = Field(default=False, description="`dry_run`: arr has a login to remove")
+    removed: bool = False
+    profile: ProfileInfo | None = None
+
+
+class ProfileUsageSum(ApiModel):
+    """Tokens and costs of a period; the three cost fields keep billed and estimated apart."""
+
+    label: str
+    runs: int = Field(default=0, ge=0)
+    turns: int = Field(default=0, ge=0)
+    input: int = Field(default=0, ge=0)
+    output: int = Field(default=0, ge=0)
+    cache_read: int = Field(default=0, ge=0)
+    cache_write: int = Field(default=0, ge=0)
+    reasoning: int = Field(default=0, ge=0)
+    cost_billed_usd: float = Field(default=0, ge=0)
+    cost_estimated_usd: float = Field(default=0, ge=0)
+    cost_unknown_turns: int = Field(default=0, ge=0)
+
+
+class ProfileRunUsage(ProfileUsageSum):
+    """One run in the record of a profile; only the agents on this profile count."""
+
+    run_id: str
+    status: RunStatus
+    agents: list[str] = Field(default_factory=list)
+    started: float | None = None
+    ended: float | None = None
+    aborted: bool = Field(default=False, description="stopped, failed or interrupted")
+    active: bool = False
+    url: str
+
+
+class ProfileUsage(ApiModel):
+    """„Nachweis je Profil“: what ran through arr on this profile (W3-06)."""
+
+    profile: str
+    today: ProfileUsageSum
+    week: ProfileUsageSum
+    total: ProfileUsageSum
+    runs: list[ProfileRunUsage] = Field(default_factory=list)
+    note: str
 
 
 class ProjectCheck(ApiModel):

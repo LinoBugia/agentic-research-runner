@@ -58,7 +58,9 @@ from arr.service.api_models import (
     Message,
     MessagesPage,
     PostMessageRequest,
+    ProfileActionResult,
     ProfileInfo,
+    ProfileUsage,
     ProjectInfo,
     ProjectSetupResult,
     ResolveResult,
@@ -88,6 +90,7 @@ from arr.service.real_api.approvals import ApprovalsArea
 from arr.service.real_api.base import ServiceState
 from arr.service.real_api.catalog import CatalogArea
 from arr.service.real_api.live import LiveArea
+from arr.service.real_api.profile_usage import ProfileUsageArea
 from arr.service.real_api.profiles import ProfilesArea
 from arr.service.real_api.runs import RunsArea
 from arr.service.real_api.setup import SetupArea
@@ -134,6 +137,8 @@ class RealApi:
         self.usage = UsageArea(self.state)
         self.storage = StorageArea(self.state)
         self.runs = RunsArea(self.state, self.approvals, self.storage)
+        self.profiles.stop_run = self.runs.stop_for_profile
+        self.profile_usage = ProfileUsageArea(self.state, self.profiles.find)
         self.live = LiveArea(self.state)
         self.notifier = Notifier(self.state.hub, notify or send_notification)
 
@@ -303,6 +308,18 @@ class RealApi:
 
     async def delete_profile(self, name: str) -> None:
         await self.profiles.delete_profile(name)
+
+    async def disable_profile(self, name: str, dry_run: bool = False) -> ProfileActionResult:
+        return await self.profiles.disable_profile(name, dry_run)
+
+    async def enable_profile(self, name: str) -> ProfileActionResult:
+        return await self.profiles.enable_profile(name)
+
+    async def remove_login(self, name: str, dry_run: bool = False) -> ProfileActionResult:
+        return await self.profiles.remove_login(name, dry_run)
+
+    async def get_profile_usage(self, name: str) -> ProfileUsage:
+        return self.profile_usage.get(name)
 
     async def start_login(self, name: str) -> LoginStart:
         return await self.profiles.start_login(name)
