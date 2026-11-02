@@ -37,6 +37,7 @@ from arr.permissions.types import (
     DecisionScope,
     EscalationOption,
     PermissionRequest,
+    RequestCategory,
 )
 
 ALLOW, DENY = DecisionAction.ALLOW, DecisionAction.DENY
@@ -734,3 +735,41 @@ async def test_w3_03_1_terminal_says_what_immer_means_in_arr_run(engine: PolicyE
     assert "für alle künftigen Runs" not in terminal.text
     assert "nicht in arr.yaml" in terminal.text
     assert "bis zum Ende dieses Runs" in terminal.text
+
+
+class KeepItems:
+    """A decider that keeps what it was asked and says no."""
+
+    def __init__(self) -> None:
+        self.items: list[ApprovalItem] = []
+
+    async def decide(self, item: ApprovalItem) -> Decision:
+        self.items.append(item)
+        return Decision(action=DecisionAction.DENY, decided_by=DecidedBy.USER, reason="Test")
+
+
+@pytest.mark.parametrize(
+    "command", ["pip install six", "python3 -m pip install six", "uv pip install six"]
+)
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_a_package_install_is_asked_as_an_installation(
+    engine: PolicyEngine, provider: str, command: str
+) -> None:
+    """The way of today (W3-06.2): a request of the command, not of the network."""
+    keep = KeepItems()
+    inbox = ApprovalInbox(engine, decider=keep, timeout=5)
+    request = PermissionRequest(
+        run_id="r1",
+        agent_id="explorer-1",
+        role=None,
+        provider=provider,
+        tool="Bash",
+        command=command,
+        work_dir=str(engine.profile("explorer-1").work_dir),
+    )
+    decision = await inbox.handle(request)
+    assert decision.action is DecisionAction.DENY
+    [item] = keep.items
+    assert item.request.tool == "Bash" and item.request.command == command
+    assert RequestCategory.INSTALL in item.request.categories
+    assert not item.request.hosts, "the request does not wait for the network"

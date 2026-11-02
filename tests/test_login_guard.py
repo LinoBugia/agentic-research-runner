@@ -21,6 +21,7 @@ import pytest
 from claude_agent_sdk._cli_version import __cli_version__
 
 from arr.models import AuthKind
+from arr.permissions.types import DecidedBy, Decision, DecisionAction, RequestCategory
 
 FIXTURE = Path(__file__).parent / "fixtures" / "login_guard.json"
 
@@ -355,6 +356,31 @@ def test_file_tools_do_not_follow_a_link_to_a_login() -> None:
         assert not any(lab.bait in text_ for text_ in api.results)
         assert not outside.exists()
         assert start.read_text() == text
+
+
+class Refuse:
+    """A decider that keeps what it was asked and says no."""
+
+    def __init__(self) -> None:
+        self.items: list[Any] = []
+
+    async def decide(self, item: Any) -> Decision:
+        self.items.append(item)
+        return Decision(action=DecisionAction.DENY, decided_by=DecidedBy.USER, reason="Test")
+
+
+@mac
+def test_pip_install_of_the_real_cli_asks_as_an_installation() -> None:
+    """What the live smoke test checks, without a model: asked before it runs, as Bash."""
+    import login_guard_kit as kit
+
+    refuse = Refuse()
+    with kit.open_lab("claude") as lab:
+        api = kit.run_file_tools(lab, [kit.bash("pip install six")], refuse)
+    assert api.errors == [True], "denied, so it never ran"
+    [item] = refuse.items
+    assert item.request.tool == "Bash" and item.request.command == "pip install six"
+    assert RequestCategory.INSTALL in item.request.categories
 
 
 @mac

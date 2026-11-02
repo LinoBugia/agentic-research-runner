@@ -606,7 +606,7 @@ async def _backend_turn(backend: ClaudeBackend) -> None:
     await backend.close()
 
 
-def run_file_tools(lab: Lab, script: list[ToolCall]) -> FakeMessagesApi:
+def run_file_tools(lab: Lab, script: list[ToolCall], decider: Any = None) -> FakeMessagesApi:
     """`script` through the real backend: real hooks and `PolicyEngine`, outside the sandbox."""
     with FakeMessagesApi(script) as api:
         engine = PolicyEngine([lab.profile], log=ApprovalLog(lab.run.run_dir / "approvals.jsonl"))
@@ -622,7 +622,7 @@ def run_file_tools(lab: Lab, script: list[ToolCall]) -> FakeMessagesApi:
         backend = ClaudeBackend(
             lab.agent,
             run_id=lab.run.run_id,
-            inbox=ApprovalInbox(engine, timeout=0.05),
+            inbox=ApprovalInbox(engine, decider=decider, timeout=5 if decider else 0.05),
             auth=lab.auth,
             secret_reader=lambda _service, _account: lab.token,
             client_factory=factory,
