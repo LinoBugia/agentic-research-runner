@@ -73,7 +73,7 @@ from arr.service.api_models import (
 )
 from arr.service.real_api.approvals import ApprovalsArea
 from arr.service.real_api.base import RunHandle, ServiceState, not_allowed, not_found
-from arr.service.real_api.catalog import _provider_of as _profile_provider
+from arr.service.real_api.profiles import provider_of as _profile_provider
 from arr.service.real_api.rundir import (
     RunRecord,
     agent_changes,

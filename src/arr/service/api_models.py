@@ -128,7 +128,7 @@ class ApiModel(BaseModel):
     See docs/08-ux-konzept.md §5.0.
     """
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, hide_input_in_errors=True)
 
 
 # --------------------------------------------------------------------------------------------
@@ -1810,19 +1810,27 @@ class CreateProfileRequest(ApiModel):
     """„Neues Profil“ (docs/08 §5.8, `POST /api/profiles`). The key travels only in the request.
 
     API-key kinds need `api_key`; subscription kinds log in afterwards with `start_login`
-    (E18), they never take a pasted token.
+    (E18), they never take a pasted token. `replace` puts a new key on an existing profile
+    (§8.4 „Key ersetzen“): the profile stays, `concurrency` is ignored.
     """
 
     name: str = Field(pattern=SLUG)
     kind: AuthKind
     concurrency: int = Field(default=2, ge=1, le=16)
     api_key: SecretStr | None = None
+    replace: bool = False
 
     @model_validator(mode="after")
     def _key_only_for_key_kinds(self) -> Self:
+        # Not a ValueError: pydantic would add the whole input, with the key in clear, to
+        # `errors()` and `.json()`; `hide_input_in_errors` only covers `str()`.
         key_kinds = (AuthKind.CLAUDE_API_KEY, AuthKind.OPENAI_API_KEY)
         if (self.kind in key_kinds) != (self.api_key is not None):
-            raise ValueError("api_key gehört genau zu Profilen mit API-Key")
+            raise ApiException.of(
+                ErrorCode.INVALID, "Ein API-Key gehört genau zu Profilen mit API-Key."
+            )
+        if self.replace and self.api_key is None:
+            raise ApiException.of(ErrorCode.INVALID, "Ersetzen geht nur mit einem neuen API-Key.")
         return self
 
 
@@ -1830,6 +1838,8 @@ class LoginStart(ApiModel):
     """Start of a login in the browser or by device code (docs/08 §5.8, E18).
 
     `note` tells what arr runs for it (G4, e.g. „arr führt dafür `claude setup-token` aus“).
+    With `browser` the CLI opens the browser itself, `browser_url` stays empty; with
+    `device_code` it is the page where the user enters the code.
     """
 
     profile: str
@@ -1842,8 +1852,6 @@ class LoginStart(ApiModel):
 
     @model_validator(mode="after")
     def _matches_method(self) -> Self:
-        if (self.method == "browser") != (self.browser_url is not None):
-            raise ValueError("browser_url gehört genau zu method=browser")
         if (self.method == "device_code") != (self.device_code is not None):
             raise ValueError("device_code gehört genau zu method=device_code")
         return self

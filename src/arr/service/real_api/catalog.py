@@ -14,12 +14,11 @@ import time
 from pathlib import Path
 
 from arr.errors import ArrError, ConfigError
-from arr.models import AuthKind, GroupSpec, ParamSpec, ProjectSettings, Provider
+from arr.models import GroupSpec, ParamSpec, ProjectSettings
 from arr.resolve import _count_param, load_group_spec
 from arr.service.api_models import (
     Action,
     ParamInfo,
-    ProfileConcurrency,
     ProfileInfo,
     ProjectCheck,
     ProjectFolder,
@@ -33,6 +32,7 @@ from arr.service.api_models import (
     SkillUsage,
 )
 from arr.service.real_api.base import ServiceState, not_found
+from arr.service.real_api.profiles import load_status, profile_info, unreadable_profiles
 from arr.service.real_api.rundir import open_items
 from arr.skills import SkillAudience, SkillCatalog, discover_skills, skills_for_user_agent
 from arr.workfolder import USER_AGENT_BLOCK, block_span, load_project_settings, os_reason
@@ -112,11 +112,6 @@ def _agents_count(spec: GroupSpec) -> int | None:
             return None
         total += count
     return total
-
-
-def _provider_of(kind: AuthKind) -> Provider:
-    codex = (AuthKind.CODEX_CHATGPT, AuthKind.OPENAI_API_KEY)
-    return Provider.CODEX if kind in codex else Provider.CLAUDE
 
 
 class CatalogArea:
@@ -396,36 +391,10 @@ class CatalogArea:
     # -- profiles ---------------------------------------------------------------------------
 
     async def list_profiles(self) -> list[ProfileInfo]:
-        """Profiles from `profiles.yaml` only: no test, no secret (W3-05 fills the rest)."""
-        from arr.backends.codex_config import codex_home_for
-
-        settings = self.state.settings
-        out = []
-        for profile in self.state.profiles_or_empty().profiles:
-            provider = _provider_of(profile.kind)
-            gate = self.state.gates.get(profile.name)
-            login_dir = None
-            present = False
-            if profile.kind is AuthKind.CODEX_CHATGPT:
-                home = codex_home_for(profile)
-                login_dir = str(home)
-                present = (home / "auth.json").is_file()
-            keychain = None
-            if profile.keychain is not None:
-                keychain = f"{profile.keychain.service}/{profile.keychain.account}"
-            out.append(
-                ProfileInfo(
-                    name=profile.name,
-                    kind=profile.kind,
-                    provider=provider,
-                    default_for=[p for p, d in settings.defaults.items() if d.auth == profile.name],
-                    concurrency=ProfileConcurrency(
-                        limit=settings.concurrency.get(profile.name, 0),
-                        in_use=gate.active if gate is not None else 0,
-                    ),
-                    secret_present=present,
-                    keychain_label=keychain,
-                    login_dir=login_dir,
-                )
-            )
-        return out
+        """Profiles from `profiles.yaml` with the remembered test: no call, no keychain."""
+        status = load_status()
+        try:
+            profiles = self.state.profiles_or_empty().profiles
+        except (UnicodeDecodeError, OSError):
+            raise unreadable_profiles() from None
+        return [profile_info(self.state, profile, status.get(profile.name)) for profile in profiles]

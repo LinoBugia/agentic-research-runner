@@ -166,7 +166,8 @@ class RealApi:
         await self.runs.stop_all()
 
     async def close(self) -> None:
-        """Stop watcher and notifier (runs are stopped with `stop_runs` first)."""
+        """Stop logins, watcher and notifier (runs are stopped with `stop_runs` first)."""
+        await self.profiles.close()
         await self.live.stop()
         await self.notifier.stop()
 

@@ -184,7 +184,7 @@ async def test_pages_of_later_orders_show_the_message_instead_of_crashing(wf: Pa
             html = await see(user, "kommt mit Auftrag")
             assert order in html, path
             assert "Traceback" not in html
-        # profiles are listed (catalog, read only); testing and logins come with W3-05
+        # profiles are listed from `profiles.yaml` without a call
         await user.open("/profile")
         html = await see(user, "fake-auth")
         assert "Traceback" not in html
