@@ -414,8 +414,7 @@ class ProfilePage:
             [
                 stopping,
                 "Neue Runs und Tests mit dem Profil starten nicht mehr, offene Anmeldungen enden.",
-                "Runs in anderen Workfoldern sieht diese Seite nicht. Sie stoppen hier nicht, "
-                "neue Agenten starten dort aber auch nicht.",
+                "Runs in anderen Workfoldern stoppen von selbst innerhalb weniger Sekunden.",
                 "Der Login bleibt erhalten, du kannst das Profil wieder entsperren.",
             ],
             "Profil sperren",

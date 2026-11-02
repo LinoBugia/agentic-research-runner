@@ -792,7 +792,7 @@ async def test_sperren_asks_first_and_shows_the_block(api: MockApi) -> None:
         user.find(marker="disable-claude-api-uni").click()
         html = await see(user, "Profil „claude-api-uni“ sperren?")
         assert "offene Anmeldungen enden" in html and "Der Login bleibt erhalten" in html
-        assert "Runs in anderen Workfoldern sieht diese Seite nicht" in html
+        assert "Runs in anderen Workfoldern stoppen von selbst" in html
         assert not next(p for p in await api.list_profiles() if p.name == "claude-api-uni").disabled
         user.find(marker="dialog-confirm").click()
         html = await see(user, "gesperrt")

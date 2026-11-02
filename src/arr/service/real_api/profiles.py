@@ -12,9 +12,10 @@
   keychain item goes last: if something fails, the profile stays and can be deleted again.
 - Logins run in `arr.service.login.LoginService`, and only in arr's own login folders.
 - The Not-Aus (W3-06): `disable_profile` writes `disabled` first, so nothing new starts, then
-  ends open logins and stops the runs of this workfolder, those of `arr run` too. `run_launch`
-  and `plan_run_input` refuse a blocked profile (`refuse_disabled`). „Login entfernen“ is a
-  second, explicit step on a blocked profile and removes only what belongs to arr.
+  ends open logins and stops the runs of this workfolder, those of `arr run` too. A run in
+  another workfolder sees the block itself (`watch_blocked_profiles`). `plan_run_input` and
+  the agent's start refuse a blocked profile (`refuse_disabled`). „Login entfernen“ is a second,
+  explicit step on a blocked profile and removes only what belongs to arr.
 
 Listing belongs to `catalog`, which uses `profile_info` from here.
 """

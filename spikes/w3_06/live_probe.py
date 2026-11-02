@@ -5,10 +5,12 @@ A real agent writes a small program and runs it. The program tries to read `auth
 While the agent waits in its next step, the Not-Aus blocks the profile. The block is lifted and
 `profiles.yaml` restored byte for byte in any case. Afterwards the secret scan must be clean.
 
-Budget (Auftrag §7): at most 2 runs, 15 requests per backend, `budget_usd` 0.30, 10 min.
+Budget (W3-06.1): 15 requests per backend including the unplanned smoke tests of W3-06, which
+took 7 (Claude) and 15 (Codex), so `REQUESTS_LEFT` is 8 and 0. The run stops one request before
+the rest is used up, `budget_usd` 0.30, 10 min. `check` plans the run without any model.
 
+    uv run python spikes/w3_06/live_probe.py check
     uv run python spikes/w3_06/live_probe.py claude
-    uv run python spikes/w3_06/live_probe.py codex
 """
 
 import asyncio
@@ -22,8 +24,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from arr.models import RunStatus
+from arr.models import RunInput, RunStatus
+from arr.resolve import validate_model
 from arr.runs.eventlog import read_events
+from arr.runs.launch import plan_run_input
 from arr.runs.orchestrator import OrchestratorLog
 from arr.runs.prepare import load_run_meta
 from arr.runs.secret_scan import SCAN_KIND
@@ -39,6 +43,7 @@ BACKENDS = {
 OUT = Path(__file__).with_name("tmp")
 WAIT_S = 240
 STOP_LIMIT_S = 120
+REQUESTS_LEFT = {"claude": 8, "codex": 0}
 
 PROGRAM = r"""import json, os, pwd, subprocess
 home = pwd.getpwuid(os.getuid()).pw_dir
@@ -115,11 +120,13 @@ def requests_of(run_dir: Path) -> int:
     return sum(1 for event in events if event.get("kind") == "usage")
 
 
-async def until(check: Any, limit_s: float, what: str) -> None:
+async def until(check: Any, limit_s: float, what: str, guard: Any = None) -> None:
     end = time.monotonic() + limit_s
     while not check():
         if time.monotonic() > end:
             raise TimeoutError(what)
+        if guard is not None:
+            guard()
         await asyncio.sleep(0.5)
 
 
@@ -132,9 +139,14 @@ async def live(backend: str) -> dict[str, Any]:
     result = work / "result.json"
     began = time.monotonic()
     report: dict[str, Any] = {"run": started.run_id}
+
+    def guard() -> None:
+        if requests_of(run_dir) >= REQUESTS_LEFT[backend] - 1:
+            raise RuntimeError("the request budget is used up")
+
     try:
-        await until(result.is_file, 300, "the agent never wrote result.json")
-        await until((work / "warte.py").is_file, 120, "the agent never started to wait")
+        await until(result.is_file, 300, "the agent never wrote result.json", guard)
+        await until((work / "warte.py").is_file, 120, "the agent never started to wait", guard)
         await asyncio.sleep(3)
         report["probe"] = json.loads(result.read_text())
         stop_began = time.monotonic()
@@ -164,8 +176,22 @@ async def live(backend: str) -> dict[str, Any]:
     return report
 
 
+def check() -> None:
+    """Everything before the first model request: nothing is created, nothing is called."""
+    launch = plan_run_input(validate_model(RunInput, run_input("claude")), workfolder=WORKFOLDER)
+    print("geplant:", [(a.id, a.auth, a.model) for a in launch.resolved.agents])
+    print("Limits:", launch.resolved.limits.budget_usd, launch.resolved.limits.wall_time)
+    print("Python der Agenten:", launch.settings.toolchain.python)
+    compile(PROGRAM, "probe.py", "exec")
+
+
 def main() -> None:
     backend = sys.argv[1]
+    if backend == "check":
+        check()
+        return
+    if REQUESTS_LEFT[backend] <= 0:
+        raise SystemExit(f"{backend}: Der Rahmen von W3-06.1 ist ausgeschöpft, kein Lauf.")
     profiles = app_dir() / "profiles.yaml"
     original = profiles.read_bytes()
     before = stamp(HOME / ".codex"), keychain_list()

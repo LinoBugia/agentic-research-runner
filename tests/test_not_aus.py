@@ -6,6 +6,7 @@ the run folder. Everything else runs on FakeBackends, without a model and withou
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -165,7 +166,7 @@ async def test_a_block_after_the_planning_still_stops_the_agent(
         signals=False,
         pacing=FAST,
     )
-    assert started == [] and result.status is RunStatus.FAILED
+    assert started == [] and result.status in (RunStatus.FAILED, RunStatus.STOPPED)
 
 
 def test_the_factory_reads_the_block_anew(arr_home: Path, wf: Path) -> None:
@@ -285,6 +286,134 @@ async def test_a_run_of_arr_run_in_another_process_stops(
     assert load_run_meta(run_dir).status is RunStatus.STOPPED
     assert (run_dir / "output" / "summary.md").is_file(), "the finalizer ran"
     assert scanned(run_dir), "the scan ran"
+
+
+def write_block(arr_home: Path, name: str) -> None:
+    """What `disable_profile` writes, atomically, by a service of another workfolder."""
+    path = arr_home / "profiles.yaml"
+    text = path.read_text().replace(f"{{name: {name}, kind: claude_oauth}}", "X")
+    temp = path.with_suffix(".tmp")
+    temp.write_text(text.replace("X", f"{{name: {name}, kind: claude_oauth, disabled: true}}"))
+    os.replace(temp, path)
+
+
+def start_elsewhere(tmp_path: Path, arr_home: Path, folder: str, auth: str) -> Any:
+    """`arr run` in a workfolder of its own, in a process of its own."""
+    root = tmp_path / folder
+    root.mkdir()
+    workfolder = make_workfolder(root)
+    run_yaml = workfolder / "run.yaml"
+    run_yaml.write_text(SOLO.replace("auth: fake-auth", f"auth: {auth}"), "utf-8")
+    process = start_run_process(root, arr_home, run_yaml, LONG)
+    return process, workfolder / "runs"
+
+
+def active_dir(runs: Path) -> Path | None:
+    for folder in runs.iterdir():
+        if (folder / "meta.json").is_file() and (load_run_meta(folder).status is RunStatus.RUNNING):
+            return folder
+    return None
+
+
+async def test_a_block_reaches_a_run_in_another_workfolder_and_only_that_one(
+    tmp_path: Path, arr_home: Path, wf: Path
+) -> None:
+    """Two real processes, two workfolders. No stop.request: the block alone must do it."""
+    write_profiles(arr_home, {"fake-auth": "claude_oauth", "other-auth": "claude_oauth"})
+    hit, hit_runs = start_elsewhere(tmp_path, arr_home, "wf-hit", "fake-auth")
+    free, free_runs = start_elsewhere(tmp_path, arr_home, "wf-free", "other-auth")
+    try:
+        await eventually(lambda: active_dir(hit_runs) is not None, within=40)
+        await eventually(lambda: active_dir(free_runs) is not None, within=40)
+        run_dir = active_dir(hit_runs)
+        started = time.monotonic()
+        write_block(arr_home, "fake-auth")
+        await eventually(lambda: load_run_meta(run_dir).status.is_final, within=5)
+        assert time.monotonic() - started <= 5
+        assert await asyncio.to_thread(hit.wait, 30) == 130
+        assert load_run_meta(run_dir).status is RunStatus.STOPPED
+        assert (run_dir / "output" / "summary.md").is_file(), "the finalizer ran"
+        assert scanned(run_dir), "the scan ran"
+        assert free.poll() is None and active_dir(free_runs) is not None, "the other profile runs"
+    finally:
+        for process in (hit, free):
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(10)
+
+
+async def launch_with(
+    wf: Path, scripts: dict[str, Any], lines: list[str], text: str = SOLO, **kwargs: Any
+) -> Any:
+    run_yaml = wf / "run.yaml"
+    run_yaml.write_text(text, "utf-8")
+    return asyncio.create_task(
+        run_launch(
+            plan_launch(run_yaml, cwd=wf),
+            decider=None,
+            report=lines.append,
+            builders=fake_builders(scripts),
+            signals=False,
+            pacing=FAST,
+            block_poll_s=0.02,
+            **kwargs,
+        )
+    )
+
+
+async def test_one_blocked_profile_of_several_is_enough(wf: Path, arr_home: Path) -> None:
+    """A mixed run: only the second agent's profile is blocked."""
+    write_profiles(arr_home, {"fake-auth": "claude_oauth", "fake-b": "claude_oauth"})
+    mixed = SOLO.replace(
+        "agents: [{id: a}]\ngroupchats: [{name: main, members: [a]}]",
+        "agents: [{id: a}, {id: b, auth: fake-b}]\ngroupchats: [{name: main, members: [a, b]}]",
+    ).replace("topology: {kind: solo}", "topology: {kind: solo, params: {agent: a}}")
+    lines: list[str] = []
+    running = await launch_with(wf, LONG | {"b": LONG["a"]}, lines, mixed)
+    await eventually(lambda: any(line.startswith("▶ a: Turn 1") for line in lines), within=15)
+    write_block(arr_home, "fake-b")
+    result = await asyncio.wait_for(running, 15)
+    assert result.status is RunStatus.STOPPED
+    assert "Das Profil „fake-b“ wurde gesperrt: Der Run wird gestoppt …" in lines
+
+
+async def test_a_run_goes_on_while_the_file_cannot_be_read(
+    wf: Path, arr_home: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Fail closed holds for the start only: a short outage must not kill hours of work."""
+    caplog.set_level(logging.WARNING, logger="arr.runs.launch")
+    path = arr_home / "profiles.yaml"
+    good = path.read_text()
+    lines: list[str] = []
+    running = await launch_with(wf, LONG, lines)
+    await eventually(lambda: any(line.startswith("▶ a: Turn 1") for line in lines), within=15)
+    path.write_text("profiles: [{ kaputt")
+    await eventually(lambda: "nicht lesbar" in caplog.text, within=5)
+    await asyncio.sleep(0.2)
+    assert not running.done()
+    assert caplog.text.count("nicht lesbar") == 1, "one warning per outage"
+    path.write_text(good.replace("claude_oauth}", "claude_oauth, disabled: true}", 1))
+    result = await asyncio.wait_for(running, 15)
+    assert result.status is RunStatus.STOPPED, "the block works again after the outage"
+
+
+async def test_a_second_stop_through_the_block_changes_nothing(api: RealApi, wf: Path) -> None:
+    """In the service's own workfolder the run is told twice: by the service and by the file."""
+    run_id = (await api.start_run(RUN_INPUT)).run_id
+    await eventually(lambda: status_of(wf, run_id) is RunStatus.RUNNING, within=15)
+    await api.disable_profile("fake-auth")
+    await eventually(lambda: status_of(wf, run_id) is RunStatus.STOPPED, within=15)
+    await eventually(lambda: scanned(wf / "runs" / run_id), within=15)
+    kinds = [e["kind"] for e in OrchestratorLog(wf / "runs" / run_id).entries()]
+    assert kinds.count(SCAN_KIND) == 1
+
+
+async def test_a_run_ends_without_a_block_and_leaves_no_watcher(wf: Path) -> None:
+    lines: list[str] = []
+    running = await launch_with(wf, {"a": turns([say("x")])}, lines)
+    result = await asyncio.wait_for(running, 15)
+    assert result.status is not RunStatus.STOPPED
+    assert not any("wurde gesperrt" in line for line in lines)
 
 
 async def test_a_run_that_cannot_be_stopped_is_named(

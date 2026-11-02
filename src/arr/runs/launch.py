@@ -12,13 +12,15 @@ always set), runs it, scans the run folder for secrets and reports progress thro
 Two ways to stop a run from outside: `StopControl` (Ctrl-C: the first stops the run with the
 finalizer, the second aborts hard) and `stop.request`, a file that `arr runs stop` puts into
 the run folder and that the running process polls and consumes (`watch_stop_request`; none
-stays behind when `run_launch` returns). The module knows
+stays behind when `run_launch` returns). A third way is the Not-Aus: `watch_blocked_profiles`
+stops the run when one of its profiles is blocked, also from another workfolder. The module knows
 neither Typer nor a terminal: text goes through `report`, approvals through the `decider`.
 """
 
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import shutil
 import signal
@@ -113,10 +115,18 @@ __all__ = [
     "request_stop",
     "reserve_run",
     "run_launch",
+    "blocked_profiles",
+    "watch_blocked_profiles",
     "watch_stop_request",
 ]
 
+log = logging.getLogger(__name__)
+
 PROFILES_FILE = "profiles.yaml"
+BLOCK_POLL_S = 2.0
+"""How often a running run looks at the block of its profiles (W3-06.1)."""
+UNREADABLE = (ArrError, OSError, UnicodeDecodeError, YAMLError)
+"""What reading `profiles.yaml` can raise; `ConfigError` is an `ArrError`."""
 EXIT_OK, EXIT_FAILED, EXIT_STOPPED = 0, 1, 130
 """Exit codes of `arr run`: `done`, anything else, stopped by the user (like SIGINT)."""
 
@@ -186,12 +196,11 @@ def parse_params(items: Sequence[str]) -> dict[str, Any]:
     return params
 
 
-def refuse_disabled(names: Iterable[str], known: ProfilesFile) -> None:
-    """The Not-Aus (W3-06): no agent starts with a blocked profile, on any way of starting.
+def blocked_profiles(names: Iterable[str], known: ProfilesFile) -> list[str]:
+    """Which of `names` are blocked now, read anew from `profiles.yaml`.
 
-    Reads `profiles.yaml` anew at every start, because a run may be planned long before its
-    agent starts. A file that does not exist says nothing, then `known` counts; a file that
-    cannot be read stops the start (fail closed). Raises `ArrError`.
+    A file that does not exist says nothing, then `known` counts. A file that cannot be read
+    raises one of `UNREADABLE`: the caller decides what that means.
     """
     file = app_dir() / PROFILES_FILE
     try:
@@ -199,19 +208,29 @@ def refuse_disabled(names: Iterable[str], known: ProfilesFile) -> None:
         current = load_yaml_model(file, ProfilesFile)
     except FileNotFoundError:
         current = known
-    except (ArrError, OSError, UnicodeDecodeError, YAMLError):
+    wanted = set(names)
+    blocked = {p.name for p in (*current.profiles, *known.profiles) if p.disabled}
+    return sorted(blocked & wanted)
+
+
+def refuse_disabled(names: Iterable[str], known: ProfilesFile) -> None:
+    """The Not-Aus (W3-06): no agent starts with a blocked profile, on any way of starting.
+
+    Reads `profiles.yaml` anew at every start, because a run may be planned long before its
+    agent starts. A file that cannot be read stops the start (fail closed). Raises `ArrError`.
+    """
+    try:
+        blocked = blocked_profiles(names, known)
+    except UNREADABLE:
         raise ArrError(
             "Der Sperr-Stand der Profile ließ sich nicht lesen (profiles.yaml). Deshalb startet "
             "kein Agent. Prüfe die Datei und versuche es erneut."
         ) from None
-    wanted = set(names)
-    blocked = sorted(p.name for p in (*current.profiles, *known.profiles) if p.disabled)
-    for name in blocked:
-        if name in wanted:
-            raise ArrError(
-                f"Das Profil „{name}“ ist gesperrt, der Agent läuft nicht an. Entsperre es auf "
-                "der Seite „Auth-Profile“ oder nimm ein anderes Profil."
-            )
+    if blocked:
+        raise ArrError(
+            f"Das Profil „{blocked[0]}“ ist gesperrt, der Agent läuft nicht an. Entsperre es auf "
+            "der Seite „Auth-Profile“ oder nimm ein anderes Profil."
+        )
 
 
 def load_profiles(path: str | Path | None = None) -> ProfilesFile:
@@ -694,6 +713,43 @@ async def watch_stop_request(
         await asyncio.sleep(interval_s)
 
 
+async def watch_blocked_profiles(
+    manager: RunManager,
+    names: Iterable[str],
+    known: ProfilesFile,
+    report: Report,
+    done: asyncio.Event,
+    *,
+    interval_s: float = BLOCK_POLL_S,
+) -> None:
+    """Stop the run as soon as one of its profiles is blocked (W3-06.1), in any workfolder.
+
+    `profiles.yaml` is shared by all workfolders, so this also reaches a run the blocking
+    service cannot see. A file that cannot be read does not stop a running run: it logs one
+    warning per outage and the run goes on, only the start is fail closed.
+    """
+    profiles = set(names)
+    warned = False
+    while not done.is_set():
+        try:
+            blocked = blocked_profiles(profiles, known)
+            warned = False
+        except UNREADABLE as exc:
+            blocked = []
+            if not warned:
+                warned = True
+                log.warning(
+                    "Der Sperr-Stand der Profile ist gerade nicht lesbar (%s). Der Run läuft "
+                    "weiter.",
+                    type(exc).__name__,
+                )
+        if blocked:
+            report(f"Das Profil „{blocked[0]}“ wurde gesperrt: Der Run wird gestoppt …")
+            manager.stop()
+            return
+        await asyncio.sleep(interval_s)
+
+
 # --------------------------------------------------------------------------------------------
 # Progress: orchestrator.jsonl and approvals.jsonl as German lines
 # --------------------------------------------------------------------------------------------
@@ -906,6 +962,7 @@ async def run_launch(
     finalizer: Finalizer = finalize_run,
     interval_s: float = 0.5,
     stop_poll_s: float = 1.0,
+    block_poll_s: float = BLOCK_POLL_S,
     hard_exit: Callable[[int], Any] = os._exit,
     signals: bool = True,
     scan: bool = True,
@@ -960,6 +1017,12 @@ async def run_launch(
     done = asyncio.Event()
     follower = asyncio.create_task(follow_run(manager, report, done, interval_s=interval_s))
     stopper = asyncio.create_task(watch_stop_request(manager, report, done, interval_s=stop_poll_s))
+    names = {a.auth for a in launch.resolved.agents}
+    blocker = asyncio.create_task(
+        watch_blocked_profiles(
+            manager, names, launch.profiles, report, done, interval_s=block_poll_s
+        )
+    )
     try:
         try:
             status = await manager.run()
@@ -972,9 +1035,10 @@ async def run_launch(
             done.set()
             with contextlib.suppress(Exception):
                 await follower
-            stopper.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await stopper
+            for watcher in (stopper, blocker):
+                watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await watcher
         run_id = manager.prepared.run_id if manager.prepared else run_dir.name
         reason = run_reason(load_run_meta(run_dir), OrchestratorLog(run_dir).entries())
         result = RunResult(run_id, run_dir, status, reason)
