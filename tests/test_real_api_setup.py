@@ -676,9 +676,7 @@ async def test_new_keys_stay_in_their_section(fresh: Path) -> None:
     approvals = info.approvals.model_copy(
         update={"decider": Decider.GATEKEEPER_THEN_USER, "gatekeeper_model": "claude-sonnet-5-5"}
     )
-    toolchain = info.toolchain.model_copy(
-        update={"python": str(venv), "extra_path": ["/Library/TeX/texbin"]}
-    )
+    toolchain = info.toolchain.model_copy(update={"python": str(venv), "extra_path": ["/usr/bin"]})
     await api.update_workfolder_settings(
         info.model_copy(update={"approvals": approvals, "toolchain": toolchain})
     )
