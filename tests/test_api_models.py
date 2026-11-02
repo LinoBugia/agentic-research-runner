@@ -382,6 +382,7 @@ async def test_w1_08_endpoints_deliver_valid_objects(dataset: Dataset) -> None:
         await api.get_mandate(),
         await api.test_toolchain(),
         await api.test_toolchain("System-Python"),
+        (await api.get_workfolder_settings()).toolchain_candidates[0],
         *(await api.list_fixed_rules()),
         await api.get_skill_file("proof-review", "group.yaml"),
         await api.get_skill_file("proof-review", "roles/judge.md"),

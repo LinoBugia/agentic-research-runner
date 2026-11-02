@@ -23,8 +23,10 @@ user_agent_runs:
   require_approval: true
 
 # Umgebung der Research-Agenten: Python-Umgebung und zusätzliche Ordner im PATH.
+# Für Codex-Agenten liegt die Basis-venv außerhalb deines Benutzerordners, ohne von uv verwaltetes
+# Python. Wählen kannst du sie in der GUI unter „Einstellungen → Python-Umgebung“.
 toolchain:
-  # python: ~/.venvs/mathe
+  # python: /Users/Shared/arr-<user>/venvs/mathe
   # extra_path: []
   run_venv: overlay          # overlay | off
 

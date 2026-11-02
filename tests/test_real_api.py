@@ -152,8 +152,8 @@ def test_real_api_satisfies_the_contract_and_is_split_into_areas(wf: Path) -> No
 async def test_empty_areas_raise_unavailable_with_german_message(wf: Path) -> None:
     api = make_api(wf)
     cases = [
-        (api.get_app_settings(), "W3-04"),
-        (api.get_setup_state(), "W3-04"),
+        (api.get_setup_state(), "W5-02"),
+        (api.get_mandate(), "W4-04"),
         (api.get_usage(), "W5-01"),
         (api.get_storage(), "W5-01"),
     ]
@@ -590,7 +590,12 @@ async def test_catalog_lists_projects_skills_and_profiles_without_secrets(wf: Pa
     api = make_api(wf)
     projects = await api.list_projects()
     assert [p.name for p in projects] == ["demo"] and projects[0].setup_ok is False
-    assert {c.key for c in projects[0].checks} == {"claude_md", "mcp_json", "agents_md"}
+    assert {c.key for c in projects[0].checks} == {
+        "claude_md",
+        "mcp_json",
+        "skill_links",
+        "agents_md",
+    }
     assert (await api.get_project("demo")).path.endswith("projects/demo")
     skills = {s.name: s for s in await api.list_skills()}
     assert skills["sympy-check"].kind is SkillKind.TOOL and skills["sympy-check"].valid

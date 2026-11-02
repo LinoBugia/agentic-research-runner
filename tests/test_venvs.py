@@ -98,7 +98,7 @@ def test_writable_for_others_is_refused(venv_root: Path, bits: int) -> None:
     venv_root.chmod(bits)
     with pytest.raises(ArrError, match="Gruppe oder andere") as info:
         ensure_venv_root()
-    assert f"chmod 700 {venv_root}" in info.value.message
+    assert "Schreibrecht" in info.value.message and "chmod" not in info.value.message
 
 
 def test_writable_runs_is_refused(venv_root: Path) -> None:

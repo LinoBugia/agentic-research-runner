@@ -179,7 +179,6 @@ async def test_pages_of_later_orders_show_the_message_instead_of_crashing(wf: Pa
         for path, order in [
             ("/usage", "W5-01"),
             ("/speicher", "W5-01"),
-            ("/einstellungen", "W3-04"),
         ]:
             await user.open(path)
             html = await see(user, "kommt mit Auftrag")

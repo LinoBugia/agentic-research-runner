@@ -58,6 +58,7 @@ from arr.service.api_client import (  # noqa: E402 - re-exported for the GUI and
     count_waiting,
 )
 from arr.service.api_models import (
+    BUILTIN_FIXED_RULES,
     Action,
     ActionResult,
     Activity,
@@ -1806,13 +1807,19 @@ Nie erlauben:
 - Schreiben außerhalb des Runs, Zugriff auf Zugangsdaten, Programme mit Systemrechten.
 """
 
-_BUILTIN_RULES = [
-    (RuleEffect.ALLOW, "Lesen und Schreiben im Arbeitsordner, Python in der Sandbox"),
-    (RuleEffect.DENY, "Schreiben außerhalb des Runs (auch Original-Projekt)"),
-    (RuleEffect.DENY, "Sensible Pfade (~/.ssh, ~/.aws, ~/.arr, Schlüsselbund, Browser-Profile)"),
-    (RuleEffect.DENY, "sudo, security, launchctl, ssh, git push"),
-    (RuleEffect.ASK, "Lesen außerhalb des Runs, sonstiges Netzwerk, Paketinstallation"),
-]
+
+def _toolchain_candidates() -> list[ToolchainCandidate]:
+    """Sample Python environments for the settings and the setup assistant."""
+    return [
+        ToolchainCandidate(
+            path="~/.venvs/mathe",
+            python_version="3.12.0",
+            packages={"sympy": True, "numpy": True, "sage": False},
+        ),
+        ToolchainCandidate(
+            path="System-Python", python_version="3.12.0", packages={"sympy": False}
+        ),
+    ]
 
 
 def _skill_file_text(skill: SkillInfo, path: str) -> str:
@@ -6330,7 +6337,9 @@ class MockApi:
         """Workfolder settings with the number of running runs."""
         assert self.state.workfolder_settings is not None
         running = sum(1 for r in self.state.runs.values() if r.status is RunStatus.RUNNING)
-        return self.state.workfolder_settings.model_copy(update={"running_runs": running})
+        return self.state.workfolder_settings.model_copy(
+            update={"running_runs": running, "toolchain_candidates": _toolchain_candidates()}
+        )
 
     async def update_workfolder_settings(
         self, settings: WorkfolderSettingsInfo
@@ -6385,7 +6394,7 @@ class MockApi:
                 origin_text="Standard",
                 removable=False,
             )
-            for i, (effect, rule) in enumerate(_BUILTIN_RULES)
+            for i, (effect, rule) in enumerate(BUILTIN_FIXED_RULES)
         ]
         return builtin + list(self.state.user_rules)
 
@@ -6665,16 +6674,7 @@ class MockApi:
         return SetupState(
             workfolder=await self.get_workfolder(),
             profiles=list(self.state.profiles),
-            toolchain_candidates=[
-                ToolchainCandidate(
-                    path="~/.venvs/mathe",
-                    python_version="3.12.0",
-                    packages={"sympy": True, "numpy": True, "sage": False},
-                ),
-                ToolchainCandidate(
-                    path="System-Python", python_version="3.12.0", packages={"sympy": False}
-                ),
-            ],
+            toolchain_candidates=_toolchain_candidates(),
             projects=[p.name for p in self.state.projects],
         )
 

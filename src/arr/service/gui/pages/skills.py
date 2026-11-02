@@ -217,7 +217,9 @@ class SkillsPage:
             with (
                 ui.element("div").classes("btn-row").style("justify-content:center;margin-top:12px")
             ):
-                button("Start-Skills anlegen", self._create_start_skills, classes="btn primary")
+                button(
+                    "Start-Skills anlegen", self._create_start_skills, classes="btn primary"
+                ).mark("start-skills")
             return
         names = [s.name for s in skills]
         selected = self.name if self.name in names else names[0]
@@ -404,6 +406,9 @@ class SkillsPage:
             )
 
     def _create_start_skills(self) -> None:
+        if not hasattr(getattr(self.api, "base", self.api), "datasets"):  # the real service
+            self.frame.toast("Die Start-Skills kommen mit Auftrag W4-05.")
+            return
         self.frame.toast(
             "Start-Skills angelegt: exploration, proof, proof-review, roundtable, sympy-check, "
             "latex-writeup, arr (im Prototyp simuliert)."
