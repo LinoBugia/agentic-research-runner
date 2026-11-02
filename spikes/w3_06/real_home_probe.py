@@ -1,4 +1,4 @@
-"""The program of the live probe in both real sandboxes, with the real `HOME`, without a model.
+"""A program that reaches for the logins, in both sandboxes, real `HOME`, without a model.
 
 No request leaves the Mac: Codex runs through `codex sandbox`, Claude through the real CLI
 against the local fake server. The rules of the sandbox are the ones of a real agent of this
@@ -20,19 +20,43 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-sys.path[:0] = [str(Path(__file__).parents[2] / "tests"), str(Path(__file__).parent)]
+sys.path[:0] = [str(Path(__file__).parents[2] / "tests")]
 
 import login_guard_kit as kit  # noqa: E402
 from claude_agent_sdk import ClaudeSDKClient  # noqa: E402
 from claude_agent_sdk.types import PermissionResultAllow  # noqa: E402
 from fake_messages_api import FakeMessagesApi  # noqa: E402
-from live_probe import PROGRAM  # noqa: E402
 
 from arr.auth import CLAUDE_SWITCHES  # noqa: E402
 from arr.backends.claude_options import build_options, remove_tmp_link, tmp_link  # noqa: E402
 from arr.permissions.policy import PermissionRules, profile_for  # noqa: E402
 
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+PROGRAM = r"""import json, os, pwd, subprocess
+home = pwd.getpwuid(os.getuid()).pw_dir
+targets = {
+    "auth.json": home + "/.arr/auth/chatgpt-w2-02a/codex_home/auth.json",
+    "profiles": home + "/.arr/profiles.yaml",
+    "claude": home + "/.claude/settings.json",
+    "codex": home + "/.codex/config.toml",
+    "keychain": home + "/Library/Keychains/login.keychain-db",
+}
+quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+out = {}
+for name, path in targets.items():
+    out["cat " + name] = subprocess.run(["/bin/cat", path], **quiet).returncode
+out["ls .claude"] = subprocess.run(["/bin/ls", home + "/.claude"], **quiet).returncode
+out["ls .codex"] = subprocess.run(["/bin/ls", home + "/.codex"], **quiet).returncode
+security = "/usr/bin/security"
+out["security find"] = subprocess.run(
+    [security, "find-generic-password", "-s", "Claude Code-credentials"], **quiet
+).returncode
+dump = subprocess.run([security, "dump-keychain"], capture_output=True, text=True, errors="replace")
+out["security items"] = dump.stdout.count("keychain:")
+json.dump(out, open("result.json", "w"))
+print("fertig")
+"""
 
 
 def stamp(folder: Path) -> list[tuple[str, int]]:
