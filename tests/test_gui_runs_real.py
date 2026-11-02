@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from nicegui import ui
 from nicegui.testing.user import User
 from run_kit import FAST, done, fake_builders, post, say, turns, wait, write_profiles
 from service_kit import (
@@ -31,15 +32,18 @@ from test_gui_real import page_html, see
 from arr.models import RunStatus
 from arr.room.store import RoomStore
 from arr.room.types import DeliveryStatus, MessageKind
+from arr.runs import manager as manager_module
 from arr.runs.manager import RunManager, set_run_status
 from arr.service.api_models import (
     ApiException,
     ChannelMessageEvent,
+    CountsChangedEvent,
     ErrorCode,
     PostMessageRequest,
     RunAction,
     RunFilter,
 )
+from arr.service.gui.pages.run_detail import START_CHECK_SECONDS
 from arr.service.real_api import RealApi
 from arr.service.real_api.rundir import counts_as_active
 
@@ -1009,3 +1013,87 @@ async def test_a_deep_link_does_not_wait_past_the_end_of_the_run(
             await asyncio.sleep(0.05)
         assert "erscheint hier, sobald" not in html
         assert "Der Run wird vorbereitet" not in html
+
+
+# --- W3-04.4: the preparation fails -------------------------------------------------------------
+
+
+@pytest.fixture
+def unreadable(wf: Path) -> Iterator[Path]:
+    """A real file of the project that `prepare_run` cannot copy."""
+    file = wf / "projects" / "demo" / "geheim.txt"
+    file.write_text("x")
+    file.chmod(0o000)
+    yield file
+    file.chmod(0o644)
+
+
+@pytest.fixture
+def slow_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The page is open before the preparation fails, as with a large project."""
+    real = manager_module.prepare_run
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        time.sleep(0.6)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(manager_module, "prepare_run", slow)
+
+
+@pytest.mark.parametrize("query", ["", "?agent=m-1"])
+async def test_a_failed_preparation_replaces_the_open_page(
+    wf: Path, unreadable: Path, slow_preparation: None, query: str
+) -> None:
+    api = make_api(wf, ANSWERS)
+    async with real_user(api) as user:
+        checked = await api.resolve_run(FORM)
+        assert not checked.errors and not checked.warnings
+        started = await api.start_run(FORM)
+        assert started.status is RunStatus.QUEUED
+        await user.open(f"/runs/{started.run_id}{query}")
+        html = await see(user, "Der Run wird vorbereitet")
+        assert "Stoppen" in html
+        html = await see(user, "Run konnte nicht vorbereitet werden", retries=200)
+        assert "Kein Zugriff auf projects/demo/geheim.txt (keine Berechtigung)" in html
+        assert 'href="/neuer-run"' in html
+        assert "Stoppen" not in html and "Der Run wird vorbereitet" not in html
+        assert f"{wf}/projects" not in html and "Traceback" not in html
+
+        await user.open(f"/runs/{started.run_id}{query}")
+        html = await see(user, "Run konnte nicht vorbereitet werden")
+        assert "Kein Zugriff auf projects/demo/geheim.txt" in html and "Stoppen" not in html
+    restarted = make_api(wf)
+    with pytest.raises(ApiException) as error:
+        await restarted.get_run(started.run_id)
+    assert error.value.error.code is ErrorCode.NOT_FOUND
+
+
+async def test_a_failed_preparation_clears_the_counters(wf: Path, unreadable: Path) -> None:
+    api = make_api(wf, ANSWERS)
+    async with real_user(api):
+        events = api.subscribe()
+        started = await api.start_run(FORM)
+        handle = api.state.registry.get(started.run_id)
+
+        async def failed() -> bool:
+            return handle.start_failure is not None
+
+        await until(failed, what="reason of the failed start")
+        changed = [e for e in events.drain() if isinstance(e, CountsChangedEvent)]
+        assert changed and changed[-1].counts.active == 0
+        assert not (await api.list_runs()).items
+
+
+async def test_a_run_that_begins_stops_asking_about_its_start(wf: Path) -> None:
+    api = make_api(wf, {"m-1": turns([say("eins"), wait(30)]), "m-2": turns([wait(30)])})
+    async with real_user(api) as user:
+        started = await api.start_run(FORM)
+        await user.open(f"/runs/{started.run_id}")
+        await see(user, "Pausieren", retries=400)
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+        with user.client:
+            timers = [e for e in user.client.elements.values() if isinstance(e, ui.timer)]
+        assert any(t.interval == START_CHECK_SECONDS and not t.active for t in timers)
+        await api.run_action(started.run_id, RunAction.STOP)
+        await see(user, "Gestoppt", retries=600)

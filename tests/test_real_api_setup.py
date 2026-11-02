@@ -58,7 +58,7 @@ from arr.service.api_models import (
     WorkfolderRequest,
 )
 from arr.service.real_api import RealApi, live
-from arr.service.real_api.runs import RunsArea
+from arr.service.real_api.runs import RunsArea, _start_failure
 from arr.service.real_api.setup import base_venvs, duration_text, toolchain_notice
 from arr.service.state import (
     ServiceInfo,
@@ -1701,3 +1701,41 @@ async def test_the_switch_for_finished_runs_counts_without_a_restart(fresh: Path
     finally:
         await api.stop_runs()
         await api.close()
+
+
+# --- W3-04.4 ------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("error", "words", "gone"),
+    [
+        (
+            PermissionError(errno.EACCES, "Permission denied", "{wf}/projects/demo/a.txt"),
+            "Kein Zugriff auf projects/demo/a.txt (keine Berechtigung).",
+            "Permission denied",
+        ),
+        (
+            PermissionError(errno.EACCES, "Permission denied", "/Users/ich/privat/a.txt"),
+            "Kein Zugriff auf a.txt (keine Berechtigung).",
+            "/Users",
+        ),
+        (
+            ArrError("Der Ordner ~/.arr/geheim fehlt, siehe /opt/daten/liste.txt, bitte prüfen."),
+            "Der Ordner geheim fehlt, siehe liste.txt, bitte prüfen.",
+            "/opt",
+        ),
+        (
+            ArrError("Schlüssel sk-ant-api03-SECRETSECRETSECRET abgelehnt."),
+            "abgelehnt.",
+            "SECRETSECRET",
+        ),
+        (RuntimeError("Traceback (most recent call last)"), "interner Fehler", "Traceback"),
+    ],
+)
+def test_the_reason_of_a_failed_start_is_fit_for_the_page(
+    tmp_path: Path, error: Exception, words: str, gone: str
+) -> None:
+    if isinstance(error, OSError):
+        error.filename = error.filename.format(wf=tmp_path)
+    text = _start_failure(error, tmp_path)
+    assert words in text and gone not in text and str(tmp_path) not in text

@@ -37,6 +37,7 @@ from arr.service.api_models import (
     ChannelInfo,
     ChannelMessageEvent,
     DecisionRequest,
+    ErrorCode,
     LiveEvent,
     Message,
     RatingSubmittedEvent,
@@ -76,6 +77,9 @@ from arr.service.gui.pages.run_detail_transcript import TranscriptView
 from arr.service.gui.texts import RISK, STARTER_PHRASE, WAITING_FOR_YOU, run_status
 
 PUMP_SECONDS = 0.1
+START_CHECK_SECONDS = 1.0
+NOT_BEGUN = (RunStatus.QUEUED, RunStatus.PREPARING)
+START_FAILED = "Run konnte nicht vorbereitet werden"
 """Live events are applied in batches, at most 10 times a second (§6.6)."""
 DECIDED_SECONDS = 1.5
 """A decided compact card shows its confirmation this long (G2, same as the Freigaben page)."""
@@ -193,10 +197,28 @@ class RunDetailPage:
         self.subscription = api.subscribe(self.run_id, agents=self._wanted_agents())
         self.frame.client.on_delete(self._close)
         ui.timer(PUMP_SECONDS, self._pump)
+        if self.status in NOT_BEGUN:
+            self.start_check = ui.timer(START_CHECK_SECONDS, self._check_start)
 
     def _close(self) -> None:
         if self.subscription is not None:
             self.subscription.close()
+
+    async def _check_start(self) -> None:
+        """A failed preparation leaves no folder and no event, so ask until the run has begun."""
+        if self.status not in NOT_BEGUN:
+            self.start_check.deactivate()
+            return
+        try:
+            await self.api.get_run(self.run_id)
+        except ApiException as exc:
+            if exc.error.code is ErrorCode.START_FAILED:
+                self.start_check.deactivate()
+                self._close()
+                self.subscription = None
+                self.frame.content.clear()
+                with self.frame.content:
+                    _start_failed(exc.error.message)
 
     # --- head -------------------------------------------------------------------------------
 
@@ -1028,6 +1050,12 @@ class RunDetailPage:
                 self.view.refresh_messages()
 
 
+def _start_failed(reason: str) -> None:
+    """What is left of a run whose preparation failed (docs/08 §8.4)."""
+    raw(f'<h1 id="run-title" tabindex="-1">{START_FAILED}</h1>')
+    banner("err", reason, "", [("Neuer Run", "/neuer-run")])
+
+
 def _show_decided(element: ui.element, message: str, *, positive: bool) -> None:
     """A decided compact card: same height, content hidden, confirmation on top (G2)."""
     element.props(remove="data-primary-scope")
@@ -1075,14 +1103,19 @@ def register() -> None:
         try:
             detail = await api.get_run(run_id)
         except ApiException as exc:
+            failed = exc.error.code is ErrorCode.START_FAILED
             frame = Frame(
                 api,
                 active="runs",
-                title="Run nicht gefunden",
+                title=START_FAILED if failed else "Run nicht gefunden",
                 crumbs=[("Runs", "/runs"), ("Run", None)],
                 focus="#run-title",
             )
             await frame.start()
+            if failed:
+                with frame.content:
+                    _start_failed(exc.error.message)
+                return
             with frame.content:
                 raw('<h1 id="run-title" tabindex="-1">Run nicht gefunden</h1>')
                 banner(
