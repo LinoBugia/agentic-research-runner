@@ -8,6 +8,7 @@ pages go to the start page of the new workfolder (W3-04).
 
 import asyncio
 import contextlib
+import logging
 import time
 
 from arr.service.api_client import Subscription
@@ -16,14 +17,19 @@ from arr.service.real_api.base import ServiceState
 from arr.service.real_api.workfolder import counts
 from arr.service.watcher import RunWatcher
 
+log = logging.getLogger("arr.service")
+
 
 def show_new_workfolder() -> None:
     """Send every open tab to the start page: what it shows belongs to the old workfolder."""
     from nicegui import Client
 
     for client in list(Client.instances.values()):
-        if client.has_socket_connection:
-            client.run_javascript("location.assign('/')")
+        try:
+            if client.has_socket_connection:
+                client.run_javascript("location.assign('/')")
+        except Exception:  # noqa: BLE001 - one tab must not stop the switch half way
+            log.warning("Ein offener Tab folgt dem Workfolder-Wechsel nicht", exc_info=True)
 
 
 class LiveArea:

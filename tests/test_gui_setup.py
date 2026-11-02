@@ -425,3 +425,24 @@ async def test_new_run_shows_the_python_notice_for_codex_agents(
         await see(user, "1 · Projekt und Skill")
         user.find(marker="radio-skill-").trigger("change")
         await see(user, "Das Python von arr startet nicht für Codex-Agenten.", retries=120)
+
+
+# --- W3-04.3 ------------------------------------------------------------------------------------
+
+
+async def test_start_skills_on_the_real_service_say_when_they_come(wf: Path) -> None:
+    async with real_user(wf) as (user, _api):
+        await user.open("/skills")
+        await see(user, "Start-Skills anlegen")
+        user.find(marker="start-skills").click()
+        html = await see(user, "Die Start-Skills kommen mit Auftrag W4-05.")
+        assert "simuliert" not in html and "angelegt" not in html.replace("anlegen", "")
+    assert not list((wf / "skills").iterdir())
+
+
+async def test_start_skills_stay_simulated_in_the_prototype() -> None:
+    async with gui_user(MockApi()) as user:
+        await user.open("/skills?zustand=leer")
+        await see(user, "Start-Skills anlegen")
+        user.find(marker="start-skills").click()
+        await see(user, "im Prototyp simuliert")

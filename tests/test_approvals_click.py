@@ -600,8 +600,11 @@ def test_n4_open_approvals_skips_damaged_entries() -> None:
 
 
 async def test_the_inbox_stays_the_source_after_a_workfolder_switch(
-    wf: Path, tmp_path: Path
+    wf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from nicegui import Client
+
+    monkeypatch.setattr(Client, "instances", {})  # pages left by GUI tests hang on closed loops
     (tmp_path / "zweiter").mkdir()
     other = make_workfolder(tmp_path / "zweiter")
     async with Service(wf, {"a": asking(HOST)}) as svc:

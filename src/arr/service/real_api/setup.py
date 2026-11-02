@@ -337,7 +337,8 @@ def toolchain_notice(settings: WorkfolderSettings, workfolder: Path) -> Toolchai
     way = (
         "Wähle unter „Einstellungen → Python-Umgebung“ eine Basis-venv außerhalb davon."
         if base_venvs()
-        else "Anlegen kann arr sie noch nicht selbst, bis dahin laufen Runs nur mit Claude-Agenten."
+        else "Eine Basis-venv kann arr noch nicht selbst anlegen, bis dahin laufen Runs nur mit "
+        "Claude-Agenten."
     )
     return ToolchainNotice(
         title=title,

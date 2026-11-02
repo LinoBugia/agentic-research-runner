@@ -148,7 +148,7 @@ def read_app_settings() -> dict[str, Any]:
     """Content of `settings.yaml`; empty if there is none or it is unreadable."""
     try:
         data = YAML(typ="safe").load(app_settings_file().read_text(encoding="utf-8"))
-    except (OSError, YAMLError):
+    except (OSError, ValueError, YAMLError):
         return {}
     return data if isinstance(data, dict) else {}
 

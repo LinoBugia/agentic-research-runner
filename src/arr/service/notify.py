@@ -1,6 +1,8 @@
 """macOS notifications of the service (docs/08 §4.2) through `osascript`, no new dependency.
 
-The `Notifier` hangs on the `EventHub`: a new approval always, a finished run per §4.2. Agents
+The `Notifier` hangs on the `EventHub`: a new approval always, a finished run per §4.2 unless
+its switch in the app settings is off (read at every event, so a change counts at once; a
+missing switch means on). The other switches of §5.11 have no event here yet. Agents
 determine parts of a request, so the text goes to `osascript` as an argument (`on run argv`)
 and is never built into the script. It names agent, run and the kind of request; the full
 command never appears (lock screen), secrets are removed. Without `osascript`, or with
@@ -16,17 +18,31 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from arr.permissions.policy import redact
 from arr.permissions.types import ApprovalType
 from arr.service.api_client import EventHub
-from arr.service.api_models import ApprovalEvent, ApprovalItem, LiveEvent, RunStatusEvent
+from arr.service.api_models import (
+    ApprovalEvent,
+    ApprovalItem,
+    LiveEvent,
+    NotificationEvent,
+    RunStatusEvent,
+)
 from arr.service.gui.components.notification import FINAL_WORD
 from arr.service.gui.format import deadline as deadline_text
 from arr.service.gui.texts import CATEGORY
+from arr.service.state import read_app_settings
 
-__all__ = ["Notifier", "Sender", "message_for", "osascript_args", "send_notification"]
+__all__ = [
+    "Notifier",
+    "Sender",
+    "message_for",
+    "osascript_args",
+    "send_notification",
+    "switched_on",
+]
 
 log = logging.getLogger("arr.service.notify")
 
@@ -88,6 +104,15 @@ def message_for(event: LiveEvent, now: float) -> str | None:
     return None
 
 
+def switched_on(event: LiveEvent) -> bool:
+    """Whether the switch of §5.11 lets this event through; approvals always pass."""
+    if not isinstance(event, RunStatusEvent):
+        return True
+    saved = read_app_settings().get("notifications")
+    switches = saved if isinstance(saved, Mapping) else {}
+    return switches.get(NotificationEvent.RUN_FINISHED.value) is not False
+
+
 class Notifier:
     """Follows the global live stream and sends notifications, one after the other."""
 
@@ -117,7 +142,7 @@ class Notifier:
         async for event in self._subscription:
             try:
                 text = message_for(event, time.time())
-                if text:
+                if text and switched_on(event):
                     await asyncio.to_thread(self.send, text, TITLE)
             except asyncio.CancelledError:
                 raise

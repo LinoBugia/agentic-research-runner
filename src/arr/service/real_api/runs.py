@@ -694,12 +694,12 @@ class RunsArea:
             notice = toolchain_notice(launch.settings, self.state.workfolder)
             if notice is not None:
                 warnings.append(f"{notice.title} {notice.text}")
-        standards = launch.run_input.defaults
-        if standards is not None and "task_md" in run_input:
-            chosen = [f"das Modell {model_label(standards.model)}"] if standards.model else []
-            chosen += [f"das Profil „{standards.auth}“"] if standards.auth else []
+        if launch.run_input.defaults is not None and "task_md" in run_input:
+            used = dict.fromkeys(
+                f"{model_label(a.model)} mit dem Profil „{a.auth}“" for a in resolved.agents
+            )
             warnings.append(
-                f"In diesem Workfolder fehlen Standards, deshalb nimmt arr {' und '.join(chosen)}. "
+                f"In diesem Workfolder fehlen Standards, dieser Run nutzt {' und '.join(used)}. "
                 f"Festlegen kannst du sie unter {STANDARDS_PLACE}."
             )
         return ResolveResult(

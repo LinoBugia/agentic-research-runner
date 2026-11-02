@@ -920,8 +920,8 @@ def test_notice_when_python_lies_below_home(
     assert notice.title == "Das Python von arr startet nicht für Codex-Agenten."
     assert "unter deinem Benutzerordner" in notice.text and "Codex-Sandbox" in notice.text
     assert "Claude-Agenten sind nicht betroffen" in notice.text
-    assert "noch nicht selbst" in notice.text
-    assert "arr " not in notice.text.replace("arr sie", "")  # no command
+    assert "Eine Basis-venv kann arr noch nicht selbst anlegen" in notice.text
+    assert "arr " not in notice.text.replace("arr noch", "")  # no command
 
     fake_base_venv("mathe")
     notice = toolchain_notice(settings, fresh)
@@ -1538,7 +1538,7 @@ async def test_a_new_workfolder_takes_its_standards_from_the_profiles(
     assert (agent.provider, agent.profile) == (Provider.CLAUDE, "mein-claude")
     assert agent.model == "claude-sonnet-5-5"
     [warning] = result.warnings
-    assert "Claude Sonnet 5.5" in warning and "„mein-claude“" in warning
+    assert "dieser Run nutzt Claude Sonnet 5.5 mit dem Profil „mein-claude“" in warning
     assert "Einstellungen → Standards und Limits" in warning and "arr.yaml" not in warning
 
 
@@ -1560,7 +1560,7 @@ async def test_standards_that_exist_stay_and_only_the_gap_is_filled(
     result = await make_api(fresh).resolve_run(ALONE)
     [agent] = result.agents
     assert (agent.model, agent.profile) == ("claude-sonnet-5-5", "gewaehlt")
-    assert "gewaehlt" not in result.warnings[0] and "Claude Sonnet 5.5" in result.warnings[0]
+    assert "Claude Sonnet 5.5 mit dem Profil „gewaehlt“" in result.warnings[0]
 
     update_settings_file(
         fresh, lambda d: set_setting(d, ("defaults", "claude", "model"), "claude-opus-5-5")
@@ -1608,3 +1608,98 @@ async def test_a_file_without_rights_reads_right_in_the_check(wf: Path) -> None:
     finally:
         file.chmod(0o644)
     assert check.detail == "Keine Berechtigung. Prüfe die Rechte der Datei."
+
+
+# --- W3-04.3: last round before the merge -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("model", "words"),
+    [
+        ("gpt-5.5", "dieser Run nutzt gpt-5.5 mit dem Profil „chatgpt“"),
+        ("claude-haiku-5-5", "dieser Run nutzt Claude Haiku 5.5 mit dem Profil „mein-claude“"),
+    ],
+)
+async def test_the_warning_names_what_the_run_really_uses(
+    fresh: Path, arr_home: Path, model: str, words: str
+) -> None:
+    write_profiles(arr_home, {"mein-claude": "claude_oauth", "chatgpt": "codex_chatgpt"})
+    (fresh / "projects" / "demo").mkdir()
+    api = make_api(fresh)
+    [agent] = (await api.resolve_run(ALONE)).agents
+    result = await api.resolve_run({**ALONE, "agents": {agent.id: {"model": model}}})
+    [warning] = [w for w in result.warnings if "fehlen Standards" in w]
+    assert words in warning and "Sonnet" not in warning
+
+
+async def test_a_tab_that_fails_does_not_stop_the_switch(
+    wf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nicegui import Client
+
+    class Tab:
+        has_socket_connection = True
+
+        def __init__(self, broken: bool) -> None:
+            self.broken = broken
+            self.sent: list[str] = []
+
+        def run_javascript(self, code: str) -> None:
+            if self.broken:
+                raise RuntimeError("Event loop is closed")
+            self.sent.append(code)
+
+    broken, fine = Tab(True), Tab(False)
+    monkeypatch.setattr(Client, "instances", {"a": broken, "b": fine})
+    other = init_workfolder(tmp_path / "zweiter")
+    write_service_info(
+        ServiceInfo(host="127.0.0.1", port=1, token="t", pid=os.getpid(), workfolder=str(wf))
+    )
+    api = make_api(wf)
+    await api.select_workfolder(WorkfolderRequest(path=str(other)))
+    info = read_service_info()
+    assert api.state.workfolder == other and info is not None and info.workfolder == str(other)
+    assert recent_workfolders()[0] == other
+    assert fine.sent == ["location.assign('/')"]
+
+
+async def test_app_settings_that_are_not_utf8_count_as_empty(fresh: Path, arr_home: Path) -> None:
+    (arr_home / "settings.yaml").write_bytes(NOT_UTF8)
+    assert read_app_settings() == {}
+    assert (await make_api(fresh).get_app_settings()).notifications == {}
+
+
+async def test_the_switch_for_finished_runs_counts_without_a_restart(fresh: Path) -> None:
+    (fresh / "projects" / "demo").mkdir()
+    update_settings_file(fresh, lambda d: set_setting(d, ("toolchain", "run_venv"), "off"))
+    sent: list[str] = []
+    api = RealApi(
+        fresh,
+        base_url=BASE,
+        # long enough for the watcher to see it running: only an end it saw is announced
+        builders=fake_builders({"a": turns([say("los"), wait(0.6), done()])}),
+        manager_kwargs={"pacing": FAST},
+        notify=lambda text, _title: sent.append(text),
+    )
+    await api.start()
+    try:
+        settings = await api.get_app_settings()
+        off = {**settings.notifications, NotificationEvent.RUN_FINISHED: False}
+        await api.update_app_settings(settings.model_copy(update={"notifications": off}))
+        first = (await api.start_run(RUN_INPUT)).run_id
+        await until_status(api, first, RunStatus.DONE)
+        await asyncio.sleep(0.6)  # time for the watcher and the notifier to have passed it on
+        assert not sent
+
+        on = {**off, NotificationEvent.RUN_FINISHED: True}
+        await api.update_app_settings(settings.model_copy(update={"notifications": on}))
+        second = (await api.start_run(RUN_INPUT)).run_id
+        await until_status(api, second, RunStatus.DONE)
+        for _ in range(250):
+            if sent:
+                break
+            await asyncio.sleep(0.02)
+        assert len(sent) == 1 and sent[0].startswith("Run fertig")
+    finally:
+        await api.stop_runs()
+        await api.close()
