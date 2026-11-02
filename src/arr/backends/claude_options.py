@@ -21,6 +21,8 @@ from typing import Any
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk.types import CanUseTool, SystemPromptPreset
 
+from arr.auth import START_PROFILE_VARIABLE
+from arr.backends.claude_start import start_program
 from arr.errors import ArrError
 from arr.models import Effort
 from arr.permissions.policy import ROOM_TOOL_PREFIX, SandboxProfile, claude_options
@@ -202,8 +204,10 @@ def build_options(
 ) -> ClaudeAgentOptions:
     """All options of one agent; `env` holds the auth part (`arr.auth.claude_env`).
 
-    `tmpdir` replaces `TMPDIR` (Run-tmp) with its short alias from `tmp_link` and also
-    becomes `CLAUDE_CODE_TMPDIR`, the temp root the CLI gives sandboxed commands.
+    An `env` that names a profile for the start program gets it as `cli_path`: only that
+    program hands the secret to the CLI (`arr.backends.claude_start`). `tmpdir` replaces
+    `TMPDIR` (Run-tmp) with its short alias from `tmp_link` and also becomes
+    `CLAUDE_CODE_TMPDIR`, the temp root the CLI gives sandboxed commands.
     """
     config = agent.file.config
     perms = claude_options(profile)
@@ -214,7 +218,9 @@ def build_options(
     process_env.update(cache_env(Path(perms.env["TMPDIR"])))
     if tmpdir is not None:
         process_env["TMPDIR"] = process_env["CLAUDE_CODE_TMPDIR"] = str(tmpdir)
+    needs_start = START_PROFILE_VARIABLE in env
     return ClaudeAgentOptions(
+        cli_path=start_program(profile.write_roots) if needs_start else None,
         model=config.model,
         cwd=Path(perms.cwd),
         add_dirs=list(perms.add_dirs),

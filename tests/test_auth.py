@@ -6,6 +6,7 @@ import pytest
 
 from arr.auth import (
     CLAUDE_SWITCHES,
+    START_PROFILE_VARIABLE,
     AuthError,
     claude_env,
     clean_process_env,
@@ -57,7 +58,7 @@ def test_oauth_with_token_in_keychain() -> None:
         return SECRET
 
     env = claude_env(AuthProfile(name="max-privat", kind="claude_oauth"), reader)
-    assert env == {**CLAUDE_SWITCHES, "CLAUDE_CODE_OAUTH_TOKEN": SECRET}
+    assert env == {**CLAUDE_SWITCHES, START_PROFILE_VARIABLE: "max-privat"}, "never the secret"
     assert calls == [("arr", "max-privat")]
 
 
@@ -77,7 +78,8 @@ def test_api_key_profile() -> None:
         seen.append((service, account))
         return SECRET
 
-    assert claude_env(profile, reader)["ANTHROPIC_API_KEY"] == SECRET
+    env = claude_env(profile, reader)
+    assert env[START_PROFILE_VARIABLE] == "api" and SECRET not in env.values()
     assert seen == [("arr-keys", "team")] and keychain_ref(profile) == ref
     with pytest.raises(AuthError, match="kein API-Key"):
         claude_env(profile, lambda s, a: None)

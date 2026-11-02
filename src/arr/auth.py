@@ -1,11 +1,16 @@
 """Auth profiles: secrets in the macOS keychain via `keyring` and the environment
-built for each agent process.
+built for each agent process, which never holds a secret.
 
 `clean_process_env()` strips everything from `os.environ` that would select a credential or
 tie a child process to a parent Claude Code session (docs/spikes/S1 §2.5, §3.1): the SDK only
 merges `ClaudeAgentOptions.env` on top of the inherited environment, it cannot remove keys.
 `claude_env()` then builds the per-agent variables from an `AuthProfile`. Secrets are read
 from the keychain only, never logged and never put into an error message.
+
+A secret never goes into an environment: every program of the user can read the start
+environment of a process, also from inside the sandbox (`KERN_PROCARGS2`, W3-06 §12). The start
+program (`arr.backends.claude_start`) hands it to the CLI through a pipe; `claude_env` only
+names the profile for it, and there is no way back.
 
 See docs/01-architektur.md §8, docs/04-service-gui-und-schnittstellen.md §5.
 """
@@ -38,6 +43,18 @@ environment of Bash and other child processes (W2-01.1, B2): without it the CLI 
 `CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` on (only GitHub Actions scrubs by default).
 The CLI then also drops secret-like names (`*_TOKEN`, `*_KEY`, …) and config paths such as
 `XDG_CACHE_HOME`, and forces the permission mode to `default` (writes go to `can_use_tool`)."""
+
+SECRET_VARIABLES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+"""Names the CLI takes a secret from; none of them is ever set by arr."""
+
+START_PROFILE_VARIABLE = "ARR_CLAUDE_START_PROFILE"
+"""Tells the start program which profile's secret to hand over: the name, never the secret."""
+
+DESCRIPTOR_VARIABLES = {
+    AuthKind.CLAUDE_OAUTH: "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+    AuthKind.CLAUDE_API_KEY: "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+}
+"""Where the CLI finds the descriptor of the pipe, by kind of secret."""
 
 SecretReader = Callable[[str, str], str | None]
 """`(service, account) -> secret or None`, defaults to `keyring.get_password`."""
@@ -102,19 +119,29 @@ def read_secret(profile: AuthProfile, reader: SecretReader | None = None) -> str
     return secret or None
 
 
-def claude_env(profile: AuthProfile, reader: SecretReader | None = None) -> dict[str, str]:
-    """Per-agent environment of a Claude agent: the switches plus the profile's credential.
+def descriptor_variable(profile: AuthProfile) -> str:
+    """The variable of the CLI that takes this profile's secret through a pipe."""
+    variable = DESCRIPTOR_VARIABLES.get(profile.kind)
+    if variable is None:
+        raise AuthError(
+            f"Das Profil „{profile.name}“ ({profile.kind}) passt nicht zu einem Claude-Agenten."
+        )
+    return variable
 
-    - `claude_oauth` with a token in the keychain → `CLAUDE_CODE_OAUTH_TOKEN`
+
+def claude_env(profile: AuthProfile, reader: SecretReader | None = None) -> dict[str, str]:
+    """Per-agent environment of a Claude agent: the switches, never a secret.
+
+    - `claude_oauth` with a token in the keychain, `claude_api_key` with a key →
+      `START_PROFILE_VARIABLE`: the start program must run, it hands the secret over
     - `claude_oauth` without a stored token → no credential: the agent uses the Mac's
       existing Claude login (logged as info, without account data)
-    - `claude_api_key` → `ANTHROPIC_API_KEY` (missing key is an error)
+    - `claude_api_key` without a key is an error
     """
     env = dict(CLAUDE_SWITCHES)
     if profile.kind is AuthKind.CLAUDE_OAUTH:
-        token = read_secret(profile, reader)
-        if token:
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        if read_secret(profile, reader):
+            env[START_PROFILE_VARIABLE] = profile.name
         else:
             log.info(
                 "Profil „%s“: kein Token im Schlüsselbund, der Agent nutzt den vorhandenen "
@@ -122,14 +149,11 @@ def claude_env(profile: AuthProfile, reader: SecretReader | None = None) -> dict
                 profile.name,
             )
     elif profile.kind is AuthKind.CLAUDE_API_KEY:
-        key = read_secret(profile, reader)
-        if not key:
+        if not read_secret(profile, reader):
             raise AuthError(f"Für das Profil „{profile.name}“ liegt kein API-Key im Schlüsselbund.")
-        env["ANTHROPIC_API_KEY"] = key
+        env[START_PROFILE_VARIABLE] = profile.name
     else:
-        raise AuthError(
-            f"Das Profil „{profile.name}“ ({profile.kind}) passt nicht zu einem Claude-Agenten."
-        )
+        descriptor_variable(profile)  # raises: this kind has no Claude login
     return env
 
 

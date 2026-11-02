@@ -16,6 +16,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     PermissionResultAllow,
     PermissionResultDeny,
+    ProcessError,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -27,7 +28,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk.types import ToolPermissionContext
 
-from arr.auth import CLAUDE_SWITCHES
+from arr.auth import CLAUDE_SWITCHES, START_PROFILE_VARIABLE, AuthError
 from arr.backends import claude_options as claude_options_module
 from arr.backends.base import AgentBackend, CostKind, EventKind
 from arr.backends.claude import ClaudeBackend, tool_request, with_context
@@ -39,6 +40,7 @@ from arr.backends.claude_options import (
     static_prompt,
     tmp_link,
 )
+from arr.backends.claude_start import HANDOVER_FAILED
 from arr.errors import ArrError
 from arr.models import AuthProfile, Limits, RunInput, Toolchain, Tools, WorkfolderSettings
 from arr.permissions.inbox import ApprovalInbox
@@ -56,6 +58,12 @@ from arr.workfolder import init_workfolder
 
 FIXTURES = Path(__file__).parent / "fixtures" / "claude"
 SECRET = "sk-ant-oat01-TESTSECRET-0123456789abcdef"
+
+
+@pytest.fixture(autouse=True)
+def private_start_program(arr_home: Path) -> Path:
+    """A profile with a secret writes the start program below `app_dir()`."""
+    return arr_home
 
 
 # --------------------------------------------------------------------------------------------
@@ -815,7 +823,7 @@ async def test_cli_failure_gives_error_and_turn_end(setup: Setup) -> None:
 # --------------------------------------------------------------------------------------------
 
 
-async def test_a8_token_only_in_the_process_env(
+async def test_a8_the_token_is_in_no_environment_and_no_file(
     setup: Setup, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.DEBUG)
@@ -828,7 +836,9 @@ async def test_a8_token_only_in_the_process_env(
     finally:
         logger.close()
         await backend.close()
-    assert clients[0].options.env["CLAUDE_CODE_OAUTH_TOKEN"] == SECRET
+    options = clients[0].options
+    assert SECRET not in options.env.values() and "CLAUDE_CODE_OAUTH_TOKEN" not in options.env
+    assert Path(options.cli_path).name.startswith("claude-start-"), "the start program hands over"
     for path in agent_dir.rglob("*"):
         if path.is_file():
             assert SECRET not in path.read_text(encoding="utf-8", errors="replace"), path
@@ -925,8 +935,33 @@ async def test_w2011_scrub_switch_for_every_auth_kind(
         await backend.close()
     env = clients[0].options.env
     assert env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
-    if credential:
-        assert env[credential] == SECRET
+    assert not (credential and credential in env), "no secret in any environment"
+    assert (START_PROFILE_VARIABLE in env) == bool(credential)
+    assert (clients[0].options.cli_path is not None) == bool(credential)
+
+
+async def test_a_failed_handover_stops_the_agent_with_a_clear_message(setup: Setup) -> None:
+    class RefusedClient(FakeClient):
+        async def connect(self, prompt: Any = None) -> None:
+            raise ProcessError("Command failed", exit_code=HANDOVER_FAILED)
+
+    backend, clients = make_backend(setup, [], reader=lambda s, a: SECRET, client_cls=RefusedClient)
+    with pytest.raises(AuthError, match="ließ sich nicht an die CLI übergeben"):
+        await backend.start()
+    assert len(clients) == 1, "no second start, and no way back into the environment"
+    assert SECRET not in clients[0].options.env.values()
+    await backend.close()
+
+
+async def test_another_failure_of_the_cli_stays_what_it_is(setup: Setup) -> None:
+    class BrokenClient(FakeClient):
+        async def connect(self, prompt: Any = None) -> None:
+            raise ProcessError("Command failed", exit_code=1)
+
+    backend, _ = make_backend(setup, [], reader=lambda s, a: SECRET, client_cls=BrokenClient)
+    with pytest.raises(ProcessError):
+        await backend.start()
+    await backend.close()
 
 
 def test_w2011_tmp_link_with_other_target_is_an_arr_error(setup: Setup) -> None:

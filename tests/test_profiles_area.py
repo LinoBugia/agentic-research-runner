@@ -215,7 +215,7 @@ async def test_delete_is_refused_while_a_run_of_another_process_uses_it(
 ) -> None:
     record = SimpleNamespace(
         run_id="r1",
-        meta=SimpleNamespace(status=RunStatus.RUNNING),
+        status=RunStatus.RUNNING,
         load_resolved=lambda: SimpleNamespace(agents=[SimpleNamespace(auth="max")]),
     )
     monkeypatch.setattr(api.state.store, "scan", lambda: [record])
@@ -285,7 +285,8 @@ async def test_test_shows_success_and_the_list_makes_no_call(
     assert info.secret_present and info.models == ["claude-haiku-5-5"]
     options = calls[0]
     assert options.model == "claude-haiku-5-5" and options.max_budget_usd <= 0.10
-    assert options.max_turns == 1 and options.tools == [] and options.env["ANTHROPIC_API_KEY"]
+    assert options.max_turns == 1 and options.tools == [] and options.cli_path
+    assert "ANTHROPIC_API_KEY" not in options.env and KEY not in options.env.values()
 
     def no_keychain(*_a: Any) -> None:
         raise AssertionError("the list must not read the keychain")
@@ -301,7 +302,7 @@ async def test_test_shows_success_and_the_list_makes_no_call(
 async def test_mac_login_works_without_a_token_in_the_keychain(api: RealApi, calls: list) -> None:
     info = await api.test_profile("max")
     assert info.last_test.ok and not info.secret_present
-    assert "CLAUDE_CODE_OAUTH_TOKEN" not in calls[0].env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in calls[0].env and calls[0].cli_path is None
 
 
 async def test_service_environment_never_reaches_the_test(
@@ -471,7 +472,7 @@ async def test_login_stores_the_token_and_tests_the_profile(
     status = await until_state(api, "max", LoginState.DONE)
     assert keychain == {("arr", "max"): MARKER}
     assert status.profile_info.secret_present and status.profile_info.last_test.ok
-    assert calls[0].env["CLAUDE_CODE_OAUTH_TOKEN"] == MARKER
+    assert calls[0].cli_path and MARKER not in calls[0].env.values()
     assert not alive(facts_of(facts)["pid"])
 
 
