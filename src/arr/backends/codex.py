@@ -13,6 +13,8 @@ yields `AgentEvent`s with the raw notification attached.
   stream missed. `rate_limit` comes from the raw message hook (it is not routed to a turn).
 - Project context: Codex reads `AGENTS.md` in its `cwd` itself; `context.md` goes into the
   first prompt only in workspace mode `shared` (docstring of `AgentFile`).
+- Project settings: Codex starts MCP servers and hooks of `<cwd>/.codex` outside the sandbox.
+  `start` keeps the state of that folder; a thread starts only while it is unchanged (W3-06.4).
 - Hints: `deliver_hint` steers the running turn and emits a `hint` event; a rejected request's
   reason reaches the agent the same way. `interrupt` ends a waiting approval first.
 
@@ -43,6 +45,7 @@ from arr.backends.codex_config import (
     build_launch,
     codex_home_for,
     command_home,
+    project_config_state,
     server_home,
 )
 from arr.backends.codex_events import TurnEvents, read_rollout, rollout_calls
@@ -157,6 +160,7 @@ class CodexBackend:
         self._interrupted = False
         self._tasks: set[asyncio.Task[Any]] = set()
         self._run_channels: list[str] = []
+        self._project_state: str | None = None
 
     # -- lifecycle --------------------------------------------------------------------------
 
@@ -172,6 +176,7 @@ class CodexBackend:
         for home in (command_home(self.agent, self.profile), server_home(self.agent, self.profile)):
             home.mkdir(parents=True, exist_ok=True)
         self._run_channels = _run_channels(self.agent.run_dir)
+        self._project_state = project_config_state(self.profile.work_dir)
         self._started = True
 
     async def close(self) -> None:
@@ -329,6 +334,7 @@ class CodexBackend:
 
     async def _open(self, queue: asyncio.Queue[Any]) -> Any:
         """Start this turn's app-server and start or resume the thread."""
+        self._check_project_config()
         launch = build_launch(
             self.agent,
             self.profile,
@@ -381,6 +387,19 @@ class CodexBackend:
         self._thread_id = started.thread.id
         self._rollout = getattr(started.thread, "path", None) or self._rollout
         return thread
+
+    def _check_project_config(self) -> None:
+        """Fail closed: no thread once `<cwd>/.codex` differs from its state at the start."""
+        if project_config_state(self.profile.work_dir) == self._project_state:
+            return
+        folder = self.profile.work_dir / ".codex"
+        logger.warning("Projekt-Konfiguration %s seit dem Start verändert", folder)
+        raise ArrError(
+            f"Der Codex-Agent {self.agent.id} arbeitet nicht weiter: Die Projekt-Konfiguration "
+            f"{folder} hat sich seit dem Start des Runs verändert. Aus ihr würde Codex Programme "
+            "außerhalb der Sandbox starten (MCP-Server, Hooks). Prüfe den Ordner und starte "
+            "den Run neu."
+        )
 
     def _refused_event(
         self, method: str, params: dict[str, Any], answer: dict[str, Any]

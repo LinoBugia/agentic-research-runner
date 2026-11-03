@@ -200,6 +200,10 @@ def remove_tmp_link(link: Path, target: Path) -> None:
         link.unlink()
 
 
+NODE_CACHE_SWITCH = "NODE_DISABLE_COMPILE_CACHE"
+"""Node keeps compiled code in `$TMPDIR/node-compile-cache` and loads it on the next start."""
+
+
 def cache_env(run_tmp: Path) -> dict[str, str]:
     """Caches of pip, matplotlib and XDG tools in Run-tmp: `~` is not writable in the sandbox
     (W1-05 §7.2), and without this pip warns and works without a cache."""
@@ -267,6 +271,9 @@ def build_options(
     process_env["VIRTUAL_ENV"] = ""
     process_env["CLAUDE_ENV_FILE"] = str(shell_env_file(agent, profile, bash_path))
     process_env.update(cache_env(Path(perms.env["TMPDIR"])))
+    # `npm` of the CLI runs outside the sandbox and would load its compile cache from TMPDIR,
+    # a write root (W3-06.4, Punkt 5)
+    process_env[NODE_CACHE_SWITCH] = "1"
     if tmpdir is not None:
         process_env["TMPDIR"] = process_env["CLAUDE_CODE_TMPDIR"] = str(tmpdir)
     needs_start = START_PROFILE_VARIABLE in env

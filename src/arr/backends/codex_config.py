@@ -34,8 +34,10 @@ See docs/01-architektur.md §4.2, docs/07-berechtigungen-und-freigaben.md §3 �
 docs/spikes/S2_codex.md §11, §15.
 """
 
+import hashlib
 import logging
 import os
+import stat
 import sys
 import tomllib
 from collections.abc import Mapping, Sequence
@@ -61,6 +63,7 @@ __all__ = [
     "filesystem_entries",
     "glob_escape",
     "isolation_overrides",
+    "project_config_state",
     "project_mcp_servers",
     "toml_value",
 ]
@@ -423,6 +426,31 @@ def project_mcp_servers(cwd: Path) -> list[str]:
         return []
     servers = data.get("mcp_servers")
     return sorted(str(name) for name in servers) if isinstance(servers, dict) else []
+
+
+def project_config_state(cwd: Path) -> str:
+    """A fingerprint of `<cwd>/.codex`: every entry below it with its type, link target and
+    content, links not followed; `absent` if there is none (W3-06.4, 3c).
+
+    Codex reads its project settings from there and starts MCP servers and hooks outside the
+    sandbox. arr compares the state with the one at the start of the run before every thread.
+    """
+    folder = cwd / ".codex"
+    if not os.path.lexists(folder):
+        return "absent"
+    digest = hashlib.sha256()
+    try:
+        below = (Path(top) / name for top, dirs, files in os.walk(folder) for name in dirs + files)
+        for path in [folder, *sorted(below)]:
+            info = os.lstat(path)
+            digest.update(f"{path.relative_to(cwd)}\0{stat.S_IFMT(info.st_mode)}\0".encode())
+            if stat.S_ISLNK(info.st_mode):
+                digest.update(os.readlink(path).encode())
+            elif stat.S_ISREG(info.st_mode):
+                digest.update(path.read_bytes())
+    except OSError as exc:
+        return f"unreadable: {type(exc).__name__}"  # differs from any state that was read
+    return digest.hexdigest()
 
 
 def command_home(agent: PreparedAgent, profile: SandboxProfile) -> Path:

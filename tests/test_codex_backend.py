@@ -15,6 +15,7 @@ from arr.backends import codex as codex_module
 from arr.backends.base import AgentBackend, AgentEvent, EventKind
 from arr.backends.codex import CodexBackend
 from arr.backends.codex_approvals import ApprovalBridge
+from arr.backends.codex_config import project_config_state
 from arr.errors import ArrError
 from arr.models import AgentConfig, AuthKind, AuthProfile, Provider
 from arr.permissions import policy
@@ -407,6 +408,68 @@ async def test_app_server_error_still_ends_with_turn_end(setup, monkeypatch) -> 
     assert kinds(events) == ["turn_start", "error", "turn_end"]
     assert events[-1].data["status"] == "error"
     assert kit.codexes[0].closed
+
+
+# -- W3-06.4, 3c: project settings of Codex, fail closed -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["new file", "changed file", "new hooks", "removed", "link"],
+)
+async def test_a_changed_codex_folder_starts_no_thread(setup, caplog, change: str) -> None:
+    backend, kit, _ = setup([simple_turn(), simple_turn("zwei")])
+    work = backend.profile.work_dir
+    folder = work / ".codex"
+    if change != "new file":
+        folder.mkdir()
+        (folder / "config.toml").write_text("# Projekt\n")
+    await backend.start()
+    await play(backend)
+    if change == "new file":
+        folder.mkdir()
+        (folder / "config.toml").write_text('[mcp_servers.x]\ncommand = "/bin/sh"\n')
+    elif change == "changed file":
+        (folder / "config.toml").write_text('[mcp_servers.x]\ncommand = "/bin/sh"\n')
+    elif change == "new hooks":
+        (folder / "hooks.json").write_text("{}\n")
+    elif change == "removed":
+        (folder / "config.toml").unlink()
+    else:
+        (folder / "config.toml").unlink()
+        (folder / "config.toml").symlink_to(work / "other.toml")
+    events = await play(backend, "Weiter.")
+    assert kinds(events) == ["turn_start", "error", "turn_end"]
+    assert "Projekt-Konfiguration" in events[1].data["message"]
+    assert "außerhalb der Sandbox" in events[1].data["message"]
+    assert events[-1].data["status"] == "error"
+    assert len(kit.codexes) == 1, "no app-server started for the second turn"
+    assert "seit dem Start verändert" in caplog.text
+    again = await play(backend, "Noch einmal.")
+    assert kinds(again)[1] == "error" and len(kit.codexes) == 1  # stays closed
+
+
+async def test_an_unchanged_codex_folder_keeps_the_run_going(setup) -> None:
+    backend, kit, _ = setup([simple_turn(), simple_turn("zwei")])
+    folder = backend.profile.work_dir / ".codex"
+    folder.mkdir()
+    (folder / "config.toml").write_text("# Projekt\n")
+    await backend.start()
+    await play(backend)
+    second = await play(backend, "Weiter.")
+    assert "error" not in kinds(second) and len(kit.codexes) == 2
+
+
+def test_the_state_of_the_codex_folder(tmp_path: Path) -> None:
+    assert project_config_state(tmp_path) == "absent"
+    (tmp_path / ".codex").mkdir()
+    empty = project_config_state(tmp_path)
+    (tmp_path / ".codex" / "config.toml").write_text("a = 1\n")
+    one = project_config_state(tmp_path)
+    assert len({"absent", empty, one}) == 3
+    assert project_config_state(tmp_path) == one  # stable
+    (tmp_path / ".codex" / "config.toml").write_text("a = 2\n")
+    assert project_config_state(tmp_path) != one
 
 
 async def test_close_is_idempotent(setup) -> None:

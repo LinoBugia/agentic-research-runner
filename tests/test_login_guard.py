@@ -10,6 +10,7 @@ The version guard runs everywhere, also in the CI: no update passes without a ne
 
 import importlib.metadata
 import json
+import os
 import re
 import subprocess
 import sys
@@ -56,6 +57,19 @@ def installed_versions() -> dict[str, str]:
 
 
 OUTSIDE_TEST = "test_nothing_of_a_write_root_runs_outside_the_sandbox"
+GUARD_TESTS = (
+    OUTSIDE_TEST,
+    "test_file_tools_write_nothing_that_bash_cannot",
+    "test_file_tools_of_the_cli_never_write_a_protected_name",
+    "test_the_write_tool_lays_no_git_for_a_filter",
+    "test_apply_patch_changes_no_protected_name",
+    "test_a_filter_of_apply_patch_never_runs_outside",
+    "test_no_git_runs_outside_the_sandbox",
+    "test_a_changed_codex_folder_stops_the_agent",
+    "test_no_compile_cache_of_node_in_run_tmp",
+)
+"""The fixed tests of W3-06.3 and W3-06.4: what runs outside the sandbox (CLI, app-server,
+their file tools) never executes or reads what an agent wrote. Each has a countertest."""
 REAL_HOME_PROBE = "spikes/w3_06/real_home_probe.py"
 
 
@@ -63,8 +77,8 @@ def version_problems(recorded: dict[str, str], installed: dict[str, str]) -> lis
     return [
         f"{name}: Sperr-Probe zuletzt grün mit {recorded.get(name)}, installiert ist "
         f"{installed.get(name)}. Lass die Probe auf dem Mac laufen (uv run pytest -m macos "
-        f"tests/test_login_guard.py, darin auch {OUTSIDE_TEST}), dazu die Probe mit echtem HOME "
-        f"({REAL_HOME_PROBE}), und aktualisiere dann tests/fixtures/login_guard.json."
+        f"tests/test_login_guard.py, darin auch {', '.join(GUARD_TESTS)}), dazu die Probe mit "
+        f"echtem HOME ({REAL_HOME_PROBE}), und aktualisiere dann tests/fixtures/login_guard.json."
         for name in sorted({*recorded, *installed})
         if recorded.get(name) != installed.get(name)
     ]
@@ -80,13 +94,13 @@ def test_another_version_is_reported_in_german() -> None:
     assert len(problems) == 1
     assert "Sperr-Probe zuletzt grün mit 2.1.310" in problems[0] and "9.9.9" in problems[0]
     assert "tests/fixtures/login_guard.json" in problems[0]
-    assert OUTSIDE_TEST in problems[0] and REAL_HOME_PROBE in problems[0]
+    assert all(test in problems[0] for test in GUARD_TESTS) and REAL_HOME_PROBE in problems[0]
     assert version_problems({"a": "1"}, {}) and version_problems({}, {"a": "1"})
 
 
 def test_the_guard_names_what_exists() -> None:
     assert (Path(__file__).parents[1] / REAL_HOME_PROBE).is_file()
-    assert callable(globals().get(OUTSIDE_TEST))
+    assert all(callable(globals().get(test)) for test in GUARD_TESTS)
 
 
 # --------------------------------------------------------------------------------------------
@@ -459,7 +473,6 @@ def test_the_old_way_is_found(provider: str) -> None:
 # W3-06.4: file tools never write more than Bash in the sandbox (N1, docs/07 §1)
 # --------------------------------------------------------------------------------------------
 
-FILE_TOOL_TEST = "test_file_tools_write_nothing_that_bash_cannot"
 IS_PROTECTED = SandboxProfile.is_protected  # the real check, also under `no_protection`
 
 
@@ -554,11 +567,155 @@ def test_a_missing_protection_is_found(provider: str) -> None:
         assert any(p.endswith("/.git/config") for p in result["patched"])
 
 
+@mac
+def test_file_tools_of_the_cli_never_write_a_protected_name() -> None:
+    """N3: Write and Edit of the real CLI, outside the sandbox, even when the user says yes."""
+    import login_guard_kit as kit
+    from fake_messages_api import ToolCall
+
+    with kit.open_lab("claude") as lab:
+        work = lab.agent.work_dir
+        config = work / ".git" / "config"
+        before = config.read_text()
+        (work / "to-git").symlink_to(work / ".git")
+        targets = [".gitattributes", ".gitmodules", ".GITMODULES", ".Git/hooks/x", "to-git/x"]
+        script = [
+            ToolCall("Read", {"file_path": str(config)}),
+            ToolCall("Write", {"file_path": str(config), "content": before + "[x]\n"}),
+            ToolCall(
+                "Edit", {"file_path": str(config), "old_string": "[core]", "new_string": "[x]"}
+            ),
+            *[ToolCall("Write", {"file_path": str(work / t), "content": "x\n"}) for t in targets],
+        ]
+        api = kit.run_file_tools(lab, script, Allow())
+        created = [t for t in targets if os.path.lexists(work / t)]
+        changed = config.read_text() != before
+    assert api.errors == [False] + [True] * (len(script) - 1)
+    assert "nie geschrieben" in api.results[1]
+    assert created == [] and not changed
+
+
+@mac
+def test_the_cli_writes_a_protected_name_without_the_list() -> None:
+    import login_guard_kit as kit
+    from fake_messages_api import ToolCall
+
+    with kit.no_protection(), kit.open_lab("claude") as lab:
+        target = lab.agent.work_dir / ".gitattributes"
+        api = kit.run_file_tools(
+            lab, [ToolCall("Write", {"file_path": str(target), "content": "x"})]
+        )
+        assert api.errors == [False] and target.exists()
+
+
+@mac
+def test_the_write_tool_lays_no_git_for_a_filter() -> None:
+    """N1, the whole chain of `gitfile_e2e_claude.py`: the bait stays where it is."""
+    import login_guard_kit as kit
+
+    with kit.open_lab("claude") as lab:
+        result = kit.claude_git_chain(lab)
+        assert not result["git_laid"]
+        assert not kit.stolen_bait(lab)
+
+
+@mac
+def test_the_chain_of_the_review_reaches_the_bait_without_the_walls() -> None:
+    import login_guard_kit as kit
+
+    with kit.no_protection(), kit.with_git(), kit.open_lab("claude") as lab:
+        assert kit.claude_git_chain(lab)["git_laid"]
+        assert kit.stolen_bait(lab)
+
+
+@mac
+def test_apply_patch_changes_no_protected_name() -> None:
+    """3a: Codex's own file tool, even when the user says yes."""
+    import login_guard_kit as kit
+
+    with kit.open_lab("codex") as lab:
+        work = lab.agent.work_dir
+        paths = [str(work / p) for p in (".git/config", ".codex/config.toml", ".gitattributes")]
+        paths += [str(work / ".GITATTRIBUTES"), str(lab.profile.tmp_dir / ".git" / "config")]
+        allow = Allow()
+        assert kit.apply_patches(lab, paths, allow) == []
+
+
+@mac
+def test_apply_patch_changes_git_config_without_the_walls() -> None:
+    import login_guard_kit as kit
+
+    with kit.no_protection(), kit.open_lab("codex") as lab:
+        config = str(lab.agent.work_dir / ".git" / "config")
+        assert kit.apply_patches(lab, [config], Allow()) == [config]
+
+
+@mac
+def test_a_filter_of_apply_patch_never_runs_outside() -> None:
+    """3a/3b, the whole chain under Codex: filter in `.git/config`, `.gitattributes`, next turn."""
+    import login_guard_kit as kit
+
+    with kit.open_lab("codex") as lab:
+        result = kit.codex_git_chain(lab)
+        assert not result["config_changed"]
+        assert not kit.stolen_bait(lab)
+
+
+@mac
+def test_the_codex_chain_reaches_the_bait_without_the_walls() -> None:
+    import login_guard_kit as kit
+
+    with kit.no_protection(), kit.with_git(), kit.open_lab("codex") as lab:
+        assert kit.codex_git_chain(lab)["config_changed"]
+        assert kit.stolen_bait(lab)
+
+
+@mac
+def test_a_changed_codex_folder_stops_the_agent(caplog: pytest.LogCaptureFixture) -> None:
+    """3c: a project MCP server laid during the run never starts, even when arr's list of
+    names misses it (fail closed): the agent starts no further thread."""
+    import login_guard_kit as kit
+
+    with kit.no_protection(), kit.no_name_list(), kit.open_lab("codex") as lab:
+        result = kit.codex_mcp_chain(lab)
+    assert result["laid"] and not result["ran"]
+    assert caplog.text.count("seit dem Start verändert") == 2, "turns 2 and 3 refused"
+
+
+@mac
+def test_the_mcp_server_of_the_agent_runs_without_the_check() -> None:
+    import login_guard_kit as kit
+
+    with kit.no_protection(), kit.no_project_check(), kit.open_lab("codex") as lab:
+        result = kit.codex_mcp_chain(lab)
+    assert result["laid"] and result["ran"]
+
+
+def _node_cache_after_two_turns() -> bool:
+    import login_guard_kit as kit
+
+    with kit.open_lab("claude") as lab:
+        kit.run_file_tools(lab, [kit.bash("echo eins"), kit.bash("echo zwei")], turns=2)
+        return (lab.profile.tmp_dir / "node-compile-cache").exists()
+
+
+@mac
+def test_no_compile_cache_of_node_in_run_tmp() -> None:
+    """Punkt 5: `npm` of the CLI runs outside the sandbox; Run-tmp is its TMPDIR."""
+    assert not _node_cache_after_two_turns()
+
+
+@mac
+def test_node_keeps_its_compile_cache_in_run_tmp_without_the_switch() -> None:
+    import login_guard_kit as kit
+
+    with kit.with_node_cache():
+        assert _node_cache_after_two_turns()
+
+
 # --------------------------------------------------------------------------------------------
 # W3-06.4, 3b: no `git` outside the sandbox
 # --------------------------------------------------------------------------------------------
-
-NO_GIT_TEST = "test_no_git_runs_outside_the_sandbox"
 
 
 @mac

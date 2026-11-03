@@ -211,6 +211,7 @@ PROTECTED_NAMES = (
     ".agents",
     ".claude",
     ".mcp.json",
+    ".npmrc",
     ".vscode",
     ".idea",
     ".ripgreprc",
@@ -240,11 +241,12 @@ top of each write root itself.
 PROTECTED_TOP_NAMES = ("HEAD", "objects", "refs")
 """Names an agent never writes at the top of a write root: they make it a bare Git repo."""
 
-CODEX_READ_ONLY_NAMES = (".git", ".gitattributes", ".gitmodules", ".codex", ".agents")
+CODEX_READ_ONLY_NAMES = (".git", ".gitattributes", ".gitmodules", ".codex", ".agents", ".npmrc")
 """Part of `PROTECTED_NAMES` that the Codex profile makes read-only at the top of each write
-root: what its sandbox blocks for Bash but `apply_patch` would write, and the Git attributes.
-A patch there becomes an approval the `PolicyEngine` refuses (W3-06.4). Not the whole list:
-each entry costs room in the profile (`codex_config.PROFILE_MAX_BYTES`)."""
+root: what its sandbox blocks for Bash but `apply_patch` would write, the Git attributes, and
+`.npmrc`, which `npm` of a Claude CLI reads in a shared working folder. A patch there becomes
+an approval the `PolicyEngine` refuses (W3-06.4). Not the whole list: each entry costs room in
+the profile (`codex_config.PROFILE_MAX_BYTES`)."""
 
 
 def user_temp_dirs() -> list[Path]:
