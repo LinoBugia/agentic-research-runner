@@ -25,6 +25,12 @@ Setups like [OpenProver](https://github.com/Kripner/openprover), where a planner
 - **Safety:** Agents run in a sandbox and can only read and write what they're allowed to. Risky steps such as installing packages need your approval, and every run ends with a scan for leaked secrets.
 - **Local:** Everything runs on your machine. Credentials stay in the macOS keychain or your existing logins.
 
+## Security
+
+Agents in `arr` work on very hard, sometimes unsolvable problems, for hours and without confirming every command. Under that kind of pressure, models look for ways around their limits. `arr` therefore assumes that every agent actively tries to escape its sandbox, and only counts a limit as real when a test proves it.
+
+[SECURITY.md](SECURITY.md) describes the threat model, the principles and layers, how they are implemented on macOS, and which ways out are known, closed or still open. Until agents run under a separate macOS user, real runs should stay supervised.
+
 ## Status
 
 | Wave | Topic | Status |
