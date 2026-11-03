@@ -24,11 +24,24 @@ from arr.backends.codex_config import (
     isolation_overrides,
     toml_value,
 )
+from arr.backends.process_path import NO_GIT_FOLDER
 from arr.errors import ArrError
 from arr.models import AgentConfig, Provider, RunVenvMode, Toolchain
 from arr.permissions import policy
-from arr.permissions.policy import PermissionRules, RunPaths, profile_for
+from arr.permissions.policy import (
+    CODEX_READ_ONLY_NAMES,
+    PROTECTED_NAMES,
+    PermissionRules,
+    RunPaths,
+    profile_for,
+)
 from arr.runs.prepare import AgentFile, PreparedAgent
+from arr.settings import app_dir
+
+
+def no_git() -> str:
+    """The folder of the `git` stub, first on the PATH outside the sandbox (W3-06.4)."""
+    return str(app_dir().joinpath(*NO_GIT_FOLDER))
 
 
 @pytest.fixture(autouse=True)
@@ -184,6 +197,7 @@ def test_entries_come_from_the_profile_only(layout: dict[str, Path], venv_root: 
     known = {*profile.write_roots, *profile.read_allow, *profile.read_deny, *profile.sensitive}
     known |= {run / "skills", run / "groupchats" / "attachments", Path(os.path.realpath(venv_root))}
     known |= {run / "agents" / "gpt-1" / "plugin"}
+    known |= {root / name for root in profile.write_roots for name in CODEX_READ_ONLY_NAMES}
     plain = {Path(k) for k in entries if k != ":root" and "*" not in k}
     assert plain <= known, plain - known
     assert not any(Path(k).parent == run.parent for k in entries)  # no other runs
@@ -529,14 +543,14 @@ def test_launch_env_and_thread_config(layout: dict[str, Path], tmp_path: Path) -
     assert not profile.can_write(Path(env["HOME"]) / ".gitconfig")
     venv = str(paths.venv_dir / "bin")  # outside the run folder (W3-00)
     # the app-server runs outside the sandbox: the run venv is for the commands only (B1)
-    assert env["PATH"].split(":") == ["/opt/base/bin", "/usr/bin"]
+    assert env["PATH"].split(":") == [no_git(), "/opt/base/bin", "/usr/bin"]
     assert launch.shell_env["PATH"].split(":") == [venv, "/opt/base/bin", "/usr/bin"]
     assert env["OPENAI_API_KEY"] == ""
     assert all(env[name] == "" for name in SECRET_ENV if name in environ)
     assert env["MPLCONFIGDIR"].startswith(str(run / "tmp"))
     room = launch.thread_config["mcp_servers"][ROOM_SERVER]
     assert room["args"] == ["-I", "-m", "arr.room.server"]  # no `arr/` of the cwd (B2)
-    assert room["env"] == {"AGENT_ID": "gpt-1", "RUN_DIR": str(run)}
+    assert room["env"] == {"AGENT_ID": "gpt-1", "RUN_DIR": str(run), "PATH": env["PATH"]}
     assert room["default_tools_approval_mode"] == "approve"
     assert launch.cwd == str(layout["work"])
     assert launch.developer_instructions.startswith("Du bist gpt-1.")
@@ -549,7 +563,7 @@ def test_launch_without_run_venv(layout: dict[str, Path], tmp_path: Path) -> Non
     file = agent.file.model_copy(update={"run_venv": RunVenvMode.OFF})
     agent = PreparedAgent(file, agent.run_dir)
     launch = build_launch(agent, profile, paths, codex_home=tmp_path, environ={"PATH": ""})
-    assert launch.env["PATH"] == "/opt/base/bin"
+    assert launch.env["PATH"] == f"{no_git()}:/opt/base/bin"
 
 
 def test_project_mcp_servers_are_switched_off(layout: dict[str, Path], tmp_path: Path) -> None:
@@ -728,7 +742,7 @@ def test_no_source_puts_a_write_root_on_the_app_servers_path(
     agent = PreparedAgent(file, agent.run_dir)
     environ = {"PATH": f"{tmp_bin}:bin:/usr/bin"}
     launch = build_launch(agent, profile, paths, codex_home=tmp_path, environ=environ)
-    assert launch.env["PATH"].split(":") == ["/opt/base/bin", "/usr/bin"]
+    assert launch.env["PATH"].split(":") == [no_git(), "/opt/base/bin", "/usr/bin"]
     venv = str(paths.venv_dir / "bin")
     assert launch.shell_env["PATH"].split(":") == [
         venv,
@@ -751,3 +765,18 @@ def test_the_app_servers_home_never_lies_in_a_write_root(
     inside = dataclasses.replace(profile, write_roots=(*profile.write_roots, agent.agent_dir))
     with pytest.raises(ArrError, match="Home-Ordner"):
         server_home(agent, inside)
+
+
+def test_protected_names_are_read_only_at_the_top_of_every_write_root(
+    layout: dict[str, Path],
+) -> None:
+    """W3-06.4: `apply_patch` honours the profile but not the sandbox's own `.git` block."""
+    assert set(CODEX_READ_ONLY_NAMES) <= set(PROTECTED_NAMES)
+    _, profile, paths = setup(layout)
+    entries = filesystem_entries(profile, paths, ["main"])
+    for root in profile.write_roots:
+        assert entries[str(root)] == "write"
+        for name in CODEX_READ_ONLY_NAMES:
+            assert entries[str(root / name)] == "read", (root, name)
+        assert codex_access(entries, root / ".git" / "config") == "read"
+        assert codex_access(entries, root / "sub" / "x.py") == "write"

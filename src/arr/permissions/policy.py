@@ -65,12 +65,15 @@ __all__ = [
     "AlwaysRule",
     "ApprovalLog",
     "ApprovalLogEntry",
+    "CODEX_READ_ONLY_NAMES",
     "Assessment",
     "ClaudeOptions",
     "CodexOptions",
     "CommandInfo",
     "Grant",
     "LogEvent",
+    "PROTECTED_NAMES",
+    "PROTECTED_TOP_NAMES",
     "PermissionRules",
     "PolicyEngine",
     "Remembered",
@@ -83,7 +86,9 @@ __all__ = [
     "command_paths",
     "normalize_path",
     "profile_for",
+    "protected_write_globs",
     "redact",
+    "written_path",
 ]
 
 # --------------------------------------------------------------------------------------------
@@ -195,6 +200,51 @@ SENSITIVE_ABSOLUTE_PATHS = ("/Library/Keychains",)
 
 READ_BLOCKED_ROOTS = ("/Volumes",)
 """Besides `~` and the workfolder: roots that are not readable unless on the allowlist."""
+
+PROTECTED_NAMES = (
+    ".git",
+    ".gitattributes",
+    ".gitmodules",
+    ".gitconfig",
+    ".lfsconfig",
+    ".codex",
+    ".agents",
+    ".claude",
+    ".mcp.json",
+    ".vscode",
+    ".idea",
+    ".ripgreprc",
+    ".envrc",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".bash_aliases",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".zlogout",
+)
+"""Names an agent never writes anywhere below a write root, in any case (W3-06.4, docs/07 §1).
+
+Programs outside the sandbox read them as settings: Git, Codex, Claude, editors and shells.
+One list for both walls: the `PolicyEngine` refuses file tools (and visible shell writes),
+the Claude sandbox gets it as `denyWrite` (`protected_write_globs`). It covers what the
+sandboxes of the CLI and of Codex block for Bash by themselves (measured, see
+`tests/test_login_guard.py`); the Codex sandbox blocks `.git`, `.codex` and `.agents` at the
+top of each write root itself.
+"""
+
+PROTECTED_TOP_NAMES = ("HEAD", "objects", "refs")
+"""Names an agent never writes at the top of a write root: they make it a bare Git repo."""
+
+CODEX_READ_ONLY_NAMES = (".git", ".gitattributes", ".gitmodules", ".codex", ".agents")
+"""Part of `PROTECTED_NAMES` that the Codex profile makes read-only at the top of each write
+root: what its sandbox blocks for Bash but `apply_patch` would write, and the Git attributes.
+A patch there becomes an approval the `PolicyEngine` refuses (W3-06.4). Not the whole list:
+each entry costs room in the profile (`codex_config.PROFILE_MAX_BYTES`)."""
 
 
 def user_temp_dirs() -> list[Path]:
@@ -347,6 +397,13 @@ _R_WRITE_OUTSIDE = (
     "Schreiben außerhalb des Runs ist nicht erlaubt. Lege die Datei in deinem Arbeitsordner "
     "an und hänge sie im Chat an."
 )
+_R_PROTECTED = (
+    "Diese Datei steuert Git, Codex, Claude, einen Editor oder die Shell (z. B. .git, "
+    ".gitattributes, .gitmodules, .codex, .claude, .bashrc) und darf nie geschrieben werden, "
+    "auch nicht mit Freigabe. Lesen bleibt erlaubt. Lege deine Datei unter einem anderen Namen "
+    "im Arbeitsordner an, z. B. notes/git-attributes.txt, und beschreibe im Chat, was du "
+    "brauchst."
+)
 _R_READ_ONLY = (
     "Dieser Ordner ist nur lesbar. Kopiere die Datei in deinen Arbeitsordner und bearbeite "
     "sie dort."
@@ -430,6 +487,12 @@ def normalize_path(raw: str | Path, *, base: Path, home: Path) -> Path:
     collapses leading `//`, removes `..` and follows symlinks of existing components.
     Raises `ValueError` for empty paths and paths with NUL bytes.
     """
+    return Path(os.path.realpath(written_path(raw, base=base, home=home)))
+
+
+def written_path(raw: str | Path, *, base: Path, home: Path) -> Path:
+    """`raw` as an absolute path, as written: like `normalize_path`, but without `..` removed
+    or symlinks followed (W3-06.4, protected names before resolving)."""
     text = str(raw).strip()
     if not text or "\x00" in text:
         raise ValueError(_R_INVALID_PATH)
@@ -445,7 +508,7 @@ def normalize_path(raw: str | Path, *, base: Path, home: Path) -> Path:
     path = Path(text)
     if not path.is_absolute():
         path = base / path
-    return Path(os.path.realpath(path))
+    return path
 
 
 def _key(path: Path | str, case_insensitive: bool) -> str:
@@ -631,6 +694,10 @@ class SandboxProfile:
         """Normalize a path given by the agent (relative to `base` or the work folder)."""
         return normalize_path(raw, base=base or self.work_dir, home=self.home)
 
+    def written(self, raw: str | Path, base: Path | None = None) -> Path:
+        """`raw` as written, absolute but unresolved (`written_path`)."""
+        return written_path(raw, base=base or self.work_dir, home=self.home)
+
     def key(self, path: Path | str) -> str:
         """Comparison key of a normalized path (case folded on macOS)."""
         return _key(path, self.case_insensitive)
@@ -699,6 +766,27 @@ class SandboxProfile:
     def can_write(self, path: Path) -> bool:
         """Whether `path` lies below a write root and is not sensitive."""
         return not self.is_sensitive(path) and self._within_any(path, self.write_roots) >= 0
+
+    def is_protected(self, path: Path) -> bool:
+        """Whether `path` names a `PROTECTED_NAMES` entry below a write root, or a
+        `PROTECTED_TOP_NAMES` entry right at its top (W3-06.4).
+
+        `path` may be unresolved and need not exist: the shortest prefix that resolves into a
+        write root fixes the root, the names after it count as written. So a symlink is
+        checked before and, through the resolved path, after following it.
+        """
+        parts = path.parts
+        for i in range(1, len(parts) + 1):
+            real = self.key(os.path.realpath(Path(*parts[:i])))
+            roots = [self.key(r) for r in self.write_roots if _key_within(real, self.key(r))]
+            if not roots:
+                continue
+            below = real[len(max(roots, key=len).rstrip("/")) :].split("/")
+            keys = [k for k in [*below, *(self.key(p) for p in parts[i:])] if k not in ("", ".")]
+            protected = {self.key(n) for n in PROTECTED_NAMES}
+            top = {self.key(n) for n in PROTECTED_TOP_NAMES}
+            return any(k in protected for k in keys) or bool(keys and keys[0] in top)
+        return False
 
     @property
     def read_only(self) -> tuple[Path, ...]:
@@ -835,6 +923,23 @@ def profile_for(
 # --------------------------------------------------------------------------------------------
 
 
+def _claude_glob_escape(path: str) -> str:
+    """Escape glob characters as one-character classes (`[` → `[[]`)."""
+    return "".join(f"[{c}]" if c in "*?[]{}" else c for c in path)
+
+
+def protected_write_globs(profile: SandboxProfile) -> list[str]:
+    """`denyWrite` of the Claude sandbox: `PROTECTED_NAMES` anywhere below each write root,
+    `PROTECTED_TOP_NAMES` at its top (W3-06.4). Measured with the CLI: absolute globs work,
+    match in any case and cover the tree below; relative ones (`**/x`) do not."""
+    globs = []
+    for root in profile.write_roots:
+        base = _claude_glob_escape(str(root))
+        globs += [f"{base}/**/{name}" for name in PROTECTED_NAMES]
+        globs += [f"{base}/{name}" for name in PROTECTED_TOP_NAMES]
+    return globs
+
+
 def _claude_path(path: Path, tree: bool) -> str:
     # Claude permission rules take absolute paths with a leading `//` (S1 §3.1).
     return f"/{path}/**" if tree else f"/{path}"
@@ -898,6 +1003,7 @@ def claude_options(profile: SandboxProfile) -> ClaudeOptions:
         "network": {"allowedDomains": list(profile.allowed_domains)},
         "filesystem": {
             "allowWrite": [str(p) for p in profile.write_roots],
+            "denyWrite": protected_write_globs(profile),
             "denyRead": [str(p) for p in (*profile.read_deny, *profile.sensitive)],
             "allowRead": [str(p) for p in profile.read_allow],
         },
@@ -2289,6 +2395,9 @@ class PolicyEngine:
             analysis.facts.add(("write", profile.key(path)))
             if profile.is_sensitive(path):
                 analysis.ban(_R_SENSITIVE, RequestCategory.WRITE_OUTSIDE)
+            elif profile.is_protected(path) or profile.is_protected(profile.written(raw, base)):
+                # file tools never write more than Bash in the sandbox (docs/07 §1, W3-06.4)
+                analysis.ban(_R_PROTECTED, RequestCategory.WRITE_OUTSIDE)
             elif profile.can_write(path):
                 continue
             elif any(_key_within(profile.key(path), profile.key(p)) for p in profile.read_only):
@@ -2334,9 +2443,10 @@ class PolicyEngine:
             analysis.no_rules = True
 
     def _command_path(
-        self, raw: str, base: Path, profile: SandboxProfile
+        self, raw: str, base: Path, profile: SandboxProfile, *, written: bool = False
     ) -> tuple[Path | None, bool]:
-        """Resolve a path word of a command; `None` if not determinable, flag: pattern cut."""
+        """Resolve a path word of a command; `None` if not determinable, flag: pattern cut.
+        `written` keeps it as written (`SandboxProfile.written`)."""
         text = raw.strip()
         for name, value in (("TMPDIR", profile.tmp_dir), ("PWD", base), ("HOME", profile.home)):
             text = re.sub(rf"\$(?:{name}\b|\{{{name}\}})", lambda _, v=value: str(v), text)
@@ -2345,6 +2455,8 @@ class PolicyEngine:
         prefix, cut = _strip_pattern(text)
         if prefix is None:
             return None, True
+        if written:
+            return profile.written(prefix, base), cut
         return profile.resolve(prefix, base), cut
 
     def _check_command_read(
@@ -2380,8 +2492,11 @@ class PolicyEngine:
             analysis.ban(_R_SHELL_UNKNOWN_PATH, RequestCategory.WRITE_OUTSIDE)
             return
         analysis.facts.add(("write", profile.key(path)))
+        written, _ = self._command_path(raw, base, profile, written=True)
         if profile.is_sensitive(path):
             analysis.ban(_R_SENSITIVE, RequestCategory.WRITE_OUTSIDE)
+        elif profile.is_protected(path) or (written and profile.is_protected(written)):
+            analysis.ban(_R_PROTECTED, RequestCategory.WRITE_OUTSIDE)
         elif profile.can_write(path):
             return
         elif any(_key_within(profile.key(path), profile.key(p)) for p in profile.read_only):

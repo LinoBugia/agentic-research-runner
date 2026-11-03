@@ -43,10 +43,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from arr.backends.process_path import outside_path, within
+from arr.backends.process_path import no_git_folder, outside_path, within
 from arr.errors import ArrError
 from arr.models import AuthKind, AuthProfile, RunVenvMode
-from arr.permissions.policy import RunPaths, SandboxProfile
+from arr.permissions.policy import CODEX_READ_ONLY_NAMES, RunPaths, SandboxProfile
 from arr.runs.prepare import PreparedAgent
 from arr.settings import app_dir
 from arr.venvs import glob_safe_name, venv_root
@@ -200,6 +200,10 @@ def _entries(
 
     for path in profile.write_roots:
         put(path, "write")
+        # W3-06.4: `apply_patch` honours these entries but not the sandbox's own `.git` and
+        # `.codex` blocks; read-only, a patch there becomes an approval the PolicyEngine refuses
+        for name in CODEX_READ_ONLY_NAMES:
+            put(path / name, "read")
     for path in profile.read_allow:
         if not any(_within(profile, path, h) for h in hidden):
             put(path, "read", overwrite=False)
@@ -478,7 +482,8 @@ def build_launch(
         "CODEX_HOME": str(codex_home),
         "HOME": str(server_home(agent, profile)),
         # the app-server runs outside the sandbox and starts `git` through it (W3-06.3, B1)
-        "PATH": outside_path(path, profile.write_roots),
+        # no `git` outside the sandbox: the first one does nothing (W3-06.4, 3b)
+        "PATH": outside_path([str(no_git_folder(profile.write_roots)), *path], profile.write_roots),
         "TMPDIR": str(tmp),
     }
     env |= {name: str(tmp / "cache" / name.lower()) for name in CACHE_ENV}
@@ -499,7 +504,7 @@ def build_launch(
     room = {
         "command": sys.executable,
         "args": [*ROOM_SERVER_ARGS],
-        "env": {"AGENT_ID": agent.id, "RUN_DIR": str(agent.run_dir)},
+        "env": {"AGENT_ID": agent.id, "RUN_DIR": str(agent.run_dir), "PATH": env["PATH"]},
         "default_tools_approval_mode": "approve",
     }
     servers: dict[str, Any] = {

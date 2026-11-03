@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -31,7 +31,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from claude_agent_sdk.types import PermissionResultAllow
 from codex_cli_bin import bundled_codex_path
 from fake_messages_api import FakeMessagesApi, ToolCall
-from fake_responses_api import FakeResponsesApi
+from fake_responses_api import FakeResponsesApi, Patch, add_file
 
 import arr
 from arr.auth import (
@@ -660,7 +660,9 @@ def run_file_tools(
     return api
 
 
-def run_codex_backend(lab: Lab, script: list[str], *, turns: int = 1) -> FakeResponsesApi:
+def run_codex_backend(
+    lab: Lab, script: list[str | Patch], decider: Any = None, *, turns: int = 1
+) -> FakeResponsesApi:
     """`script` through the real `CodexBackend` and app-server (one per turn), no model.
 
     The app-server gets an empty `CODEX_HOME` of its own, the bait login folder stays as it is.
@@ -680,7 +682,7 @@ def run_codex_backend(lab: Lab, script: list[str], *, turns: int = 1) -> FakeRes
         backend = CodexBackend(
             lab.agent,
             run_id=lab.run.run_id,
-            inbox=ApprovalInbox(engine, timeout=0.05),
+            inbox=ApprovalInbox(engine, decider=decider, timeout=5 if decider else 0.05),
             auth=lab.auth,
             factory=factory,
         )
@@ -888,3 +890,213 @@ def old_home() -> Iterator[None]:
         yield
     finally:
         codex_config.server_home = saved
+
+
+# --------------------------------------------------------------------------------------------
+# Names the sandbox blocks for Bash, against the file tools (W3-06.4, N1)
+# --------------------------------------------------------------------------------------------
+
+WRITE_CANDIDATES = tuple(
+    [
+        # the CLI's own lists (2.1.310): shell, Git and tool settings, editors, `.claude`
+        ".gitconfig",
+        ".gitmodules",
+        ".gitattributes",
+        ".lfsconfig",
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".bash_logout",
+        ".bash_aliases",
+        ".profile",
+        ".zshrc",
+        ".zprofile",
+        ".zshenv",
+        ".zlogin",
+        ".zlogout",
+        ".envrc",
+        ".ripgreprc",
+        ".mcp.json",
+        ".claude.json",
+        ".lsp.json",
+        ".npmrc",
+        ".yarnrc",
+        ".yarnrc.yml",
+        ".pnp.cjs",
+        ".pnpmfile.cjs",
+        "bunfig.toml",
+        ".bazelrc",
+        ".pre-commit-config.yaml",
+        "lefthook.yml",
+        ".devcontainer.json",
+        "pyrightconfig.json",
+        ".worktreeinclude",
+        "CLAUDE.md",
+        "CLAUDE.local.md",
+        "AGENTS.md",
+        ".vscode/settings.json",
+        ".idea/workspace.xml",
+        ".claude/settings.json",
+        ".claude/settings.local.json",
+        ".claude/commands/x.md",
+        ".claude/agents/x.md",
+        ".claude/skills/x/SKILL.md",
+        ".claude/x.txt",
+        ".claude-plugin/plugin.json",
+        # Codex
+        ".codex/config.toml",
+        ".agents/skills/x/SKILL.md",
+        # Git: a repo, a bare repo at the top, spellings
+        ".git",
+        ".GIT",
+        ".git/config",
+        ".git/hooks/post-commit",
+        ".git/info/attributes",
+        ".git/HEAD",
+        ".git/objects/x",
+        "HEAD",
+        "config",
+        "objects/x",
+        "refs/heads/x",
+        "sub/.git",
+        "sub/.gitmodules",
+        "sub/.bashrc",
+        "sub/HEAD",
+        ".GITATTRIBUTES",
+        ".Gitmodules",
+    ]
+)
+"""Paths below a write root to try with Bash: what the CLI, Codex and arr protect, and more."""
+
+WRITE_PROGRAM = r"""
+import json, os, subprocess, sys
+plan = json.load(open(sys.argv[1])); out = {}
+git = subprocess.run(["git", "status", "--porcelain"], cwd=plan["roots"][0], capture_output=True)
+out["git status"] = str(git.returncode)
+for root in plan["roots"]:
+    for rel in plan["paths"]:
+        path = os.path.join(root, rel)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a"):
+                pass
+            out[path] = "ok"
+        except OSError as exc:
+            out[path] = type(exc).__name__
+json.dump(out, open(plan["out"], "w"))
+"""
+
+
+def bash_writes(lab: Lab, provider: str, paths: Sequence[str]) -> dict[str, str]:
+    """Try to create `paths` in every write root with Bash in the real sandbox; path → `ok`
+    or the error. Nothing is cleaned up: call it once per lab and state."""
+    work = lab.agent.work_dir
+    out = work / f"writes-{secrets.token_hex(4)}.json"
+    plan = work / f"{out.stem}-plan.json"
+    roots = [str(root) for root in lab.profile.write_roots]
+    plan.write_text(json.dumps({"roots": roots, "paths": list(paths), "out": str(out)}))
+    (work / "writes.py").write_text(WRITE_PROGRAM)
+    command = f"python3 writes.py {plan.name}"
+    if provider == "claude":
+        run_file_tools(lab, [bash(command)])
+    else:
+        run_codex_backend(lab, [command])
+    return json.loads(out.read_text())
+
+
+def _state(path: str) -> bytes | str | None:
+    if os.path.isdir(path):
+        return "dir"
+    return Path(path).read_bytes() if os.path.lexists(path) else None
+
+
+def apply_patches(lab: Lab, paths: Sequence[str], decider: Any = None) -> list[str]:
+    """Codex's own `apply_patch` tool on each path: a new file, or one more line in a file that
+    is there (W3-06.4). Returns the paths it changed."""
+    before = {path: _state(path) for path in paths}
+    script: list[str | Patch] = []
+    for path, state in before.items():
+        if state is None:
+            script.append(add_file(path, "# x"))  # valid TOML, Git and shell text
+        elif isinstance(state, bytes) and state.strip():
+            first = state.decode(errors="replace").splitlines()[0]
+            text = f"*** Begin Patch\n*** Update File: {path}\n@@\n {first}\n+# x\n*** End Patch\n"
+            script.append(Patch(text))
+    if script:
+        run_codex_backend(lab, script, decider)
+    return [path for path in paths if _state(path) != before[path]]
+
+
+@contextmanager
+def no_protection() -> Iterator[None]:
+    """The mutation: no protected names, neither in the `PolicyEngine` nor in `denyWrite` nor
+    in the Codex profile."""
+    from arr.backends import codex_config
+    from arr.permissions import policy
+
+    saved = policy.SandboxProfile.is_protected, policy.protected_write_globs
+    names = codex_config.CODEX_READ_ONLY_NAMES
+    policy.SandboxProfile.is_protected = lambda _self, _path: False  # type: ignore[method-assign]
+    policy.protected_write_globs = lambda _profile: []
+    codex_config.CODEX_READ_ONLY_NAMES = ()
+    try:
+        yield
+    finally:
+        policy.SandboxProfile.is_protected, policy.protected_write_globs = saved
+        codex_config.CODEX_READ_ONLY_NAMES = names
+
+
+# --------------------------------------------------------------------------------------------
+# No `git` outside the sandbox (W3-06.4, 3b)
+# --------------------------------------------------------------------------------------------
+
+
+def lay_filter_repo(lab: Lab) -> Path:
+    """The lab's repo with a clean and a process filter that note outside every write root,
+    selected for a changed tracked file: what a project could bring along. Returns the note."""
+    work = lab.agent.work_dir
+    note = lab.base / "filter-outside.log"
+    driver = lab.base / "filter.sh"
+    driver.write_text(f"#!/bin/sh\necho filter >> {note}\ncat\n")
+    driver.chmod(0o755)
+    git = ["/usr/bin/git", "-C", str(work), "-c", "user.name=t", "-c", "user.email=t@t"]
+    (work / "a.txt").write_text("eins\n")
+    subprocess.run([*git, "add", "a.txt"], check=True, capture_output=True)
+    subprocess.run([*git, "commit", "-qm", "x"], check=True, capture_output=True)
+    subprocess.run([*git, "config", "filter.x.clean", str(driver)], check=True)
+    subprocess.run([*git, "config", "filter.y.process", str(driver)], check=True)
+    (work / ".gitattributes").write_text("*.txt filter=x\n*.md filter=y\n")
+    (work / "a.txt").write_text("zwei\n")
+    return note
+
+
+def run_with_filter_repo(lab: Lab, provider: str) -> dict[str, Any]:
+    """Two CLI starts with two turns each, or three app-servers; the agent runs `git` in its
+    shell. Returns how often a filter ran outside and the exit codes of the agent's `git`."""
+    note = lay_filter_repo(lab)
+    inside = lab.profile.tmp_dir / "git-inside.log"
+    commands = [f"git status --porcelain > /dev/null; echo $? >> {inside}; sleep 2", "echo zwei"]
+    if provider == "claude":
+        for _ in range(2):
+            run_file_tools(lab, [bash(command) for command in commands], turns=2)
+    else:
+        run_codex_backend(lab, [*commands, "sleep 2; echo drei"], turns=3)
+    return {
+        "outside": note.read_text().count("filter") if note.exists() else 0,
+        "inside": inside.read_text().split() if inside.exists() else [],
+    }
+
+
+@contextmanager
+def with_git() -> Iterator[None]:
+    """The mutation: no `git` stub first on the `PATH` outside the sandbox."""
+    from arr.backends import claude_options, codex_config
+
+    saved = {module: module.no_git_folder for module in (claude_options, codex_config)}
+    for module in saved:
+        module.no_git_folder = lambda _roots: Path("/nonexistent-arr-no-git")
+    try:
+        yield
+    finally:
+        for module, function in saved.items():
+            module.no_git_folder = function

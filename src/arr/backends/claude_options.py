@@ -27,7 +27,7 @@ from claude_agent_sdk.types import CanUseTool, SystemPromptPreset
 
 from arr.auth import START_PROFILE_VARIABLE
 from arr.backends.claude_start import start_program
-from arr.backends.process_path import outside_path, within
+from arr.backends.process_path import no_git_folder, outside_path, within
 from arr.errors import ArrError
 from arr.models import Effort
 from arr.permissions.policy import ROOM_TOOL_PREFIX, SandboxProfile, claude_options
@@ -211,18 +211,20 @@ def cache_env(run_tmp: Path) -> dict[str, str]:
     }
 
 
-def room_server(agent: PreparedAgent) -> dict[str, Any]:
+def room_server(agent: PreparedAgent, outside_path: str | None = None) -> dict[str, Any]:
     """stdio config of the room server for this agent (docs/01 §5).
 
     The CLI starts it outside the sandbox in the working folder, a write root: `-I` keeps the
     `cwd` out of `sys.path` (and `PYTHON*`, the user site), so an `arr/` written by an agent
-    is never imported (W3-06.3, B2).
+    is never imported (W3-06.3, B2). `outside_path` is the CLI's own `PATH`, with the `git`
+    stub first (W3-06.4).
     """
+    path = {"PATH": outside_path} if outside_path is not None else {}
     return {
         "type": "stdio",
         "command": sys.executable,
         "args": [*ROOM_SERVER_ARGS],
-        "env": {AGENT_ID_ENV: agent.id, RUN_DIR_ENV: str(agent.run_dir)},
+        "env": {AGENT_ID_ENV: agent.id, RUN_DIR_ENV: str(agent.run_dir), **path},
     }
 
 
@@ -258,7 +260,10 @@ def build_options(
     bash_path = agent_path(agent, profile.venv_dir)
     process_env = {**env, **perms.env, **python_env(profile.venv_dir)}
     # the CLI runs outside the sandbox: nothing on its PATH may come from an agent (B1)
-    process_env["PATH"] = outside_path(bash_path.split(os.pathsep), profile.write_roots)
+    # and no `git` at all there: the first `git` on it does nothing (W3-06.4, 3b)
+    no_git = str(no_git_folder(profile.write_roots))
+    outside = outside_path([no_git, *bash_path.split(os.pathsep)], profile.write_roots)
+    process_env["PATH"] = outside
     process_env["VIRTUAL_ENV"] = ""
     process_env["CLAUDE_ENV_FILE"] = str(shell_env_file(agent, profile, bash_path))
     process_env.update(cache_env(Path(perms.env["TMPDIR"])))
@@ -280,7 +285,7 @@ def build_options(
         plugins=[{"type": "local", "path": str(plugin)}] if plugin else [],
         skills=list(agent.file.skill_ids),
         strict_mcp_config=True,
-        mcp_servers={ROOM_SERVER: room_server(agent)},  # type: ignore[dict-item]
+        mcp_servers={ROOM_SERVER: room_server(agent, outside)},  # type: ignore[dict-item]
         can_use_tool=can_use_tool,
         hooks={k: list(v) for k, v in hooks.items()} if hooks else None,  # type: ignore[misc]
         thinking=THINKING,  # type: ignore[arg-type]

@@ -42,6 +42,7 @@ from arr.backends.claude_options import (
     tmp_link,
 )
 from arr.backends.claude_start import HANDOVER_FAILED
+from arr.backends.process_path import NO_GIT_FOLDER
 from arr.errors import ArrError
 from arr.models import AuthProfile, Limits, RunInput, Toolchain, Tools, WorkfolderSettings
 from arr.permissions.inbox import ApprovalInbox
@@ -55,6 +56,7 @@ from arr.permissions.types import (
 from arr.resolve import resolve_run
 from arr.runs.eventlog import EventLogger
 from arr.runs.prepare import PreparedAgent, PreparedRun, prepare_run
+from arr.settings import app_dir
 from arr.workfolder import init_workfolder
 
 FIXTURES = Path(__file__).parent / "fixtures" / "claude"
@@ -138,6 +140,11 @@ def options_for(setup: Setup, agent_id: str = "e1", **kw: Any):
 # --------------------------------------------------------------------------------------------
 
 
+def no_git() -> str:
+    """The folder of the `git` stub, first on the PATH outside the sandbox (W3-06.4)."""
+    return str(app_dir().joinpath(*NO_GIT_FOLDER))
+
+
 def bash_env(options: Any) -> dict[str, str]:
     """What the CLI puts in front of every Bash command: the file of `CLAUDE_ENV_FILE`."""
     lines = Path(options.env["CLAUDE_ENV_FILE"]).read_text(encoding="utf-8").splitlines()
@@ -174,7 +181,11 @@ def test_a5_options_follow_the_architecture(setup: Setup) -> None:
     assert list(options.mcp_servers) == [ROOM_SERVER] == ["arr-room"]
     room = options.mcp_servers[ROOM_SERVER]
     assert room["args"] == ["-I", "-m", "arr.room.server"]  # no `arr/` of the cwd (W3-06.3, B2)
-    assert room["env"] == {"AGENT_ID": "e1", "RUN_DIR": str(setup.run.run_dir)}
+    assert room["env"] == {
+        "AGENT_ID": "e1",
+        "RUN_DIR": str(setup.run.run_dir),
+        "PATH": options.env["PATH"],  # with the git stub first (W3-06.4)
+    }
     prompt = options.system_prompt
     assert prompt["type"] == "preset" and prompt["preset"] == "claude_code"
     assert prompt["exclude_dynamic_sections"] is True
@@ -1085,7 +1096,7 @@ def test_w3_06_3_no_source_puts_a_write_root_on_the_clis_path(
         agent, profile, env=dict(CLAUDE_SWITCHES), can_use_tool=None, hooks=None
     )
     cli = options.env["PATH"].split(os.pathsep)
-    assert cli == [*agent.file.path_prepend[1:], "/usr/bin"]
+    assert cli == [no_git(), *agent.file.path_prepend[1:], "/usr/bin"]
     shell = bash_env(options)["PATH"].split(os.pathsep)
     assert shell[:2] == [str(profile.venv_dir / "bin"), work_bin]
     assert shell[-3:] == [tmp_bin, "bin", "/usr/bin"]

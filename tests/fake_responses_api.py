@@ -1,14 +1,16 @@
 """A local stand-in for the OpenAI Responses API, so the real Codex app-server runs without a model.
 
 The counterpart of `fake_messages_api.py`: `POST /v1/responses` answers with one
-`exec_command` call per step of `script`, the app-server runs it for real in its sandbox, and
-the output comes back here. Codex reaches it as its own provider (`provider_overrides`), so no
-request leaves the machine and no login is needed. Headers are never read or stored.
+`exec_command` call per step of `script` (a `Patch` step becomes a call of the `apply_patch`
+tool), the app-server runs it for real, and the output comes back here. Codex reaches it as
+its own provider (`provider_overrides`), so no request leaves the machine and no login is
+needed. Headers are never read or stored.
 """
 
 import json
 import threading
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -25,11 +27,30 @@ YIELD_MS = 120_000
 """How long `exec_command` waits for the command before the turn goes on (default 10 s)."""
 
 
+@dataclass(frozen=True)
+class Patch:
+    """A step that calls Codex's own `apply_patch` tool with `text` (W3-06.4)."""
+
+    text: str
+
+
+def add_file(path: str, line: str = "x") -> Patch:
+    return Patch(f"*** Begin Patch\n*** Add File: {path}\n+{line}\n*** End Patch\n")
+
+
 def _sse(data: Mapping[str, Any]) -> bytes:
     return f"event: {data['type']}\ndata: {json.dumps(data)}\n\n".encode()
 
 
-def _item(step: int, command: str | None) -> dict[str, Any]:
+def _item(step: int, command: "str | Patch | None") -> dict[str, Any]:
+    if isinstance(command, Patch):
+        return {
+            "type": "custom_tool_call",
+            "id": f"ctc_{step}",
+            "call_id": f"call_{step}",
+            "name": "apply_patch",
+            "input": command.text,
+        }
     if command is None:
         content = [{"type": "output_text", "text": "fertig"}]
         return {"type": "message", "role": "assistant", "id": f"msg_{step}", "content": content}
@@ -48,7 +69,7 @@ class FakeResponsesApi:
     `outputs` holds the output of every command in order.
     """
 
-    def __init__(self, script: Iterable[str]) -> None:
+    def __init__(self, script: Iterable["str | Patch"]) -> None:
         self.script = list(script)
         self.outputs: list[str] = []
         self.requests = 0
@@ -82,7 +103,8 @@ class FakeResponsesApi:
         outputs = [
             str(item.get("output", ""))
             for item in body.get("input", [])
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
+            if isinstance(item, dict)
+            and item.get("type") in ("function_call_output", "custom_tool_call_output")
         ]
         with self._lock:
             self.requests += 1

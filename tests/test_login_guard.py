@@ -21,6 +21,7 @@ import pytest
 from claude_agent_sdk._cli_version import __cli_version__
 
 from arr.models import AuthKind
+from arr.permissions.policy import CODEX_READ_ONLY_NAMES, SandboxProfile
 from arr.permissions.types import DecidedBy, Decision, DecisionAction, RequestCategory
 
 FIXTURE = Path(__file__).parent / "fixtures" / "login_guard.json"
@@ -389,7 +390,8 @@ def test_a_git_filter_of_the_agent_never_runs_outside(provider: str) -> None:
 def test_the_old_home_of_the_app_server_is_found() -> None:
     import login_guard_kit as kit
 
-    with kit.old_home(), kit.open_lab("codex") as lab:
+    # the later walls of W3-06.4 (read-only `.gitattributes`, no `git` outside) off as well
+    with kit.old_home(), kit.no_protection(), kit.with_git(), kit.open_lab("codex") as lab:
         assert "filter" in kit.run_git_filter(lab, "codex")
 
 
@@ -447,10 +449,138 @@ def test_the_old_way_is_found(provider: str) -> None:
     """The mutation: the agent's `PATH` for CLI and app-server, the room server without `-I`."""
     import login_guard_kit as kit
 
-    with kit.old_way():
+    with kit.old_way(), kit.with_git():  # and without the `git` stub of W3-06.4
         result = _run_trapped(provider)
     assert any(line.startswith("git ") for line in result["outside"])
     assert result["shadow"] is True
+
+
+# --------------------------------------------------------------------------------------------
+# W3-06.4: file tools never write more than Bash in the sandbox (N1, docs/07 §1)
+# --------------------------------------------------------------------------------------------
+
+FILE_TOOL_TEST = "test_file_tools_write_nothing_that_bash_cannot"
+IS_PROTECTED = SandboxProfile.is_protected  # the real check, also under `no_protection`
+
+
+CODEX_TOP = {name.casefold() for name in CODEX_READ_ONLY_NAMES}
+
+
+def _top_name(path: str, roots: list[str]) -> str | None:
+    """The first name of `path` below its write root, case folded."""
+    for root in roots:
+        if path.startswith(root + "/"):
+            return path[len(root) + 1 :].split("/")[0].casefold()
+    return None
+
+
+def _against_bash(provider: str) -> dict[str, Any]:
+    """Bash tries `WRITE_CANDIDATES` in every write root, with the lab's repo and without one;
+    each path Bash could not write goes to the `PolicyEngine` as a file tool and, under Codex,
+    through the real `apply_patch` with a decider that allows everything."""
+    import shutil
+
+    import login_guard_kit as kit
+
+    from arr.permissions.policy import PolicyEngine
+    from arr.permissions.types import PermissionRequest
+
+    tool = "Write" if provider == "claude" else "fileChange"
+    with kit.open_lab(provider) as lab:
+        first = [p for p in kit.WRITE_CANDIDATES if p not in (".git", ".GIT")]
+        results = kit.bash_writes(lab, provider, first)
+        git_status = results.pop("git status")
+        patched = []
+        if provider == "codex":
+            blocked = [p for p, r in results.items() if r == "PermissionError"]
+            patched += kit.apply_patches(lab, blocked, Allow())
+        shutil.rmtree(lab.agent.work_dir / ".git")
+        second = kit.bash_writes(lab, provider, [".git", ".GIT"])
+        second.pop("git status")
+        if provider == "codex":
+            blocked = [p for p, r in second.items() if r == "PermissionError"]
+            patched += kit.apply_patches(lab, blocked, Allow())
+        results |= second
+        engine = PolicyEngine([lab.profile])
+        roots = [str(root) for root in lab.profile.write_roots]
+
+        def refused(path: str) -> bool:
+            request = PermissionRequest(
+                run_id=lab.run.run_id, agent_id=lab.agent.id, tool=tool, paths=[path]
+            )
+            return engine.evaluate(request).action is DecisionAction.DENY
+
+        blocked = [p for p, r in results.items() if r == "PermissionError"]
+        return {
+            "blocked": blocked,
+            "written_by_tools": [p for p in blocked if not refused(p)],
+            "protected_but_written": [
+                p for p, r in results.items() if r == "ok" and IS_PROTECTED(lab.profile, Path(p))
+            ],
+            "top_protected_but_written": [
+                p for p, r in results.items() if r == "ok" and _top_name(p, roots) in CODEX_TOP
+            ],
+            "patched": patched,
+            "git_status": git_status,
+        }
+
+
+@mac
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_file_tools_write_nothing_that_bash_cannot(provider: str) -> None:
+    """The fixed lists of the CLI and of Codex are compared with arr's one list, measured."""
+    result = _against_bash(provider)
+    assert result["blocked"], "the sandbox blocks nothing at all, the measurement is broken"
+    assert result["written_by_tools"] == []
+    assert result["patched"] == [], "apply_patch wrote what Bash cannot"
+    if provider == "claude":  # arr's list reaches Bash as `denyWrite`, at every depth
+        assert result["protected_but_written"] == []
+    else:  # and the Codex profile as read-only entries at the top of each write root
+        assert result["top_protected_but_written"] == []
+    assert result["git_status"] == "0", "git in the sandbox still reads the repo"
+
+
+@mac
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_a_missing_protection_is_found(provider: str) -> None:
+    import login_guard_kit as kit
+
+    with kit.no_protection():
+        result = _against_bash(provider)
+    assert result["written_by_tools"], "without the list a file tool writes what Bash cannot"
+    if provider == "claude":
+        assert result["protected_but_written"]
+    else:  # the finding of W3-06.4: apply_patch changes `.git/config`
+        assert any(p.endswith("/.git/config") for p in result["patched"])
+
+
+# --------------------------------------------------------------------------------------------
+# W3-06.4, 3b: no `git` outside the sandbox
+# --------------------------------------------------------------------------------------------
+
+NO_GIT_TEST = "test_no_git_runs_outside_the_sandbox"
+
+
+@mac
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_no_git_runs_outside_the_sandbox(provider: str) -> None:
+    """A repo with filters that a project brings along: CLI and app-server run `git` only
+    through the stub, the agent's shell keeps the real one."""
+    import login_guard_kit as kit
+
+    with kit.open_lab(provider) as lab:
+        result = kit.run_with_filter_repo(lab, provider)
+    assert result["outside"] == 0, "a git outside the sandbox ran a filter"
+    assert result["inside"] and set(result["inside"]) == {"0"}, "git in the shell works"
+
+
+@mac
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_git_outside_runs_the_filter_without_the_stub(provider: str) -> None:
+    import login_guard_kit as kit
+
+    with kit.with_git(), kit.open_lab(provider) as lab:
+        assert kit.run_with_filter_repo(lab, provider)["outside"] > 0
 
 
 # --------------------------------------------------------------------------------------------
