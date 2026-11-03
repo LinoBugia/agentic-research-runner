@@ -3,7 +3,8 @@
 The source is `usage.json` of a finished run. A run without one (`interrupted`, or one that is
 still active) is summed from its transcripts by `compute_run_usage`, so aborted runs and runs
 of `arr run` count too; they lie in the same run folders. Only the agents on this profile count
-in a mixed run. A period takes a run by the moment it started.
+in a mixed run; which those are says `run.yaml`, so a run without a finished turn shows too,
+with zero. A period takes a run by the moment it started.
 
 The record covers this workfolder only, and no use of Claude Code or Codex outside arr: `NOTE`
 says so on the page.
@@ -49,8 +50,22 @@ def _added(total: UsageTotal, part: UsageTotal) -> UsageTotal:
     )
 
 
-def _agents_on(usage: RunUsage, name: str) -> dict[str, AgentUsage]:
-    return {agent: item for agent, item in usage.by_agent.items() if item.profile == name}
+def _agents_on(usage: RunUsage | None, name: str, planned: dict[str, str]) -> dict[str, AgentUsage]:
+    """Agents of the run on profile `name`. An agent without a finished turn has no profile in
+    the usage, so `planned` (`run.yaml`) names it: a run that is still in its first turn,
+    or ended before one finished, shows with zero (review W3-06, B4)."""
+    known = usage.by_agent if usage is not None else {}
+    agents = {agent: item for agent, item in known.items() if item.profile == name}
+    for agent, profile in planned.items():
+        if profile == name and known.get(agent, AgentUsage()).profile is None:
+            agents[agent] = known.get(agent) or AgentUsage(profile=name)
+    return agents
+
+
+def _planned(record: RunRecord) -> dict[str, str]:
+    """Agent → auth profile from `run.yaml`."""
+    resolved = record.load_resolved()
+    return {a.id: a.auth for a in resolved.agents if a.auth} if resolved is not None else {}
 
 
 def _period(label: str, rows: list[tuple[ProfileRunUsage, UsageTotal]]) -> ProfileUsageSum:
@@ -85,8 +100,7 @@ class ProfileUsageArea:
         return usage
 
     def _row(self, record: RunRecord, name: str) -> tuple[ProfileRunUsage, UsageTotal] | None:
-        usage = self._run_usage(record)
-        agents = _agents_on(usage, name) if usage is not None else {}
+        agents = _agents_on(self._run_usage(record), name, _planned(record))
         if not agents or record.meta is None:
             return None
         total = UsageTotal()

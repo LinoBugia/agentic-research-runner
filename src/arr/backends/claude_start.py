@@ -42,6 +42,7 @@ from arr.auth import (
     descriptor_variable,
     read_secret,
 )
+from arr.backends.process_path import within
 from arr.errors import ArrError
 from arr.models import AuthProfile, ProfilesFile
 from arr.resolve import load_yaml_model
@@ -74,12 +75,6 @@ def shim_text(entry: str = _ENTRY, python: str | None = None) -> str:
     return f'#!/bin/sh\nexec {interpreter} -I -c {shlex.quote(entry)} "$@"\n'
 
 
-def _within(path: Path, root: Path) -> bool:
-    """Whether `path` lies below `root`; APFS ignores case by default, so compare without it."""
-    resolved, top = (os.path.realpath(p).casefold() for p in (path, root))
-    return resolved == top or resolved.startswith(top.rstrip(os.sep) + os.sep)
-
-
 def program_parts(shim: Path) -> list[Path]:
     """Everything that runs outside the sandbox with access to the keychain."""
     package = Path(__file__).parents[1]
@@ -90,7 +85,7 @@ def refuse_writable(shim: Path, write_roots: Iterable[Path]) -> None:
     """Raise `ArrError` if an agent could change the start program: no agent starts then."""
     roots = list(write_roots)
     for part in program_parts(shim):
-        if any(_within(part, root) or _within(root, part) for root in roots):
+        if any(within(part, root) or within(root, part) for root in roots):
             raise ArrError(
                 "Der Claude-Agent startet nicht: Ein Teil des Startprogramms liegt in einem "
                 "Ordner, in den Agenten schreiben dürfen. Lege den Workfolder außerhalb der "

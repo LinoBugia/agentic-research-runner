@@ -446,15 +446,50 @@ async def test_an_open_login_ends(api: RealApi, monkeypatch: pytest.MonkeyPatch)
     assert ended == ["fake-auth"]
 
 
-async def test_the_block_stays_when_it_cannot_be_written(
-    api: RealApi, arr_home: Path, monkeypatch: pytest.MonkeyPatch
+async def test_a_block_that_cannot_be_written_still_stops_the_runs_here(
+    api: RealApi, wf: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review W3-06, B9: the message names both, the missing block and the stopped run."""
+
+    def refuse(_file: Any) -> None:
+        raise OSError("read-only")
+
+    run_id = (await api.start_run(RUN_INPUT)).run_id
+    await eventually(lambda: status_of(wf, run_id) is RunStatus.RUNNING, within=15)
+    monkeypatch.setattr(api.profiles, "_save", refuse)
+    result = await api.disable_profile("fake-auth")
+    assert not result.ok and result.runs == [run_id]
+    assert "nicht gesperrt" in result.message and "ließ sich nicht speichern" in result.message
+    assert "trotzdem gestoppt (1)" in result.message and "anderen Workfoldern" in result.message
+    assert result.profile is not None and not result.profile.disabled
+    assert not disabled_in_file(arr_home, "fake-auth")
+    await eventually(lambda: status_of(wf, run_id) is RunStatus.STOPPED, within=15)
+    await eventually(lambda: scanned(wf / "runs" / run_id), within=15)
+
+
+async def test_an_unreadable_file_still_stops_the_runs_here(
+    api: RealApi, wf: Path, arr_home: Path
+) -> None:
+    run_id = (await api.start_run(RUN_INPUT)).run_id
+    await eventually(lambda: status_of(wf, run_id) is RunStatus.RUNNING, within=15)
+    (arr_home / "profiles.yaml").write_bytes(b"\xff\xfe kaputt")
+    preview = await api.disable_profile("fake-auth", dry_run=True)
+    assert preview.runs == [run_id]
+    result = await api.disable_profile("fake-auth")
+    assert not result.ok and result.runs == [run_id] and result.profile is None
+    assert "nicht gesperrt" in result.message and "trotzdem gestoppt" in result.message
+    await eventually(lambda: status_of(wf, run_id) is RunStatus.STOPPED, within=15)
+
+
+async def test_a_block_without_a_run_that_cannot_be_written_says_so(
+    api: RealApi, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def refuse(_file: Any) -> None:
         raise OSError("read-only")
 
     monkeypatch.setattr(api.profiles, "_save", refuse)
-    with pytest.raises(ApiException, match="ließ sich nicht speichern"):
-        await api.disable_profile("fake-auth")
+    result = await api.disable_profile("fake-auth")
+    assert not result.ok and result.runs == [] and "Hier lief kein Run" in result.message
 
 
 # --------------------------------------------------------------------------------------------
@@ -633,6 +668,40 @@ async def test_a_running_run_counts_and_updates_when_read_again(api: RealApi, wf
     assert (await api.get_profile_usage("fake-auth")).runs[0].active
     turn_end(run_dir, "a", 10, 1)
     assert (await api.get_profile_usage("fake-auth")).total.input == 50
+
+
+@pytest.mark.parametrize(
+    "status", [RunStatus.RUNNING, RunStatus.INTERRUPTED, RunStatus.FAILED, RunStatus.STOPPED]
+)
+async def test_a_run_without_a_finished_turn_shows_with_zero(
+    api: RealApi, wf: Path, status: RunStatus
+) -> None:
+    """Review W3-06, B4: the profile comes from `run.yaml`, not from a turn."""
+    run_dir = make_run_folder(wf, status=status)
+    record = await api.get_profile_usage("fake-auth")
+    [row] = record.runs
+    assert row.run_id == run_dir.name and row.agents == ["a"]
+    assert (row.input, row.output, row.turns) == (0, 0, 0)
+    assert row.active is status.is_active and row.aborted is (status is not RunStatus.RUNNING)
+    assert record.total.runs == 1
+    assert (await api.get_profile_usage("fake-key")).runs == []
+
+
+async def test_a_finalized_run_without_a_turn_shows_with_zero(api: RealApi, wf: Path) -> None:
+    """`usage.json` of such a run has the agent, but no profile for it."""
+    run_dir = make_run_folder(wf, status=RunStatus.FAILED)
+    usage = RunUsage(run=run_dir.name, by_agent={"a": AgentUsage()})
+    (run_dir / "usage.json").write_text(usage.model_dump_json(), "utf-8")
+    [row] = (await api.get_profile_usage("fake-auth")).runs
+    assert row.agents == ["a"] and row.input == 0 and row.aborted
+
+
+def test_a_row_without_tokens_shows_zero_and_a_dash() -> None:
+    from arr.service.api_models import ProfileUsageSum
+    from arr.service.gui.pages.profile import usage_cells
+
+    cells = usage_cells(ProfileUsageSum(label="x", runs=1))
+    assert cells.count('<td class="num">0</td>') == 5 and cells.endswith(">–</td>")
 
 
 async def test_periods_take_a_run_by_its_start(api: RealApi, wf: Path) -> None:

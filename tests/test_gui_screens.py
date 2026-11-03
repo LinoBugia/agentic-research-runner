@@ -822,3 +822,7 @@ async def test_nachweis_opens_with_sums_runs_and_its_limit(api: MockApi) -> None
             assert text in html
         assert 'href="/runs/20261030-1402_demo"' in html
         assert "direkte Nutzung von Claude Code oder Codex" in html
+        # wider than the card: it scrolls inside it, so „Kosten“ stays reachable (B3)
+        [box] = user.find(marker="usage-claude-api-uni").elements
+        [area] = [e for e in box.parent_slot.children if "profile-usage" in e.classes]
+        assert area.style.get("overflow-x") == "auto" and area.props.get("tabindex") == "0"

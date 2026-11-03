@@ -119,6 +119,8 @@ def usage_cells(row: ProfileUsageSum) -> str:
     return f'{cells}<td class="num">{esc(" + ".join(costs) or "–")}</td>'
 
 
+USAGE_BOX_STYLE = "overflow-x: auto; max-width: 100%; min-width: 0"
+
 USAGE_HEAD = (
     '<th class="num">Input</th><th class="num">Output</th><th class="num">Cache lesen</th>'
     '<th class="num">Cache schreiben</th><th class="num">Reasoning</th><th class="num">Kosten</th>'
@@ -316,7 +318,10 @@ class ProfilePage:
                 )
             with ui.element("div").classes("btn-row"):
                 self._actions(p, bad)
-            usage_box = ui.element("div").classes("profile-usage")
+            # the record is wider than a card: it scrolls inside it, so no column is cut off
+            # (review W3-06, B3); focusable, so the keys scroll it too
+            usage_box = ui.element("div").classes("profile-usage").style(USAGE_BOX_STYLE)
+            usage_box.props(f'tabindex="0" role="region" aria-label="Nachweis {esc(p.name)}"')
             button("Nachweis", None, classes="btn btn-sm ghost").mark(f"usage-{p.name}").on(
                 "click", lambda _e, box=usage_box: self._usage(p, box)
             )

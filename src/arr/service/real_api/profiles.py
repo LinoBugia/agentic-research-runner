@@ -439,17 +439,41 @@ class ProfilesArea:
                     failed.append(run_id)
         return failed
 
+    def _find_for_block(self, name: str) -> tuple[AuthProfile | None, ApiException | None]:
+        """The profile, or the reason the file cannot be read: the runs stop either way."""
+        if not _NAME.match(name):
+            raise not_found("Profil", name)
+        try:
+            return self._find(name), None
+        except ApiException as exc:
+            if exc.error.code is ErrorCode.NOT_FOUND:
+                raise
+            return None, exc
+
     async def disable_profile(self, name: str, dry_run: bool = False) -> ProfileActionResult:
-        profile = self.find(name)
-        ids = self._run_ids(name)
+        """Block the profile, then stop the runs of this workfolder on it.
+
+        If the block cannot be written (or `profiles.yaml` not read), the runs here stop all
+        the same and the answer says both (review W3-06, B9): runs in other workfolders only
+        see a saved block.
+        """
+        profile, unsaved = self._find_for_block(name)
         if dry_run:
+            ids = self._run_ids(name)
             text = f"{len(ids)} laufende Runs würden gestoppt." if ids else "Es läuft kein Run."
-            return ProfileActionResult(message=text, runs=ids, profile=self._info(profile))
-        async with self._lock:
-            profile = self._write_disabled(name, True)
+            info = self._info(profile) if profile is not None else None
+            return ProfileActionResult(message=text, runs=ids, profile=info)
+        if unsaved is None:
+            try:
+                async with self._lock:
+                    profile = self._write_disabled(name, True)
+            except ApiException as exc:
+                unsaved = exc
         await self.logins.cancel(name)
         ids = self._run_ids(name)
         failed = await self._stop_runs(ids)
+        if unsaved is not None:
+            return self._unsaved_block(name, unsaved, ids, failed, profile)
         text = f"„{name}“ ist gesperrt. "
         if failed:
             text += (
@@ -466,6 +490,31 @@ class ProfilesArea:
             runs=[run_id for run_id in ids if run_id not in failed],
             failed_runs=failed,
             profile=self._info(profile),
+        )
+
+    def _unsaved_block(
+        self,
+        name: str,
+        cause: ApiException,
+        ids: list[str],
+        failed: list[str],
+        profile: AuthProfile | None,
+    ) -> ProfileActionResult:
+        text = f"„{name}“ ist nicht gesperrt: {cause.error.message} "
+        stopped = [run_id for run_id in ids if run_id not in failed]
+        if stopped:
+            text += f"Die laufenden Runs hier werden trotzdem gestoppt ({len(stopped)}). "
+        if failed:
+            text += f"Nicht stoppen ließen sich: {', '.join(failed)}. Beende sie im Terminal. "
+        if not ids:
+            text += "Hier lief kein Run. "
+        text += "Runs in anderen Workfoldern laufen weiter, bis die Sperre gespeichert ist."
+        return ProfileActionResult(
+            ok=False,
+            message=text,
+            runs=stopped,
+            failed_runs=failed,
+            profile=self._info(profile) if profile is not None else None,
         )
 
     async def enable_profile(self, name: str) -> ProfileActionResult:

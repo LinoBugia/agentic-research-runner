@@ -5,14 +5,18 @@ The permission part comes from `claude_options(profile)` (PolicyEngine, W1-05): 
 with the read allowlist. This module adds the rest: fixed tool set, system prompt (preset
 `claude_code` + role text + static arr part, byte-identical per role), no setting sources,
 the generated plugin with its skill list, only the `arr-room` MCP server, adaptive thinking
-and the process environment (`PATH` with `path_prepend`, `TMPDIR` = Run-tmp).
+and the process environment (`TMPDIR` = Run-tmp). The CLI's own `PATH` holds no folder an
+agent can write to; the agent's `PATH` (run venv, `path_prepend`) reaches only its Bash
+commands, through `CLAUDE_ENV_FILE` (W3-06.3, B1).
 """
 
 import contextlib
 import hashlib
 import os
+import shlex
 import stat
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from importlib import resources
 from pathlib import Path
@@ -23,6 +27,7 @@ from claude_agent_sdk.types import CanUseTool, SystemPromptPreset
 
 from arr.auth import START_PROFILE_VARIABLE
 from arr.backends.claude_start import start_program
+from arr.backends.process_path import outside_path, within
 from arr.errors import ArrError
 from arr.models import Effort
 from arr.permissions.policy import ROOM_TOOL_PREFIX, SandboxProfile, claude_options
@@ -43,6 +48,12 @@ PERMISSION_MODE = "default"
 """Every Bash, Write and Edit call goes to `can_use_tool` (PolicyEngine, then the inbox). The
 scrub switch `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` makes the CLI force `default` anyway (W2-01.1);
 set explicitly so the options say what happens (Nachprüfung W2-01.1 N2, W2-05)."""
+
+ROOM_SERVER_ARGS = ("-I", "-m", "arr.room.server")
+"""Start of the room server with arr's interpreter (see `room_server`)."""
+
+SHELL_ENV_FILE = "shell-env.sh"
+"""Name of the `CLAUDE_ENV_FILE` in the agent's folder (see `shell_env_file`)."""
 
 TMP_LINK_ROOT = Path("/tmp")
 """Where the short alias of Run-tmp lives (see `tmp_link`)."""
@@ -87,7 +98,8 @@ def agent_path(agent: PreparedAgent, venv_dir: Path | None, base_path: str | Non
 
     The run venv (`SandboxProfile.venv_dir`, outside `~`; None with `run_venv: off`) comes
     first so `pip install` lands there and never in the base venv (docs/07 §2); the
-    RunManager creates it before the agents start.
+    RunManager creates it before the agents start. Only the Bash commands get this `PATH`
+    (`shell_env_file`); the CLI runs with `outside_path` of it (W3-06.3, B1).
     """
     parts: list[str] = []
     if venv_dir is not None:
@@ -111,6 +123,31 @@ def python_env(venv_dir: Path | None) -> dict[str, str]:
         "PYTHONPATH": "",
         "PYTHONHOME": "",
     }
+
+
+def shell_env_file(agent: PreparedAgent, profile: SandboxProfile, bash_path: str) -> Path:
+    """Write `agents/<id>/shell-env.sh`, the file of `CLAUDE_ENV_FILE` (W3-06.3, B1).
+
+    The CLI reads it itself and puts it in front of every Bash command, so the run venv
+    reaches the commands inside the sandbox without being on the CLI's own `PATH`
+    (measured with the real CLI). The folder is no write root: an agent cannot change what
+    the next command runs with. Raises `ArrError` if it is one.
+    """
+    folder = agent.agent_dir
+    path = folder / SHELL_ENV_FILE
+    if any(within(folder, root) for root in profile.write_roots):
+        raise ArrError(
+            "Der Claude-Agent startet nicht: Der Ordner für die Umgebung seiner Befehle liegt "
+            f"in einem Ordner, in den Agenten schreiben dürfen ({folder})."
+        )
+    venv = python_env(profile.venv_dir)["VIRTUAL_ENV"]
+    text = f"export PATH={shlex.quote(bash_path)}\nexport VIRTUAL_ENV={shlex.quote(venv)}\n"
+    folder.mkdir(parents=True, exist_ok=True)
+    handle, temp = tempfile.mkstemp(dir=folder, prefix=f".{SHELL_ENV_FILE}.")
+    with os.fdopen(handle, "w", encoding="utf-8") as file:
+        file.write(text)
+    os.replace(temp, path)
+    return path
 
 
 def tmp_link(target: Path, key: str, root: Path = TMP_LINK_ROOT) -> Path:
@@ -175,11 +212,16 @@ def cache_env(run_tmp: Path) -> dict[str, str]:
 
 
 def room_server(agent: PreparedAgent) -> dict[str, Any]:
-    """stdio config of the room server for this agent (docs/01 §5)."""
+    """stdio config of the room server for this agent (docs/01 §5).
+
+    The CLI starts it outside the sandbox in the working folder, a write root: `-I` keeps the
+    `cwd` out of `sys.path` (and `PYTHON*`, the user site), so an `arr/` written by an agent
+    is never imported (W3-06.3, B2).
+    """
     return {
         "type": "stdio",
         "command": sys.executable,
-        "args": ["-m", "arr.room.server"],
+        "args": [*ROOM_SERVER_ARGS],
         "env": {AGENT_ID_ENV: agent.id, RUN_DIR_ENV: str(agent.run_dir)},
     }
 
@@ -213,8 +255,12 @@ def build_options(
     perms = claude_options(profile)
     plugin = agent.plugin_dir
     # one source for the run venv: the profile (W3-00.1 G4), as for add_dirs and the sandbox
-    process_env = {**env, **perms.env, "PATH": agent_path(agent, profile.venv_dir)}
-    process_env.update(python_env(profile.venv_dir))
+    bash_path = agent_path(agent, profile.venv_dir)
+    process_env = {**env, **perms.env, **python_env(profile.venv_dir)}
+    # the CLI runs outside the sandbox: nothing on its PATH may come from an agent (B1)
+    process_env["PATH"] = outside_path(bash_path.split(os.pathsep), profile.write_roots)
+    process_env["VIRTUAL_ENV"] = ""
+    process_env["CLAUDE_ENV_FILE"] = str(shell_env_file(agent, profile, bash_path))
     process_env.update(cache_env(Path(perms.env["TMPDIR"])))
     if tmpdir is not None:
         process_env["TMPDIR"] = process_env["CLAUDE_CODE_TMPDIR"] = str(tmpdir)

@@ -31,6 +31,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from claude_agent_sdk.types import PermissionResultAllow
 from codex_cli_bin import bundled_codex_path
 from fake_messages_api import FakeMessagesApi, ToolCall
+from fake_responses_api import FakeResponsesApi
 
 import arr
 from arr.auth import (
@@ -41,6 +42,7 @@ from arr.auth import (
 from arr.backends.claude import ClaudeBackend
 from arr.backends.claude_options import build_options, remove_tmp_link, tmp_link
 from arr.backends.claude_start import bundled_cli, shim_text
+from arr.backends.codex import CodexBackend
 from arr.backends.codex_config import PERMISSION_PROFILE, build_launch, codex_home_for, toml_value
 from arr.models import AuthKind, AuthProfile, RunInput, WorkfolderSettings
 from arr.permissions.inbox import ApprovalInbox
@@ -98,6 +100,21 @@ class Lab:
         return self.home / ".arr" / "bin"
 
 
+def guard_bin(base: Path) -> Path:
+    """A `security` that finds nothing, first on the `PATH` of the lab (W3-06.3).
+
+    The real CLI asks the keychain for a login of its own, outside the sandbox and through its
+    `PATH` (`find-generic-password -s "Claude Code-credentials" -w`). In the lab it gets „not
+    found“, so the real keychain stays out (W3-06 §12). The probe inside the sandbox calls
+    `/usr/bin/security` by its path and is not affected.
+    """
+    folder = base / "guard-bin"
+    folder.mkdir(exist_ok=True)
+    (folder / "security").write_text("#!/bin/sh\nexit 44\n")
+    (folder / "security").chmod(0o755)
+    return folder
+
+
 @contextmanager
 def lab_env(base: Path, home: Path) -> Iterator[None]:
     """`HOME`, `ARR_HOME` and the venv root of the lab, and no credential of this process."""
@@ -110,6 +127,7 @@ def lab_env(base: Path, home: Path) -> Iterator[None]:
         "HOME": str(home),
         "ARR_HOME": str(home / ".arr"),
         "ARR_VENV_ROOT": str(base / "venv-root"),
+        "PATH": f"{guard_bin(base)}{os.pathsep}{os.environ.get('PATH', os.defpath)}",
     }
     try:
         yield
@@ -144,7 +162,9 @@ def _run_input(provider: str, model: str, auth: str, agent: str) -> RunInput:
     )
 
 
-def build_lab(provider: str, kind: AuthKind = AuthKind.CLAUDE_OAUTH) -> Lab:
+def build_lab(
+    provider: str, kind: AuthKind = AuthKind.CLAUDE_OAUTH, *, with_pip: bool = False
+) -> Lab:
     """A prepared run of one agent (`codex` | `claude`) in a fresh test `HOME`. Call it inside
     `lab_env`, see `open_lab`. `kind` is the login of a Claude profile."""
     base = Path(os.environ["ARR_VENV_ROOT"]).parent
@@ -172,7 +192,7 @@ def build_lab(provider: str, kind: AuthKind = AuthKind.CLAUDE_OAUTH) -> Lab:
     agent = run.agents[agent_id]
     run_paths = RunPaths(wf, run.run_dir, settings.toolchain)
     (run_paths.tmp_dir / "home" / agent_id).mkdir(parents=True, exist_ok=True)
-    create_run_venv(run_paths, agent.file.base_python, with_pip=False)
+    create_run_venv(run_paths, agent.file.base_python, with_pip=with_pip)
     RoomStore.create(run.run_dir).setup_channels(resolved.groupchats, {})
     subprocess.run(["git", "init", "-q", str(agent.work_dir)], check=True)
     profile = profile_for(agent.file.config, run_paths, PermissionRules(), home=home)
@@ -204,13 +224,15 @@ def build_lab(provider: str, kind: AuthKind = AuthKind.CLAUDE_OAUTH) -> Lab:
 
 
 @contextmanager
-def open_lab(provider: str, kind: AuthKind = AuthKind.CLAUDE_OAUTH) -> Iterator[Lab]:
+def open_lab(
+    provider: str, kind: AuthKind = AuthKind.CLAUDE_OAUTH, *, with_pip: bool = False
+) -> Iterator[Lab]:
     base = Path(tempfile.mkdtemp(prefix="arr-guard-", dir="/private/tmp")).resolve()
     base.chmod(0o700)
     home = base / "home"
     home.mkdir()
     with lab_env(base, home):
-        lab = build_lab(provider, kind)
+        lab = build_lab(provider, kind, with_pip=with_pip)
         try:
             yield lab
         finally:
@@ -386,6 +408,7 @@ def in_codex(lab: Lab, plan: Mapping[str, Any], mode: str, entries=None) -> list
 
 def run_codex(lab: Lab, entries: dict[str, str] | None = None) -> dict[str, Any]:
     """The whole probe in the Codex sandbox, then the process that outlives the command."""
+    guard_start(lab)  # the start program exists, as in a mixed run (review W3-06, B5)
     listener = _free_listener()
     real, env, cwd = codex_entries(lab)
     entries = real if entries is None else entries
@@ -600,13 +623,19 @@ os._exit(0)
 """
 
 
-async def _backend_turn(backend: ClaudeBackend) -> None:
-    async for _ in backend.run_turn("Starte."):
-        pass
-    await backend.close()
+async def _backend_turn(backend: Any, turns: int = 1) -> None:
+    try:
+        await backend.start()
+        for _ in range(turns):
+            async for _ in backend.run_turn("Starte."):
+                pass
+    finally:
+        await backend.close()
 
 
-def run_file_tools(lab: Lab, script: list[ToolCall], decider: Any = None) -> FakeMessagesApi:
+def run_file_tools(
+    lab: Lab, script: list[ToolCall], decider: Any = None, *, turns: int = 1
+) -> FakeMessagesApi:
     """`script` through the real backend: real hooks and `PolicyEngine`, outside the sandbox."""
     with FakeMessagesApi(script) as api:
         engine = PolicyEngine([lab.profile], log=ApprovalLog(lab.run.run_dir / "approvals.jsonl"))
@@ -627,5 +656,235 @@ def run_file_tools(lab: Lab, script: list[ToolCall], decider: Any = None) -> Fak
             secret_reader=lambda _service, _account: lab.token,
             client_factory=factory,
         )
-        asyncio.run(asyncio.wait_for(_backend_turn(backend), 200))
+        asyncio.run(asyncio.wait_for(_backend_turn(backend, turns), 200))
     return api
+
+
+def run_codex_backend(lab: Lab, script: list[str], *, turns: int = 1) -> FakeResponsesApi:
+    """`script` through the real `CodexBackend` and app-server (one per turn), no model.
+
+    The app-server gets an empty `CODEX_HOME` of its own, the bait login folder stays as it is.
+    """
+    from openai_codex import AsyncCodex, CodexConfig
+
+    home = lab.base / "codex-home"
+    home.mkdir(exist_ok=True)
+    with FakeResponsesApi(script) as api:
+        engine = PolicyEngine([lab.profile], log=ApprovalLog(lab.run.run_dir / "approvals.jsonl"))
+
+        def factory(config: CodexConfig) -> AsyncCodex:
+            env = {**(config.env or {}), "CODEX_HOME": str(home)}
+            overrides = (*config.config_overrides, *api.provider_overrides())
+            return AsyncCodex(replace(config, env=env, config_overrides=overrides))
+
+        backend = CodexBackend(
+            lab.agent,
+            run_id=lab.run.run_id,
+            inbox=ApprovalInbox(engine, timeout=0.05),
+            auth=lab.auth,
+            factory=factory,
+        )
+        asyncio.run(asyncio.wait_for(_backend_turn(backend, turns), 200))
+    return api
+
+
+# --------------------------------------------------------------------------------------------
+# Programs outside the sandbox (W3-06.3, B1, B2)
+# --------------------------------------------------------------------------------------------
+
+STUB_NAMES = tuple(
+    [
+        "git",
+        "security",
+        "ps",
+        "npm",
+        "node",
+        "env",
+        "which",
+        "uname",
+        "sw_vers",
+        "rg",
+        "sh",
+        "bash",
+        "zsh",
+        "uv",
+        "pip",
+        "pip3",
+        "gh",
+        "pgrep",
+        "lsof",
+        "tput",
+        "stty",
+        "osascript",
+        "sysctl",
+        "sandbox-exec",
+        "cat",
+        "ls",
+        "sed",
+        "grep",
+        "find",
+        "date",
+        "id",
+        "whoami",
+        "hostname",
+        "tr",
+        "cut",
+        "awk",
+        "mktemp",
+        "rm",
+        "mkdir",
+        "stat",
+        "readlink",
+        "dirname",
+        "basename",
+        "tail",
+        "head",
+        "wc",
+        "sort",
+        "xargs",
+        "file",
+    ]
+)
+"""Programs a process outside the sandbox could look up on its `PATH` (seen in the review of
+W3-06: `git`, `security`, `ps`, `npm`, `env`), plus shells and common tools. Not `python`:
+in the run venv it is a link to the real interpreter, and a stub never writes through it."""
+
+SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+PATH_PROBES = {
+    "venv": "arr-guard-venv",
+    "prepend": "arr-guard-prepend",
+    "inherited": "arr-guard-tmp",
+}
+"""One program per source of the agent's `PATH`, each in a write root."""
+
+
+@dataclass
+class Traps:
+    outside: Path  # written only by a program that runs without the sandbox
+    inside: Path  # in Run-tmp: the agent's commands report here
+    shadow: Path  # written by an `arr/__init__.py` of the working folder
+    folders: dict[str, Path]
+
+    def outside_lines(self) -> list[str]:
+        return self.outside.read_text().splitlines() if self.outside.exists() else []
+
+    def inside_lines(self) -> list[str]:
+        return self.inside.read_text().splitlines() if self.inside.exists() else []
+
+
+def _stub(path: Path, text: str) -> None:
+    if path.is_symlink() or path.exists():
+        path.unlink()  # replace the entry itself, never write through a link out of the lab
+    path.write_text(text)
+    path.chmod(0o755)
+
+
+def set_traps(lab: Lab) -> Traps:
+    """A stub of every program in each write root on a `PATH`, and `arr/` in the working folder.
+
+    The three sources of the agent's `PATH` each get a write root: the run venv, `path_prepend`
+    (working folder) and the inherited `PATH` (Run-tmp). Every stub notes its name in a file
+    outside every write root, which only a process outside the sandbox can write. The
+    harness itself starts its programs by absolute path.
+    """
+    folders = {
+        "venv": lab.run_paths.venv_dir / "bin",
+        "prepend": lab.agent.work_dir / "bin",
+        "inherited": lab.profile.tmp_dir / "bin",
+    }
+    traps = Traps(
+        outside=lab.base / "ran-outside.log",
+        inside=lab.profile.tmp_dir / "ran-inside.log",
+        shadow=lab.base / "shadow-ran",
+        folders=folders,
+    )
+    for source, folder in folders.items():
+        folder.mkdir(parents=True, exist_ok=True)
+        for name in STUB_NAMES:
+            real = shutil.which(name, path=SYSTEM_PATH)
+            tail = {"security": "exit 44", "git": "exit 128"}.get(name)
+            tail = tail or (f'exec {real} "$@"' if real else "exit 127")
+            note = f'echo "{name} {source}" >> {traps.outside} 2>/dev/null'
+            _stub(folder / name, f"#!/bin/sh\n{note}\n{tail}\n")
+        probe = PATH_PROBES[source]
+        _stub(
+            folder / probe,
+            f'#!/bin/sh\necho "{probe}" >> {traps.outside} 2>/dev/null\n'
+            f'echo "{probe}" >> {traps.inside}\n',
+        )
+    shadow = lab.agent.work_dir / "arr"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text(f"open({str(traps.shadow)!r}, 'w').write('ran')\n")
+    file = lab.agent.file.model_copy(
+        update={"path_prepend": [str(folders["prepend"]), *lab.agent.file.path_prepend]}
+    )
+    lab.agent = replace(lab.agent, file=file)
+    guard = guard_bin(lab.base)
+    os.environ["PATH"] = os.pathsep.join([str(folders["inherited"]), str(guard), SYSTEM_PATH])
+    return traps
+
+
+def trap_commands(traps: Traps) -> list[str]:
+    """What the agent runs: one program of each source, then Python of the run venv."""
+    probes = "; ".join(PATH_PROBES.values())
+    python = f"python3 -c 'import sys; print(\"prefix\", sys.prefix)' >> {traps.inside}"
+    return [f"{probes}; {python}", "git status; echo zwei"]
+
+
+@contextmanager
+def old_way() -> Iterator[None]:
+    """The mutation: the whole agent `PATH` for CLI and app-server, `python -m` without `-I`."""
+    from arr.backends import claude_options, codex_config
+
+    saved = {
+        module: (module.outside_path, module.ROOM_SERVER_ARGS)
+        for module in (claude_options, codex_config)
+    }
+    for module in saved:
+        module.outside_path = lambda entries, _roots: os.pathsep.join(entries)
+        module.ROOM_SERVER_ARGS = ("-m", "arr.room.server")
+    try:
+        yield
+    finally:
+        for module, (path, args) in saved.items():
+            module.outside_path, module.ROOM_SERVER_ARGS = path, args
+
+
+def run_git_filter(lab: Lab, provider: str) -> list[str]:
+    """The agent defines a clean filter in `$HOME/.gitconfig`, selects it in `.gitattributes`
+    and touches a tracked file; the next CLI or app-server runs `git status` outside the
+    sandbox. Returns what the filter noted outside every write root."""
+    work = lab.agent.work_dir
+    (work / "a.txt").write_text("hallo\n")
+    git = ["/usr/bin/git", "-C", str(work), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "add", "a.txt"], check=True, capture_output=True)
+    subprocess.run([*git, "commit", "-qm", "x"], check=True, capture_output=True)
+    log = lab.base / "filter-ran.log"
+    script = lab.profile.tmp_dir / "filter.sh"
+    script.write_text(f"#!/bin/sh\necho filter >> {log} 2>/dev/null\ncat\n")
+    script.chmod(0o755)
+    plant = (
+        f'/usr/bin/git config --file "$HOME/.gitconfig" filter.x.clean {script} && '
+        "echo '* filter=x' > .gitattributes && touch -t 200101010000 a.txt && echo planted"
+    )
+    # Codex runs `git` in the background at the start of a turn: the next command gives it time
+    wait = "sleep 2; echo zwei"
+    if provider == "claude":
+        for _ in range(2):
+            run_file_tools(lab, [bash(plant), bash(wait)], turns=2)
+    else:
+        run_codex_backend(lab, [plant, wait, wait], turns=3)
+    return log.read_text().splitlines() if log.exists() else []
+
+
+@contextmanager
+def old_home() -> Iterator[None]:
+    """The mutation: the app-server gets the writable `HOME` of the commands again."""
+    from arr.backends import codex_config
+
+    saved = codex_config.server_home
+    codex_config.server_home = codex_config.command_home
+    try:
+        yield
+    finally:
+        codex_config.server_home = saved

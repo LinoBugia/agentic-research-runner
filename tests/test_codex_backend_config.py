@@ -522,14 +522,20 @@ def test_launch_env_and_thread_config(layout: dict[str, Path], tmp_path: Path) -
     env = launch.env
     assert env["CODEX_HOME"] == str(tmp_path / "ch")
     assert env["TMPDIR"] == str(run / "tmp")
-    assert env["HOME"] == str(run / "tmp" / "home" / "gpt-1")
+    # the app-server's git reads $HOME/.gitconfig: no write root (W3-06.3), the commands
+    # get a writable HOME of their own
+    assert env["HOME"] == str(run / "agents" / "gpt-1" / "home")
+    assert launch.shell_env["HOME"] == str(run / "tmp" / "home" / "gpt-1")
+    assert not profile.can_write(Path(env["HOME"]) / ".gitconfig")
     venv = str(paths.venv_dir / "bin")  # outside the run folder (W3-00)
-    assert env["PATH"].split(":") == [venv, "/opt/base/bin", "/usr/bin"]
+    # the app-server runs outside the sandbox: the run venv is for the commands only (B1)
+    assert env["PATH"].split(":") == ["/opt/base/bin", "/usr/bin"]
+    assert launch.shell_env["PATH"].split(":") == [venv, "/opt/base/bin", "/usr/bin"]
     assert env["OPENAI_API_KEY"] == ""
     assert all(env[name] == "" for name in SECRET_ENV if name in environ)
     assert env["MPLCONFIGDIR"].startswith(str(run / "tmp"))
     room = launch.thread_config["mcp_servers"][ROOM_SERVER]
-    assert room["args"] == ["-m", "arr.room.server"]
+    assert room["args"] == ["-I", "-m", "arr.room.server"]  # no `arr/` of the cwd (B2)
     assert room["env"] == {"AGENT_ID": "gpt-1", "RUN_DIR": str(run)}
     assert room["default_tools_approval_mode"] == "approve"
     assert launch.cwd == str(layout["work"])
@@ -557,7 +563,7 @@ def test_project_mcp_servers_are_switched_off(layout: dict[str, Path], tmp_path:
     launch = build_launch(agent, profile, paths, codex_home=tmp_path, environ={"PATH": ""})
     servers = launch.thread_config["mcp_servers"]
     assert servers["decoy"] == {"command": "/usr/bin/false", "enabled": False}
-    assert servers[ROOM_SERVER]["args"] == ["-m", "arr.room.server"]  # ours, not the project's
+    assert servers[ROOM_SERVER]["args"] == ["-I", "-m", "arr.room.server"]  # ours
 
 
 def test_broken_project_config_is_ignored(layout: dict[str, Path], tmp_path: Path) -> None:
@@ -571,8 +577,10 @@ def test_broken_project_config_is_ignored(layout: dict[str, Path], tmp_path: Pat
 def test_launch_env_isolates_python(layout: dict[str, Path], tmp_path: Path) -> None:
     agent, profile, paths = setup(layout)
     environ = {"PATH": "/usr/bin", "VIRTUAL_ENV": "/arr/.venv", "PYTHONPATH": "/arr/src"}
-    env = build_launch(agent, profile, paths, codex_home=tmp_path, environ=environ).env
-    assert env["VIRTUAL_ENV"] == str(paths.venv_dir)  # not arr's own venv
+    launch = build_launch(agent, profile, paths, codex_home=tmp_path, environ=environ)
+    env = launch.env
+    assert env["VIRTUAL_ENV"] == ""  # neither arr's own venv nor the run venv
+    assert launch.shell_env["VIRTUAL_ENV"] == str(paths.venv_dir)
     assert env["PYTHONPATH"] == "" and env["PYTHONHOME"] == ""
     assert env["UV_NO_CONFIG"] == "1"  # parents on the way may hold a denied pyproject.toml
 
@@ -708,3 +716,38 @@ def test_m5_login_folder_is_never_opened(layout: dict[str, Path]) -> None:
     entries = filesystem_entries(profile, paths, hard_deny=[login])
     assert codex_access(entries, login / "auth.json") == "deny"
     assert codex_access(entries, login / "notes" / "x.md") == "deny"
+
+
+def test_no_source_puts_a_write_root_on_the_app_servers_path(
+    layout: dict[str, Path], tmp_path: Path
+) -> None:
+    """W3-06.3, B1: run venv, `path_prepend` and the inherited PATH, each with a write root."""
+    agent, profile, paths = setup(layout)
+    work_bin, tmp_bin = str(layout["work"] / "bin"), str(layout["run"] / "tmp" / "bin")
+    file = agent.file.model_copy(update={"path_prepend": [work_bin, "/opt/base/bin"]})
+    agent = PreparedAgent(file, agent.run_dir)
+    environ = {"PATH": f"{tmp_bin}:bin:/usr/bin"}
+    launch = build_launch(agent, profile, paths, codex_home=tmp_path, environ=environ)
+    assert launch.env["PATH"].split(":") == ["/opt/base/bin", "/usr/bin"]
+    venv = str(paths.venv_dir / "bin")
+    assert launch.shell_env["PATH"].split(":") == [
+        venv,
+        work_bin,
+        "/opt/base/bin",
+        tmp_bin,
+        "bin",
+        "/usr/bin",
+    ]
+
+
+def test_the_app_servers_home_never_lies_in_a_write_root(
+    layout: dict[str, Path], tmp_path: Path
+) -> None:
+    import dataclasses
+
+    from arr.backends.codex_config import server_home
+
+    agent, profile, paths = setup(layout)
+    inside = dataclasses.replace(profile, write_roots=(*profile.write_roots, agent.agent_dir))
+    with pytest.raises(ArrError, match="Home-Ordner"):
+        server_home(agent, inside)

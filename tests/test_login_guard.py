@@ -54,11 +54,16 @@ def installed_versions() -> dict[str, str]:
     }
 
 
+OUTSIDE_TEST = "test_nothing_of_a_write_root_runs_outside_the_sandbox"
+REAL_HOME_PROBE = "spikes/w3_06/real_home_probe.py"
+
+
 def version_problems(recorded: dict[str, str], installed: dict[str, str]) -> list[str]:
     return [
         f"{name}: Sperr-Probe zuletzt grün mit {recorded.get(name)}, installiert ist "
         f"{installed.get(name)}. Lass die Probe auf dem Mac laufen (uv run pytest -m macos "
-        "tests/test_login_guard.py) und aktualisiere dann tests/fixtures/login_guard.json."
+        f"tests/test_login_guard.py, darin auch {OUTSIDE_TEST}), dazu die Probe mit echtem HOME "
+        f"({REAL_HOME_PROBE}), und aktualisiere dann tests/fixtures/login_guard.json."
         for name in sorted({*recorded, *installed})
         if recorded.get(name) != installed.get(name)
     ]
@@ -74,7 +79,13 @@ def test_another_version_is_reported_in_german() -> None:
     assert len(problems) == 1
     assert "Sperr-Probe zuletzt grün mit 2.1.310" in problems[0] and "9.9.9" in problems[0]
     assert "tests/fixtures/login_guard.json" in problems[0]
+    assert OUTSIDE_TEST in problems[0] and REAL_HOME_PROBE in problems[0]
     assert version_problems({"a": "1"}, {}) and version_problems({}, {"a": "1"})
+
+
+def test_the_guard_names_what_exists() -> None:
+    assert (Path(__file__).parents[1] / REAL_HOME_PROBE).is_file()
+    assert callable(globals().get(OUTSIDE_TEST))
 
 
 # --------------------------------------------------------------------------------------------
@@ -160,10 +171,14 @@ def test_the_start_program_cannot_be_changed_or_run(probe: dict[str, Any]) -> No
     rows = [row for row in probe["rows"] if row["way"].startswith("Startprogramm")]
     assert len(rows) == 5 and reached(rows) == []
     assert all(row["note"].endswith("Error") or "exit" in row["note"] for row in rows)
+    assert not [row for row in rows if "FileNotFoundError" in row["note"]], "nothing to block"
 
 
 @mac
 def test_the_keychain_gives_nothing(probe: dict[str, Any]) -> None:
+    """Not a proof on its own (review W3-06, B6): the bait is a text file, no keychain, so this
+    stays green with or without the block. The block on the files is proven by the mutations
+    below, the real keychain by `spikes/w3_06/real_home_probe.py`."""
     rows = [row for row in probe["rows"] if row["target"] == "Schlüsselbund"]
     assert len(rows) == 3 and reached(rows) == []
 
@@ -320,6 +335,122 @@ def test_the_cli_still_knows_the_pipe_variables() -> None:
 
     program = bundled_cli().read_bytes()
     assert all(name.encode() in program for name in DESCRIPTOR_VARIABLES.values())
+
+
+# --------------------------------------------------------------------------------------------
+# W3-06.3: what runs outside the sandbox never comes from a write root (B1, B2)
+# --------------------------------------------------------------------------------------------
+
+
+def _run_trapped(provider: str) -> dict[str, Any]:
+    """The real CLI or app-server with stubs in every write root on a `PATH` and `arr/` in the
+    working folder: two CLI starts with two turns each, or three app-servers (one per turn)."""
+    import login_guard_kit as kit
+
+    with kit.open_lab(provider) as lab:
+        traps = kit.set_traps(lab)
+        commands = kit.trap_commands(traps)
+        if provider == "claude":
+            for _ in range(2):
+                kit.run_file_tools(lab, [kit.bash(command) for command in commands], turns=2)
+        else:
+            kit.run_codex_backend(lab, commands, turns=3)
+        return {
+            "outside": traps.outside_lines(),
+            "inside": traps.inside_lines(),
+            "shadow": traps.shadow.exists(),
+            "prefix": f"prefix {lab.run_paths.venv_dir}",
+            "probes": set(kit.PATH_PROBES.values()),
+        }
+
+
+@mac
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_nothing_of_a_write_root_runs_outside_the_sandbox(provider: str) -> None:
+    result = _run_trapped(provider)
+    assert result["outside"] == [], "a program of a write root ran without the sandbox"
+    assert result["shadow"] is False, "the room server imported arr from the working folder"
+    # the agent's commands keep their PATH: each source, and Python of the run venv
+    assert result["probes"] <= set(result["inside"])
+    assert result["prefix"] in result["inside"]
+
+
+@mac
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_a_git_filter_of_the_agent_never_runs_outside(provider: str) -> None:
+    """Found in W3-06.3: `git` of the app-server read `$HOME/.gitconfig` in Run-tmp."""
+    import login_guard_kit as kit
+
+    with kit.open_lab(provider) as lab:
+        assert kit.run_git_filter(lab, provider) == []
+
+
+@mac
+def test_the_old_home_of_the_app_server_is_found() -> None:
+    import login_guard_kit as kit
+
+    with kit.old_home(), kit.open_lab("codex") as lab:
+        assert "filter" in kit.run_git_filter(lab, "codex")
+
+
+class Allow:
+    async def decide(self, item: Any) -> Decision:
+        return Decision(action=DecisionAction.ALLOW, decided_by=DecidedBy.USER, reason="Test")
+
+
+def _wheel(folder: Path, name: str) -> Path:
+    """A tiny wheel of one package, so `pip install` needs no network."""
+    import zipfile
+
+    info = f"{name}-0.1.dist-info"
+    files = {
+        f"{name}/__init__.py": "",
+        f"{info}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: 0.1\n",
+        f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\n"
+        "Tag: py3-none-any\n",
+    }
+    files[f"{info}/RECORD"] = "".join(f"{path},,\n" for path in [*files, f"{info}/RECORD"])
+    wheel = folder / f"{name}-0.1-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for path, text in files.items():
+            archive.writestr(path, text)
+    return wheel
+
+
+@mac
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_pip_and_python_of_the_agent_use_the_run_venv(provider: str) -> None:
+    import login_guard_kit as kit
+
+    with kit.open_lab(provider, with_pip=True) as lab:
+        wheel = _wheel(lab.agent.work_dir, "arrguardpkg")
+        report = lab.profile.tmp_dir / "pip.log"
+        python = "import arrguardpkg, sys; print(sys.prefix); print(arrguardpkg.__file__)"
+        # `;`, not `&&`: under Codex pip installs, then fails to remove its temp folder (rmdir
+        # is denied in the write roots, an older finding outside W3-06)
+        command = (
+            f"pip install --no-index --no-deps ./{wheel.name}; python3 -c {python!r} > {report}"
+        )
+        if provider == "claude":
+            kit.run_file_tools(lab, [kit.bash(command)], Allow())
+        else:
+            kit.run_codex_backend(lab, [command])
+        lines = report.read_text().splitlines() if report.exists() else []
+        venv = str(lab.run_paths.venv_dir)
+    assert lines and lines[0] == venv
+    assert lines[1].startswith(venv + "/lib/")
+
+
+@mac
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_the_old_way_is_found(provider: str) -> None:
+    """The mutation: the agent's `PATH` for CLI and app-server, the room server without `-I`."""
+    import login_guard_kit as kit
+
+    with kit.old_way():
+        result = _run_trapped(provider)
+    assert any(line.startswith("git ") for line in result["outside"])
+    assert result["shadow"] is True
 
 
 # --------------------------------------------------------------------------------------------

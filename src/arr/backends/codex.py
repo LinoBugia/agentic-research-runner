@@ -38,7 +38,13 @@ from arr.backends.base import (
     UsageData,
 )
 from arr.backends.codex_approvals import ApprovalBridge
-from arr.backends.codex_config import CodexLaunch, build_launch, codex_home_for
+from arr.backends.codex_config import (
+    CodexLaunch,
+    build_launch,
+    codex_home_for,
+    command_home,
+    server_home,
+)
 from arr.backends.codex_events import TurnEvents, read_rollout, rollout_calls
 from arr.backends.codex_sdk import (
     install_approval_handler,
@@ -163,8 +169,8 @@ class CodexBackend:
                 f"Das Profil „{self.auth.name}“ ist nicht bei ChatGPT angemeldet. Melde es einmal "
                 f"an: uv run arr auth codex-login {self.auth.name}"
             )
-        home = self.profile.tmp_dir / "home" / self.agent.id
-        home.mkdir(parents=True, exist_ok=True)
+        for home in (command_home(self.agent, self.profile), server_home(self.agent, self.profile)):
+            home.mkdir(parents=True, exist_ok=True)
         self._run_channels = _run_channels(self.agent.run_dir)
         self._started = True
 

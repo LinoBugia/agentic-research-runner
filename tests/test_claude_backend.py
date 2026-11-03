@@ -6,6 +6,7 @@ import dataclasses
 import json
 import logging
 import os
+import shlex
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -137,6 +138,12 @@ def options_for(setup: Setup, agent_id: str = "e1", **kw: Any):
 # --------------------------------------------------------------------------------------------
 
 
+def bash_env(options: Any) -> dict[str, str]:
+    """What the CLI puts in front of every Bash command: the file of `CLAUDE_ENV_FILE`."""
+    lines = Path(options.env["CLAUDE_ENV_FILE"]).read_text(encoding="utf-8").splitlines()
+    return dict(shlex.split(line)[1].split("=", 1) for line in lines)
+
+
 def test_a5_options_follow_the_architecture(setup: Setup) -> None:
     profile = setup.profile()
     link = tmp_link(profile.tmp_dir, "r/e1", setup.tmp_root)
@@ -166,7 +173,7 @@ def test_a5_options_follow_the_architecture(setup: Setup) -> None:
     assert options.plugins == [{"type": "local", "path": str(agent.plugin_dir)}]
     assert list(options.mcp_servers) == [ROOM_SERVER] == ["arr-room"]
     room = options.mcp_servers[ROOM_SERVER]
-    assert room["args"] == ["-m", "arr.room.server"]
+    assert room["args"] == ["-I", "-m", "arr.room.server"]  # no `arr/` of the cwd (W3-06.3, B2)
     assert room["env"] == {"AGENT_ID": "e1", "RUN_DIR": str(setup.run.run_dir)}
     prompt = options.system_prompt
     assert prompt["type"] == "preset" and prompt["preset"] == "claude_code"
@@ -181,14 +188,18 @@ def test_a5_options_follow_the_architecture(setup: Setup) -> None:
     assert env["TMPDIR"] == env["CLAUDE_CODE_TMPDIR"] == str(link)
     assert env["PIP_CACHE_DIR"] == str(profile.tmp_dir / "cache" / "pip")
     assert env["MPLCONFIGDIR"].startswith(str(profile.tmp_dir))
-    path = env["PATH"].split(os.pathsep)
+    shell = bash_env(options)
+    path = shell["PATH"].split(os.pathsep)
     venv = RunPaths(setup.run.run_dir.parent.parent, setup.run.run_dir).venv_dir
     assert path[0] == str(venv / "bin")  # from RunPaths, outside the run folder (W3-00)
+    # the CLI itself runs outside the sandbox: no write root on its PATH (W3-06.3, B1)
+    assert str(venv / "bin") not in env["PATH"].split(os.pathsep)
+    assert env["VIRTUAL_ENV"] == ""
     assert not path[0].startswith(str(setup.run.run_dir))
     real = os.path.realpath(venv)  # PATH, add_dirs and the sandbox name the same run venv
     assert real in options.add_dirs and real in options.sandbox["filesystem"]["allowWrite"]
     assert real in options.sandbox["filesystem"]["allowRead"]
-    assert env["VIRTUAL_ENV"] == str(venv)  # not arr's own venv (W3-00 live check)
+    assert shell["VIRTUAL_ENV"] == str(venv)  # not arr's own venv (W3-00 live check)
     assert env["PYTHONNOUSERSITE"] == "1"  # no user site folder below ~ (pip list)
     assert env["PYTHONPATH"] == env["PYTHONHOME"] == ""
     assert path[1 : 1 + len(agent.file.path_prepend)] == agent.file.path_prepend
@@ -202,8 +213,8 @@ def test_w3_00_no_virtual_env_without_run_venv(setup: Setup, monkeypatch) -> Non
     options = build_options(
         setup.agent(), profile, env=dict(CLAUDE_SWITCHES), can_use_tool=None, hooks=None
     )
-    assert options.env["VIRTUAL_ENV"] == ""
-    assert not any("venv-root" in p for p in options.env["PATH"].split(os.pathsep))
+    assert options.env["VIRTUAL_ENV"] == bash_env(options)["VIRTUAL_ENV"] == ""
+    assert not any("venv-root" in p for p in bash_env(options)["PATH"].split(os.pathsep))
 
 
 def test_w3_00_1_g4_run_venv_comes_from_the_profile(setup: Setup, monkeypatch) -> None:
@@ -214,8 +225,9 @@ def test_w3_00_1_g4_run_venv_comes_from_the_profile(setup: Setup, monkeypatch) -
         setup.agent(), profile, env=dict(CLAUDE_SWITCHES), can_use_tool=None, hooks=None
     )
     assert profile.venv_dir is not None
-    assert options.env["PATH"].split(os.pathsep)[0] == str(profile.venv_dir / "bin")
-    assert options.env["VIRTUAL_ENV"] == str(profile.venv_dir)
+    shell = bash_env(options)
+    assert shell["PATH"].split(os.pathsep)[0] == str(profile.venv_dir / "bin")
+    assert shell["VIRTUAL_ENV"] == str(profile.venv_dir)
     assert str(profile.venv_dir) in options.sandbox["filesystem"]["allowWrite"]
 
 
@@ -1056,3 +1068,44 @@ def test_w2011_raw_only_on_the_first_event_of_a_message() -> None:
         UserMessage([ToolResultBlock("t1", "a", False), ToolResultBlock("t2", "b", False)])
     )
     assert len(results) == 2 and results[0].raw is not None and results[1].raw is None
+
+
+def test_w3_06_3_no_source_puts_a_write_root_on_the_clis_path(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1: run venv, `path_prepend` and the inherited PATH, each with a write root; the Bash
+    commands keep all of them through `CLAUDE_ENV_FILE`, which no agent can change."""
+    profile = setup.profile()
+    agent = setup.agent()
+    work_bin, tmp_bin = str(profile.work_dir / "bin"), str(profile.tmp_dir / "bin")
+    file = agent.file.model_copy(update={"path_prepend": [work_bin, *agent.file.path_prepend]})
+    agent = PreparedAgent(file, agent.run_dir)
+    monkeypatch.setenv("PATH", f"{tmp_bin}{os.pathsep}bin{os.pathsep}/usr/bin")
+    options = build_options(
+        agent, profile, env=dict(CLAUDE_SWITCHES), can_use_tool=None, hooks=None
+    )
+    cli = options.env["PATH"].split(os.pathsep)
+    assert cli == [*agent.file.path_prepend[1:], "/usr/bin"]
+    shell = bash_env(options)["PATH"].split(os.pathsep)
+    assert shell[:2] == [str(profile.venv_dir / "bin"), work_bin]
+    assert shell[-3:] == [tmp_bin, "bin", "/usr/bin"]
+    env_file = Path(options.env["CLAUDE_ENV_FILE"])
+    assert env_file.parent == agent.agent_dir
+    assert not any(profile.can_write(p) for p in (env_file, env_file.parent))
+
+
+def test_w3_06_3_the_env_file_never_lies_in_a_write_root(setup: Setup) -> None:
+    from arr.backends.claude_options import shell_env_file
+
+    profile = setup.profile()
+    inside = dataclasses.replace(
+        profile, write_roots=(*profile.write_roots, setup.agent().agent_dir)
+    )
+    with pytest.raises(ArrError, match="Umgebung seiner Befehle"):
+        shell_env_file(setup.agent(), inside, "/usr/bin")
+
+
+def test_w3_06_3_an_inherited_env_file_is_replaced(setup: Setup, monkeypatch) -> None:
+    """Started from a Claude Code session, arr must not hand its env file to the agents."""
+    options = options_for(setup, env={**CLAUDE_SWITCHES, "CLAUDE_ENV_FILE": "/elsewhere"})
+    assert options.env["CLAUDE_ENV_FILE"] == str(setup.agent().agent_dir / "shell-env.sh")
