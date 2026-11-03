@@ -67,6 +67,10 @@ GUARD_TESTS = (
     "test_no_git_runs_outside_the_sandbox",
     "test_a_changed_codex_folder_stops_the_agent",
     "test_no_compile_cache_of_node_in_run_tmp",
+    "test_apply_patch_move_is_refused",
+    "test_apply_patch_delete_is_refused_outside_and_on_the_block_list",
+    "test_a_file_request_with_a_grant_root_is_refused",
+    "test_a_file_request_arr_cannot_read_is_refused",
 )
 """The fixed tests of W3-06.3 and W3-06.4: what runs outside the sandbox (CLI, app-server,
 their file tools) never executes or reads what an agent wrote. Each has a countertest."""
@@ -689,6 +693,160 @@ def test_the_mcp_server_of_the_agent_runs_without_the_check() -> None:
     with kit.no_protection(), kit.no_project_check(), kit.open_lab("codex") as lab:
         result = kit.codex_mcp_chain(lab)
     assert result["laid"] and result["ran"]
+
+
+# --------------------------------------------------------------------------------------------
+# W3-06.5: a file change runs outside the sandbox, so the request names every path (N5)
+# --------------------------------------------------------------------------------------------
+
+
+@mac
+def test_apply_patch_move_is_refused() -> None:
+    """`*** Move to:` whose target would leave the sandbox is refused: outside every write
+    root and on the block list. The source stays, nothing is written at the target (N5).
+
+    A move whose target is a plain path inside a write root is not refused here: Codex applies
+    it without asking arr (`test_an_in_workspace_move_is_not_surfaced_to_arr`). It stays inside
+    the write roots, so it is no escape; the block-list targets below N7 are the known limit."""
+    import login_guard_kit as kit
+
+    with kit.open_lab("codex") as lab:
+        work = lab.agent.work_dir
+        (work / "m1.txt").write_text("eins\n")
+        (work / "m3.txt").write_text("eins\n")
+        outside = lab.base / "outside.txt"  # outside every write root
+        config = work / ".git" / "config"  # on the block list, already there
+        before = config.read_text()
+        kit.apply_raw_patches(
+            lab, [kit.move_patch("m1.txt", str(outside)), kit.move_patch("m3.txt", str(config))]
+        )
+        assert not outside.exists(), "moved outside every write root"
+        assert config.read_text() == before, "move overwrote .git/config"
+        assert (work / "m1.txt").read_text() == "eins\n", "source m1 changed"
+        assert (work / "m3.txt").read_text() == "eins\n", "source m3 changed"
+
+
+@mac
+def test_an_in_workspace_move_is_not_surfaced_to_arr() -> None:
+    """A move to a plain path inside a write root triggers no approval, so arr cannot deny it.
+    Documented, not a guard test: it never leaves the write roots and is no escape (Punkt 4
+    limit, reported to the Lead)."""
+    import login_guard_kit as kit
+
+    from arr.backends import codex_approvals as ca
+
+    calls: list[str] = []
+    original = ca.ApprovalBridge.__call__
+    ca.ApprovalBridge.__call__ = lambda self, m, p: (calls.append(m), original(self, m, p))[1]
+    try:
+        with kit.open_lab("codex") as lab:
+            work = lab.agent.work_dir
+            (work / "m.txt").write_text("eins\n")
+            target = work / "sub" / "moved.txt"
+            kit.apply_raw_patches(lab, [kit.move_patch("m.txt", str(target))])
+            assert target.exists() and calls == [], "in-workspace move asked arr after all"
+    finally:
+        ca.ApprovalBridge.__call__ = original
+
+
+@mac
+def test_a_move_outside_succeeds_without_the_fix() -> None:
+    import login_guard_kit as kit
+
+    with kit.old_file_request(), kit.open_lab("codex") as lab:
+        work = lab.agent.work_dir
+        (work / "m.txt").write_text("eins\n")
+        target = lab.base / "outside.txt"
+        kit.apply_raw_patches(lab, [kit.move_patch("m.txt", str(target))])
+        assert target.exists(), "the countertest should let the move through"
+
+
+@mac
+def test_apply_patch_delete_is_refused_outside_and_on_the_block_list() -> None:
+    """`*** Delete File:` is refused outside every write root and on the block list."""
+    import login_guard_kit as kit
+
+    with kit.open_lab("codex") as lab:
+        work = lab.agent.work_dir
+        outside = lab.base / "keep.txt"
+        outside.write_text("eins\n")
+        config = work / ".git" / "config"
+        before = config.read_text()
+        kit.apply_raw_patches(lab, [kit.delete_patch(str(outside)), kit.delete_patch(str(config))])
+        assert outside.exists(), "deleted a file outside every write root"
+        assert config.read_text() == before, "deleted .git/config"
+
+
+@mac
+def test_delete_on_the_block_list_succeeds_without_the_protection() -> None:
+    import login_guard_kit as kit
+
+    with kit.no_protection(), kit.open_lab("codex") as lab:
+        config = lab.agent.work_dir / ".git" / "config"
+        kit.apply_raw_patches(lab, [kit.delete_patch(str(config))])
+        assert not config.exists(), "the countertest should delete .git/config"
+
+
+def _bridge(lab: Any, item_changes: list[dict[str, Any]], **params: Any) -> Any:
+    """An `ApprovalBridge` with one observed file item, to call `_file_request` directly.
+
+    grantRoot and an unknown change arr cannot be produced by a fake model, so they are
+    checked on the bridge, where they are decided (W3-06.5, Punkt 2 and 3)."""
+    from arr.backends.codex_approvals import ApprovalBridge
+
+    bridge = ApprovalBridge(
+        inbox=None,
+        run_id=lab.run.run_id,
+        agent_id=lab.agent.id,
+        role=None,
+        work_dir=str(lab.agent.work_dir),
+        loop=None,  # _file_request never touches the loop or the inbox
+        on_denied=lambda _reason: None,
+    )
+    bridge._items["i1"] = {"type": "fileChange", "id": "i1", "changes": item_changes}
+    return bridge._file_request({"itemId": "i1", **params})
+
+
+@mac
+def test_a_file_request_with_a_grant_root_is_refused() -> None:
+    """Every `grantRoot` is refused, even one that points into the work folder (Punkt 3)."""
+    import login_guard_kit as kit
+
+    from arr.permissions.types import Decision, DecisionAction
+
+    with kit.open_lab("codex") as lab:
+        work = str(lab.agent.work_dir)
+        change = {"path": f"{work}/a.txt", "kind": {"type": "update"}, "diff": "x"}
+        result = _bridge(lab, [change], grantRoot=work)
+        assert isinstance(result, Decision) and result.action is DecisionAction.DENY
+        assert "grantRoot" in result.reason
+        # without the fix a grantRoot into the work folder is allowed
+        with kit.old_file_request():
+            request = _bridge(lab, [change], grantRoot=work)
+        assert not isinstance(request, Decision)
+
+
+@mac
+def test_a_file_request_arr_cannot_read_is_refused() -> None:
+    """An unknown change kind, an unknown field and an unreadable change are refused (Punkt 2)."""
+    import login_guard_kit as kit
+
+    from arr.permissions.types import Decision, DecisionAction
+
+    with kit.open_lab("codex") as lab:
+        work = str(lab.agent.work_dir)
+
+        def denied(changes: list[dict[str, Any]], **params: Any) -> bool:
+            result = _bridge(lab, changes, **params)
+            return isinstance(result, Decision) and result.action is DecisionAction.DENY
+
+        good = {"path": f"{work}/a.txt", "kind": {"type": "add"}, "diff": "x"}
+        assert not isinstance(_bridge(lab, [good]), Decision)  # a plain add is allowed to ask
+        assert denied([{"path": f"{work}/a.txt", "kind": {"type": "rename"}, "diff": "x"}])
+        assert denied([{"path": f"{work}/a.txt", "kind": {"type": "update", "secret": "x"}}])
+        assert denied([{"path": f"{work}/a.txt", "kind": {"type": "add"}, "diff": "x", "extra": 1}])
+        assert denied([{"kind": {"type": "add"}, "diff": "x"}])  # no path
+        assert denied([good], unknownField="/etc/x")  # a new param that could carry a path
 
 
 def _node_cache_after_two_turns() -> bool:

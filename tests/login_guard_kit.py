@@ -1046,6 +1046,49 @@ def no_protection() -> Iterator[None]:
         codex_config.CODEX_READ_ONLY_NAMES = names
 
 
+def _old_file_request(self: Any, params: dict[str, Any]) -> Any:
+    """`_file_request` before W3-06.5: only the source path, no move target, grantRoot as a
+    plain path. The countertest for N5 restores this."""
+    item = self._items.get(str(params.get("itemId")), {})
+    paths = [str(c["path"]) for c in item.get("changes") or [] if c.get("path")]
+    if params.get("grantRoot"):
+        paths.append(str(params["grantRoot"]))
+    return self._request(
+        tool="fileChange",
+        tool_call_id=params.get("itemId"),
+        paths=paths,
+        work_dir=self.work_dir,
+        reason=params.get("reason"),
+    )
+
+
+@contextmanager
+def old_file_request() -> Iterator[None]:
+    """The mutation of W3-06.5: the file request names only the source, as before (N5)."""
+    from arr.backends import codex_approvals
+
+    saved = codex_approvals.ApprovalBridge._file_request
+    codex_approvals.ApprovalBridge._file_request = _old_file_request  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        codex_approvals.ApprovalBridge._file_request = saved  # type: ignore[method-assign]
+
+
+def apply_raw_patches(lab: Lab, patches: list[Patch | str], decider: Any = None) -> None:
+    """Run raw apply_patch steps (move, delete, grantRoot can't be built from a path alone)."""
+    run_codex_backend(lab, [*patches, "echo ende"], decider, turns=1)
+
+
+def move_patch(src: str, dst: str) -> Patch:
+    body = f"*** Update File: {src}\n*** Move to: {dst}\n@@\n eins\n+zwei\n"
+    return Patch(f"*** Begin Patch\n{body}*** End Patch\n")
+
+
+def delete_patch(path: str) -> Patch:
+    return Patch(f"*** Begin Patch\n*** Delete File: {path}\n*** End Patch\n")
+
+
 # --------------------------------------------------------------------------------------------
 # No `git` outside the sandbox (W3-06.4, 3b)
 # --------------------------------------------------------------------------------------------

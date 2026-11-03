@@ -771,24 +771,25 @@ class SandboxProfile:
 
     def is_protected(self, path: Path) -> bool:
         """Whether `path` names a `PROTECTED_NAMES` entry below a write root, or a
-        `PROTECTED_TOP_NAMES` entry right at its top (W3-06.4).
+        `PROTECTED_TOP_NAMES` entry right at its top (W3-06.4, W3-06.5 N6).
 
-        `path` may be unresolved and need not exist: the shortest prefix that resolves into a
-        write root fixes the root, the names after it count as written. So a symlink is
-        checked before and, through the resolved path, after following it.
+        `path` may be unresolved and need not exist. The function checks the names as written
+        and the names of the fully resolved path, so a symlink below the write root (e.g.
+        `work/lnk/config` with `lnk → .git`) is caught here, not only by the caller.
         """
-        parts = path.parts
-        for i in range(1, len(parts) + 1):
-            real = self.key(os.path.realpath(Path(*parts[:i])))
-            roots = [self.key(r) for r in self.write_roots if _key_within(real, self.key(r))]
-            if not roots:
-                continue
-            below = real[len(max(roots, key=len).rstrip("/")) :].split("/")
-            keys = [k for k in [*below, *(self.key(p) for p in parts[i:])] if k not in ("", ".")]
-            protected = {self.key(n) for n in PROTECTED_NAMES}
-            top = {self.key(n) for n in PROTECTED_TOP_NAMES}
-            return any(k in protected for k in keys) or bool(keys and keys[0] in top)
-        return False
+        return self._protected_below(path) or self._protected_below(Path(os.path.realpath(path)))
+
+    def _protected_below(self, path: Path) -> bool:
+        """`path`'s names below the deepest write root that contains it hit a protected name."""
+        key = self.key(path)
+        roots = [self.key(r) for r in self.write_roots if _key_within(key, self.key(r))]
+        if not roots:
+            return False
+        rest = key[len(max(roots, key=len).rstrip("/")) :]
+        names = [k for k in rest.split("/") if k not in ("", ".")]
+        protected = {self.key(n) for n in PROTECTED_NAMES}
+        top = {self.key(n) for n in PROTECTED_TOP_NAMES}
+        return any(name in protected for name in names) or bool(names and names[0] in top)
 
     @property
     def read_only(self) -> tuple[Path, ...]:
@@ -2397,8 +2398,9 @@ class PolicyEngine:
             analysis.facts.add(("write", profile.key(path)))
             if profile.is_sensitive(path):
                 analysis.ban(_R_SENSITIVE, RequestCategory.WRITE_OUTSIDE)
-            elif profile.is_protected(path) or profile.is_protected(profile.written(raw, base)):
-                # file tools never write more than Bash in the sandbox (docs/07 §1, W3-06.4)
+            elif profile.is_protected(profile.written(raw, base)):
+                # file tools never write more than Bash in the sandbox (docs/07 §1, W3-06.4);
+                # is_protected resolves links of the written path itself (W3-06.5 N6)
                 analysis.ban(_R_PROTECTED, RequestCategory.WRITE_OUTSIDE)
             elif profile.can_write(path):
                 continue
@@ -2497,7 +2499,7 @@ class PolicyEngine:
         written, _ = self._command_path(raw, base, profile, written=True)
         if profile.is_sensitive(path):
             analysis.ban(_R_SENSITIVE, RequestCategory.WRITE_OUTSIDE)
-        elif profile.is_protected(path) or (written and profile.is_protected(written)):
+        elif profile.is_protected(written or path):  # is_protected resolves links (W3-06.5 N6)
             analysis.ban(_R_PROTECTED, RequestCategory.WRITE_OUTSIDE)
         elif profile.can_write(path):
             return

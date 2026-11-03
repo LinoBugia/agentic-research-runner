@@ -600,6 +600,7 @@ async def test_other_requests_are_refused(setup) -> None:
         "item/permissions/requestApproval": {"permissions": {}, "scope": "turn"},
         "mcpServer/elicitation/request": {"action": "decline", "content": None},
         "item/tool/requestUserInput": {"answers": {}},
+        "item/tool/call": {"contentItems": [], "success": False},
         "execCommandApproval": {"decision": "denied"},
         "applyPatchApproval": {"decision": "denied"},
     }

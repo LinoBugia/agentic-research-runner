@@ -513,6 +513,18 @@ def test_protected_names_before_and_after_symlinks(env: Env) -> None:
     assert engine.evaluate(write("sub/../.git")).action is DENY
 
 
+def test_is_protected_resolves_links_itself(env: Env) -> None:
+    """W3-06.5 N6: `is_protected` follows a link below the write root on its own, so a caller
+    does not have to pass the resolved path too."""
+    profile = env.profile()
+    (env.work / ".git").mkdir()
+    (env.work / "lnk").symlink_to(env.work / ".git")
+    assert profile.is_protected(env.work / "lnk" / "config")  # lnk -> .git, resolved internally
+    assert profile.is_protected(env.work / "lnk")
+    assert profile.is_protected(env.work / ".git")  # a path that does not exist yet
+    assert not profile.is_protected(env.work / "notes" / "git.md")
+
+
 def test_a_grant_or_an_always_rule_never_lifts_the_protection(env: Env) -> None:
     rules = PermissionRules(always=[AlwaysRule(action="allow", tools=["Write"], paths=["runs"])])
     engine = env.engine(rules=rules)
