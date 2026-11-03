@@ -6,6 +6,8 @@ An agent writes into its write roots, so a program there would run without the s
 entry of that `PATH` may therefore lie in or above a write root, and none may be relative (it
 would point into the working folder). The agent's commands still get the whole `PATH` with
 the run venv first: Claude through `CLAUDE_ENV_FILE`, Codex through `shell_env`.
+
+See docs/07-berechtigungen-und-freigaben.md §3.
 """
 
 import os
