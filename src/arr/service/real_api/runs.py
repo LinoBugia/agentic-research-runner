@@ -18,9 +18,11 @@ watcher has already seen; `_follow_delivery` publishes them again (W3-02).
 import asyncio
 import contextlib
 import logging
+import os
 import re
 import time
 from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from arr.errors import ArrError, ConfigError, ConfigIssue
@@ -34,6 +36,7 @@ from arr.models import (
     Starter,
     WorkfolderSettings,
 )
+from arr.permissions.policy import redact
 from arr.resolve import dump_yaml_model, validate_model
 from arr.room.types import DeliveryStatus, MessageVia
 from arr.room.types import Message as RoomMessage
@@ -50,6 +53,7 @@ from arr.service.api_models import (
     CapacityInfo,
     ChannelInfo,
     ChannelMessageEvent,
+    CountsChangedEvent,
     ErrorCode,
     FieldIssue,
     LogEntry,
@@ -93,8 +97,9 @@ from arr.service.real_api.rundir import (
 )
 from arr.service.real_api.setup import toolchain_notice
 from arr.service.real_api.storage import STORAGE_ACTIONS, StorageArea
+from arr.service.real_api.workfolder import counts
 from arr.skills import discover_skills
-from arr.workfolder import load_workfolder_settings, project_dir
+from arr.workfolder import load_workfolder_settings, os_reason, project_dir
 
 log = logging.getLogger("arr.service.runs")
 
@@ -128,6 +133,7 @@ SOLO_AGENT = "solver"
 DELIVERY_POLL_S = 0.25
 DELIVERY_POLL_MAX_S = 1.0
 _AGENT_PATH = re.compile(r"agents\[(\d+)\]\.(\w+)")
+_FOREIGN_PATH = re.compile(r"(?<![\w./:-])~?/[^\s„“\"'`,;:()]+")
 _MISSING_STANDARD = re.compile(r"Für (\w+) fehlt ")
 _MISSING_KEY = re.compile(r"agents\[\d+\]\.(model|auth)$")
 _FILE_HINT = re.compile(r"Ergänze „\w+“ .*? fest\.")
@@ -176,6 +182,23 @@ def form_input(
 
 def _provider_of(model: str) -> Provider:
     return Provider.CLAUDE if model.startswith("claude") else Provider.CODEX
+
+
+def _start_failure(exc: Exception, workfolder: Path) -> str:
+    """Why a run could not be prepared, for the page: German, no traceback, no foreign path."""
+    if isinstance(exc, ArrError):
+        text = exc.message
+    elif isinstance(exc, OSError) and exc.filename:
+        text = (
+            f"Kein Zugriff auf {exc.filename} ({os_reason(exc)}). Prüfe die Rechte und starte "
+            "den Run erneut."
+        )
+    else:
+        text = "Bei der Vorbereitung ist ein interner Fehler aufgetreten. Starte den Run erneut."
+    text = redact(text)
+    for root in (workfolder, Path(os.path.realpath(workfolder))):
+        text = text.replace(f"{root}/", "")
+    return _FOREIGN_PATH.sub(lambda m: Path(m[0]).name, text)
 
 
 def _first_profiles(profiles: ProfilesFile) -> dict[Provider, str]:
@@ -305,6 +328,9 @@ class RunsArea:
     def _record(self, run_id: str) -> RunRecord:
         record = self.state.store.get(run_id)
         if record is None:
+            handle = self.state.registry.get(run_id)
+            if handle is not None and handle.start_failure:
+                raise ApiException.of(ErrorCode.START_FAILED, handle.start_failure)
             raise not_found("Run", run_id)
         if not record.settled:
             record.refresh()
@@ -799,8 +825,22 @@ class RunsArea:
             raise
         except ArrError as exc:
             log.warning("[%s] Run nicht gestartet: %s", run_id, exc.message)
-        except Exception:
+            self._note_failed_start(handle, exc)
+        except Exception as exc:
             log.exception("[%s] Run im Service fehlgeschlagen", run_id)
+            self._note_failed_start(handle, exc)
+
+    def _note_failed_start(self, handle: RunHandle, exc: Exception) -> None:
+        """Keep the reason for the page when `run_launch` removed the reserved folder."""
+        if handle.run_dir.exists():
+            return
+        handle.start_failure = _start_failure(exc, handle.launch.workfolder)
+        hub = self.state.hub
+        hub.publish(
+            CountsChangedEvent(
+                seq=hub.next_seq(), ts=time.time(), run_id=None, counts=counts(self.state)
+            )
+        )
 
     async def stop_all(self) -> None:
         """Stop every run of the service and wait for the finalizers and scans (Ctrl-C)."""

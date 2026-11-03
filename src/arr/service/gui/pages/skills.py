@@ -210,7 +210,9 @@ class SkillsPage:
                 empty_state_html(
                     "auto_awesome",
                     "Noch keine Skills",
-                    "Die Start-Skills lassen sich mit einem Klick anlegen.",
+                    "Die Start-Skills lassen sich mit einem Klick anlegen."
+                    if self._prototype
+                    else "Die Start-Skills kommen mit Auftrag W4-05.",
                     [],
                 )
             )
@@ -405,8 +407,12 @@ class SkillsPage:
                 f"{markdown_html(file.content)}</div></section>"
             )
 
+    @property
+    def _prototype(self) -> bool:
+        return hasattr(getattr(self.api, "base", self.api), "datasets")
+
     def _create_start_skills(self) -> None:
-        if not hasattr(getattr(self.api, "base", self.api), "datasets"):  # the real service
+        if not self._prototype:
             self.frame.toast("Die Start-Skills kommen mit Auftrag W4-05.")
             return
         self.frame.toast(

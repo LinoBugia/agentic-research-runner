@@ -23,7 +23,7 @@ from arr.service.mock_api import MockApi
 from arr.service.real_api import RealApi
 from arr.service.real_api import live as live_module
 from arr.service.real_api.runs import SOLO_AGENT
-from arr.service.state import remember_workfolder
+from arr.service.state import read_app_settings, remember_workfolder, write_app_settings
 from arr.workfolder import init_workfolder, load_workfolder_settings
 
 CLICK_LIMIT_E1 = 3
@@ -433,8 +433,10 @@ async def test_new_run_shows_the_python_notice_for_codex_agents(
 async def test_start_skills_on_the_real_service_say_when_they_come(wf: Path) -> None:
     async with real_user(wf) as (user, _api):
         await user.open("/skills")
-        await see(user, "Start-Skills anlegen")
+        html = await see(user, "Die Start-Skills kommen mit Auftrag W4-05.")
+        assert "mit einem Klick" not in html
         user.find(marker="start-skills").click()
+        await see(user, "Start-Skills anlegen")
         html = await see(user, "Die Start-Skills kommen mit Auftrag W4-05.")
         assert "simuliert" not in html and "angelegt" not in html.replace("anlegen", "")
     assert not list((wf / "skills").iterdir())
@@ -446,3 +448,30 @@ async def test_start_skills_stay_simulated_in_the_prototype() -> None:
         await see(user, "Start-Skills anlegen")
         user.find(marker="start-skills").click()
         await see(user, "im Prototyp simuliert")
+
+
+# --- W3-04.4 ------------------------------------------------------------------------------------
+
+
+async def test_switches_without_an_event_are_shown_as_later_and_keep_their_value(wf: Path) -> None:
+    write_app_settings({"notifications": {"storage_low": False, "run_finished": False}})
+    async with real_user(wf) as (user, _api):
+        await user.open("/einstellungen")
+        html = await see(user, "Mitteilungen dazu kommen später.")
+        assert html.count("Mitteilungen dazu kommen später.") == 3
+        for label in ("Limit erreicht", "Speicher knapp", "Neue Nachricht"):
+            line = next(part for part in html.splitlines() if label in part)
+            assert "Mitteilungen dazu kommen später." in line
+        with user.client:
+            boxes = [
+                e
+                for e in user.client.elements.values()
+                if e.tag == "input" and e._props.get("type") == "checkbox"
+            ]
+        off = [b for b in boxes if "disabled" in b._props]
+        assert len(off) >= 4  # the three, and „Neue Freigabe“ is always on
+        user.find(marker="save-notifications").click()
+        await see(user, "Gespeichert")
+    saved = read_app_settings()["notifications"]
+    assert saved["storage_low"] is False and saved["run_finished"] is False
+    assert saved["limit_reached"] is True and saved["approval"] is True

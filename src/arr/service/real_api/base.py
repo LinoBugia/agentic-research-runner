@@ -74,6 +74,8 @@ class RunHandle:
     started: float = field(default_factory=time.time)
     task: asyncio.Task[Any] | None = None
     manager: RunManager | None = None
+    start_failure: str | None = None
+    """Why the preparation failed; `run_launch` removed the folder, so only this is left."""
 
     @property
     def done(self) -> bool:

@@ -92,6 +92,14 @@ NOTIFICATIONS = [
     (NotificationEvent.STORAGE_LOW, "Speicher knapp"),
     (NotificationEvent.MESSAGE_TO_USER, "Neue Nachricht an dich im Gruppenchat"),
 ]
+NOTIFICATIONS_LATER = frozenset(
+    {
+        NotificationEvent.LIMIT_REACHED,
+        NotificationEvent.STORAGE_LOW,
+        NotificationEvent.MESSAGE_TO_USER,
+    }
+)
+"""`notify.py` sends nothing for these yet; their saved value stays."""
 EFFECT = {
     RuleEffect.ALLOW: Status("st-ok", "check", "erlaubt"),
     RuleEffect.DENY: Status("st-err", "block", "verboten"),
@@ -771,12 +779,15 @@ class EinstellungenPage:
                 with ui.element("div").classes("stack small"):
                     for event, label in NOTIFICATIONS:
                         always = event is NotificationEvent.APPROVAL
+                        later = event in NOTIFICATIONS_LATER
+                        note = " · immer an" if always else ""
+                        note = " · Mitteilungen dazu kommen später." if later else note
                         with ui.element("div"):
                             checkbox(
-                                label + (" · immer an" if always else ""),
+                                label + note,
                                 checked=state[event],
                                 on_change=lambda v, e=event: state.__setitem__(e, bool(v)),
-                                attrs='disabled aria-disabled="true"' if always else "",
+                                attrs='disabled aria-disabled="true"' if always or later else "",
                             )
                 raw(
                     '<p class="small muted" style="margin-top:8px">Gilt für arr auf diesem Mac. '
@@ -786,7 +797,7 @@ class EinstellungenPage:
                 async def save() -> None:
                     await self._save_app({"notifications": dict(state)})
 
-                save_row(save)
+                save_row(save, marker="save-notifications")
 
     def _appearance(self, s: AppSettings) -> None:
         with ui.element("div").style("margin-top:16px"):

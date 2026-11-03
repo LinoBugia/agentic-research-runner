@@ -315,7 +315,8 @@ class ErrorCode(StrEnum):
     `invalid` (400) wrong input · `not_found` (404) · `conflict` (409) state changed, e.g.
     already decided in another tab · `not_allowed` (409) action not possible now, e.g.
     resume with open escalation · `config_invalid` (422) configuration errors with `issues` ·
-    `unavailable` (503) service or index not readable · `internal` (500).
+    `unavailable` (503) service or index not readable · `start_failed` (410) the preparation
+    failed and the run is gone, the message says why · `internal` (500).
     """
 
     INVALID = "invalid"
@@ -324,6 +325,7 @@ class ErrorCode(StrEnum):
     NOT_ALLOWED = "not_allowed"
     CONFIG_INVALID = "config_invalid"
     UNAVAILABLE = "unavailable"
+    START_FAILED = "start_failed"
     INTERNAL = "internal"
 
 
