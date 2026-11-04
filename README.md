@@ -27,7 +27,7 @@ Setups like [OpenProver](https://github.com/Kripner/openprover), where a planner
 
 ## Security
 
-Agents in `arr` work on very hard, sometimes unsolvable problems, for hours and without confirming every command. Under that kind of pressure, models look for ways around their limits. `arr` therefore assumes that every agent actively tries to escape its sandbox, and only counts a limit as real when a test proves it.
+Agents in `arr` work on hard, sometimes unsolvable problems for hours, without confirming every command. Released models rarely try to get around their limits, but models in development have done so under similar conditions. So `arr` doesn't rely on how a model behaves. The operating system and fixed rules enforce every limit, tests prove each one, and runs are monitored.
 
 [SECURITY.md](SECURITY.md) describes the threat model, the principles and layers, how they are implemented on macOS, and which ways out are known, closed or still open. Until agents run under a separate macOS user, real runs should stay supervised.
 
