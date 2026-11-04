@@ -6,7 +6,8 @@ gpt-6-luna, effort low, one agent, one turn. Not part of the normal test run:
 
 - a Python script in the work folder is written and run without approval
 - writing into the original project is refused (sandbox, then a fixed rule)
-- `pip install` creates an inbox request (the test decider denies it)
+- `pip install` installs nothing: the sandbox has no network and the test decider denies an
+  escalation. Whether the model asks for one is up to the model, so the test does not need it.
 - a hint mid-turn arrives by `steer`
 """
 
@@ -25,7 +26,13 @@ from arr.backends.codex_config import codex_home_for
 from arr.models import AuthKind, AuthProfile, RunInput, Toolchain, WorkfolderSettings
 from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.policy import PolicyEngine, RunPaths, profile_for
-from arr.permissions.types import ApprovalItem, DecidedBy, Decision, DecisionAction
+from arr.permissions.types import (
+    ApprovalItem,
+    DecidedBy,
+    Decision,
+    DecisionAction,
+    RequestCategory,
+)
 from arr.resolve import resolve_run
 from arr.room.store import RoomStore
 from arr.runs.manager import create_run_venv
@@ -122,7 +129,9 @@ def test_codex_live_smoke(monkeypatch: pytest.MonkeyPatch, request: pytest.Fixtu
     results = [e.data.get("content") or "" for e in events if e.kind is EventKind.TOOL_RESULT]
     assert any("391" in text for text in results)  # script without approval
     assert original.read_text() == "Original\n"
-    assert any("pip install" in (i.request.command or "") for i in decider.items)
+    assert not list(paths.venv_dir.rglob("tinyrecord*")), "installed without an approval"
+    asked = [i for i in decider.items if "pip install" in (i.request.command or "")]
+    assert all(RequestCategory.INSTALL in i.request.categories for i in asked)
     assert hinted is True
     assert any(e.kind is EventKind.HINT and e.data["method"] == "steer" for e in events)
     final = [e.data["text"] for e in events if e.kind is EventKind.TEXT][-1]

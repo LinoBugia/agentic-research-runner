@@ -17,6 +17,15 @@ def arr_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def no_real_arr_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test writes to the real `~/.arr`: `arr_home` or a test's own `ARR_HOME` wins.
+
+    Building the options of an agent writes the `git` stub to `app_dir()` (W3-06.4).
+    """
+    monkeypatch.setenv("ARR_HOME", str(tmp_path / "arr-home-default"))
+
+
+@pytest.fixture(autouse=True)
 def venv_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point ARR_VENV_ROOT at a temporary directory (not created) for every test.
 

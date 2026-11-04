@@ -4,7 +4,7 @@ translators for Claude and Codex, always rules, scopes, revocation and approvals
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,8 @@ from pydantic import ValidationError
 from arr.errors import ArrError
 from arr.models import AgentConfig, Toolchain
 from arr.permissions.policy import (
+    PROTECTED_NAMES,
+    PROTECTED_TOP_NAMES,
     AlwaysRule,
     ApprovalLog,
     ClaudeOptions,
@@ -27,6 +29,7 @@ from arr.permissions.policy import (
     codex_options,
     normalize_path,
     profile_for,
+    protected_write_globs,
     redact,
     user_temp_dirs,
 )
@@ -438,6 +441,120 @@ def test_case_sensitive_profile_keeps_case(env: Env) -> None:
     path = profile.resolve("~/.SSH/x")
     assert not profile.is_sensitive(path)
     assert profile.is_sensitive(profile.resolve("~/.ssh/x"))
+
+
+# --------------------------------------------------------------------------------------------
+# W3-06.4: file tools never write more than Bash in the sandbox (docs/07 §1)
+# --------------------------------------------------------------------------------------------
+
+PROTECTED_WRITES = [
+    ".git",
+    ".git/config",
+    ".git/info/attributes",
+    ".GIT/config",
+    ".Git",
+    "sub/deep/.git",
+    ".gitattributes",
+    "sub/.gitattributes",
+    ".GITMODULES",
+    ".gitconfig",
+    ".codex/config.toml",
+    ".agents/skills/x/SKILL.md",
+    ".claude/settings.json",
+    ".mcp.json",
+    "sub/.bashrc",
+    ".zshenv",
+    "HEAD",
+    "objects/ab/cd",
+    "refs/heads/main",
+]
+
+
+@pytest.mark.parametrize("path", PROTECTED_WRITES)
+@pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit", "NotebookEdit", "fileChange"])
+def test_protected_names_are_never_written_by_file_tools(env: Env, tool: str, path: str) -> None:
+    decision = env.engine().evaluate(write(path, tool=tool))
+    assert decision.action is DENY
+    assert decision.decided_by is DecidedBy.FIXED_RULE
+    assert "nie geschrieben" in decision.reason and "anderen Namen" in decision.reason
+
+
+def test_protected_names_in_every_write_root_and_in_shell_writes(env: Env) -> None:
+    engine = env.engine()
+    for root in (env.run / "tmp", env.run_venv):
+        assert engine.evaluate(write(root / ".gitattributes")).action is DENY
+        assert engine.evaluate(write(root / "HEAD")).action is DENY
+    assert engine.evaluate(bash("echo '* filter=x' > .gitattributes")).action is DENY
+    assert engine.evaluate(bash("echo x >> sub/.git/config")).action is DENY
+    assert engine.hard_deny(write(".git/config")) is not None
+
+
+def test_protected_names_are_matched_exactly(env: Env) -> None:
+    engine = env.engine()
+    for path in ["notes/git.md", ".gitignore", ".github/x.yml", "sub/HEAD", "sub/refs/x", "a.git"]:
+        assert engine.evaluate(write(path)).action is ALLOW, path
+    assert engine.evaluate(read(".git/config")).action is ALLOW  # reading stays allowed
+    assert engine.evaluate(read(".gitattributes")).action is ALLOW
+
+
+def test_protected_names_before_and_after_symlinks(env: Env) -> None:
+    (env.work / ".git").mkdir()
+    (env.work / "evil").mkdir()
+    (env.work / "to-git").symlink_to(env.work / ".git")
+    (env.work / "sub").mkdir()
+    (env.work / "sub" / ".gitattributes").symlink_to(env.work / "plain.txt")
+    engine = env.engine()
+    assert engine.evaluate(write("to-git/config")).action is DENY  # after resolving
+    assert engine.evaluate(write("to-git")).action is DENY
+    assert engine.evaluate(write("sub/.gitattributes")).action is DENY  # before resolving
+    (env.work / ".git").rmdir()
+    (env.work / ".git").symlink_to(env.work / "evil")
+    assert engine.evaluate(write(".git/config")).action is DENY
+    assert engine.evaluate(write("sub/../.git")).action is DENY
+
+
+def test_is_protected_resolves_links_itself(env: Env) -> None:
+    """W3-06.5 N6: `is_protected` follows a link below the write root on its own, so a caller
+    does not have to pass the resolved path too."""
+    profile = env.profile()
+    (env.work / ".git").mkdir()
+    (env.work / "lnk").symlink_to(env.work / ".git")
+    assert profile.is_protected(env.work / "lnk" / "config")  # lnk -> .git, resolved internally
+    assert profile.is_protected(env.work / "lnk")
+    assert profile.is_protected(env.work / ".git")  # a path that does not exist yet
+    assert not profile.is_protected(env.work / "notes" / "git.md")
+
+
+def test_a_grant_or_an_always_rule_never_lifts_the_protection(env: Env) -> None:
+    rules = PermissionRules(always=[AlwaysRule(action="allow", tools=["Write"], paths=["runs"])])
+    engine = env.engine(rules=rules)
+    assert engine.evaluate(write(".gitmodules")).action is DENY
+    assert engine.hard_deny(write(".gitmodules")) is not None
+
+
+def test_case_sensitive_profile_protects_the_exact_names(env: Env) -> None:
+    engine = env.engine(env.profile(case_insensitive=False))
+    assert engine.evaluate(write(".git/config")).action is DENY
+    assert engine.evaluate(write(".GIT/config")).action is ALLOW
+
+
+def test_the_claude_sandbox_gets_the_same_list_as_deny_write(env: Env) -> None:
+    profile = env.profile()
+    globs = claude_options(profile).sandbox["filesystem"]["denyWrite"]
+    for root in profile.write_roots:
+        for name in PROTECTED_NAMES:
+            assert f"{root}/**/{name}" in globs
+        for name in PROTECTED_TOP_NAMES:
+            assert f"{root}/{name}" in globs
+    assert len(globs) == len(profile.write_roots) * (
+        len(PROTECTED_NAMES) + len(PROTECTED_TOP_NAMES)
+    )
+
+
+def test_deny_write_escapes_glob_characters_of_a_root(env: Env) -> None:
+    profile = env.profile()
+    odd = replace(profile, write_roots=(Path("/tmp/a[1]*"),))
+    assert protected_write_globs(odd)[0] == "/tmp/a[[]1[]][*]/**/.git"
 
 
 # --------------------------------------------------------------------------------------------

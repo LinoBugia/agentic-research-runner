@@ -479,6 +479,10 @@ class RunsArea:
         record.refresh_meta()
         return ActionResult(ok=True, message=message, run=self._summary(record, with_agents=False))
 
+    async def stop_for_profile(self, run_id: str) -> None:
+        """The Not-Aus: the normal stop of a run, with finalizer and scan, of either source."""
+        await self.run_action(run_id, RunAction.STOP)
+
     async def _slim(self, record: RunRecord, *, dry_run: bool) -> ActionResult:
         result = await self.storage.slim(record, dry_run=dry_run)
         summary = self._summary(record, with_agents=False)

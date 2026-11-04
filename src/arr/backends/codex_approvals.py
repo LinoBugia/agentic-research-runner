@@ -48,9 +48,15 @@ _REFUSALS: dict[str, dict[str, Any]] = {
     "item/permissions/requestApproval": {"permissions": {}, "scope": "turn"},
     "mcpServer/elicitation/request": {"action": "decline", "content": None},
     "item/tool/requestUserInput": {"answers": {}},
+    "item/tool/call": {"contentItems": [], "success": False},
     "execCommandApproval": {"decision": "denied"},
     "applyPatchApproval": {"decision": "denied"},
 }
+"""Well-formed negative answers to the server requests arr does not act on (W3-06.5, Punkt 5):
+extra permissions, MCP elicitations, user input, a dynamic tool call (arr runs no tool for
+the app-server), and the legacy approval methods. `account/chatgptAuthTokens/refresh` and
+`attestation/generate` are answered with `{}` (no token): arr never hands out a credential, and
+the app-server uses its own `CODEX_HOME`. Every one is also surfaced to the user as an error."""
 
 _UNCHECKED = "Die Anfrage konnte nicht geprüft werden und gilt als abgelehnt."
 _UNCHECKABLE = (
@@ -58,6 +64,46 @@ _UNCHECKABLE = (
     "in einen laufenden Prozess). Sie ist abgelehnt. Starte den Befehl neu als ganzen Befehl."
 )
 _STOPPED = "Der Turn wurde gestoppt. Die Anfrage ist damit hinfällig."
+
+# W3-06.5: an applied file change runs outside the sandbox, so its request must name every
+# path it touches. What arr does not fully understand it refuses (fail closed).
+FILE_PARAM_FIELDS = frozenset(
+    {"itemId", "startedAtMs", "threadId", "turnId", "grantRoot", "reason"}
+)
+"""Fields of `FileChangeRequestApprovalParams` in the pinned Codex version (schema). A field
+beyond these could carry a path arr does not check, so arr refuses the request."""
+
+CHANGE_FIELDS = frozenset({"path", "kind", "diff"})
+"""Fields of one `FileUpdateChange` (schema): the file, the kind of change, the diff."""
+
+CHANGE_KIND_FIELDS = frozenset({"type", "move_path"})
+"""Fields of a change kind: `type` (add/delete/update) and, for an update, the move target."""
+
+CHANGE_KINDS = frozenset({"add", "delete", "update"})
+"""Kinds of change arr understands; `update` may carry `move_path`."""
+
+_FILE_UNREADABLE = (
+    "Diese Datei-Änderung lässt sich nicht vollständig lesen und ist deshalb abgelehnt. Lege "
+    "deine Dateien einzeln mit einem Add-Patch im Arbeitsordner an."
+)
+_FILE_UNKNOWN_FIELD = (
+    "Diese Datei-Anfrage enthält ein Feld, das arr nicht kennt und das einen Pfad außerhalb "
+    "der Sandbox tragen könnte. Sie ist abgelehnt. Arbeite mit Add-, Update- oder Delete-Patches "
+    "in deinem Arbeitsordner."
+)
+_FILE_UNKNOWN_CHANGE = (
+    "Diese Art von Datei-Änderung kennt arr nicht und ist deshalb abgelehnt. Nutze Add, Update "
+    "oder Delete in deinem Arbeitsordner."
+)
+_FILE_MOVE = (
+    "Eine Datei verschieben („Move to“) ist über das Patch-Werkzeug nicht erlaubt: Das Ziel "
+    "läge sonst ungeprüft außerhalb der Sandbox. Verschiebe die Datei in der Shell mit „mv "
+    "quelle ziel“, dann greift die Sandbox."
+)
+_FILE_GRANT_ROOT = (
+    "„grantRoot“ (dauerhaftes Schreibrecht für einen ganzen Ordner) ist nicht erlaubt, auch "
+    "nicht mit Freigabe. Schreibe einzelne Dateien in deinem Arbeitsordner."
+)
 
 
 def refusal(method: str) -> dict[str, Any]:
@@ -124,7 +170,12 @@ class ApprovalBridge:
                 return refusal(method)
             request = self._command_request(params)
         elif method == FILE_CHANGE:
-            request = self._file_request(params)
+            result = self._file_request(params)
+            if isinstance(result, Decision):
+                logger.info("Datei-Anfrage von %s abgelehnt: %s", self.agent_id, result.reason)
+                self.on_denied(result.reason)
+                return refusal(method)
+            request = result
         else:
             logger.info("Codex-Anfrage %s von %s abgelehnt", method, self.agent_id)
             answer = refusal(method)
@@ -168,11 +219,40 @@ class ApprovalBridge:
             categories=categories,
         )
 
-    def _file_request(self, params: dict[str, Any]) -> PermissionRequest:
-        item = self._items.get(str(params.get("itemId")), {})
-        paths = [str(c["path"]) for c in item.get("changes") or [] if c.get("path")]
+    def _file_request(self, params: dict[str, Any]) -> PermissionRequest | Decision:
+        """Build the request with every path the change touches, or a hard deny (W3-06.5).
+
+        An applied `fileChange` runs outside the sandbox, so the request must name the source
+        and the `move_path` target of each change. Anything arr cannot fully read, a move, a
+        `grantRoot` and an unknown field are refused before the request reaches the inbox.
+        """
+        if set(params) - FILE_PARAM_FIELDS:
+            return _deny(_FILE_UNKNOWN_FIELD)
+        item = self._items.get(str(params.get("itemId")))
+        changes = item.get("changes") if isinstance(item, dict) else None
+        if not isinstance(changes, list):
+            return _deny(_FILE_UNREADABLE)
+        paths: list[str] = []
+        moved = False
+        for change in changes:
+            if not isinstance(change, dict) or set(change) - CHANGE_FIELDS:
+                return _deny(_FILE_UNREADABLE)
+            path, kind = change.get("path"), change.get("kind")
+            if not isinstance(path, str) or not isinstance(kind, dict):
+                return _deny(_FILE_UNREADABLE)
+            if set(kind) - CHANGE_KIND_FIELDS or kind.get("type") not in CHANGE_KINDS:
+                return _deny(_FILE_UNKNOWN_CHANGE)
+            paths.append(path)
+            target = kind.get("move_path")
+            if target is not None:
+                if not isinstance(target, str):
+                    return _deny(_FILE_UNREADABLE)
+                paths.append(target)  # into the request, so the PolicyEngine sees it too
+                moved = True
         if params.get("grantRoot"):
-            paths.append(str(params["grantRoot"]))
+            return _deny(_FILE_GRANT_ROOT)
+        if moved:
+            return _deny(_FILE_MOVE)
         return self._request(
             tool="fileChange",
             tool_call_id=params.get("itemId"),

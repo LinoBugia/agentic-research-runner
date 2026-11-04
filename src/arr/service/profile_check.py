@@ -15,9 +15,17 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from arr.auth import AuthError, SecretReader, claude_env, clean_process_env
+from arr.auth import (
+    START_PROFILE_VARIABLE,
+    AuthError,
+    SecretReader,
+    claude_env,
+    clean_process_env,
+)
+from arr.backends.claude_start import start_program
 from arr.backends.codex_login import TEST_MODEL as CODEX_TEST_MODEL
 from arr.backends.codex_login import ForeignLoginFolder, codex_check
+from arr.errors import ArrError
 from arr.models import AuthKind, AuthProfile
 from arr.service.api_models import Action, ProfileTest, UsageWindow
 
@@ -29,7 +37,6 @@ TEST_BUDGET_USD = 0.10
 CHECK_TIMEOUT_S = 30.0
 
 MAC_LOGIN_TEXT = "Nutzt den Claude-Login dieses Macs, kein eigenes Token."
-SECRET_VARIABLES = {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
 WINDOW_LABELS = {
     "five_hour": "5-Stunden-Fenster",
     "seven_day": "7-Tage-Fenster",
@@ -101,10 +108,16 @@ async def _claude_turn(profile: AuthProfile, reader: SecretReader | None, cwd: s
     clean_process_env()
     # In a thread: a dialog of the keychain must not stop the service (W3-05 §11).
     env = await asyncio.to_thread(claude_env, profile, reader)
-    found = bool(env.keys() & SECRET_VARIABLES)
+    found = START_PROFILE_VARIABLE in env
     if found:  # only the login of this Mac needs the real folder
         env["CLAUDE_CONFIG_DIR"] = str(Path(cwd) / "config")
+    try:
+        cli_path = start_program() if found else None
+    except ArrError as exc:  # no way back into the environment: the test does not start
+        log.warning("Profil-Test %s: %s", profile.name, type(exc).__name__)
+        return CheckResult(CheckFailure.OTHER, secret_present=found)
     options = ClaudeAgentOptions(
+        cli_path=cli_path,
         model=CLAUDE_TEST_MODEL,
         max_turns=1,
         max_budget_usd=TEST_BUDGET_USD,

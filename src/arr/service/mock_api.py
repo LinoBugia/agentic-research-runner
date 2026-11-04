@@ -121,9 +121,13 @@ from arr.service.api_models import (
     NotificationEvent,
     ParamInfo,
     PostMessageRequest,
+    ProfileActionResult,
     ProfileConcurrency,
     ProfileInfo,
+    ProfileRunUsage,
     ProfileTest,
+    ProfileUsage,
+    ProfileUsageSum,
     ProjectCheck,
     ProjectFolder,
     ProjectInfo,
@@ -6491,6 +6495,101 @@ class MockApi:
                 f"„{name}“ wird gerade von laufenden Runs genutzt. Warte, bis sie fertig sind.",
             )
         self.state.profiles = [p for p in self.state.profiles if p.name != name]
+
+    def _profile(self, name: str) -> ProfileInfo:
+        profile = next((p for p in self.state.profiles if p.name == name), None)
+        if profile is None:
+            raise _not_found("Profil", name)
+        return profile
+
+    def _set_disabled(self, name: str, disabled: bool) -> ProfileInfo:
+        changed = self._profile(name).model_copy(update={"disabled": disabled})
+        self.state.profiles = [changed if p.name == name else p for p in self.state.profiles]
+        return changed
+
+    async def disable_profile(self, name: str, dry_run: bool = False) -> ProfileActionResult:
+        """Not-Aus in the mock: the profile is blocked, nothing runs on it."""
+        profile = self._profile(name)
+        if dry_run:
+            return ProfileActionResult(message="Es läuft kein Run.", profile=profile)
+        changed = self._set_disabled(name, True)
+        text = f"„{name}“ ist gesperrt. Es lief kein Run."
+        return ProfileActionResult(message=text, profile=changed)
+
+    async def enable_profile(self, name: str) -> ProfileActionResult:
+        changed = self._set_disabled(name, False)
+        text = f"„{name}“ ist entsperrt. Neue Runs dürfen es wieder nutzen."
+        return ProfileActionResult(message=text, profile=changed)
+
+    async def remove_login(self, name: str, dry_run: bool = False) -> ProfileActionResult:
+        profile = self._profile(name)
+        if not profile.disabled:
+            raise ApiException.of(
+                ErrorCode.NOT_ALLOWED,
+                f"Sperre „{name}“ zuerst. Erst dann lässt sich der Login entfernen.",
+            )
+        if dry_run:
+            text = f"Der Login von „{name}“ würde aus arr entfernt."
+            return ProfileActionResult(message=text, removable=True, profile=profile)
+        changed = profile.model_copy(update={"secret_present": False, "last_test": None})
+        self.state.profiles = [changed if p.name == name else p for p in self.state.profiles]
+        return ProfileActionResult(
+            message=f"Der Login von „{name}“ ist aus arr entfernt.", removed=True, profile=changed
+        )
+
+    async def get_profile_usage(self, name: str) -> ProfileUsage:
+        """A small record: one finished and one aborted run."""
+        self._profile(name)
+        now = self.clock.now()
+        done = ProfileRunUsage(
+            label="20261030-1402_demo",
+            runs=1,
+            turns=4,
+            input=1200,
+            output=480,
+            cache_read=9000,
+            cost_estimated_usd=0.42,
+            run_id="20261030-1402_demo",
+            status=RunStatus.DONE,
+            agents=["claude-1"],
+            started=now - 3600,
+            ended=now - 3000,
+            url="/runs/20261030-1402_demo",
+        )
+        broken = ProfileRunUsage(
+            label="20261030-0910_demo",
+            runs=1,
+            turns=1,
+            input=300,
+            output=20,
+            run_id="20261030-0910_demo",
+            status=RunStatus.INTERRUPTED,
+            agents=["claude-1"],
+            started=now - 90000,
+            aborted=True,
+            url="/runs/20261030-0910_demo",
+        )
+
+        def period(label: str, rows: list[ProfileRunUsage]) -> ProfileUsageSum:
+            return ProfileUsageSum(
+                label=label,
+                runs=len(rows),
+                turns=sum(r.turns for r in rows),
+                input=sum(r.input for r in rows),
+                output=sum(r.output for r in rows),
+                cache_read=sum(r.cache_read for r in rows),
+                cost_estimated_usd=sum(r.cost_estimated_usd for r in rows),
+            )
+
+        return ProfileUsage(
+            profile=name,
+            today=period("Heute", [done]),
+            week=period("7 Tage", [done, broken]),
+            total=period("Gesamt", [done, broken]),
+            runs=[done, broken],
+            note="Erfasst sind nur Läufe über arr in diesem Workfolder, auch aus „arr run“. Die "
+            "direkte Nutzung von Claude Code oder Codex fehlt hier.",
+        )
 
     async def start_login(self, name: str) -> LoginStart:
         """Simulated login: done 3 s after the start (mock clock)."""

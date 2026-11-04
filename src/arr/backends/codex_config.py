@@ -20,6 +20,8 @@ Pure data, no SDK import, so it is testable without the Codex binary. `CodexBack
   are not visible, and a file that appears during a turn is denied like everything else.
 - **Shell environment (W2-02.1 H1):** `shell_environment_policy.inherit = "core"` plus `set`
   with what the agent needs; no `CODEX_HOME`, tokens, keys or account data reach a command.
+  The run venv is only on this `PATH`: the app-server's own `PATH` holds no folder an agent
+  can write to (W3-06.3, B1).
 - **Isolation from the user's Codex config** (S2 §7, §8, §13, §15): own `CODEX_HOME`, no
   notify hook, plugins, apps, MCP servers of the user, user or system skills, no project
   root walk (`project_root_markers = []`), model and effort set per thread and turn.
@@ -32,8 +34,10 @@ See docs/01-architektur.md §4.2, docs/07-berechtigungen-und-freigaben.md §3 �
 docs/spikes/S2_codex.md §11, §15.
 """
 
+import hashlib
 import logging
 import os
+import stat
 import sys
 import tomllib
 from collections.abc import Mapping, Sequence
@@ -41,9 +45,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from arr.backends.process_path import no_git_folder, outside_path, within
 from arr.errors import ArrError
 from arr.models import AuthKind, AuthProfile, RunVenvMode
-from arr.permissions.policy import RunPaths, SandboxProfile
+from arr.permissions.policy import CODEX_READ_ONLY_NAMES, RunPaths, SandboxProfile
 from arr.runs.prepare import PreparedAgent
 from arr.settings import app_dir
 from arr.venvs import glob_safe_name, venv_root
@@ -58,6 +63,7 @@ __all__ = [
     "filesystem_entries",
     "glob_escape",
     "isolation_overrides",
+    "project_config_state",
     "project_mcp_servers",
     "toml_value",
 ]
@@ -69,6 +75,11 @@ PERMISSION_PROFILE = "arr"
 
 ROOM_SERVER = "arr-room"
 """MCP server name of the group chat; tools appear as `mcp__arr-room__*` (docs/01 §5)."""
+
+ROOM_SERVER_ARGS = ("-I", "-m", "arr.room.server")
+"""The app-server starts the room server outside the sandbox in the working folder, a write
+root: `-I` keeps the `cwd` out of `sys.path`, so an `arr/` of an agent is never imported
+(W3-06.3, B2)."""
 
 SECRET_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
 """Variables blanked in the app-server environment: the login comes from `CODEX_HOME` only."""
@@ -192,6 +203,10 @@ def _entries(
 
     for path in profile.write_roots:
         put(path, "write")
+        # W3-06.4: `apply_patch` honours these entries but not the sandbox's own `.git` and
+        # `.codex` blocks; read-only, a patch there becomes an approval the PolicyEngine refuses
+        for name in CODEX_READ_ONLY_NAMES:
+            put(path / name, "read")
     for path in profile.read_allow:
         if not any(_within(profile, path, h) for h in hidden):
             put(path, "read", overwrite=False)
@@ -413,6 +428,53 @@ def project_mcp_servers(cwd: Path) -> list[str]:
     return sorted(str(name) for name in servers) if isinstance(servers, dict) else []
 
 
+def project_config_state(cwd: Path) -> str:
+    """A fingerprint of `<cwd>/.codex`: every entry below it with its type, link target and
+    content, links not followed; `absent` if there is none (W3-06.4, 3c).
+
+    Codex reads its project settings from there and starts MCP servers and hooks outside the
+    sandbox. arr compares the state with the one at the start of the run before every thread.
+    """
+    folder = cwd / ".codex"
+    if not os.path.lexists(folder):
+        return "absent"
+    digest = hashlib.sha256()
+    try:
+        below = (Path(top) / name for top, dirs, files in os.walk(folder) for name in dirs + files)
+        for path in [folder, *sorted(below)]:
+            info = os.lstat(path)
+            digest.update(f"{path.relative_to(cwd)}\0{stat.S_IFMT(info.st_mode)}\0".encode())
+            if stat.S_ISLNK(info.st_mode):
+                digest.update(os.readlink(path).encode())
+            elif stat.S_ISREG(info.st_mode):
+                digest.update(path.read_bytes())
+    except OSError as exc:
+        return f"unreadable: {type(exc).__name__}"  # differs from any state that was read
+    return digest.hexdigest()
+
+
+def command_home(agent: PreparedAgent, profile: SandboxProfile) -> Path:
+    """`HOME` of the agent's commands: `<Run-tmp>/home/<id>`, writable for them."""
+    return profile.tmp_dir / "home" / agent.id
+
+
+def server_home(agent: PreparedAgent, profile: SandboxProfile) -> Path:
+    """`HOME` of the app-server: `agents/<id>/home`, no write root (W3-06.3).
+
+    The app-server runs `git` outside the sandbox, and `git` reads `$HOME/.gitconfig`. In a
+    writable `HOME` an agent could define a clean filter there, select it in `.gitattributes`
+    and have it run outside the sandbox in the next turn (measured). Raises `ArrError` if the
+    folder lies in a write root.
+    """
+    home = agent.agent_dir / "home"
+    if any(within(home, root) for root in profile.write_roots):
+        raise ArrError(
+            f"Der Codex-Agent {agent.id} startet nicht: Sein Home-Ordner {home} liegt in einem "
+            "Ordner, in den Agenten schreiben dürfen."
+        )
+    return home
+
+
 def _role_text(agent: PreparedAgent) -> str:
     role = (agent.run_dir / agent.file.role_file).read_text(encoding="utf-8").strip()
     static = read_template("prompts", "codex.md").strip()
@@ -446,26 +508,31 @@ def build_launch(
     # CODEX_HOME (S2 §8). This is isolation, not E19 protection (the sandbox does that).
     env = {
         "CODEX_HOME": str(codex_home),
-        "HOME": str(tmp / "home" / agent.id),
-        "PATH": os.pathsep.join(path),
+        "HOME": str(server_home(agent, profile)),
+        # the app-server runs outside the sandbox and starts `git` through it (W3-06.3, B1)
+        # no `git` outside the sandbox: the first one does nothing (W3-06.4, 3b)
+        "PATH": outside_path([str(no_git_folder(profile.write_roots)), *path], profile.write_roots),
         "TMPDIR": str(tmp),
     }
     env |= {name: str(tmp / "cache" / name.lower()) for name in CACHE_ENV}
-    # arr's own venv must not leak into the agent (`uv run arr` sets VIRTUAL_ENV); uv reads
-    # no config files: it looks for `pyproject.toml`/`uv.toml` in the denied parents.
+    # arr's own venv must not leak into the agent (`uv run arr` sets VIRTUAL_ENV), and the run
+    # venv is for the commands only; uv reads no config files: it looks for
+    # `pyproject.toml`/`uv.toml` in the denied parents.
     overlay = agent.file.run_venv is RunVenvMode.OVERLAY
-    env["VIRTUAL_ENV"] = str(run_paths.venv_dir) if overlay else ""
+    env["VIRTUAL_ENV"] = ""
     env |= {"PYTHONPATH": "", "PYTHONHOME": "", "UV_NO_CONFIG": "1"}
     env |= {name: "" for name in SECRET_ENV if environ.get(name)}
-    shell_env = {name: env[name] for name in ("HOME", "PATH", "TMPDIR", *CACHE_ENV)}
+    shell_env = {name: env[name] for name in ("TMPDIR", *CACHE_ENV)}
+    shell_env["HOME"] = str(command_home(agent, profile))
+    shell_env["PATH"] = os.pathsep.join(path)
     shell_env["LANG"] = environ.get("LANG") or "C.UTF-8"
     shell_env["UV_NO_CONFIG"] = "1"
     if overlay:
-        shell_env["VIRTUAL_ENV"] = env["VIRTUAL_ENV"]
+        shell_env["VIRTUAL_ENV"] = str(run_paths.venv_dir)
     room = {
         "command": sys.executable,
-        "args": ["-m", "arr.room.server"],
-        "env": {"AGENT_ID": agent.id, "RUN_DIR": str(agent.run_dir)},
+        "args": [*ROOM_SERVER_ARGS],
+        "env": {"AGENT_ID": agent.id, "RUN_DIR": str(agent.run_dir), "PATH": env["PATH"]},
         "default_tools_approval_mode": "approve",
     }
     servers: dict[str, Any] = {

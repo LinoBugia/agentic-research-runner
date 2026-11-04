@@ -30,7 +30,13 @@ from arr.models import (
 )
 from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.policy import PolicyEngine, RunPaths, profile_for
-from arr.permissions.types import ApprovalItem, DecidedBy, Decision, DecisionAction
+from arr.permissions.types import (
+    ApprovalItem,
+    DecidedBy,
+    Decision,
+    DecisionAction,
+    RequestCategory,
+)
 from arr.resolve import resolve_run
 from arr.room.store import RoomStore
 from arr.runs.eventlog import EventLogger
@@ -221,13 +227,14 @@ async def test_live_smoke(tmp_path: Path) -> None:
     refused = results[write_call.data["id"]]
     print("Ablehnung:", refused["content"])
     assert refused["is_error"] and "Arbeitsordner" in str(refused["content"])
-    # pip install → a request in the inbox (denied by the test decider)
-    print("Inbox:", [(i.request.tool, i.request.hosts) for i in decider.items])
+    # pip install → a Bash request of the category „Installation“ in the inbox, denied by the
+    # test decider. It is asked before it runs: since W2-01.1 every Bash call goes through
+    # `can_use_tool`, so no `SandboxNetworkAccess` to pypi.org follows.
+    print("Inbox:", [(i.request.tool, i.request.categories) for i in decider.items])
     assert any("pip install" in str(e.data["input"].get("command")) for e in tool_calls(events))
-    assert any(
-        h.endswith(("pypi.org", "pythonhosted.org")) for i in decider.items for h in i.request.hosts
-    )
-    assert all(i.request.tool == "SandboxNetworkAccess" for i in decider.items)
+    installs = [i for i in decider.items if "pip install" in (i.request.command or "")]
+    assert installs and all(i.request.tool == "Bash" for i in installs)
+    assert all(RequestCategory.INSTALL in i.request.categories for i in installs)
     # Hints: delivered as `hint` events, hit rate printed
     delivered = [e[1] for events_n in runs for e in events_n if isinstance(e, tuple)]
     print(f"Hinweis zugestellt: {delivered}; befolgt: {sum(hits)}/{len(hits)} {hits}")

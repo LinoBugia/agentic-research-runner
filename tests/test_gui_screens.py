@@ -780,3 +780,49 @@ async def test_no_terminal_step_in_setup_profiles_and_errors(zustand: str) -> No
             assert not TERMINAL.findall(html), (path, TERMINAL.findall(html))
             for line in re.findall(r"[^<>\n]*setup-token[^<>\n]*", html):
                 assert "arr führt dafür" in line or "selbst aus" in html, line
+
+
+# --- Not-Aus and record per profile (W3-06) ---------------------------------------------------
+
+
+async def test_sperren_asks_first_and_shows_the_block(api: MockApi) -> None:
+    async with gui_user(api) as user:
+        await user.open("/profile/claude-api-uni")
+        await see(user, "claude-api-uni")
+        user.find(marker="disable-claude-api-uni").click()
+        html = await see(user, "Profil „claude-api-uni“ sperren?")
+        assert "offene Anmeldungen enden" in html and "Der Login bleibt erhalten" in html
+        assert "Runs in anderen Workfoldern stoppen von selbst" in html
+        assert not next(p for p in await api.list_profiles() if p.name == "claude-api-uni").disabled
+        user.find(marker="dialog-confirm").click()
+        html = await see(user, "gesperrt")
+        assert next(p for p in await api.list_profiles() if p.name == "claude-api-uni").disabled
+        await user.should_see(marker="enable-claude-api-uni")
+
+
+async def test_login_entfernen_is_a_second_step_and_names_the_provider(api: MockApi) -> None:
+    await api.disable_profile("claude-api-uni")
+    async with gui_user(api) as user:
+        await user.open("/profile/claude-api-uni")
+        await see(user, "claude-api-uni")
+        user.find(marker="remove-login-claude-api-uni").click()
+        html = await see(user, "Login von „claude-api-uni“ entfernen?")
+        assert "Anthropic Console" in html and "Das Profil bleibt gesperrt" in html
+        user.find(marker="dialog-confirm").click()
+        await see(user, "ist aus arr entfernt")
+
+
+async def test_nachweis_opens_with_sums_runs_and_its_limit(api: MockApi) -> None:
+    async with gui_user(api) as user:
+        await user.open("/profile/claude-api-uni")
+        await see(user, "claude-api-uni")
+        user.find(marker="usage-claude-api-uni").click()
+        html = await see(user, "Erfasst sind nur Läufe über arr")
+        for text in ("Heute", "7 Tage", "Gesamt", "Cache lesen", "Reasoning", "abgebrochen"):
+            assert text in html
+        assert 'href="/runs/20261030-1402_demo"' in html
+        assert "direkte Nutzung von Claude Code oder Codex" in html
+        # wider than the card: it scrolls inside it, so „Kosten“ stays reachable (B3)
+        [box] = user.find(marker="usage-claude-api-uni").elements
+        [area] = [e for e in box.parent_slot.children if "profile-usage" in e.classes]
+        assert area.style.get("overflow-x") == "auto" and area.props.get("tabindex") == "0"

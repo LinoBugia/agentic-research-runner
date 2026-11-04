@@ -6,6 +6,9 @@ a failing profile. „Neues Profil“ logs in with „Mit Claude anmelden“ / �
 anmelden“: arr runs the login in the browser and keeps the token in the keychain (E18); there
 is no field to paste a token. API-key profiles take the key once. `/profile/<name>` scrolls
 to the card, `?neu=1` opens „Neues Profil“.
+
+The Not-Aus (W3-06): „Sperren …“ blocks a profile with a click and a confirmation, „Login
+entfernen …“ is the second step. „Nachweis“ opens what ran through arr on the profile.
 """
 
 import asyncio
@@ -15,6 +18,7 @@ from typing import Any
 from nicegui import ui
 from pydantic import SecretStr
 
+from arr.backends.base import CostKind
 from arr.models import AuthKind, Provider
 from arr.service.api_client import ApiClient
 from arr.service.api_models import (
@@ -22,6 +26,8 @@ from arr.service.api_models import (
     CreateProfileRequest,
     LoginState,
     ProfileInfo,
+    ProfileUsage,
+    ProfileUsageSum,
     ProviderDefaultsInfo,
 )
 from arr.service.gui import format as fmt
@@ -83,6 +89,13 @@ CONCURRENCY_HINT = {
 CONCURRENCY_TEXT = "Höchstens so viele Agenten nutzen das Profil gleichzeitig."
 LOGIN_POLL_S = 1.0
 WAITING_TEXT = "Warte auf die Anmeldung im Browser …"
+REVOKE_TEXT = {
+    AuthKind.CLAUDE_API_KEY: "Widerrufe den Key zusätzlich in der Anthropic Console, sonst bleibt "
+    "er dort gültig.",
+    AuthKind.OPENAI_API_KEY: "Widerrufe den Key zusätzlich beim Anbieter, sonst bleibt er dort "
+    "gültig.",
+}
+REVOKE_LOGIN = "Widerrufe den Zugang zusätzlich in deinen Kontoeinstellungen beim Anbieter."
 MIN_TEST_S = 0.8
 """„Testen …“ stays at least this long, so the result does not flash by (§5.8 „lädt“)."""
 
@@ -94,10 +107,62 @@ def uses_mac_login(profile: ProfileInfo) -> bool:
     return plain and test is not None and test.ok
 
 
+def usage_cells(row: ProfileUsageSum) -> str:
+    """Tokens by kind and the cost, „–“ where nothing is known (§8.7)."""
+    numbers = (row.input, row.output, row.cache_read, row.cache_write, row.reasoning)
+    cells = "".join(f'<td class="num">{fmt.tokens(n)}</td>' for n in numbers)
+    costs = []
+    if row.cost_billed_usd:
+        costs.append(fmt.money(row.cost_billed_usd, CostKind.BILLED))
+    if row.cost_estimated_usd:
+        costs.append(fmt.money(row.cost_estimated_usd, CostKind.ESTIMATED))
+    return f'{cells}<td class="num">{esc(" + ".join(costs) or "–")}</td>'
+
+
+USAGE_BOX_STYLE = "overflow-x: auto; max-width: 100%; min-width: 0"
+
+USAGE_HEAD = (
+    '<th class="num">Input</th><th class="num">Output</th><th class="num">Cache lesen</th>'
+    '<th class="num">Cache schreiben</th><th class="num">Reasoning</th><th class="num">Kosten</th>'
+)
+
+
+def usage_html(usage: ProfileUsage, now: float) -> str:
+    """Sums for today, 7 days and all, then one row per run with a link to it (W3-06)."""
+    sums = "".join(
+        f"<tr><th>{esc(row.label)}</th><td class='num'>{row.runs}</td>{usage_cells(row)}</tr>"
+        for row in (usage.today, usage.week, usage.total)
+    )
+    rows = ""
+    for run in usage.runs:
+        mark = " · abgebrochen" if run.aborted else " · läuft" if run.active else ""
+        period = fmt.when(run.started, now)
+        if run.ended:
+            period += f" bis {fmt.clock(run.ended)}"
+        rows += (
+            f'<tr><td><a href="{esc(run.url)}">{esc(run.run_id)}</a>'
+            f'<span class="small muted" style="display:block">{esc(", ".join(run.agents))} · '
+            f"{esc(period)}{esc(mark)}</span></td><td></td>{usage_cells(run)}</tr>"
+        )
+    runs = (
+        f'<table class="tbl compact" style="margin-top:8px"><thead><tr><th>Run</th><th></th>'
+        f"{USAGE_HEAD}</tr></thead><tbody>{rows}</tbody></table>"
+        if rows
+        else '<p class="small muted">Noch kein Lauf über arr mit diesem Profil.</p>'
+    )
+    return (
+        f'<table class="tbl compact"><thead><tr><th>Zeitraum</th><th class="num">Runs</th>'
+        f"{USAGE_HEAD}</tr></thead><tbody>{sums}</tbody></table>{runs}"
+        f'<p class="small muted" style="margin-top:8px">{esc(usage.note)}</p>'
+    )
+
+
 def status_badge(profile: ProfileInfo, now: float) -> str:
     """„✓ funktioniert“ with the time of the last test, „✕ Test fehlgeschlagen“ or „nicht
     verbunden“ (§5.8). The login of this Mac gets its own word: it is no login of the profile."""
     test = profile.last_test
+    if profile.disabled:
+        return badge_html(Status("st-err", "block", "gesperrt"))
     if test is None:
         return badge_html(Status("st-neutral", "link_off", "nicht verbunden"))
     when = f' <span class="faint">getestet {esc(fmt.when(test.ts, now))}</span>'
@@ -253,8 +318,40 @@ class ProfilePage:
                 )
             with ui.element("div").classes("btn-row"):
                 self._actions(p, bad)
+            # the record is wider than a card: it scrolls inside it, so no column is cut off
+            # (review W3-06, B3); focusable, so the keys scroll it too
+            usage_box = ui.element("div").classes("profile-usage").style(USAGE_BOX_STYLE)
+            usage_box.props(f'tabindex="0" role="region" aria-label="Nachweis {esc(p.name)}"')
+            button("Nachweis", None, classes="btn btn-sm ghost").mark(f"usage-{p.name}").on(
+                "click", lambda _e, box=usage_box: self._usage(p, box)
+            )
+
+    async def _usage(self, p: ProfileInfo, box: ui.element) -> None:
+        """Opens and closes the record; every opening reads it anew, also of a running run."""
+        if box.default_slot.children:
+            box.clear()
+            return
+        try:
+            usage = await self.api.get_profile_usage(p.name)
+        except ApiException as exc:
+            self.frame.toast(exc.error.message, error=True)
+            return
+        box.clear()
+        with box:
+            raw(usage_html(usage, self.api.now()), tag="div")
 
     def _actions(self, p: ProfileInfo, bad: bool) -> None:
+        if p.disabled:
+            button("Entsperren …", lambda: self._enable(p), classes="btn btn-sm primary").mark(
+                f"enable-{p.name}"
+            )
+            button(
+                "Login entfernen …",
+                lambda: self._remove_login(p),
+                classes="btn btn-sm ghost danger",
+            ).mark(f"remove-login-{p.name}")
+            button("Löschen …", lambda: self._delete(p), classes="btn btn-sm ghost danger")
+            return
         key_kind = p.kind in (AuthKind.CLAUDE_API_KEY, AuthKind.OPENAI_API_KEY)
         primary_label = None
         if bad:
@@ -287,9 +384,104 @@ class ProfilePage:
             )
         if not bad and p.secret_present and not key_kind:
             button("Neu anmelden", lambda: self._relogin(p), classes="btn btn-sm")
+        button("Sperren …", lambda: self._disable(p), classes="btn btn-sm danger").mark(
+            f"disable-{p.name}"
+        )
         button("Löschen …", lambda: self._delete(p), classes="btn btn-sm ghost danger")
 
     # --- actions -------------------------------------------------------------------------------
+
+    async def _disable(self, p: ProfileInfo) -> None:
+        """„Sperren“, the Not-Aus, with its consequences (§8.6)."""
+        try:
+            preview = await self.api.disable_profile(p.name, dry_run=True)
+        except ApiException as exc:
+            self.frame.toast(exc.error.message, error=True)
+            return
+        stopping = (
+            f"{len(preview.runs)} laufende Runs in diesem Workfolder stoppen sofort, auch aus "
+            "„arr run“. Zusammenfassung und Secret-Scan laufen danach."
+            if preview.runs
+            else "In diesem Workfolder läuft gerade kein Run auf dem Profil."
+        )
+
+        async def confirm(_value: str) -> None:
+            try:
+                result = await self.api.disable_profile(p.name)
+            except ApiException as exc:
+                self.frame.toast(exc.error.message, error=True)
+                return
+            self.frame.toast(result.message, error=not result.ok)
+            await self._load()
+
+        self.confirm.show(
+            f"Profil „{p.name}“ sperren?",
+            [
+                stopping,
+                "Neue Runs und Tests mit dem Profil starten nicht mehr, offene Anmeldungen enden.",
+                "Runs in anderen Workfoldern stoppen von selbst innerhalb weniger Sekunden.",
+                "Der Login bleibt erhalten, du kannst das Profil wieder entsperren.",
+            ],
+            "Profil sperren",
+            confirm,
+        )
+
+    def _enable(self, p: ProfileInfo) -> None:
+        async def confirm(_value: str) -> None:
+            try:
+                result = await self.api.enable_profile(p.name)
+            except ApiException as exc:
+                self.frame.toast(exc.error.message, error=True)
+                return
+            self.frame.toast(result.message)
+            await self._load()
+
+        self.confirm.show(
+            f"Profil „{p.name}“ entsperren?",
+            [
+                "Neue Runs und Tests dürfen das Profil wieder nutzen.",
+                "Gestoppte Runs bleiben gestoppt.",
+            ],
+            "Profil entsperren",
+            confirm,
+            danger=False,
+        )
+
+    async def _remove_login(self, p: ProfileInfo) -> None:
+        """The second, explicit step; a login that is not arr's stays and the page says so."""
+        try:
+            preview = await self.api.remove_login(p.name, dry_run=True)
+        except ApiException as exc:
+            self.frame.toast(exc.error.message, error=True)
+            return
+        if not preview.removable:
+            self.frame.toast(preview.message)
+            return
+        where = (
+            "Der Login-Ordner von arr wird entfernt."
+            if p.login_dir
+            else "Der Eintrag im Schlüsselbund wird entfernt."
+        )
+
+        async def confirm(_value: str) -> None:
+            try:
+                result = await self.api.remove_login(p.name)
+            except ApiException as exc:
+                self.frame.toast(exc.error.message, error=True)
+                return
+            self.frame.toast(result.message)
+            await self._load()
+
+        self.confirm.show(
+            f"Login von „{p.name}“ entfernen?",
+            [
+                where,
+                "Das Profil bleibt gesperrt. Für neue Runs meldest du dich danach neu an.",
+                REVOKE_TEXT.get(p.kind, REVOKE_LOGIN),
+            ],
+            "Login entfernen",
+            confirm,
+        )
 
     async def _test(self, p: ProfileInfo, btn: ui.element) -> None:
         """„Testen“: a minimal call, result in ≤ 10 s (simulated in the mock)."""

@@ -37,7 +37,9 @@ from arr.service.api_models import (
     Message,
     MessagesPage,
     PostMessageRequest,
+    ProfileActionResult,
     ProfileInfo,
+    ProfileUsage,
     ProjectInfo,
     ProjectSetupResult,
     ResolveResult,
@@ -407,6 +409,22 @@ class ApiClient(Protocol):
 
     async def delete_profile(self, name: str) -> None:
         """Delete a profile and its secret (`DELETE /api/profiles/{name}`)."""
+        ...
+
+    async def disable_profile(self, name: str, dry_run: bool = False) -> ProfileActionResult:
+        """Not-Aus: block the profile, stop its runs, end its logins (W3-06)."""
+        ...
+
+    async def enable_profile(self, name: str) -> ProfileActionResult:
+        """Lift the block of a profile (W3-06)."""
+        ...
+
+    async def remove_login(self, name: str, dry_run: bool = False) -> ProfileActionResult:
+        """„Login entfernen“: only what belongs to arr, on a blocked profile (W3-06)."""
+        ...
+
+    async def get_profile_usage(self, name: str) -> ProfileUsage:
+        """„Nachweis je Profil“: runs, tokens and costs through arr (W3-06)."""
         ...
 
     async def start_login(self, name: str) -> LoginStart:

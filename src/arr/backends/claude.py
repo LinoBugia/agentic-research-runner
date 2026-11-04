@@ -33,6 +33,7 @@ from claude_agent_sdk import (
     HookMatcher,
     PermissionResultAllow,
     PermissionResultDeny,
+    ProcessError,
 )
 from claude_agent_sdk.types import (
     CanUseToolShadowedWarning,
@@ -41,10 +42,11 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 
-from arr.auth import SecretReader, claude_env, clean_process_env, is_billed
+from arr.auth import AuthError, SecretReader, claude_env, clean_process_env, is_billed
 from arr.backends.base import AgentEvent, CostKind, EventKind
 from arr.backends.claude_events import ClaudeEvents
 from arr.backends.claude_options import build_options, remove_tmp_link, tmp_link
+from arr.backends.claude_start import HANDOVER_FAILED
 from arr.errors import ArrError
 from arr.models import AuthProfile, Limits, Provider
 from arr.permissions.inbox import ApprovalInbox
@@ -59,6 +61,10 @@ CONTEXT_HEADING = "## Projektkontext"
 TASK_HEADING = "## Auftrag"
 _NO_DECISION = "Keine Freigabe erhalten, arbeite ohne weiter oder frage im Chat nach."
 CLOSED = "Der Claude-Agent ist bereits beendet und startet nicht neu."
+NO_HANDOVER = (
+    "Der Claude-Agent startet nicht: Der Login von „{name}“ ließ sich nicht an die CLI übergeben. "
+    "Teste das Profil auf der Seite „Profile“."
+)
 
 
 class ClaudeClient(Protocol):
@@ -212,9 +218,11 @@ class ClaudeBackend:
         self._owner = asyncio.create_task(self._own(self._client, ready))
         try:
             await ready
-        except BaseException:
+        except BaseException as exc:
             self._client = None
             self._release_link()
+            if isinstance(exc, ProcessError) and exc.exit_code == HANDOVER_FAILED:
+                raise AuthError(NO_HANDOVER.format(name=self.auth.name)) from None
             raise
         log.info("Claude-Agent %s gestartet (Profil %s)", self.agent.id, self.auth.name)
 

@@ -934,6 +934,7 @@ class AuthProfile(StrictModel):
     kind: AuthKind
     keychain: KeychainRef | None = None
     login_dir: str | None = Field(default=None, description="Codex login folder (CODEX_HOME)")
+    disabled: bool = Field(default=False, description="Not-Aus: nothing starts with this profile")
 
     @model_validator(mode="after")
     def _storage_matches_kind(self) -> Self:
