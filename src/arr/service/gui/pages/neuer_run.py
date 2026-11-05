@@ -41,7 +41,14 @@ from arr.service.gui import format as fmt
 from arr.service.gui.app import get_api
 from arr.service.gui.components.banner import empty_state_html
 from arr.service.gui.components.base import button, esc, icon, markdown_html, raw, set_disabled
-from arr.service.gui.components.form import Field, auto_focus_js, checkbox, radio
+from arr.service.gui.components.form import (
+    Field,
+    NativeInput,
+    auto_focus_js,
+    checkbox,
+    on_value,
+    radio,
+)
 from arr.service.gui.components.page_state import (
     clean_href,
     load_into,
@@ -694,17 +701,17 @@ class NeuerRunPage:
                 with ui.element("div").classes("list-edit"):
                     for index, text in enumerate(items):
                         with ui.element("div").classes("row"):
-                            box = ui.element("input").props(
+                            box = NativeInput("input").props(
                                 f'type="text" aria-label="{esc(title)} {index + 1}" '
                                 f'id="li-{esc(p.name)}-{index}"'
                             )
-                            box._props["value"] = text
+                            box.set_value(text)
 
-                            def changed(event: Any, i: int = index) -> None:
-                                items[i] = str(event.args)
+                            def changed(value: str, i: int = index) -> None:
+                                items[i] = value
                                 update(check=False)
 
-                            box.on("input", changed, js_handler="(e) => emit(e.target.value)")
+                            on_value(box, changed)
                             box.on("change", lambda _e: self._commit(), js_handler="() => emit()")
                             button(
                                 "×",

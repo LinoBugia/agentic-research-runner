@@ -4,7 +4,8 @@ Label, optional mark, native input, help text, change mark „● geändert (Sta
 zurücksetzen“, error text, locked state with a reason. Help and error are linked with
 `aria-describedby`. Values reach Python as strings on every input and on leaving the field;
 `on_commit` tells a page that a value is final (you left the changed field, or „zurücksetzen“),
-so it can check then instead of on every keystroke (W3-08 U1). A field counts as `touched` once
+so it can check then instead of on every keystroke (W3-08 U1). The text of a field belongs to the
+browser while you type (`NativeInput`, W3-08.1). A field counts as `touched` once
 you left it (K7 „Prüfung beim Verlassen“); pages show its error from then on. A field the
 page focused by itself (deep link, marked `data-auto-focus`) is not touched by leaving it,
 only after you typed in it or put the focus there yourself.
@@ -23,12 +24,43 @@ _ids = itertools.count(1)
 ChangeHandler = Callable[[str], Any]
 
 
-def _on_value(element: ui.element, handler: ChangeHandler, *, checkbox: bool = False) -> None:
-    """Call `handler(value)` on input and change; keep the element's `value` prop in sync
-    without sending it back: an echo of each keystroke would reach the browser late and set the
-    field to an older text while you type on (W3-08 U1). Python sets values with `props()`."""
+class NativeInput(ui.element):
+    """A native `input`, `textarea` or `select` whose text the browser owns (W3-08.1 U1).
+
+    NiceGUI renders the whole page in one Vue render function, and Vue sets `value` of a native
+    field on every render from the value stored on the client. Three things keep your typing:
+    the browser stores each new text itself, without a render (`STORE_JS`); Python stores it
+    without sending it back (an echo would arrive late and set an older text, W3-08 U1); an
+    update of the field from Python keeps the browser's text unless Python set a new value
+    (`preserved_props`, as NiceGUI's own value elements do). Set values with `set_value`.
+    """
+
+    def __init__(self, tag: str) -> None:
+        super().__init__(tag)
+        self._client_value: Any = None
+
+    def set_value(self, value: str) -> None:
+        """A value from Python (e.g. „zurücksetzen“): it replaces the browser's text."""
+        self._client_value = None
+        self._props["value"] = value
+
+    def _to_dict(self) -> dict[str, Any]:
+        data = super()._to_dict()
+        if self._client_value is not None and self._props.get("value") == self._client_value:
+            data["preserved_props"] = ["value"]
+        return data
+
+
+# The browser keeps the field's stored value equal to what you typed: written to the raw store
+# (`Vue.toRaw`), so no render follows; `element` is the field's entry in NiceGUI's client store,
+# the same object NiceGUI's own `emit` writes `model-value` to.
+STORE_JS = "(e) => {{ Vue.toRaw(element.props).{prop} = e.target.{prop}; emit(e.target.{prop}); }}"
+
+
+def on_value(element: NativeInput, handler: ChangeHandler, *, checkbox: bool = False) -> None:
+    """Call `handler(value)` on input and change; the browser keeps the text (`NativeInput`)."""
     prop = "checked" if checkbox else "value"
-    js = "(e) => emit(e.target.checked)" if checkbox else "(e) => emit(e.target.value)"
+    js = STORE_JS.format(prop=prop)
 
     def handle(event: Any) -> Any:
         value = event.args
@@ -41,6 +73,7 @@ def _on_value(element: ui.element, handler: ChangeHandler, *, checkbox: bool = F
                 value = "true" if value else ""
             else:
                 element._props[prop] = value
+                element._client_value = value
         return handler(str(value))
 
     for kind in ("change",) if checkbox else ("input", "change"):
@@ -115,7 +148,7 @@ class Field:
             raw(f'<label for="{self.input_id}">{esc(label)}{code}{opt}{lock}</label>', tag="span")
             described = f'aria-describedby="{help_id} {error_id}"'
             if kind == "select":
-                self.input = ui.element("select").props(f'id="{self.input_id}" {described}')
+                self.input = NativeInput("select").props(f'id="{self.input_id}" {described}')
                 with self.input:
                     for opt_value, opt_label in options or []:
                         option = text("option", opt_label).props(f'value="{esc(opt_value)}"')
@@ -123,12 +156,12 @@ class Field:
                             option.props("selected")
                 self.input._props["value"] = value
             elif kind == "textarea":
-                self.input = ui.element("textarea").props(
+                self.input = NativeInput("textarea").props(
                     f'id="{self.input_id}" rows="{rows}" {described} spellcheck="false"'
                 )
                 self.input._props["value"] = value
             else:
-                self.input = ui.element("input").props(
+                self.input = NativeInput("input").props(
                     f'id="{self.input_id}" type="{kind}" {described} {attrs}'
                 )
                 self.input._props["value"] = value
@@ -137,7 +170,7 @@ class Field:
                 self.input.style(f"width:{width}")
             if locked:
                 self.input.props('disabled aria-disabled="true"')
-            _on_value(self.input, self._changed)
+            on_value(self.input, self._changed)
             self.input.on("blur", self._left, js_handler=_BLUR_JS)
             if on_commit is not None:
                 self.input.on("change", lambda _e: on_commit(), js_handler="() => emit()")
@@ -170,7 +203,7 @@ class Field:
     def set_value(self, value: str) -> None:
         """Set the value from Python (e.g. „zurücksetzen“) and tell the page."""
         self.value = value
-        self.input.props(f'value="{esc(value)}"')
+        self.input.set_value(value)
         self._render_mark()
         if self._on_change is not None:
             self._on_change(value)
@@ -220,7 +253,7 @@ def checkbox(
             element.mark(marker)
         if checked:
             element.props("checked")
-        _on_value(element, on_change, checkbox=True)
+        on_value(element, on_change, checkbox=True)
         raw(esc(label), tag="span")
     return box
 
