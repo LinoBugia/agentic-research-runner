@@ -76,6 +76,12 @@ SUGGEST_QUESTION_JS = r"""(e) => {
 }"""
 """U6: `@name` or a single addressee suggests „Frage“ (client only, nothing is sent)."""
 
+SENT_JS = (
+    "arr.rd.sent(); document.getElementById('cmp-body')"
+    "?.dispatchEvent(new Event('input', {bubbles: true}));"
+)
+"""After sending: empty the input (static/run_detail.js) and let `SUGGEST_QUESTION_JS` see it."""
+
 _MODE = {
     ChannelMode.EVENT: "ereignisgesteuert",
     ChannelMode.ROUNDS: "in Runden",
@@ -364,7 +370,8 @@ class ChannelView:
         except ApiException as exc:
             self.page.frame.toast(exc.error.message, error=True)
             return
-        self.page.frame.js("arr.rd.sent()")
+        # the emptied field tells the form: the suggestion „Frage“ goes away (W3-08.1)
+        self.page.frame.js(SENT_JS)
         self.add_live(msg, own=True)
 
     # --- live -------------------------------------------------------------------------------

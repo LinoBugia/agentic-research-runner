@@ -89,7 +89,8 @@ def _approval_text(item: ApprovalItem, now: float) -> str:
     kinds = ", ".join(CATEGORY[c] for c in item.categories) or "eine Berechtigung"
     deadline = f" · {deadline_text(item.deadline, now)}" if item.deadline else ""
     risk = f" · Risiko {risk_text(item)}" if item.risk is not None else ""  # W3-08 U8
-    return f"{agent} fragt nach: {kinds}{risk} · {item.run.name}{deadline}"
+    # the deadline before risk and run: `MAX_TEXT` cuts the end, never the deadline (W3-08.1)
+    return f"{agent} fragt nach: {kinds}{deadline}{risk} · {item.run.name}"
 
 
 def message_for(event: LiveEvent, now: float) -> str | None:

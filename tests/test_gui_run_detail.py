@@ -37,7 +37,7 @@ from arr.service.gui.components.approval_card import (
 from arr.service.gui.components.base import markdown_html
 from arr.service.gui.components.stage_bar import stage_bar_html
 from arr.service.gui.pages.run_detail import KATEX_URL
-from arr.service.gui.pages.run_detail_channel import SUGGEST_QUESTION_JS
+from arr.service.gui.pages.run_detail_channel import SENT_JS, SUGGEST_QUESTION_JS
 from arr.service.gui.pages.run_detail_results import run_links_html
 from arr.service.mock_api import R_EXPLORE, R_LEMMA, R_RAMSEY, R_SATZ2, Dataset, MockApi, _ev
 
@@ -360,6 +360,12 @@ def test_w3_08_u4_relative_links_of_a_run_file_open_the_result_or_stay_text() ->
     # a result's own file links to its neighbour: relative to `output/results/`
     own = run_links_html(markdown_html("[davor](002-x.md)"), results[0].path, results)
     assert 'data-sel="ergebnis:2"' in own
+    # W3-08.1: the number counts only in `output/results/`, not in any folder named `results`
+    work = run_links_html(
+        markdown_html("[Notiz](results/002-notiz.md)"), "agents/x/work/proof.md", results
+    )
+    assert "data-sel" not in work
+    assert 'title="Im Run-Ordner: agents/x/work/results/002-notiz.md">Notiz</span>' in work
 
 
 async def test_w3_08_u4_summary_link_opens_the_result_in_the_run(api: MockApi) -> None:
@@ -428,6 +434,7 @@ async def test_w3_08_u6_composer_says_what_a_note_and_a_question_do(scenario: Us
         handlers = {(lis.type, lis.js_handler) for lis in form._event_listeners.values()}
     assert ("input", SUGGEST_QUESTION_JS) in handlers
     assert ("change", SUGGEST_QUESTION_JS) in handlers
+    assert "arr.rd.sent();" in SENT_JS and "new Event('input', {bubbles: true})" in SENT_JS
     scenario.find(marker="pause").click()
     await until(lambda: "Zustellung beim Fortsetzen" in html(scenario, "run-detail"))
     assert "@name schreiben. · Zustellung beim Fortsetzen" in html(scenario, "run-detail")

@@ -162,6 +162,10 @@ seen.push(await pick(""));
 kind.value = "idea";
 seen.push(await fire(kind, "change"));
 seen.push(await type("Idee für @diskutant-1"));
+// W3-08.1: after sending, the emptied field takes the suggestion back
+delete kind.dataset.chosen; kind.value = "note";
+seen.push(await type("Frage an @diskutant-2?"));
+seen.push(await type(""));  // SENT_JS: rd.sent() empties the field, then an input event
 return seen;
 """
 
@@ -185,4 +189,6 @@ def test_w3_08_u6_mention_or_single_addressee_suggests_question() -> None:
         ["note", ""],
         ["idea", ""],
         ["idea", ""],
+        ["question", why + "du sprichst @diskutant-2 an."],
+        ["note", ""],
     ]

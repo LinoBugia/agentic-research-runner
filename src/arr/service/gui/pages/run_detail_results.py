@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from itertools import groupby
 from typing import TYPE_CHECKING
 
+from arr.room.store import RESULTS_DIR
 from arr.service.api_models import Result, ResultStatus, RunResults
 from arr.service.gui import format as fmt
 from arr.service.gui.components.badge import badge_html
@@ -57,8 +58,8 @@ def _result_for(path: str, results: Sequence[Result]) -> Result | None:
     for result in results:
         if result.path and posixpath.normpath(result.path) == path:
             return result
-    if posixpath.basename(posixpath.dirname(path)) != "results":
-        return None
+    if posixpath.dirname(path) != RESULTS_DIR:
+        return None  # `agents/x/work/results/003-….md` is another file (W3-08.1)
     match = _NUMBER_RE.search(path)
     number = int(match.group(1)) if match else None
     return next((r for r in results if r.id == number), None)
