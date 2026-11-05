@@ -2,9 +2,10 @@
 
 One long page with numbered sections and a fixed summary on the right: project and skill,
 task, parameters from `group.yaml`, resolved agents with web and read folders per agent (E19),
-channels, limits and decider, `run.yaml` preview. Every change is checked like `estimate_run`
-(debounced 500 ms): errors stand at the field and in the check list with a jump link, „Run
-starten“ is locked while one is open.
+channels, limits and decider, `run.yaml` preview. Every change is checked like `estimate_run`:
+a choice at once, typed text when you leave the field or start (W3-08 U1, not on every
+keystroke). Errors stand at the field and in the check list with a jump link, „Run starten“ is
+locked while one is open; after unchecked typing it stays clickable and checks first.
 
 `/neuer-run?skill=…&projekt=…` preselects; `/neuer-run?von=<approval>` adjusts a run start of
 Claude Code: same run ID, values from the request, your changes marked, „Freigeben und
@@ -189,6 +190,7 @@ class NeuerRunPage:
         self._agents_signature: tuple[Any, ...] = ()
         self._timer: ui.timer | None = None
         self._checking = False
+        self._unchecked = False  # text typed since the last check started (U1)
         self._focus_after: str | None = None
         self.tried_start = False
 
@@ -517,7 +519,8 @@ class NeuerRunPage:
                 value=self.input["name"],
                 optional="optional",
                 help_text="Leer: arr nennt den Run nach Skill und Projekt.",
-                on_change=lambda v: self._set("name", v),
+                on_change=lambda v: self._set("name", v, check=False),
+                on_commit=self._commit,
                 width="520px",
             )
             self.fields["name"].box.style("margin-top:12px;margin-bottom:0")
@@ -548,7 +551,8 @@ class NeuerRunPage:
                 default_word="",
                 help_text="Gliederung aus der Vorlage. Markdown und LaTeX ($σ(n)$) werden in der "
                 "Vorschau gesetzt.",
-                on_change=lambda v: self._set("task_md", v),
+                on_change=lambda v: self._set("task_md", v, check=False),
+                on_commit=self._commit,
             )
             self.fields["task_md"].box.style("margin-bottom:0")
             self.preview = raw("", tag="div", classes="task-preview prose").style("display:none")
@@ -622,8 +626,9 @@ class NeuerRunPage:
                 help_text=help_text,
                 key=key,
                 on_change=lambda v, name=p.name, kind=p.type: self._set_param(
-                    name, _number(v, kind)
+                    name, _number(v, kind), check=False
                 ),
+                on_commit=self._commit,
                 width="110px",
                 attrs=(f'min="{p.min:g}"' if p.min is not None else "")
                 + (f' max="{p.max:g}"' if p.max is not None else ""),
@@ -665,7 +670,8 @@ class NeuerRunPage:
                 default_word=word,
                 help_text=doc,
                 key=key,
-                on_change=lambda v, name=p.name: self._set_param(name, v or None),
+                on_change=lambda v, name=p.name: self._set_param(name, v or None, check=False),
+                on_commit=self._commit,
             )
 
     def _list_param(self, p: ParamInfo, values: list[Any]) -> None:
@@ -673,8 +679,8 @@ class NeuerRunPage:
         holder = ui.element("div").classes("field").props(f'id="f-params.{esc(p.name)}"')
         items = [str(v) for v in values] or [""]  # one empty entry: no click for the first
 
-        def update() -> None:
-            self._set_param(p.name, [v for v in items if v.strip()])
+        def update(check: bool = True) -> None:
+            self._set_param(p.name, [v for v in items if v.strip()], check=check)
 
         title, doc = param_text(p)
         code = f' <span class="opt mono">{esc(p.name)}</span>' if title != p.name else ""
@@ -696,9 +702,10 @@ class NeuerRunPage:
 
                             def changed(event: Any, i: int = index) -> None:
                                 items[i] = str(event.args)
-                                update()
+                                update(check=False)
 
                             box.on("input", changed, js_handler="(e) => emit(e.target.value)")
+                            box.on("change", lambda _e: self._commit(), js_handler="() => emit()")
                             button(
                                 "×",
                                 lambda i=index: remove(i),
@@ -743,7 +750,8 @@ class NeuerRunPage:
                         default=duration_text(base("wall_time_s", std.wall_time_s)),
                         default_word=word,
                         help_text=f"Standard {duration_text(std.wall_time_s)}",
-                        on_change=lambda v: self._set_limit("wall_time_s", v),
+                        on_change=lambda v: self._set_limit("wall_time_s", v, check=False),
+                        on_commit=lambda: self._commit("wall_time_s"),
                         width="110px",
                     )
                 with ui.element("div"):
@@ -756,7 +764,8 @@ class NeuerRunPage:
                         default=str(base("turns_per_agent", std.turns_per_agent)),
                         default_word=word,
                         help_text=f"Standard {std.turns_per_agent}",
-                        on_change=lambda v: self._set_limit("turns_per_agent", v),
+                        on_change=lambda v: self._set_limit("turns_per_agent", v, check=False),
+                        on_commit=lambda: self._commit("turns_per_agent"),
                         width="110px",
                         attrs='min="1" max="500"',
                     )
@@ -770,7 +779,8 @@ class NeuerRunPage:
                         default_word=word,
                         help_text="Gilt auch bei Abo-Profilen über den rechnerischen Preis (≈). "
                         "Codex-Agenten ohne Kostenangabe begrenzen Turns und Laufzeit.",
-                        on_change=lambda v: self._set_limit("budget_usd", v),
+                        on_change=lambda v: self._set_limit("budget_usd", v, check=False),
+                        on_commit=lambda: self._commit("budget_usd"),
                         width="110px",
                     )
                 with ui.element("div"):
@@ -996,24 +1006,41 @@ class NeuerRunPage:
 
     # --- changes and checks ---------------------------------------------------------------------
 
-    def _set(self, key: str, value: Any) -> None:
+    def _set(self, key: str, value: Any, *, check: bool = True) -> None:
         self.input[key] = value
-        self._schedule()
+        self._changed(check)
 
-    def _set_param(self, name: str, value: Any) -> None:
+    def _set_param(self, name: str, value: Any, *, check: bool = True) -> None:
         self.input["params"][name] = value
-        self._schedule()
+        self._changed(check)
+
+    def _changed(self, check: bool) -> None:
+        """A choice is checked at once (debounced); typed text only when you leave the field
+        or start (U1): until then „Run starten“ stays clickable and checks first."""
+        if check:
+            self._schedule()
+            return
+        self._unchecked = True
+        if not self._checking:
+            set_disabled(self.start_button, False)
+
+    def _commit(self, limit: str | None = None) -> None:
+        """You left a changed text field (or reset it): check now."""
+        if limit is not None:
+            self._show_error(self.fields[limit], self._limit_input_error(limit))
+        self._schedule(now=True)
 
     def _set_agent(self, agent_id: str, key: str, value: Any) -> None:
         self.input["agents"].setdefault(agent_id, {})[key] = value
         self._schedule(now=key != "web")
 
-    def _set_limit(self, key: str, text: str) -> None:
+    def _set_limit(self, key: str, text: str, *, check: bool = True) -> None:
         value = _limit_value(key, text)
-        self._show_error(self.fields[key], self._limit_input_error(key))
+        if check:
+            self._show_error(self.fields[key], self._limit_input_error(key))
         if value:
             self.input["limits"][key] = value
-        self._schedule()
+        self._changed(check)
 
     def _limits_invalid(self) -> bool:
         """A limit field holds no valid value: the check saw its last good one, so this is
@@ -1069,6 +1096,7 @@ class NeuerRunPage:
 
     async def _check(self) -> None:
         self._timer = None
+        self._unchecked = False
         if self.input["skill"] is None:
             self._render_no_skill()
             return
@@ -1118,6 +1146,8 @@ class NeuerRunPage:
             '<b>Noch offen (1)</b><small><a class="jump todo" href="#s1" data-jump="s1">Wähle '
             "einen Skill oder „Ohne Skill“.</a></small></span></div>"
         )
+        for key in LIMIT_KEYS:  # the limit inputs need no skill to be checked
+            self._show_error(self.fields[key], self._limit_input_error(key))
         rows = [("Projekt", self.input["project"]), ("Skill", "noch nicht gewählt")]
         body = "".join(f"<dt>{esc(k)}</dt><dd>{esc(v)}</dd>" for k, v in rows)
         self.summary_box.set_content(f'<dl class="kv">{body}</dl>')
@@ -1402,14 +1432,15 @@ class NeuerRunPage:
                 f'<span class="txt small">{esc(word)}</span></div>'
             )
         self.checks_box.set_content("".join(lines))
-        set_disabled(self.start_button, bool(errors) or self._limits_invalid())
+        blocked = bool(errors) or self._limits_invalid()
+        set_disabled(self.start_button, blocked and not self._unchecked)
 
     # --- start ---------------------------------------------------------------------------------
 
     async def _start(self) -> None:
         self.tried_start = True
-        if self._checking:
-            # leaving a field right before the click starts a check: run it now
+        if self._checking or self._unchecked:
+            # typed text, or leaving a field right before the click: check it now (U1)
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None

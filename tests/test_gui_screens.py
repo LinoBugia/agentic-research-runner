@@ -142,18 +142,19 @@ async def test_new_run_checks_budget_and_starts(api: MockApi) -> None:
         await see(user, "1 · Projekt und Skill")
         html = await see(user, "Die Aufgabe fehlt.")
         assert "Rollen und Skills gefunden" in html
-        user.find(marker="field-task_md").trigger("input", "# Aufgabe\n\nZwei Ideen prüfen.")
+        type_and_leave(user, "field-task_md", "# Aufgabe\n\nZwei Ideen prüfen.")
+        await see(user, "Profile getestet")
         user.find(marker="field-limits.budget_usd").trigger("input", "10 $")
         await asyncio.sleep(0.7)
-        html = await see(user, "Zu knapp: Die Schätzung liegt bei ≈ 9–16 $.")
-        assert "Noch offen (1)" in html  # the budget field was not left yet
+        assert "Zu knapp" not in page_html(user)  # U1: typing alone checks nothing
+        user.find(marker="field-limits.budget_usd").trigger("change", "10 $")
         user.find(marker="field-limits.budget_usd").trigger("blur")
         html = await see(user, "1 Problem")
+        assert "Zu knapp: Die Schätzung liegt bei ≈ 9–16 $." in html
         assert "nimm weniger Turns pro Idee" in html
         assert invalid_fields(user) == ["f-limits.budget_usd"]
         assert (await api.list_runs()).total == 31
-        user.find(marker="field-params.turns_per_idea").trigger("input", "3")
-        await asyncio.sleep(0.7)
+        type_and_leave(user, "field-params.turns_per_idea", "3")
         await see(user, "Profile getestet")
         html = page_html(user)
         assert "Zu knapp" not in html
@@ -167,6 +168,14 @@ async def test_new_run_checks_budget_and_starts(api: MockApi) -> None:
         new = next(r for r in page.items if r.starter.value == "gui" and r.created_at > 1.7e9)
         assert new.project == "collatz" and new.skill == "exploration"
         assert new.limits.budget_usd == 10
+
+
+def type_and_leave(user: User, marker: str, text: str) -> None:
+    """Type `text` into a field and leave it, in the order of a browser: input, change, blur."""
+    field = user.find(marker=marker)
+    field.trigger("input", text)
+    field.trigger("change", text)
+    field.trigger("blur", False)
 
 
 def invalid_fields(user: User) -> list[str]:
@@ -194,13 +203,126 @@ async def test_fresh_new_run_form_has_no_red_field(api: MockApi) -> None:
         user.find(marker="field-task_md").trigger("input", "# Aufgabe\n\n")
         await asyncio.sleep(0.7)
         assert invalid_fields(user) == []  # typing alone does not make it red
+        user.find(marker="field-task_md").trigger("change", "# Aufgabe\n\n")
         user.find(marker="field-task_md").trigger("blur", True)  # typed, then left: touched
         await see(user, "1 Problem")
         assert invalid_fields(user) == ["f-task_md"]
-        user.find(marker="field-task_md").trigger("input", "# Aufgabe\n\nZwei Ideen prüfen.")
-        await asyncio.sleep(0.7)
+        type_and_leave(user, "field-task_md", "# Aufgabe\n\nZwei Ideen prüfen.")
         await see(user, "Profile getestet")
         assert invalid_fields(user) == []
+
+
+LONG_TASK = "# Aufgabe\n\n" + "".join(
+    f"Schritt {n}: Prüfe die Collatz-Folge ab {n * 37} bis zur ersten 1 – σ(n) ≤ 2n?\n"
+    for n in range(1, 31)
+)
+
+
+def _count_resolves(api: MockApi) -> list[dict]:
+    """Inputs of every `resolve_run` the page sends (one per check)."""
+    calls: list[dict] = []
+    resolve = api.resolve_run
+
+    async def counted(run_input: dict) -> object:
+        calls.append(run_input)
+        return await resolve(run_input)
+
+    api.resolve_run = counted  # type: ignore[method-assign]
+    return calls
+
+
+def _count_updates(user: User, marker: str) -> tuple[Element, list[int]]:
+    """The field's element and a list that grows on every update sent to the browser."""
+    [element] = user.find(marker=marker).elements
+    sent: list[int] = []
+    update = element.update
+
+    def counted() -> None:
+        sent.append(1)
+        update()
+
+    element.update = counted  # type: ignore[method-assign]
+    return element, sent
+
+
+async def test_w3_08_u1_fast_typing_lands_whole_and_is_checked_on_leaving(api: MockApi) -> None:
+    """U1: every keystroke only stores the text; nothing goes back to the textarea (an echo
+    would arrive late and set an older text) and nothing is checked. Leaving the field checks
+    once, with the whole text in order."""
+    calls = _count_resolves(api)
+    async with gui_user(api) as user:
+        await user.open("/neuer-run?skill=exploration&projekt=collatz")
+        await see(user, "Die Aufgabe fehlt.")
+        before = len(calls)
+        area, sent = _count_updates(user, "field-task_md")
+        field = user.find(marker="field-task_md")
+        for end in range(1, len(LONG_TASK) + 1):  # one input event per keystroke, as a browser
+            field.trigger("input", LONG_TASK[:end])
+        await asyncio.sleep(0.8)  # longer than the old debounce
+        assert len(LONG_TASK) > 1500
+        assert sent == [], "no echo of the typed text to the browser"
+        assert len(calls) == before, "typing alone checks nothing"
+        assert area.props["value"] == LONG_TASK
+        assert "Die Aufgabe fehlt." in page_html(user)  # the last check still stands
+        assert "disabled" not in user.find(marker="start-run").elements.pop().props
+        field.trigger("change", LONG_TASK)
+        field.trigger("blur", False)
+        await see(user, "Profile getestet")
+        assert "Die Aufgabe fehlt." not in page_html(user)
+        assert len(calls) == before + 1 and calls[-1]["task_md"] == LONG_TASK
+        assert sent == []
+
+
+async def test_w3_08_u1_start_checks_typed_text_first(api: MockApi) -> None:
+    """U1: typed, never left, „Run starten“ at once: the start checks and then starts; with an
+    error it shows it at the field and starts nothing."""
+    calls = _count_resolves(api)
+    async with gui_user(api) as user:
+        await user.open("/neuer-run?skill=exploration&projekt=collatz")
+        await see(user, "Die Aufgabe fehlt.")
+        user.find(marker="field-limits.budget_usd").trigger("input", "10 $")
+        user.find(marker="field-task_md").trigger("input", "# Aufgabe\n\nZwei Ideen prüfen.")
+        before = len(calls)
+        user.find(marker="start-run").click()
+        html = await see(user, "1 Problem")
+        assert "Zu knapp" in html and invalid_fields(user) == ["f-limits.budget_usd"]
+        assert len(calls) == before + 1 and (await api.list_runs()).total == 31
+        user.find(marker="field-limits.budget_usd").trigger("input", "20 $")
+        user.find(marker="start-run").click()
+        for _ in range(40):
+            if (await api.list_runs()).total == 32:
+                break
+            await asyncio.sleep(0.05)
+        assert (await api.list_runs()).total == 32
+        assert calls[-1]["task_md"] == "# Aufgabe\n\nZwei Ideen prüfen."
+
+
+async def test_w3_08_u1_reset_and_choices_still_check(api: MockApi) -> None:
+    """A choice (decider) and „zurücksetzen“ of a typed field check without leaving a field."""
+    calls = _count_resolves(api)
+    async with gui_user(api) as user:
+        await user.open("/neuer-run?skill=exploration&projekt=collatz")
+        await see(user, "Die Aufgabe fehlt.")
+        type_and_leave(user, "field-limits.budget_usd", "10 $")
+        await see(user, "Zu knapp")
+        count = len(calls)
+        with user.client:
+            [reset] = [
+                node
+                for node in _walk(user.client.layout)
+                if str(node.props.get("title", "")).startswith("Zurücksetzen auf")
+            ]
+        reset.mark("reset-budget")
+        user.find(marker="reset-budget").click()
+        for _ in range(40):
+            if len(calls) > count and "Zu knapp" not in page_html(user):
+                break
+            await asyncio.sleep(0.05)
+        assert len(calls) > count and "Zu knapp" not in page_html(user)
+        count = len(calls)
+        user.find(marker="field-decider").trigger("change", "user")
+        await asyncio.sleep(0.8)
+        assert len(calls) > count
 
 
 async def test_new_run_parameters_have_german_labels(api: MockApi) -> None:

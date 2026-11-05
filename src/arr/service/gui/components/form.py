@@ -2,8 +2,9 @@
 
 Label, optional mark, native input, help text, change mark „● geändert (Standard 6) ·
 zurücksetzen“, error text, locked state with a reason. Help and error are linked with
-`aria-describedby`. Values reach Python as strings on every input (pages debounce their
-checks, §5.4 „entprellt 500 ms“) and on leaving the field. A field counts as `touched` once
+`aria-describedby`. Values reach Python as strings on every input and on leaving the field;
+`on_commit` tells a page that a value is final (you left the changed field, or „zurücksetzen“),
+so it can check then instead of on every keystroke (W3-08 U1). A field counts as `touched` once
 you left it (K7 „Prüfung beim Verlassen“); pages show its error from then on. A field the
 page focused by itself (deep link, marked `data-auto-focus`) is not touched by leaving it,
 only after you typed in it or put the focus there yourself.
@@ -23,21 +24,23 @@ ChangeHandler = Callable[[str], Any]
 
 
 def _on_value(element: ui.element, handler: ChangeHandler, *, checkbox: bool = False) -> None:
-    """Call `handler(value)` on input and change; keep the element's `value` prop in sync, so a
-    later reset from Python reaches the browser."""
+    """Call `handler(value)` on input and change; keep the element's `value` prop in sync
+    without sending it back: an echo of each keystroke would reach the browser late and set the
+    field to an older text while you type on (W3-08 U1). Python sets values with `props()`."""
     prop = "checked" if checkbox else "value"
     js = "(e) => emit(e.target.checked)" if checkbox else "(e) => emit(e.target.value)"
 
     def handle(event: Any) -> Any:
         value = event.args
-        if checkbox:
-            if value:
-                element._props["checked"] = True
+        with element._props.suspend_updates():
+            if checkbox:
+                if value:
+                    element._props["checked"] = True
+                else:
+                    element._props.pop("checked", None)
+                value = "true" if value else ""
             else:
-                element._props.pop("checked", None)
-            value = "true" if value else ""
-        else:
-            element._props[prop] = value
+                element._props[prop] = value
         return handler(str(value))
 
     for kind in ("change",) if checkbox else ("input", "change"):
@@ -85,6 +88,7 @@ class Field:
         attrs: str = "",
         key: str | None = None,
         on_leave: Callable[[], Any] | None = None,
+        on_commit: Callable[[], Any] | None = None,
     ) -> None:
         self.name = name
         self.value = value
@@ -95,6 +99,7 @@ class Field:
         self.default_word = default_word
         self._on_change = on_change
         self._on_leave = on_leave
+        self._on_commit = on_commit
         uid = next(_ids)
         self.input_id = f"in-{name}-{uid}".replace(".", "-")
         help_id = f"{self.input_id}-help"
@@ -134,6 +139,8 @@ class Field:
                 self.input.props('disabled aria-disabled="true"')
             _on_value(self.input, self._changed)
             self.input.on("blur", self._left, js_handler=_BLUR_JS)
+            if on_commit is not None:
+                self.input.on("change", lambda _e: on_commit(), js_handler="() => emit()")
             self.error = raw("", tag="span", classes="error").props(
                 f'id="{error_id}" aria-live="polite"'
             )
@@ -167,6 +174,8 @@ class Field:
         self._render_mark()
         if self._on_change is not None:
             self._on_change(value)
+        if self._on_commit is not None:
+            self._on_commit()
 
     def set_help(self, help_text: str) -> None:
         """Replace the help text (e.g. a hint that depends on another choice)."""
