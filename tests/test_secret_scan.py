@@ -245,3 +245,52 @@ def test_w3_00_missing_or_absent_run_venv_scans_the_run_folder_only(
     assert scan_run_dir(run, {"Profil „max“": VALUE}).files == 2
     _meta(run, None)
     assert scan_run_dir(run, {"Profil „max“": VALUE}).files == 2
+
+
+CODE_LINES = (
+    "ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)",
+    "    key=lambda n: steps[n],",
+    "best = max(pairs, key=itemgetter(1))",
+    "top = sorted(counts, key=counts.get)",
+    "order = sorted(words, key=str.lower)[:10]",
+    "token = make(token=os.environ['X'])",
+    '{"input": {"command": "python -c \\"print(sorted(x, key=lambda t: -t))\\""}}',
+    "allow: python3 collatz.py # key=«entfernt»",
+    '{"command": "sort key=\\u00abentfernt\\u00bb"}',
+)
+"""Python code from the UX acceptance 3 runs (U2) and redacted values: no secret."""
+
+SECRET_LINES = (
+    "export API_KEY=abc123def456ghi",
+    "API_KEY=sk_live_planted",
+    'token="planted-value-9f8e7d6c"',
+    "PASSWORD='hunter2hunter2'",
+    "curl -H x MY_SECRET=plain",
+    "GITHUB_TOKEN=Ab12Cd34Ef56Gh78Ij90)",
+)
+"""Real assignments of secrets: still hits."""
+
+
+def test_w3_08_u2_python_code_is_no_env_assignment_but_real_secrets_are(tmp_path: Path) -> None:
+    from arr.permissions.policy import _SECRET_ASSIGN_RE
+
+    for line in CODE_LINES[:6]:
+        assert _SECRET_ASSIGN_RE.search(line), f"counter-check: the old rule flags {line!r}"
+    run = _run_dir(tmp_path)
+    _write(run / "agents/a/work/code.py", "\n".join(CODE_LINES) + "\n")
+    _write(run / "approvals.jsonl", json.dumps({"command": "sort key=«entfernt»"}) + "\n")
+    assert scan_run_dir(run).clean
+
+    _write(run / "agents/a/work/env.sh", "\n".join(SECRET_LINES) + "\n")
+    report = scan_run_dir(run)
+    found = {(f.file, f.line) for f in report.findings if f.kind == "env_assignment"}
+    assert found == {("agents/a/work/env.sh", n) for n in range(1, len(SECRET_LINES) + 1)}
+    text = format_report(report) + json.dumps(report.to_data())
+    for secret in ("abc123def456ghi", "planted-value", "hunter2", "Ab12Cd34"):
+        assert secret not in text
+
+
+def test_w3_08_u2_a_secret_after_code_on_the_same_line_is_found(tmp_path: Path) -> None:
+    run = _run_dir(tmp_path)
+    _write(run / "x.sh", "sorted(a, key=len); export API_TOKEN=planted123planted\n")
+    assert [(f.file, f.kind) for f in scan_run_dir(run).findings] == [("x.sh", "env_assignment")]

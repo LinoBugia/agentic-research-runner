@@ -35,6 +35,7 @@ from arr.permissions.policy import (
     _SECRET_FLAG_RE,
     _SECRET_PATTERNS,
     _URL_CREDS_RE,
+    REDACTED,
 )
 from arr.runs.orchestrator import OrchestratorLog
 from arr.runs.prepare import run_venv_location
@@ -82,12 +83,45 @@ PATTERN_KINDS = (
 )
 """Names of `policy._SECRET_PATTERNS` in their order; „muster“ if the tuple changes shape."""
 
-_NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+_CODE_VALUE_RE = re.compile(r"lambda\b|([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)[(),\[\]}]")
+"""Start of a value that is Python code, not a literal: `key=lambda …`, `key=itemgetter(1)`,
+`key=counts.get)`, `token=os.environ["X"]` (W3-08 U2)."""
+
+_RANDOM_SEGMENT_RE = re.compile(r"(?=[^.]*\d)(?=[^.]*[A-Z])[A-Za-z0-9_]{16,}")
+"""A name segment with digits and capitals of 16+ characters looks like a token, not code."""
+
+_PLACEHOLDERS = (REDACTED, json.dumps(REDACTED).strip('"'))
+"""`policy.redact`'s placeholder, raw and JSON-escaped: an already removed value."""
+
+
+class _SecretAssignment:
+    """`env_assignment`: `_SECRET_ASSIGN_RE` without Python code and redacted values (U2).
+
+    `sorted(…, key=lambda …)`, `key=itemgetter(1)` or `key=counts.get)` name a function, not a
+    secret; `key=«entfernt»` in `approvals.jsonl` was redacted before. A quoted value, a bare
+    word (`API_KEY=abc123`) and a token-like name (`TOKEN=Ab1…)`) stay hits.
+    """
+
+    def search(self, line: str) -> bool:
+        return any(_is_secret_value(m.group(2)) for m in _SECRET_ASSIGN_RE.finditer(line))
+
+
+def _is_secret_value(value: str) -> bool:
+    if value.startswith(_PLACEHOLDERS):
+        return False
+    code = _CODE_VALUE_RE.match(value)
+    if code is None:
+        return True
+    name = code.group(1)
+    return name is not None and bool(_RANDOM_SEGMENT_RE.search(name))
+
+
+_NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str] | _SecretAssignment], ...] = (
     tuple(zip(PATTERN_KINDS, _SECRET_PATTERNS, strict=True))
     if len(PATTERN_KINDS) == len(_SECRET_PATTERNS)
     else tuple(("muster", pattern) for pattern in _SECRET_PATTERNS)
 ) + (
-    ("env_assignment", _SECRET_ASSIGN_RE),
+    ("env_assignment", _SecretAssignment()),
     ("cli_flag", _SECRET_FLAG_RE),
     ("auth_header", _AUTH_HEADER_RE),
     ("url_credentials", _URL_CREDS_RE),
