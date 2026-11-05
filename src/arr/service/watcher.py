@@ -64,6 +64,15 @@ INTERVAL_S = 0.25
 FULL_EVERY_S = 5.0
 TICK_EVERY_S = 1.0
 WARN_RATIO = 0.8
+_AGENT_KINDS = frozenset(
+    {"turn", "turn_end", "rate_limit", "wake", "hint", "waiting", "agent_done", "turn_silent"}
+)
+"""Log kinds that change an agent card (docs/09 §4.6: waits, done, silent turns)."""
+_RUN_KINDS = frozenset(
+    {"limit", "stop", "pause", "resume", "error", "round", "discussion_start", "discussion_end"}
+    | {"secret_scan"}
+)
+"""Log kinds that change the head of the run detail or the run in lists."""
 APPROVAL_EVENTS = {
     "open": "approval.created",
     "decision": "approval.updated",
@@ -165,7 +174,8 @@ class RunWatcher:
             if previous is not None:
                 counts_dirty = True
                 seen.status = record.status
-            seen.active = record.status.is_active
+            # a finished run is followed until it settles: the secret scan comes after it (U3)
+            seen.active = record.status.is_active or not record.settled
             counts_dirty = counts_dirty or seen.counts_dirty
             seen.counts_dirty = False
         if counts_dirty:
@@ -232,13 +242,18 @@ class RunWatcher:
                     if stage.key == data.get("stage"):
                         self._emit(StageCheckpointEvent, run_id=record.run_id, stage=stage)
                 run_dirty = True
-            elif kind in ("turn", "turn_end", "rate_limit", "wake", "hint"):
+            elif kind in _AGENT_KINDS:
                 agent = data.get("agent")
                 if isinstance(agent, str):
                     agents_dirty.add(agent)
                 if kind == "turn_end":
                     run_dirty = True
-            elif kind in ("limit", "stop", "pause", "resume", "error"):
+                if kind == "waiting" and data.get("channel"):
+                    run_dirty = True  # the state of the discussion in the head (docs/09 §4.6)
+                    channels = {c.name: c for c in resolved.groupchats} if resolved else {}
+                    if data["channel"] in channels:  # idle members show the next round
+                        agents_dirty.update(channels[data["channel"]].members)
+            elif kind in _RUN_KINDS:
                 run_dirty = True
 
         # approvals.jsonl

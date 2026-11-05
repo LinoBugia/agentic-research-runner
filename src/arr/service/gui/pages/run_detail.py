@@ -93,6 +93,10 @@ _SENTENCE_END = re.compile(r"(?<=[^\d])\. ")
 View = ChannelView | TranscriptView | ResultsView | LogView
 
 
+SCAN_SHOWN = 5
+"""Hits of the secret scan named in the head; the rest is counted."""
+
+
 def _icon_button(symbol: str, label: str, handler: Any, *, classes: str = "btn") -> ui.element:
     element = ui.element("button").classes(classes).props('type="button"')
     with element:
@@ -249,10 +253,17 @@ class RunDetailPage:
         else:
             since = fmt.when(run.started_at or run.created_at, self.api.now())
             when = f"seit {since.removeprefix('heute ')}, {starter}"
-        self.meta.set_content(f"{esc(run.project)} · {esc(run.skill or 'frei')} · {esc(when)}")
+        scan = ""
+        if run.secret_scan is not None and run.secret_scan.clean:
+            scan = ' · <span class="scan-ok" data-mark="scan">Secret-Scan sauber</span>'
+        self.meta.set_content(
+            f"{esc(run.project)} · {esc(run.skill or 'frei')} · {esc(when)}{scan}"
+        )
         self._render_actions()
         self._render_attention()
-        self.stagebar.set_content(stage_bar_html(self.detail.stages, run.topology))
+        self.stagebar.set_content(
+            stage_bar_html(self.detail.stages, run.topology, self.detail.discussion, self.api.now())
+        )
         self._render_meters()
 
     def _render_meters(self) -> None:
@@ -349,9 +360,23 @@ class RunDetailPage:
         title = title if title.endswith((".", "!", "?")) else f"{title}."
         return banner_html("err", title, f" {rest}" if rest else "", actions, small=True)
 
+    def _scan_html(self) -> str:
+        """U3: a scan with hits names file, line and kind of each, never the value."""
+        scan = self.detail.run.secret_scan
+        if scan is None or scan.clean:
+            return ""
+        n = len(scan.findings)
+        shown = [f"{f.file} Zeile {f.line} ({f.kind})" for f in scan.findings[:SCAN_SHOWN]]
+        more = f" und {n - SCAN_SHOWN} weitere" if n > SCAN_SHOWN else ""
+        body = (
+            f" {'; '.join(shown)}{more}. Der Wert wird nie angezeigt: Prüfe die Stellen im "
+            "Run-Ordner, bevor du Ergebnisse weitergibst."
+        )
+        return banner_html("warn", f"Secret-Scan: {n} Treffer.", body, small=True)
+
     def _render_attention(self) -> None:
         """Banner „Wartet auf dich“ (at every width) and the hint „Fragen an dich“ (K13, K15)."""
-        failure = self._run_error_html()
+        failure = self._run_error_html() + self._scan_html()
         top = self.detail.open_approvals_top
         questions = self.detail.questions_to_user
         first_q = next((m for m in self.questions.values() if "user" in m.to), None)

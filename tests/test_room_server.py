@@ -25,6 +25,8 @@ AGENT_TOOLS = {
     "submit_result",
     "submit_rating",
     "get_assignment",
+    "wait_for_messages",
+    "wait_until",
 }
 MODERATOR_TOOLS = {"give_floor", "call_vote", "pin", "close_discussion"}
 FOOTER = re.compile(r"\n\n---\nungelesen: (nichts|.+)$")

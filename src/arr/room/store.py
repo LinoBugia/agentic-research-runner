@@ -42,6 +42,7 @@ from arr.models import (
     Rubric,
 )
 from arr.resolve import load_yaml_model
+from arr.room.address import address, mentions
 from arr.room.types import (
     AgentStatusRecord,
     Assignment,
@@ -60,6 +61,8 @@ from arr.room.types import (
     Vote,
     VoteChoice,
     VoteRule,
+    WaitKind,
+    WaitState,
 )
 from arr.runs.prepare import load_agent_file
 
@@ -79,6 +82,9 @@ _COPY_CHUNK = 1024 * 1024
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK  # NONBLOCK: a FIFO must not hang
 AGENT_STATUSES = (AgentStatus.WORKING, AgentStatus.DONE)
+WAIT_UNTIL_MAX_MIN = 30.0
+"""`wait_until` waits at most this long (docs/09 §4.3); the orchestrator also caps it at the
+wall time of the run."""
 """Statuses an agent may set itself; `idle` and `blocked` are set by the orchestrator."""
 
 SCHEMA = """
@@ -108,29 +114,39 @@ CREATE TABLE IF NOT EXISTS poll(proposal_id INTEGER PRIMARY KEY, channel TEXT, r
     called_by TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS floor(id INTEGER PRIMARY KEY, ts REAL, channel TEXT,
     moderator TEXT, agent TEXT, prompt TEXT, msg_id INTEGER, handled INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS agent_report(agent TEXT PRIMARY KEY, status TEXT, ts REAL);
+CREATE TABLE IF NOT EXISTS agent_wait(agent TEXT PRIMARY KEY, kind TEXT, since REAL,
+    until REAL, file TEXT);
 """
-"""Tables of docs/02 §5 plus `channel.state`, `msg.via`/`msg.delivery`, `poll` and `floor`."""
+"""Tables of docs/02 §5 plus `channel.state`, `msg.via`/`msg.delivery`, `poll`, `floor`,
+`agent_report` (the status an agent reported itself) and `agent_wait` (docs/09 §4.3).
+Rooms of runs before W3-07 lack the last two; readers treat that as „no rows“."""
 
 CONVERSATION_RULES = (
     "Eine Nachricht, ein Gedanke. Setze `kind` korrekt.",
     "Behauptungen mit Begründung oder Beleg: Datei, Rechnung, Anhang.",
     "Beantworte Fragen an dich zuerst.",
-    "Fragen an konkrete Mitglieder mit `to` stellen, nicht an alle.",
+    "Wer jemanden fragt, schreibt `@name` (oder `to`); `@alle` fragt alle. Auf eine Antwort "
+    "wartest du mit `wait_for_messages`.",
     "Widerspruch als `objection` mit `reply_to`, sachlich und konkret.",
     "Nicht wiederholen. Zustimmung nur, wenn sie etwas hinzufügt.",
     "Lange Inhalte (Beweise, Code, Tabellen) als Anhang, im Text nur die Kernaussage.",
-    "Melde `done` mit kurzem Fazit, wenn du nichts mehr beitragen kannst.",
+    "Wer fertig ist, gibt sein Ergebnis ab (`submit_result` oder Nachricht `result`) oder "
+    "meldet `done`. Danach weckt dich nur noch eine Frage an dich.",
 )
-"""Conversation rules of docs/06-gruppenchats.md §6, repeated in every channel brief."""
+"""Conversation rules of docs/06-gruppenchats.md §6 and docs/09 §4.7, in every channel brief."""
 
 _MODE_TEXT = {
     ChannelMode.ROUNDS: "Runden: Alle Mitglieder kommen pro Runde dran, sonst `pass`.",
-    ChannelMode.EVENT: "ereignisgesteuert: Wer adressiert wird oder gefragt ist, wird geweckt.",
+    ChannelMode.EVENT: "ereignisgesteuert: Wer mit `@name` angesprochen, gefragt oder mit "
+    "`reply_to` beantwortet wird, wird sofort geweckt. Runden gibt es nur, wenn niemand mehr "
+    "schreibt.",
     ChannelMode.MODERATED: "moderiert: Der Moderator erteilt das Wort und beendet die Diskussion.",
 }
 _END_TEXT = {
     ChannelMode.ROUNDS: "nach der letzten Runde oder wenn alle `pass`/`done` melden.",
-    ChannelMode.EVENT: "wenn es lange ruhig ist oder alle Mitglieder `done` melden.",
+    ChannelMode.EVENT: "wenn alle fertig sind (Ergebnis abgegeben oder `done`), nach den "
+    "Leerlauf-Runden oder wenn es lange ruhig ist.",
     ChannelMode.MODERATED: "wenn der Moderator die Diskussion mit einer Entscheidung beendet.",
 }
 
@@ -635,6 +651,9 @@ class RoomStore:
                     f"Kein Mitglied von #{channel}: {', '.join(unknown)}. "
                     f"Mitglieder: {', '.join(ch.members)}."
                 )
+            if sender == USER:  # `@name` of the user addresses like `to` (docs/09 §4.1)
+                named = mentions(body, ch.members, USER, lambda n: n if n in ch.members else None)
+                to = [*to, *named]
             if reply_to is not None:
                 self._check_reply_to(con, ch.name, reply_to, ArrError)
             msg_id = self._insert_msg(
@@ -805,6 +824,49 @@ class RoomStore:
             )
             for r in rows
         ]
+
+    def reports(self) -> dict[str, tuple[AgentStatus, float]]:
+        """Status each agent reported itself with `set_status`, with its time (docs/09 §4.2)."""
+        try:
+            with self._read() as con:
+                rows = con.execute("SELECT agent, status, ts FROM agent_report").fetchall()
+        except sqlite3.OperationalError:  # a room from before W3-07
+            return {}
+        return {r["agent"]: (AgentStatus(r["status"]), r["ts"]) for r in rows}
+
+    def waits(self) -> dict[str, WaitState]:
+        """Current waits of the agents (`wait_for_messages`, `wait_until`), by agent."""
+        try:
+            with self._read() as con:
+                rows = con.execute("SELECT * FROM agent_wait").fetchall()
+        except sqlite3.OperationalError:  # a room from before W3-07
+            return {}
+        return {
+            r["agent"]: WaitState(
+                agent=r["agent"],
+                kind=WaitKind(r["kind"]),
+                since=r["since"],
+                until=r["until"],
+                file=r["file"],
+            )
+            for r in rows
+        }
+
+    def clear_wait(self, agent: str, kind: WaitKind | None = None) -> None:
+        """End the wait of an agent (only one of `kind`, if given)."""
+        sql, args = "DELETE FROM agent_wait WHERE agent=?", [agent]
+        if kind is not None:
+            sql, args = sql + " AND kind=?", [*args, kind.value]
+        with self._write() as con:
+            con.execute(sql, args)
+
+    def open_questions_by(self, agent: str) -> list[Message]:
+        """Questions `agent` asked that are still open (no `answer` of the addressee yet)."""
+        with self._read() as con:
+            rows = con.execute(
+                "SELECT * FROM msg WHERE sender=? AND open=1 ORDER BY id", (agent,)
+            ).fetchall()
+        return [_row_to_message(r) for r in rows]
 
     def add_assignment(
         self,
@@ -1434,6 +1496,12 @@ class AgentRoom:
                         "Eine „decision“ dürfen nur der Moderator und der Orchestrator posten."
                     )
                 targets = self._targets(ch, to or [])
+                # `@name` in the text addresses like `to` (docs/09 §4.1)
+                targets = list(
+                    dict.fromkeys(
+                        [*targets, *mentions(body, ch.members, self.agent_id, ch.resolve)]
+                    )
+                )
                 if reply_to is not None:
                     self.store._check_reply_to(con, ch.name, reply_to, RoomError)
                 # Inside BEGIN IMMEDIATE nobody else inserts: max+1 is the next ID.
@@ -1555,6 +1623,114 @@ class AgentRoom:
             raise RoomError(f"Diesen Status setzt arr selbst. Du kannst melden: {allowed}.")
         with self.store._write() as con:
             self.store._set_state(con, self.agent_id, status, note)
+            con.execute(
+                "INSERT INTO agent_report(agent, status, ts) VALUES(?,?,?) "
+                "ON CONFLICT(agent) DO UPDATE SET status=excluded.status, ts=excluded.ts",
+                (self.agent_id, status.value, _now()),
+            )
+
+    # ----------------------------------------------------------------------------------------
+    # Waiting (docs/09 §4.3)
+    # ----------------------------------------------------------------------------------------
+
+    def until_file_exists(self, rel: str) -> bool:
+        """True if `rel` exists below the working folder; only the existence is checked.
+
+        `rel` must be relative and stay inside (no `/…`, no `..`). Every folder on the way is
+        opened with `O_NOFOLLOW` and the last part is looked at with `lstat`: a link anywhere
+        raises `RoomError`, so the check never leaves the working folder. Nothing is read,
+        nothing is started (SECURITY.md principle 3).
+        """
+        parts = self._source_parts(rel)
+        dir_fd = self._open_work_dir()
+        try:
+            for i, part in enumerate(parts):
+                try:
+                    info = os.stat(part, dir_fd=dir_fd, follow_symlinks=False)
+                except (FileNotFoundError, NotADirectoryError):
+                    return False
+                except OSError as exc:
+                    raise self._errno_message(rel, exc.errno) from None
+                if stat.S_ISLNK(info.st_mode):
+                    raise RoomError(
+                        f"„{rel}“ führt über den Verweis (Symlink) „{'/'.join(parts[: i + 1])}“. "
+                        "Warte nur auf Dateien in deinem Arbeitsordner."
+                    )
+                if i == len(parts) - 1:
+                    return True
+                if not stat.S_ISDIR(info.st_mode):
+                    return False
+                try:
+                    next_fd = os.open(part, _DIR_FLAGS, dir_fd=dir_fd)
+                except OSError:
+                    return False  # replaced meanwhile: not there (yet)
+                os.close(dir_fd)
+                dir_fd = next_fd
+            return False
+        finally:
+            os.close(dir_fd)
+
+    def _check_until_file(self, until_file: str | None) -> str | None:
+        if until_file is None or not until_file.strip():
+            return None
+        self.until_file_exists(until_file)  # rejects absolute paths, `..` and links
+        return until_file
+
+    def begin_wait(
+        self, kind: WaitKind, seconds: float, until_file: str | None = None
+    ) -> WaitState:
+        """Record that this agent waits from now for `seconds` (and maybe `until_file`)."""
+        until_file = self._check_until_file(until_file)
+        now = _now()
+        state = WaitState(
+            agent=self.agent_id, kind=kind, since=now, until=now + seconds, file=until_file
+        )
+        with self.store._write() as con:
+            con.execute(
+                "INSERT INTO agent_wait(agent, kind, since, until, file) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(agent) DO UPDATE SET kind=excluded.kind, since=excluded.since, "
+                "until=excluded.until, file=excluded.file",
+                (self.agent_id, kind.value, state.since, state.until, state.file),
+            )
+        return state
+
+    def end_wait(self, kind: WaitKind = WaitKind.MESSAGES) -> None:
+        """End this agent's wait of `kind`."""
+        self.store.clear_wait(self.agent_id, kind)
+
+    def wait_until(self, minutes: float, until_file: str | None = None) -> WaitState:
+        """Ask to be woken after `minutes` (at most 30), on a message or when `until_file` is
+        there; the agent ends its turn afterwards (docs/09 §4.3)."""
+        if not isinstance(minutes, int | float) or not math.isfinite(minutes) or minutes <= 0:
+            raise RoomError("„minutes“ muss eine Zahl größer als 0 sein, z. B. 10.")
+        minutes = min(float(minutes), WAIT_UNTIL_MAX_MIN)
+        return self.begin_wait(WaitKind.UNTIL, minutes * 60, until_file)
+
+    def messages_for_me(self) -> list[Message]:
+        """Unread messages in my readable channels that concern me (`address`).
+
+        Unread, not „new since the call“: an answer that came before `wait_for_messages`
+        was called must end the wait at once.
+        """
+        with self.store._read() as con:
+            found = []
+            for ch in self._readable(con):
+                found += [
+                    _row_to_message(r)
+                    for r in con.execute(
+                        "SELECT * FROM msg WHERE channel=? AND id>? AND sender!=? ORDER BY id",
+                        (ch.name, self._cursor(con, ch.name), self.agent_id),
+                    )
+                ]
+            senders: dict[int, str] = {}
+
+            def sender_of(msg_id: int) -> str | None:
+                if msg_id not in senders:
+                    row = con.execute("SELECT sender FROM msg WHERE id=?", (msg_id,)).fetchone()
+                    senders[msg_id] = row["sender"] if row else ""
+                return senders[msg_id] or None
+
+            return [m for m in found if address(m, self.agent_id, sender_of) is not None]
 
     def submit_result(
         self,

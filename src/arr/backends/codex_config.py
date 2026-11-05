@@ -47,8 +47,9 @@ from typing import Any
 
 from arr.backends.process_path import no_git_folder, outside_path, within
 from arr.errors import ArrError
-from arr.models import AuthKind, AuthProfile, RunVenvMode
+from arr.models import AuthKind, AuthProfile, Provider, RunVenvMode
 from arr.permissions.policy import CODEX_READ_ONLY_NAMES, RunPaths, SandboxProfile
+from arr.room.waiting import WAIT_MAX_ENV, WAIT_MAX_S
 from arr.runs.prepare import PreparedAgent
 from arr.settings import app_dir
 from arr.venvs import glob_safe_name, venv_root
@@ -532,7 +533,12 @@ def build_launch(
     room = {
         "command": sys.executable,
         "args": [*ROOM_SERVER_ARGS],
-        "env": {"AGENT_ID": agent.id, "RUN_DIR": str(agent.run_dir), "PATH": env["PATH"]},
+        "env": {
+            "AGENT_ID": agent.id,
+            "RUN_DIR": str(agent.run_dir),
+            "PATH": env["PATH"],
+            WAIT_MAX_ENV: f"{WAIT_MAX_S[Provider.CODEX]:g}",
+        },
         "default_tools_approval_mode": "approve",
     }
     servers: dict[str, Any] = {

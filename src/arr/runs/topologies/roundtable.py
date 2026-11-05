@@ -1,7 +1,8 @@
 """Topology `roundtable`: the agents discuss the task in a shared group chat.
 
 One discussion phase `diskussion` via `ctx.discuss` with the pacing of the channel: in `rounds`
-mode up to `rounds` rounds, in `event` mode from a kick-off until all are `done` or it is quiet.
+mode up to `rounds` rounds, in `event` mode from a kick-off until all are `done`, after at
+most `rounds` idle rounds, or when it is quiet (docs/09 §4.4).
 It also ends when all members are `done` or on a stop. Then, optionally, the `summarizer`
 gets one turn and submits a summary with `submit_result(kind="summary")`.
 See docs/03-skills-und-research-groups.md §4.2 and docs/06-gruppenchats.md §5.
@@ -18,6 +19,14 @@ STAGE = "diskussion"
 SUMMARY_STAGE = "zusammenfassung"
 SUMMARY_KIND = "summary"
 ROUNDS = 3
+
+_PACING_TEXT = {
+    ChannelMode.ROUNDS: "Es gibt {rounds} Runden. Hast du in einer Runde nichts beizutragen, "
+    "poste `pass`.",
+    ChannelMode.EVENT: "Wer angesprochen wird, kommt sofort dran. Runden gibt es nur, wenn "
+    "niemand mehr schreibt, höchstens {rounds}.",
+}
+"""What the prompt says about the pacing: `pass` only means something in `rounds` (docs/09 §4.7)."""
 
 
 def _channel_name(resolved: ResolvedRun) -> str | None:
@@ -91,9 +100,11 @@ async def run(ctx: RunContext) -> None:
     context = {"task": task, "channel": channel}
     prompt = (
         f"## Aufgabe\n\n{task}\n\nBearbeitet die Aufgabe gemeinsam in #{channel}. Lies die neuen "
-        "Nachrichten, arbeite weiter und poste deinen Beitrag. Hast du gerade nichts "
-        "beizutragen, poste `pass`. Bist du fertig, melde `done` mit set_status und einem "
-        "kurzen Fazit."
+        "Nachrichten, arbeite weiter und poste deinen Beitrag. "
+        + _PACING_TEXT[ctx.config.channel(channel).mode].format(rounds=rounds)
+        + " Wen du fragst, nennst du mit `@name`; auf eine Antwort wartest du mit "
+        "`wait_for_messages`. Bist du fertig, gib dein Ergebnis ab oder melde `done` mit "
+        "set_status und einem kurzen Fazit."
     )
     await ctx.discuss(channel, prompt, stage=STAGE, rounds=rounds, context=context)
     if ctx.stop_requested or not summarizer:

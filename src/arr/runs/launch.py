@@ -793,6 +793,61 @@ def _clock(ts: Any) -> str:
         return "–"
 
 
+WAKE_TEXT = {
+    "question": "Frage an ihn",
+    "mention": "Nachricht an ihn",
+    "reply": "Antwort auf seine Nachricht",
+    "question_all": "Frage an alle",
+    "any": "neue Nachrichten",
+    "file": "Datei ist da",
+    "timeout": "Wartezeit um",
+}
+DONE_TEXT = {
+    "result": "Ergebnis abgegeben",
+    "reported": "meldet fertig",
+    "limit": "Turns aufgebraucht (turns_per_agent)",
+}
+END_TEXT = {
+    "all_done": "alle fertig",
+    "rounds": "Runden gespielt",
+    "all_passed": "alle passen",
+    "quiet": "Ruhezeit abgelaufen",
+    "stopped": "gestoppt",
+    "limit": "Limit erreicht",
+}
+
+
+def _describe_waiting(data: Mapping[str, Any]) -> str | None:
+    """`waiting` of an agent or a channel (docs/09 §4.6)."""
+    until = f" bis {_clock(data['until'])}" if data.get("until") else ""
+    file = f" oder auf „{data['file']}“" if data.get("file") else ""
+    reason = str(data.get("reason"))
+    if data.get("agent"):
+        who = data["agent"]
+        match reason:
+            case "wait_for_messages":
+                return f"⏳ {who} wartet im Turn auf eine Nachricht{file}{until}"
+            case "wait_until":
+                return f"⏳ {who} beendet den Turn und wartet auf eine Nachricht{file}{until}"
+            case "approval":
+                return f"⏳ {who} wartet auf eine Freigabe{until}"
+            case "capacity":
+                return f"⏳ {who} wartet auf einen freien Platz im Profil „{data.get('profile')}“"
+        return f"⏳ {who} wartet ({reason}){until}"
+    channel = f"#{data.get('channel')}"
+    match reason:
+        case "idle":
+            what = "letzte Runde vorbei, Ende" if data.get("next") == "end" else "nächste Runde"
+            return f"Diskussion in {channel} ruht: {what} um {_clock(data.get('until'))}"
+        case "agents":
+            return f"Diskussion in {channel} wartet auf wartende Agenten{until}"
+        case "approval":
+            return f"Diskussion in {channel} wartet auf deine Freigabe"
+        case "capacity":
+            return f"Diskussion in {channel} wartet auf einen freien Platz"
+    return None
+
+
 def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str | None:
     """One German progress line for an entry of `orchestrator.jsonl`, None to skip it."""
     kind = str(entry.get("kind"))
@@ -850,10 +905,12 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
         case "discussion_start":
             return f"Diskussion in #{data.get('channel')} beginnt ({data.get('mode')})"
         case "discussion_end":
-            return (
-                f"Diskussion in #{data.get('channel')} beendet: {data.get('ended_by')}, "
+            ended = str(data.get("ended_by"))
+            text = (
+                f"Diskussion in #{data.get('channel')} beendet: {END_TEXT.get(ended, ended)}, "
                 f"{data.get('turns')} Turns"
             )
+            return text + (f", {data['rounds']} Runden" if data.get("rounds") else "")
         case "escalation":
             return f"Eskalation in Stufe „{data.get('stage')}“: {data.get('summary')}"
         case "escalation_decided":
@@ -863,6 +920,23 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
             return f"Fehler{where}: {data.get('message')}"
         case "warning":
             return f"Warnung: {data.get('message')}"
+        case "waiting":
+            return _describe_waiting(data)
+        case "round":
+            agents = ", ".join(str(a) for a in data.get("agents") or []) or "niemand"
+            return (
+                f"↻ Runde {data.get('number')} von {data.get('of')} in #{data.get('channel')}: "
+                f"{agents}"
+            )
+        case "wake_scheduled":
+            why = WAKE_TEXT.get(str(data.get("reason")), str(data.get("reason")))
+            return f"⏰ {data.get('agent')} wird geweckt ({why}) um {_clock(data.get('due'))}"
+        case "agent_done":
+            reason = DONE_TEXT.get(str(data.get("reason")), str(data.get("reason")))
+            return f"✓ {data.get('agent')} ist fertig: {reason}"
+        case "turn_silent":
+            minutes = int(data.get("seconds") or 0) // 60
+            return f"⚠ {data.get('agent')}: seit {minutes} min kein Ereignis im Turn"
         case "wake_skipped" | "ping_pong" | "secret_scan":
             return None
     extra = ", ".join(f"{k}={v}" for k, v in data.items())

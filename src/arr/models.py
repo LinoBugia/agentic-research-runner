@@ -298,6 +298,7 @@ class AgentStatus(StrEnum):
     IDLE = "idle"
     DONE = "done"
     BLOCKED = "blocked"
+    WAITING = "waiting"  # turn ended with `wait_until`; arr wakes it (docs/09 §4.3)
 
 
 class Starter(StrEnum):
@@ -544,6 +545,9 @@ class GroupChatConfig(StrictModel):
     debounce_s: float = Field(default=20, ge=0)
     max_wakeups_per_agent: int = Field(default=12, ge=0)
     quiet_after_s: float = Field(default=300, gt=0)
+    idle_after_s: float = Field(
+        default=30, gt=0, description="event: idle time before a round (docs/09 §4.4)"
+    )
     max_message_chars: int = Field(default=3000, ge=1)
     summary_every: int = Field(default=15, ge=0, description="0 turns the summary off")
 

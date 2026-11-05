@@ -205,6 +205,28 @@ class AgentStatusRecord(Record):
     ts: float
 
 
+class WaitKind(StrEnum):
+    """How an agent waits (docs/09-agent-loop.md §4.3): inside its turn, or after it."""
+
+    MESSAGES = "wait_for_messages"
+    UNTIL = "wait_until"
+
+
+class WaitState(Record):
+    """Row of table `agent_wait`: an agent waits for a message, a file or its deadline.
+
+    `file` is relative to the agent's working folder (`until_file`); `since`/`until` are Unix
+    times. Written by the room tools, cleared when the wait ends or the next turn starts
+    (docs/09-agent-loop.md §4.3).
+    """
+
+    agent: str
+    kind: WaitKind
+    since: float
+    until: float
+    file: str | None = None
+
+
 class RoomError(Exception):
     """Expected failure of a room tool, e.g. not a member or message too long (docs/06 §9).
 
@@ -277,6 +299,14 @@ class RoomAPI(Protocol):
         path: str | None = None,
     ) -> Result:
         """Submit a result for the current stage; `path` is relative to the working folder."""
+        ...
+
+    def wait_until(self, minutes: float, until_file: str | None = None) -> WaitState:
+        """Ask to be woken after `minutes` (at most 30), on a message to me or `until_file`.
+
+        The agent ends its turn afterwards; the orchestrator wakes it (docs/09 §4.3). The
+        blocking `wait_for_messages` is built on this view in `arr.room.waiting`.
+        """
         ...
 
     def submit_rating(

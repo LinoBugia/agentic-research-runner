@@ -27,6 +27,8 @@ from arr.errors import ArrError
 from arr.log import setup_logging
 from arr.room.store import USER, AgentRoom, RoomStore
 from arr.room.types import ChannelInfo, Inbox, Message, RoomError
+from arr.room.waiting import WaitEnd, WaitOutcome, wait_max_s
+from arr.room.waiting import wait_for_messages as wait_for_messages_
 
 log = logging.getLogger("arr.room.server")  # fixed name, also under `python -m`
 
@@ -39,8 +41,9 @@ FOOTER_SEPARATOR = "\n\n---\n"
 INSTRUCTIONS = (
     "Gruppenchat dieses Runs. Lies zuerst `inbox()`. Neue Nachrichten holst du mit "
     "`read_messages()`, schreiben mit `post_message(channel, body, kind, to, reply_to, refs)`. "
-    "Dateien aus deinem Arbeitsordner hängst du über `refs` an. Jedes Ergebnis endet mit "
-    "„ungelesen: …“."
+    "Wen du ansprichst, nennst du mit `@name` im Text. Auf eine Antwort wartest du mit "
+    "`wait_for_messages`. Dateien aus deinem Arbeitsordner hängst du über `refs` an. Jedes "
+    "Ergebnis endet mit „ungelesen: …“."
 )
 INTERNAL_ERROR = "Interner Fehler im Gruppenchat. Die Details stehen im Run-Log."
 _EXPECTED = {
@@ -169,6 +172,39 @@ def _respond(room: AgentRoom, tool: str, call: Callable[[], str]) -> str:
         "agent %s: %s ok (%.1f ms)", room.agent_id, tool, (time.perf_counter() - started) * 1000
     )
     return _with_footer(room, text)
+
+
+def _clock(ts: float) -> str:
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def render_wait(outcome: WaitOutcome) -> str:
+    """Result of `wait_for_messages`: why it ended, how long it waited, the new messages."""
+    waited = f"nach {outcome.waited_s:.0f} s"
+    if outcome.ended_by is WaitEnd.MESSAGE:
+        head = f"Warten beendet {waited}: Es gibt eine Nachricht an dich."
+        return head + "\n\n" + render_messages(outcome.messages)
+    if outcome.ended_by is WaitEnd.FILE:
+        return f"Warten beendet {waited}: Die Datei „{outcome.file}“ ist da."
+    text = f"Warten beendet {waited}: Frist abgelaufen, keine Nachricht an dich."
+    if outcome.asked_s > outcome.limit_s:
+        text += (
+            f" Ein Aufruf wartet höchstens {outcome.limit_s:.0f} s. Rufe "
+            "`wait_for_messages` noch einmal auf, wenn du weiter warten willst."
+        )
+    return text
+
+
+def render_wait_until(until: float, file: str | None) -> str:
+    """Answer of `wait_until`: end the turn now, arr wakes the agent."""
+    minutes = max(1, round((until - time.time()) / 60))
+    reasons = ["eine Nachricht an dich kommt"]
+    if file:
+        reasons.append(f"die Datei „{file}“ da ist")
+    return (
+        "Gut. Beende jetzt deinen Turn mit einer kurzen Zusammenfassung. arr weckt dich, "
+        f"sobald {' oder '.join(reasons)}, spätestens um {_clock(until)} (in {minutes} min)."
+    )
 
 
 def _attachment_text(path: Path) -> str:
@@ -342,6 +378,38 @@ def build_server(room: AgentRoom) -> MCPServer:
             return f"Bewertung #{r.id} für Ergebnis #{r.result_id} gespeichert ({r.score:g})."
 
         return _respond(room, "submit_rating", call)
+
+    limit = wait_max_s()
+
+    @server.tool(
+        description=f"Im Turn auf eine Antwort warten, höchstens {limit:.0f} s je Aufruf. Endet "
+        "sofort bei einer Nachricht an dich (`@name`, `to`, Antwort auf deine Nachricht, "
+        "Frage), wenn die Datei `until_file` (relativ zu deinem Arbeitsordner) da ist, oder "
+        "nach `seconds`. Gibt die neuen Nachrichten zurück. Beliebig oft hintereinander."
+    )
+    async def wait_for_messages(seconds: float = limit, until_file: str | None = None) -> str:
+        try:
+            outcome = await wait_for_messages_(room, seconds, until_file, max_s=limit)
+        except RoomError as exc:
+            log.info("agent %s: wait_for_messages rejected: %s", room.agent_id, exc)
+            raise ToolError(await asyncio.to_thread(_with_footer, room, str(exc))) from None
+        except Exception:
+            log.exception("agent %s: wait_for_messages failed", room.agent_id)
+            raise ToolError(await asyncio.to_thread(_with_footer, room, INTERNAL_ERROR)) from None
+        return await asyncio.to_thread(_with_footer, room, render_wait(outcome))
+
+    @server.tool(
+        description="Lange warten, z. B. auf eine Rechnung, die im Hintergrund läuft: `minutes` "
+        "(höchstens 30), optional `until_file` (relativ zu deinem Arbeitsordner). Danach "
+        "beendest du deinen Turn; arr weckt dich bei einer Nachricht an dich, wenn die Datei "
+        "da ist, oder nach Ablauf."
+    )
+    def wait_until(minutes: float, until_file: str | None = None) -> str:
+        def call() -> str:
+            state = room.wait_until(minutes, until_file)
+            return render_wait_until(state.until, state.file)
+
+        return _respond(room, "wait_until", call)
 
     @server.tool(description="Aktuellen Auftrag mit Stufe und Kontextpaket noch einmal abrufen.")
     def get_assignment() -> str:

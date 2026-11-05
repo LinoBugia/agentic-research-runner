@@ -316,9 +316,11 @@ async def test_w2_03_1_topology_discusses_through_the_run_context_contract(
 
 
 EVENT = {"mode": "event", "debounce_s": 0.2, "quiet_after_s": 0.4}
+IDLE = {"idle_after_s": 0.1}  # idle rounds come quickly (docs/09 §4.4)
 
 
-async def test_event_wakes_once_after_debounce_with_all_messages(workfolder: Path) -> None:
+async def test_event_wakes_at_once_for_a_question_without_debounce(workfolder: Path) -> None:
+    """L8: a message to an idle agent wakes it at once, not after `debounce_s`."""
     scripts = {
         "a": turns(
             [
@@ -336,28 +338,31 @@ async def test_event_wakes_once_after_debounce_with_all_messages(workfolder: Pat
     )
     assert outcome.ended_by is DiscussionEnd.ALL_DONE and outcome.wakeups == {"b": 1}
     [wake] = log_entries(manager.run_dir, "wake")
-    assert wake["data"]["agent"] == "b" and len(wake["data"]["messages"]) == 3
-    assert wake["data"]["reasons"] == ["question", "mention"]
+    assert wake["data"]["agent"] == "b" and wake["data"]["reasons"][0] == "question"
     kickoff, woken = prompts(manager.run_dir, "b")
     assert kickoff.endswith("## Auftrag\n\nPrüft Lemma A.")
-    assert "Du wurdest in #main geweckt: eine offene Frage an dich, eine Nachricht an dich" in woken
+    assert "Du wurdest in #main geweckt: eine Frage an dich" in woken
     assert "Gilt Lemma A für n = 9?" in woken, "the open question is in the inbox"
     first_post = min(m.ts for m in manager.room.messages("main") if m.sender == "a")
     wake_start = [e for e in events(manager.run_dir, "b") if e["kind"] == "turn_start"][1]["ts"]
-    assert wake_start - first_post >= 0.2, "woken after the debounce time"
+    assert wake_start - first_post < 0.2, "woken at once, not after the debounce time"
+    [scheduled] = log_entries(manager.run_dir, "wake_scheduled")
+    assert scheduled["data"]["agent"] == "b" and scheduled["data"]["reason"] == "question"
     checkpoint = log_entries(manager.run_dir, "checkpoint")[-1]["data"]
     assert checkpoint == {"stage": "diskussion", "channel": "main", "phase": "discussion"}
 
 
 async def test_event_any_never_wakes_the_sender(workfolder: Path) -> None:
     scripts = {
-        "a": turns([wait(0.1), post("main", "Notiz für alle")]),
+        "a": turns([wait(0.1), post("main", "Notiz für alle")], [say("nichts")], repeat_last=True),
         "b": turns([say("bereit")], [done()]),
     }
     manager, outcome = await run_discussion(
-        workfolder, scripts, {**EVENT, "wake_on": ["any"], "debounce_s": 0.05}
+        workfolder,
+        scripts,
+        {**EVENT, **IDLE, "wake_on": ["any"], "debounce_s": 0.05, "quiet_after_s": 30},
     )
-    assert outcome.ended_by is DiscussionEnd.QUIET
+    assert outcome.ended_by is DiscussionEnd.ROUNDS and outcome.rounds == 3
     assert outcome.wakeups == {"b": 1}
     assert [e["data"]["agent"] for e in log_entries(manager.run_dir, "wake")] == ["b"]
 
@@ -370,12 +375,14 @@ async def test_event_respects_max_wakeups_per_agent(workfolder: Path) -> None:
                 post("main", "Erste Frage?", to=["b"]),
                 wait(0.8),
                 post("main", "Zweite Frage?", to=["b"]),
-            ]
+            ],
+            [say("nichts")],
+            repeat_last=True,
         ),
         "b": turns([say("bereit")], [say("geweckt")], repeat_last=True),
     }
     manager, outcome = await run_discussion(
-        workfolder, scripts, {**EVENT, "debounce_s": 0.05, "max_wakeups_per_agent": 1}
+        workfolder, scripts, {**EVENT, **IDLE, "debounce_s": 0.05, "max_wakeups_per_agent": 1}
     )
     assert outcome.wakeups == {"b": 1}
     [skipped] = log_entries(manager.run_dir, "wake_skipped")
@@ -397,9 +404,9 @@ async def test_event_ping_pong_guard_stops_automatic_wakeups(workfolder: Path) -
     }
     pacing = PacingSettings(poll_interval_s=0.01, ping_pong_limit=2)
     manager, outcome = await run_discussion(
-        workfolder, scripts, {**EVENT, "debounce_s": 0.05}, pacing=pacing
+        workfolder, scripts, {**EVENT, **IDLE, "debounce_s": 0.05}, pacing=pacing
     )
-    assert outcome.ended_by is DiscussionEnd.QUIET
+    assert outcome.ended_by is DiscussionEnd.ROUNDS, "idle rounds still give both a turn"
     [guard] = log_entries(manager.run_dir, "ping_pong")
     assert guard["data"] == {"channel": "main", "agents": ["a", "b"]}
     notes = [m for m in manager.room.messages("main") if m.sender == "orchestrator" and m.to]

@@ -21,6 +21,7 @@ Script format (YAML)::
             action: post_message
             args: {channel: main, body: "Idee 1", kind: idea}
             save_as: posted         # later: reply_to: "${posted.id}"
+          - {do: room, action: wait_for_messages, args: {seconds: 20}}   # blocks, see below
           - {do: usage, input: 1200, output: 300, cost_usd: 0.02}
           - {do: delay, seconds: 0.5}      # interruptible wait
           - {do: hang, seconds: 2}         # wait that ignores interrupt()
@@ -37,6 +38,10 @@ variable number come in between.
 
 String values of room `args` that consist of exactly `${name.path}` are replaced by a value
 saved earlier with `save_as` (dotted path; list items by index).
+
+`wait_for_messages` waits like the real room tool (a message to the agent, `until_file`,
+the deadline; at most `WAIT_MAX_S` of the agent's provider) and ends early on `interrupt()`.
+Its result is JSON: `ended_by`, `waited_s` and the IDs of the returned `messages`.
 """
 
 import asyncio
@@ -72,10 +77,15 @@ from arr.backends.base import (
 from arr.errors import ArrError
 from arr.models import AgentConfig, AgentStatus, Provider, StrictModel
 from arr.resolve import load_yaml_model, validate_model
+from arr.room.store import AgentRoom
 from arr.room.types import MessageKind, RoomAPI, RoomError, VoteChoice, VoteRule
+from arr.room.waiting import WAIT_MAX_S, wait_for_messages
 
 ROOM_TOOL_PREFIX = "mcp__arr-room__"
 """Tool name prefix of room actions in the event log (MCP server `arr-room`, docs/01 §5)."""
+
+WAIT_POLL_S = 0.05
+"""`wait_for_messages` of the FakeBackend checks the room this often (tests stay fast)."""
 
 
 class FakeScriptError(ArrError):
@@ -131,6 +141,8 @@ class RoomAction(StrEnum):
     CALL_VOTE = "call_vote"
     PIN = "pin"
     CLOSE_DISCUSSION = "close_discussion"
+    WAIT_UNTIL = "wait_until"
+    WAIT_FOR_MESSAGES = "wait_for_messages"  # blocks like the MCP tool (`arr.room.waiting`)
 
 
 _ENUM_ARGS: dict[str, dict[str, type[StrEnum]]] = {
@@ -531,7 +543,10 @@ class FakeBackend:
                     EventKind.TOOL_CALL,
                     ToolCallData(id=call_id, name=ROOM_TOOL_PREFIX + step.action.value, input=args),
                 )
-                content, is_error = self._call_room(step, args, state)
+                if step.action is RoomAction.WAIT_FOR_MESSAGES:
+                    content, is_error = await self._wait_room(args)
+                else:
+                    content, is_error = self._call_room(step, args, state)
                 yield event(
                     EventKind.TOOL_RESULT,
                     ToolResultData(id=call_id, is_error=is_error, content=content, blob=None),
@@ -625,6 +640,37 @@ class FakeBackend:
         if step.save_as:
             state.saved[step.save_as] = plain
         return ("ok" if plain is None else json.dumps(plain, ensure_ascii=False)), False
+
+    async def _wait_room(self, args: Mapping[str, Any]) -> tuple[str, bool]:
+        """`wait_for_messages` through the shared loop of the room server."""
+        if not isinstance(self.room, AgentRoom):
+            raise FakeScriptError(
+                f"„wait_for_messages“ braucht für „{self.config.id}“ ein AgentRoom "
+                "(Parameter room)."
+            )
+        unknown = set(args) - {"seconds", "until_file"}
+        if unknown:
+            raise FakeScriptError(
+                f"Room-Aktion „wait_for_messages“: unbekannte Argumente {sorted(unknown)}."
+            )
+        limit = WAIT_MAX_S[self.config.provider]
+        try:
+            outcome = await wait_for_messages(
+                self.room,
+                args.get("seconds", limit),
+                args.get("until_file"),
+                max_s=limit,
+                poll_s=WAIT_POLL_S,
+                abort=self._interrupted.is_set,
+            )
+        except RoomError as exc:
+            return str(exc), True
+        data = {
+            "ended_by": outcome.ended_by.value,
+            "waited_s": round(outcome.waited_s, 2),
+            "messages": [m.id for m in outcome.messages],
+        }
+        return json.dumps(data), False
 
     async def _wait(self, seconds: float, state: _TurnState) -> AsyncIterator[AgentEvent]:
         """Sleep up to `seconds`, emitting hints meanwhile; return early on `interrupt()`."""

@@ -529,6 +529,7 @@ class RunManager:
         self._tasks.append(asyncio.create_task(orch.watch()))
         wall_time = self.resolved.limits.wall_time
         if wall_time is not None:
+            orch.wall_end = time.time() + wall_time.total_seconds()  # caps `wait_until`
             self._tasks.append(
                 asyncio.create_task(self._watch_wall_time(wall_time.total_seconds()))
             )

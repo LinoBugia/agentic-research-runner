@@ -83,6 +83,12 @@ def run_row(run: RunSummary, now: float, approval_href: str | None) -> Row:
         tags += ' <span class="tag">verschlankt</span>'
     if run.archived:
         tags += ' <span class="tag">archiviert</span>'
+    if run.secret_scan is not None and not run.secret_scan.clean:  # U3: never with a value
+        n = len(run.secret_scan.findings)
+        tags += (
+            f' <span class="tag scan-hit" title="Secret-Scan: {n} Treffer, Details im Run">'
+            f"Secret-Scan: {n} Treffer</span>"
+        )
     info = run.info or (run.error.message.split(". ")[0] if run.error else "")
     name = (
         f'<a href="/runs/{esc(run.id)}">{esc(run.name)}</a>'

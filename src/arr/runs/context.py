@@ -49,10 +49,10 @@ class DiscussionEnd(StrEnum):
     Logged as `discussion_end` in `orchestrator.jsonl`.
     """
 
-    ROUNDS = "rounds"  # rounds: N rounds played
+    ROUNDS = "rounds"  # rounds: N rounds played; event: N idle rounds played (docs/09 §4.4)
     ALL_PASSED = "all_passed"  # rounds: nobody posted anything but `pass` in a round
-    ALL_DONE = "all_done"  # all members reported `done`
-    QUIET = "quiet"  # event: `quiet_after_s` without messages and nobody working
+    ALL_DONE = "all_done"  # all members are `done` (reported, result, or turn quota used up)
+    QUIET = "quiet"  # event: `quiet_after_s` without messages although an idle round ran
     STOPPED = "stopped"  # user stop
     LIMIT = "limit"  # a run limit was reached
 
@@ -188,12 +188,16 @@ class RunContext(ABC):
         - `rounds` mode: per round all members that are not `done` get a turn (parallel or
           in order), prompt „Runde r von N …“ plus `prompt`. Ends after `rounds` rounds
           (default 3), when nobody posted anything but `pass` in a round, or on stop.
-        - `event` mode: with `kickoff`, all members that are not `done` get `prompt` at once.
-          Then idle members are woken on `wake_on` events after `debounce_s`, at most
+        - `event` mode (docs/09 §4): with `kickoff`, all members that are not `done` get
+          `prompt` at once. A message that concerns a member (`to`, `@name`, `reply_to`, a
+          question to all) wakes it at once if it is idle or waits with `wait_until`; a
+          finished member only for a question to it; `any` after `debounce_s`. At most
           `max_wakeups_per_agent` times per channel; own messages and messages of the
           orchestrator never wake; the ping-pong guard stops waking two agents that talk in
-          circles. Ends when nobody works, no wake-up is due and either all members are `done`
-          or nothing happened for `quiet_after_s` (messages and turn ends count).
+          circles. With nobody working or waiting, a round starts after `idle_after_s`, at
+          most `rounds` (default 3). Ends with `all_done`, `rounds` after the last round,
+          `quiet` when `quiet_after_s` passed without a message although a round ran, or on
+          stop. `DiscussionOutcome.rounds` counts the idle rounds.
         - Wake-up turns get `stage` and `context` like the kick-off turns. Hints mid-turn and
           the inbox work in and outside of discussions.
         """

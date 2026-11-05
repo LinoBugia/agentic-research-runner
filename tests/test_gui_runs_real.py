@@ -827,9 +827,14 @@ async def test_message_wakes_an_agent_with_visible_delivery_and_the_answer_appea
 
 
 async def test_delivery_follows_the_state_past_the_first_hint(wf: Path) -> None:
-    """Review W3-02 M1: `b` gets a hint at once, `a` is woken later; the page must show that."""
+    """Review W3-02 M1: `b` gets a hint at once, `a` is woken later; the page must show that.
+
+    Since W3-07 (L8) a message *to* `a` wakes it at once; only `any` keeps the debounce, so
+    the message goes to everybody and `a` wakes 0.8 s after the hint to `b`.
+    """
     form = json.loads(json.dumps(EVENT_FORM))
     form["groupchats"][0]["debounce_s"] = 0.8
+    form["groupchats"][0]["wake_on"] = ["mention", "question", "any"]
     scripts = {
         "a": turns([say("bereit")], [done()]),
         "b": turns([say("los"), wait(4), done()]),
@@ -846,10 +851,10 @@ async def test_delivery_follows_the_state_past_the_first_hint(wf: Path) -> None:
             return states["b"] == "working" and states["a"] != "working"
 
         await until(only_b_works, what="only b working")
-        request = PostMessageRequest(body="An beide", to=["a", "b"])
+        request = PostMessageRequest(body="An alle")
         await api.post_message(run_id, "main", request)
         await see(user, "zugestellt als Hinweis mitten im Turn", retries=400)
-        await see(user, "a und b geweckt", retries=400)
+        await see(user, "die Mitglieder geweckt", retries=400)
         await api.run_action(run_id, RunAction.STOP)
         await until_final(api, run_id)
 

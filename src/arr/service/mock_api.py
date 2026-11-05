@@ -70,6 +70,7 @@ from arr.service.api_models import (
     AgentState,
     AgentStateEvent,
     AgentTranscriptEvent,
+    AgentWait,
     ApiException,
     ApprovalAgentRef,
     ApprovalEvent,
@@ -97,6 +98,7 @@ from arr.service.api_models import (
     DecisionResponse,
     DeliveryInfo,
     Deviation,
+    DiscussionState,
     ErrorCode,
     EscalatedByInfo,
     EscalationOptionInfo,
@@ -159,6 +161,7 @@ from arr.service.api_models import (
     RunStartChannel,
     RunStatusEvent,
     RunSummary,
+    SecretScanInfo,
     SetupState,
     Severity,
     SizeInfo,
@@ -381,6 +384,8 @@ class _Run:
     cost_rate: float = 0.0  # $/s while running
     token_rate: float = 0.0  # tokens/s while running
     stages: list[StageInfo] = field(default_factory=list)
+    secret_scan: SecretScanInfo | None = None
+    discussion: DiscussionState | None = None
     agents: dict[str, AgentState] = field(default_factory=dict)
     channels: dict[str, _Channel] = field(default_factory=dict)
     transcripts: dict[str, _Transcript] = field(default_factory=dict)
@@ -472,6 +477,7 @@ def _agent(
     ratings: int = 0,
     web: bool = False,
     read_dirs: Iterable[str] = (),
+    waiting: AgentWait | None = None,
 ) -> AgentState:
     provider = _provider_for(model)
     return AgentState(
@@ -491,6 +497,7 @@ def _agent(
         state=state,
         state_since=since,
         blocked_by=blocked_by,
+        waiting=waiting,
         activity=activity,
         turn=turn,
         turns_limit=turns_limit,
@@ -4899,8 +4906,18 @@ class MockApi:
             info=run.info,
             adjusted_by_user=run.adjusted_by_user,
             changes=run.changes,
+            secret_scan=self._secret_scan(run),
             gui_url=f"{self.base_url}/runs/{run.id}",
         )
+
+    @staticmethod
+    def _secret_scan(run: _Run) -> SecretScanInfo | None:
+        """Finished runs went through the scan (U3); without own data it was clean."""
+        if run.secret_scan is not None or not run.status.is_final:
+            return run.secret_scan
+        if run.status is RunStatus.FAILED:
+            return None
+        return SecretScanInfo(clean=True, files=max(1, run.size.actual_bytes // 40_000))
 
     def _last_message(self, run: _Run) -> LastMessage | None:
         if not run.detail_built:
@@ -5454,6 +5471,7 @@ class MockApi:
             decider=run.decider,
             actions_allowed=actions,
             stages=run.stages,
+            discussion=run.discussion,
             handoff_text=handoff,
             run_dir=f"{self.state.workfolder.path}/runs/{run.id}",
             task_md=run.task_md,
