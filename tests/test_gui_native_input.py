@@ -231,3 +231,26 @@ async def test_w3_08_1_u1_python_marks_the_browser_text_as_preserved() -> None:
         user.find(marker="reset-budget").click()
         data = element._to_dict()
         assert "preserved_props" not in data and data["props"]["value"] != "10 $"
+
+
+async def test_w3_08_1_dialog_comment_survives_live_updates() -> None:
+    """The comment in a confirmation dialog (components/dialog.py) is a `NativeInput` with the
+    handler of the Node test above: live updates of the page while the dialog is open keep
+    the typed text, an update of the field keeps it through `preserved_props`."""
+    from test_gui import _within
+
+    api = MockApi()
+    async with gui_user(api) as user:
+        await user.open("/freigaben/apr_0041")
+        _within(user, "card-apr_0041", "deny").click()
+        await user.should_see(content="Run-Start ablehnen?")
+        area = user.find(marker="dialog-input")
+        [element] = area.elements
+        assert isinstance(element, NativeInput)
+        handlers = {(lis.type, lis.js_handler) for lis in element._event_listeners.values()}
+        assert ("input", STORE_JS.format(prop="value")) in handlers
+        area.trigger("input", "Bitte ohne Web")
+        assert element._to_dict()["preserved_props"] == ["value"]
+        user.find(marker="dialog-confirm").click()
+        await user.should_see(marker="decided-apr_0041")
+        assert (await api.get_approval("apr_0041")).decision.comment == "Bitte ohne Web"
