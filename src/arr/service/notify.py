@@ -30,6 +30,7 @@ from arr.service.api_models import (
     NotificationEvent,
     RunStatusEvent,
 )
+from arr.service.gui.components.approval_card import risk_text
 from arr.service.gui.components.notification import FINAL_WORD
 from arr.service.gui.format import deadline as deadline_text
 from arr.service.gui.texts import CATEGORY
@@ -87,7 +88,8 @@ def _approval_text(item: ApprovalItem, now: float) -> str:
     agent = item.agent.id if item.agent else "Ein Agent"
     kinds = ", ".join(CATEGORY[c] for c in item.categories) or "eine Berechtigung"
     deadline = f" · {deadline_text(item.deadline, now)}" if item.deadline else ""
-    return f"{agent} fragt nach: {kinds} · {item.run.name}{deadline}"
+    risk = f" · Risiko {risk_text(item)}" if item.risk is not None else ""  # W3-08 U8
+    return f"{agent} fragt nach: {kinds}{risk} · {item.run.name}{deadline}"
 
 
 def message_for(event: LiveEvent, now: float) -> str | None:

@@ -1,13 +1,15 @@
 """Simulated macOS notifications of the prototype (docs/08 §4.2, §9.2: „als Toast mit Deep-Link“).
 
 The texts follow the journeys R2, R5, R8 and R4 („arr · Run wartet auf Freigabe – …“,
-„explorer-1 möchte … · läuft in 20 min ab“). Real notifications come with W3-03.
+„explorer-1 möchte … · läuft in 20 min ab“). A permission names its risk with the explanation
+(W3-08 U8). Real notifications come with W3-03.
 """
 
 from arr.models import RunStatus, Starter
 from arr.permissions.types import ApprovalType
 from arr.service.api_models import ApprovalItem, RunSummary
 from arr.service.gui import format as fmt
+from arr.service.gui.components.approval_card import risk_text
 from arr.service.gui.texts import STARTER_PHRASE
 
 FINAL_WORD = {
@@ -34,7 +36,8 @@ def approval_notification(item: ApprovalItem, now: float) -> tuple[str, tuple[st
     if item.deadline:
         minutes = max(0, round((item.deadline - now) / 60))
         deadline = f" · läuft in {minutes} min ab ({fmt.clock(item.deadline)})"
-    return f"arr · {item.title} · {item.run.name}{deadline}", link
+    risk = f" · Risiko {risk_text(item)}" if item.risk is not None else ""
+    return f"arr · {item.title}{risk} · {item.run.name}{deadline}", link
 
 
 def run_notification(run: RunSummary) -> tuple[str, tuple[str, str]] | None:

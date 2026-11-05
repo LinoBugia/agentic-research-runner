@@ -86,6 +86,24 @@ def risk_html(item: ApprovalItem) -> str:
     )
 
 
+def risk_text(item: ApprovalItem) -> str:
+    """„mittel: Fremder Code wird in die Run-venv installiert …“, visible in the card (U8)."""
+    if item.risk is None:
+        return ""
+    return f"{RISK[item.risk.level][1]}: {item.risk.text}"
+
+
+def risk_line_html(item: ApprovalItem) -> str:
+    """The risk word + dots and its explanation as text, not only as tooltip (W3-08 U8)."""
+    if item.risk is None:
+        return ""
+    dots, word = RISK[item.risk.level]
+    return (
+        f'<span class="risk-line"><span class="dots" aria-hidden="true">{dots}</span> '
+        f"<b>{esc(word)}:</b> {esc(item.risk.text)}</span>"
+    )
+
+
 def deadline_html(item: ApprovalItem, now: float, *, short: bool = False) -> str:
     """Live countdown „⏱ läuft in 14 min ab (15:36)“, updated by arr.js."""
     if item.deadline is None:
@@ -256,6 +274,8 @@ class ApprovalCard:
         ]
         if item.work_dir:
             rows.append(("Wo", copy_html(item.work_dir, label="Arbeitsordner kopieren")))
+        if item.risk is not None:
+            rows.append(("Risiko", risk_line_html(item)))
         reason = f"„{esc(item.reason)}“" if item.reason else '<span class="muted">keine</span>'
         rows.append(("Begründung des Agenten", f'<div class="quote">{reason}</div>'))
         rows.append(("Warum bei dir", why))
@@ -696,8 +716,13 @@ def compact_card(
             if item.escalated_by:
                 why = item.escalated_by.note
             what = item.command or item.path or item.url or ""
+            risk = (
+                f'<div style="margin-top:6px"><b>Risiko:</b> {risk_line_html(item)}</div>'
+                if item.risk is not None
+                else ""
+            )
             raw(
-                f'<span class="cmd" style="font-size:12px">{esc(what)}</span>'
+                f'<span class="cmd" style="font-size:12px">{esc(what)}</span>{risk}'
                 f'<div class="reason" style="margin-top:6px" title="{esc(item.reason or "")}">'
                 f"<b>Begründung:</b> „{esc(item.reason or '')}“</div>"
                 f'<div style="margin-top:4px"><b>Warum bei dir:</b> {esc(why)}</div>'

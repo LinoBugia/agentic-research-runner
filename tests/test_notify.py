@@ -79,6 +79,12 @@ def test_a8_text_names_agent_run_and_kind_but_not_the_command() -> None:
     assert "pip install" not in text and SECRET not in text and "token" not in text
 
 
+def test_w3_08_u8_text_names_the_risk_with_its_explanation() -> None:
+    text = message_for(created(permission()), 0.0)
+    assert text is not None
+    assert "fragt nach: Installation · Risiko mittel: Installation. · Collatz" in text
+
+
 def test_a8_secrets_and_control_characters_leave_every_text() -> None:
     item = permission(
         run=ApprovalRunRef(
