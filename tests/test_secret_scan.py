@@ -245,3 +245,95 @@ def test_w3_00_missing_or_absent_run_venv_scans_the_run_folder_only(
     assert scan_run_dir(run, {"Profil „max“": VALUE}).files == 2
     _meta(run, None)
     assert scan_run_dir(run, {"Profil „max“": VALUE}).files == 2
+
+
+CODE_LINES = (
+    "ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)",
+    "    key=lambda n: steps[n],",
+    "best = max(pairs, key=itemgetter(1))",
+    "top = sorted(counts, key=counts.get)",
+    "order = sorted(words, key=str.lower)[:10]",
+    "token = make(token=os.environ['X'])",
+    '{"input": {"command": "python -c \\"print(sorted(x, key=lambda t: -t))\\""}}',
+    "allow: python3 collatz.py # key=«entfernt»",
+    '{"command": "sort key=\\u00abentfernt\\u00bb"}',
+)
+"""Python code from the UX acceptance 3 runs (U2) and redacted values: no secret."""
+
+SECRET_LINES = (
+    "export API_KEY=abc123def456ghi",
+    "API_KEY=sk_live_planted",
+    'token="planted-value-9f8e7d6c"',
+    "PASSWORD='hunter2hunter2'",
+    "curl -H x MY_SECRET=plain",
+    "GITHUB_TOKEN=Ab12Cd34Ef56Gh78Ij90)",
+)
+"""Real assignments of secrets: still hits."""
+
+
+def test_w3_08_u2_python_code_is_no_env_assignment_but_real_secrets_are(tmp_path: Path) -> None:
+    from arr.permissions.policy import _SECRET_ASSIGN_RE
+
+    for line in CODE_LINES[:6]:
+        assert _SECRET_ASSIGN_RE.search(line), f"counter-check: the old rule flags {line!r}"
+    run = _run_dir(tmp_path)
+    _write(run / "agents/a/work/code.py", "\n".join(CODE_LINES) + "\n")
+    _write(run / "approvals.jsonl", json.dumps({"command": "sort key=«entfernt»"}) + "\n")
+    assert scan_run_dir(run).clean
+
+    _write(run / "agents/a/work/env.sh", "\n".join(SECRET_LINES) + "\n")
+    report = scan_run_dir(run)
+    found = {(f.file, f.line) for f in report.findings if f.kind == "env_assignment"}
+    assert found == {("agents/a/work/env.sh", n) for n in range(1, len(SECRET_LINES) + 1)}
+    text = format_report(report) + json.dumps(report.to_data())
+    for secret in ("abc123def456ghi", "planted-value", "hunter2", "Ab12Cd34"):
+        assert secret not in text
+
+
+def test_w3_08_u2_a_secret_after_code_on_the_same_line_is_found(tmp_path: Path) -> None:
+    run = _run_dir(tmp_path)
+    _write(run / "x.sh", "sorted(a, key=len); export API_TOKEN=planted123planted\n")
+    assert [(f.file, f.kind) for f in scan_run_dir(run).findings] == [("x.sh", "env_assignment")]
+
+
+LOST_IN_REVIEW = (
+    "(API_KEY=a1b2c3d4e5f6a7b8c9d0e1f2)",
+    "API_KEY=deadbeef0123456789abcdef, next",
+    "API_KEY=0a1b2c3d4e5f6a7b8c9d,",
+    "{PATH=/usr/bin, API_KEY=supersecretvalue, HOME=/x}",
+    "{HOME=/x, API_KEY=supersecretvalue}",
+    "(set PASSWORD=hunter2)",
+    "- [TOKEN=lowercasetokenvalue1234567890]",
+    "Config(apiKey=secretvalue123, url=x)",
+    "api_key=deadbeef0123456789abcdef,",
+    "SECRET=my.secret.value)",
+    "TOKEN=«entfernt»realsecretvalue123",
+    'TOKEN="«entfernt»realsecretvalue123"',
+    "TOKEN=\\u00abentfernt\\u00bbrealsecretvalue123",
+    "password=letmein",
+)
+"""W3-08.1: real cases the first exemption of U2 lost (review findings 1 and 2), all fake."""
+
+
+@pytest.mark.parametrize("line", LOST_IN_REVIEW)
+def test_w3_08_1_u2_cases_lost_in_the_review_are_hits_again(tmp_path: Path, line: str) -> None:
+    from arr.permissions.policy import _SECRET_ASSIGN_RE
+
+    assert _SECRET_ASSIGN_RE.search(line), "the old rule found it"
+    run = _run_dir(tmp_path)
+    _write(run / "agents/a/work/env.txt", line + "\n")
+    found = [(f.file, f.line, f.kind) for f in scan_run_dir(run).findings]
+    assert ("agents/a/work/env.txt", 1, "env_assignment") in found
+
+
+def test_w3_08_1_u2_only_the_exact_placeholder_counts_as_redacted(tmp_path: Path) -> None:
+    run = _run_dir(tmp_path)
+    lines = [
+        "allow: sort key=«entfernt»",
+        json.dumps({"command": "sort key=«entfernt» -n"}),
+        json.dumps({"command": "sort key=«entfernt»"}, ensure_ascii=True),
+        "x(token='«entfernt»')",
+        "f(key=«entfernt»)",
+    ]
+    _write(run / "approvals.jsonl", "\n".join(lines) + "\n")
+    assert scan_run_dir(run).clean

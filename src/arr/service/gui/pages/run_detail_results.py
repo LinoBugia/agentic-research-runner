@@ -4,11 +4,20 @@ Summary (`summary.md`), the block „Übernehmen“ (arr never writes into the p
 Claude Code kopieren“ and „Pfad kopieren“, G8) and the results grouped by stage, each with
 origin (agent, stage, attempt), status, average and pass mark, the raters' scores per
 criterion and their comments, and „Im Transkript zeigen“ (G3: one click to the source).
+
+Relative links in the rendered files (`[…](results/001-….md)` in `summary.md`) would resolve
+against `/runs/` and end in 404 (W3-08 U4): a link to a result opens it here, any other
+relative link or image stays text with its path in the run folder as tooltip.
 """
 
+import html
+import posixpath
+import re
+from collections.abc import Sequence
 from itertools import groupby
 from typing import TYPE_CHECKING
 
+from arr.room.store import RESULTS_DIR
 from arr.service.api_models import Result, ResultStatus, RunResults
 from arr.service.gui import format as fmt
 from arr.service.gui.components.badge import badge_html
@@ -26,6 +35,62 @@ RESULT_STATUS = {
     ResultStatus.UNRATED: Status("st-neutral", "radio_button_unchecked", "noch nicht bewertet"),
 }
 """Result words of docs/08 §8.3 with symbol and colour (§7.1)."""
+
+
+_LINK_RE = re.compile(r'<a href="([^"]*)"[^>]*>(.*?)</a>', re.S)
+_IMG_RE = re.compile(r'<img src="([^"]*)" alt="([^"]*)"[^>]*>')
+_EXTERNAL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*:|[/#?]")
+_NUMBER_RE = re.compile(r"(\d+)-[^/]*$")
+
+
+def _run_path(href: str, base: str) -> str | None:
+    """The path in the run folder a relative `href` of a file in `base` points to; `None` for
+    an absolute, external or in-page link."""
+    target = html.unescape(href).split("#", 1)[0].split("?", 1)[0]
+    if not target or _EXTERNAL_RE.match(target):
+        return None
+    return posixpath.normpath(posixpath.join(base, target))
+
+
+def _result_for(path: str, results: Sequence[Result]) -> Result | None:
+    """The result stored at `path`; else the one whose number the file name starts with: the
+    finalizer writes every result to `output/results/NNN-<agent>-<kind>.md` (NNN = its ID)."""
+    for result in results:
+        if result.path and posixpath.normpath(result.path) == path:
+            return result
+    if posixpath.dirname(path) != RESULTS_DIR:
+        return None  # `agents/x/work/results/003-….md` is another file (W3-08.1)
+    match = _NUMBER_RE.search(path)
+    number = int(match.group(1)) if match else None
+    return next((r for r in results if r.id == number), None)
+
+
+def run_links_html(rendered: str, file_path: str | None, results: Sequence[Result]) -> str:
+    """Relative links of a rendered run file (`file_path`, relative to the run folder) made
+    usable in the GUI (U4); other links stay as they are."""
+    base = posixpath.dirname(file_path or "")
+
+    def link(match: re.Match[str]) -> str:
+        path = _run_path(match.group(1), base)
+        if path is None:
+            return match.group(0)
+        result = _result_for(path, results)
+        if result is not None:
+            return (
+                f'<a href="?ansicht=ergebnisse&amp;ergebnis={result.id}" '
+                f'data-sel="ergebnis:{result.id}" title="Ergebnis {result.id:03d} öffnen">'
+                f"{match.group(2)}</a>"
+            )
+        return f'<span class="run-file" title="Im Run-Ordner: {esc(path)}">{match.group(2)}</span>'
+
+    def image(match: re.Match[str]) -> str:
+        path = _run_path(match.group(1), base)
+        if path is None:
+            return match.group(0)
+        label = match.group(2) or posixpath.basename(path)
+        return f'<span class="run-file" title="Bild im Run-Ordner: {esc(path)}">{label}</span>'
+
+    return _IMG_RE.sub(image, _LINK_RE.sub(link, rendered))
 
 
 def result_dom_id(result_id: int) -> str:
@@ -84,15 +149,17 @@ def _ratings_html(result: Result) -> str:
     return table + (f'<div class="stack small comments">{comments}</div>' if comments else "")
 
 
-def result_card_html(result: Result) -> str:
-    """One result with origin, status, excerpt, ratings and the way to its source."""
+def result_card_html(result: Result, results: Sequence[Result] = ()) -> str:
+    """One result with origin, status, excerpt, ratings and the way to its source; `results`
+    are the targets of its relative links."""
     meta = [f'<span class="mono">{esc(result.agent)}</span>']
     if result.stage_label:
         meta.append(f"Stufe {esc(result.stage_label)}")
     meta.append(f"Versuch {result.attempt}")
     meta.append(fmt.clock(result.ts))
     body = (
-        f'<div class="prose excerpt">{markdown_html(result.body_excerpt)}</div>'
+        f'<div class="prose excerpt">'
+        f"{run_links_html(markdown_html(result.body_excerpt), result.path, results)}</div>"
         if result.body_excerpt
         else ""
     )
@@ -145,6 +212,7 @@ def handoff_html(handoff: str, run_dir: str) -> str:
 def results_html(results: RunResults, handoff: str, run_dir: str) -> str:
     """The whole view: summary, „Übernehmen“, results by stage."""
     parts = []
+    summary_file = results.summary_path or "output/summary.md"
     if results.summary_md:
         path = (
             f'<span class="faint mono small">{esc(results.summary_path)}</span>'
@@ -154,7 +222,9 @@ def results_html(results: RunResults, handoff: str, run_dir: str) -> str:
         parts.append(
             '<section class="card summary" aria-labelledby="h-summary"><div class="card-head">'
             f'<h2 id="h-summary">Zusammenfassung</h2>{path}</div>'
-            f'<div class="prose">{markdown_html(results.summary_md)}</div></section>'
+            f'<div class="prose">'
+            f"{run_links_html(markdown_html(results.summary_md), summary_file, results.items)}"
+            "</div></section>"
         )
     parts.append(handoff_html(handoff, run_dir))
     if not results.items:
@@ -167,7 +237,7 @@ def results_html(results: RunResults, handoff: str, run_dir: str) -> str:
         )
         return "".join(parts)
     for label, group in groupby(results.items, key=lambda r: r.stage_label or "Ohne Stufe"):
-        cards = "".join(result_card_html(r) for r in group)
+        cards = "".join(result_card_html(r, results.items) for r in group)
         parts.append(f'<h2 class="stage-h">Stufe {esc(label)}</h2>{cards}')
     return "".join(parts)
 

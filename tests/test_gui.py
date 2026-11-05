@@ -23,8 +23,9 @@ from arr.errors import ArrError
 from arr.permissions.types import ApprovalStatus
 from arr.service.gui import format as fmt
 from arr.service.gui.app import setup
+from arr.service.gui.components.notification import approval_notification
 from arr.service.gui.layout import chips_html, nav_html, tab_title
-from arr.service.mock_api import Dataset, MockApi
+from arr.service.mock_api import R_EXPLORE, Dataset, MockApi
 
 
 @asynccontextmanager
@@ -120,6 +121,41 @@ async def test_counters_are_the_same_everywhere(api: MockApi) -> None:
         assert 'Wartet auf dich <span class="n">3</span>' in page
     assert tab_title("Freigaben", 3) == "(3) Freigaben – arr"
     assert tab_title("Freigaben", 0) == "Freigaben – arr"
+
+
+def _all_contents(user: User, marker: str) -> str:
+    """HTML of the elements with `marker` and of everything inside them."""
+    with user.client:
+        return " ".join(
+            str(node.content)
+            for el in ElementFilter(marker=marker)
+            for node in [el, *el.descendants()]
+            if getattr(node, "content", None)
+        )
+
+
+RISK_MEDIUM = "Netzwerkzugriff auf eine Domain, die deine Vollmacht nicht nennt."
+
+
+async def test_w3_08_u8_risk_is_explained_in_the_card_not_only_in_the_tooltip(
+    api: MockApi,
+) -> None:
+    """U8: the explanation of the risk stands as text in the card on „Freigaben“, in the
+    compact card of the run detail and in the (simulated) notification."""
+    item = await api.get_approval("apr_0042")
+    assert item.risk is not None and item.risk.text == RISK_MEDIUM
+    line = f"<b>mittel:</b> {RISK_MEDIUM}</span>"
+    async with gui_user(api) as user:
+        await user.open("/freigaben/apr_0042")
+        await user.should_see(marker="card-apr_0042")
+        card = _all_contents(user, "card-apr_0042")
+        assert '<dt>Risiko</dt><dd><span class="risk-line">' in card and line in card
+        await user.open(f"/runs/{R_EXPLORE}")
+        await user.should_see(marker="cc-card-apr_0042")
+        compact = _all_contents(user, "cc-card-apr_0042")
+        assert "<b>Risiko:</b> " in compact and line in compact
+    text, _link = approval_notification(item, api.now())
+    assert f"· Risiko mittel: {RISK_MEDIUM} ·" in text
 
 
 async def test_allow_permission_updates_counters_and_history(api: MockApi) -> None:

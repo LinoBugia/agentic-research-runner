@@ -348,3 +348,8 @@ dialog.dlg .df { padding: var(--s3) var(--s5) var(--s4); display: flex; justify-
 .placeholder { max-width: 640px; }
 .stack-item + .stack-item { margin-top: 8px; }
 section[id] { scroll-margin-top: calc(var(--top-h) + 16px); }
+
+/* ---------- W3-08: risk as text (U8), run files (U4), note or question (U6) ---------- */
+.risk-line .dots { letter-spacing: 1px; margin-right: 2px; }
+.run-file { border-bottom: 1px dotted var(--border-strong); cursor: help; }
+.composer .cmp-suggest:not(:empty) { display: block; color: var(--text); }

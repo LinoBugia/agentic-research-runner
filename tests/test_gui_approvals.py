@@ -23,6 +23,7 @@ from test_gui_real import page_html, see
 from arr.models import RunStatus
 from arr.permissions.types import ApprovalStatus, DecisionAction, DecisionScope, PermissionRequest
 from arr.service.api_models import ApprovalItem, DecisionRequest, RunAction
+from arr.service.gui.components.base import esc
 from arr.service.gui.layout import Frame
 from arr.service.real_api import RealApi
 from arr.workfolder import load_workfolder_settings
@@ -93,6 +94,9 @@ async def test_a4_card_answers_the_four_questions_and_decides_with_real_data(wf:
         assert "Warum bei dir" in html and "Feste Regeln entscheiden das nicht allein" in html
         assert "Was passiert" in html and "nach der Frist als abgelehnt" in html
         assert "Ich brauche die Folge." in html
+        # W3-08 U8: how risky, as text in the card (not only as tooltip)
+        assert item.risk is not None and f"{esc(item.risk.text)}</span>" in html
+        assert "<dt>Risiko</dt>" in html
         user.find(marker="allow").click()
         end = time.monotonic() + 5
         while (await api.get_approval(item.id)).status is ApprovalStatus.OPEN:

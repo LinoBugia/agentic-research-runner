@@ -29,6 +29,7 @@ from arr.service.api_models import (
     Vendor,
 )
 from arr.service.notify import (
+    MAX_TEXT,
     SCRIPT,
     Notifier,
     message_for,
@@ -77,6 +78,28 @@ def test_a8_text_names_agent_run_and_kind_but_not_the_command() -> None:
     assert "explorer-1" in text and "Collatz" in text and "Installation" in text
     assert "läuft in 20 min ab" in text
     assert "pip install" not in text and SECRET not in text and "token" not in text
+
+
+def test_w3_08_u8_text_names_the_risk_with_its_explanation() -> None:
+    text = message_for(created(permission()), 0.0)
+    assert text is not None
+    assert text.startswith("explorer-1 fragt nach: Installation · läuft in 20 min ab (")
+    assert text.endswith(") · Risiko mittel: Installation. · Collatz")
+
+
+def test_w3_08_1_a_long_text_keeps_the_deadline() -> None:
+    """Review finding 5: two kinds, a long high risk and a long run name exceed `MAX_TEXT`; the
+    end is cut, the deadline stays."""
+    item = permission(
+        categories=[RequestCategory.INSTALL, RequestCategory.NETWORK],
+        risk=RiskInfo(level=RiskLevel.HIGH, text="Sehr riskant: " + "fremder Code " * 8),
+        run=ApprovalRunRef(
+            id="r1", name="Collatz – " + "Varianten " * 6, project="demo", gui_url="http://x"
+        ),
+    )
+    text = message_for(created(item), 0.0)
+    assert text is not None and len(text) == MAX_TEXT
+    assert "läuft in 20 min ab" in text and "Risiko hoch: Sehr riskant" in text
 
 
 def test_a8_secrets_and_control_characters_leave_every_text() -> None:
