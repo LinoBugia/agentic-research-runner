@@ -123,3 +123,66 @@ return seen;
 
 def test_addressee_presets_question_until_the_kind_was_chosen() -> None:
     assert run("run_detail.js", "kind", KIND) == ["question", "note", "idea"]
+
+
+SUGGEST = """
+const suggest = %(js)s;
+const note = { textContent: "" };
+const opt = (value, textContent) => ({ value, textContent });
+const options = [opt("", "alle in #main"), opt("diskutant-1", "diskutant-1"),
+                 opt("diskutant-2", "diskutant-2")];
+const kind = { name: "kind", value: "note", dataset: {} };
+const to = { name: "to", value: "", options,
+             get selectedIndex() { return options.findIndex((o) => o.value === this.value); } };
+const body = { name: "body", value: "" };
+const form = { kind, to, body, querySelector: (sel) => (sel === ".cmp-suggest" ? note : null) };
+for (const el of [kind, to, body]) {
+  el.form = form;
+  el.closest = (sel) => (sel === "form.composer" ? form : null);
+}
+const tick = () => new Promise((done) => setTimeout(done, 0));
+// the form's own listener first, then run_detail.js on the document (bubbling)
+const fire = async (target, type) => {
+  suggest({ target });
+  if (type === "change") handlers.change.forEach((fn) => fn({ target }));
+  await tick();
+  return [kind.value, note.textContent];
+};
+const type = (text) => { body.value = text; return fire(body, "input"); };
+const pick = (who) => { to.value = who; return fire(to, "change"); };
+const seen = [];
+seen.push(await type("Alles klar bei euch?"));
+seen.push(await type("Mein Vorschlag. Frage an @diskutant-2: passt das?"));
+seen.push(await type("Mein Vorschlag. Frage an diskutant-2: passt das?"));
+seen.push(await type("@diskutant-10 und mail@diskutant-1.de"));
+seen.push(await type("@alle, bitte kurz melden."));
+seen.push(await type(""));
+seen.push(await pick("diskutant-1"));
+seen.push(await pick(""));
+kind.value = "idea";
+seen.push(await fire(kind, "change"));
+seen.push(await type("Idee für @diskutant-1"));
+return seen;
+"""
+
+
+def test_w3_08_u6_mention_or_single_addressee_suggests_question() -> None:
+    """U6: `@name` of a member anywhere in the text (also mid-sentence, U5) or one addressee
+    suggests „Frage“ and says why; without them it falls back to „Notiz“; a kind you picked
+    yourself stays."""
+    from arr.service.gui.pages.run_detail_channel import SUGGEST_QUESTION_JS
+
+    out = run("run_detail.js", "suggest", SUGGEST % {"js": SUGGEST_QUESTION_JS})
+    why = "Art „Frage“ vorgeschlagen: "
+    assert out == [
+        ["note", ""],
+        ["question", why + "du sprichst @diskutant-2 an."],
+        ["note", ""],
+        ["note", ""],  # no member: @diskutant-10, an e-mail address
+        ["question", why + "du sprichst @alle an."],
+        ["note", ""],
+        ["question", why + "du schreibst an diskutant-1."],
+        ["note", ""],
+        ["idea", ""],
+        ["idea", ""],
+    ]

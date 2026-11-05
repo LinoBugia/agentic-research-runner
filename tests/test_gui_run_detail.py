@@ -37,6 +37,7 @@ from arr.service.gui.components.approval_card import (
 from arr.service.gui.components.base import markdown_html
 from arr.service.gui.components.stage_bar import stage_bar_html
 from arr.service.gui.pages.run_detail import KATEX_URL
+from arr.service.gui.pages.run_detail_channel import SUGGEST_QUESTION_JS
 from arr.service.gui.pages.run_detail_results import run_links_html
 from arr.service.mock_api import R_EXPLORE, R_LEMMA, R_RAMSEY, R_SATZ2, Dataset, MockApi, _ev
 
@@ -408,6 +409,28 @@ async def test_compact_card_allows_once_and_shows_a_confirmation(api: MockApi) -
         await until(lambda: "Erlaubt" in html(user, "overview"))  # confirmation, same card
         await until(lambda: "Wartet auf dich · 0" in html(user, "overview"), seconds=4)
         assert "2 warten auf dich" in html(user, "chips")
+
+
+async def test_w3_08_u6_composer_says_what_a_note_and_a_question_do(scenario: User) -> None:
+    """U6: the hint stands under the input (linked by aria-describedby) next to the delivery
+    note; `@name` and a single addressee suggest „Frage“ in the browser (logic in Node:
+    tests/test_gui_static_js.py)."""
+    await scenario.open(f"/runs/{R_EXPLORE}?kanal=main")
+    await until(lambda: "cmp-body" in html(scenario, "run-detail"))
+    view = html(scenario, "run-detail")
+    assert (
+        '<span class="small muted cmp-hint" id="cmp-hint">Notiz weckt niemanden. Für eine '
+        "Antwort: Frage wählen oder @name schreiben."
+    ) in view
+    assert 'aria-describedby="cmp-hint"' in view and 'class="cmp-suggest"' in view
+    with scenario.client:
+        [form] = [e for e in _walk(scenario.client.layout) if e.tag == "form"]
+        handlers = {(lis.type, lis.js_handler) for lis in form._event_listeners.values()}
+    assert ("input", SUGGEST_QUESTION_JS) in handlers
+    assert ("change", SUGGEST_QUESTION_JS) in handlers
+    scenario.find(marker="pause").click()
+    await until(lambda: "Zustellung beim Fortsetzen" in html(scenario, "run-detail"))
+    assert "@name schreiben. · Zustellung beim Fortsetzen" in html(scenario, "run-detail")
 
 
 # --- 9 states ------------------------------------------------------------------------------------

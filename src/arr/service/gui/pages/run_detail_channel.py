@@ -5,6 +5,10 @@ messages above it and „Live folgen“ off; at the end of the list it is on (st
 keeps the position, the server only appends). Older messages are counted, not loaded. The
 input bar below sends to everyone or one member; the delivery state appears under the message
 (§6.5). „gelesen bis“ lives in the browser (`ui_seen`, §5.0).
+
+Under the input a hint says what a note does and what a question does (W3-08 U6). `@name` of a
+member (or `@alle`) in the text, like a single addressee (static/run_detail.js), suggests the
+kind „Frage“ unless you picked the kind yourself; a line says why.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -38,6 +42,39 @@ LIVE_MAX = 200
 CONTEXT = 20
 """Older messages loaded above the separator „neu“; the view opens with one or two of them
 visible (§6.5), the rest is there when you scroll up."""
+
+KIND_HINT = "Notiz weckt niemanden. Für eine Antwort: Frage wählen oder @name schreiben."
+"""Always under the input bar (U6)."""
+
+SUGGEST_QUESTION_JS = r"""(e) => {
+  const f = e.target.form;
+  if (!f || !f.kind) return;
+  const note = f.querySelector(".cmp-suggest");
+  if (e.target.name === "kind") { if (note) note.textContent = ""; return; }
+  setTimeout(() => {  // after run_detail.js set the kind for a chosen addressee
+    if (f.kind.dataset.chosen) return;
+    const names = ["alle"];
+    for (const o of f.to.options) if (o.value) names.push(o.value, o.textContent.trim());
+    const said = [...f.body.value.matchAll(/(?:^|[^\w@])@([\w.-]+)/g)]
+      .map((m) => m[1].replace(/[.-]+$/, ""));
+    const hit = names.find((n) => said.includes(n));
+    const to = f.to.value ? f.to.options[f.to.selectedIndex].textContent.trim() : "";
+    let why = "";
+    if (hit) why = "du sprichst @" + hit + " an";
+    else if (to) why = "du schreibst an " + to;
+    if (why) {
+      if (f.kind.value !== "question") {
+        f.kind.value = "question";
+        f.kind.dataset.suggested = "1";
+      }
+      if (note) note.textContent = "Art „Frage“ vorgeschlagen: " + why + ".";
+    } else {
+      if (f.kind.dataset.suggested) { delete f.kind.dataset.suggested; f.kind.value = "note"; }
+      if (note) note.textContent = "";
+    }
+  });
+}"""
+"""U6: `@name` or a single addressee suggests „Frage“ (client only, nothing is sent)."""
 
 _MODE = {
     ChannelMode.EVENT: "ereignisgesteuert",
@@ -254,17 +291,19 @@ class ChannelView:
             f'<option value="{k.value}">{KIND[k][0]} {esc(KIND[k][1])}</option>'
             for k in COMPOSE_KINDS
         )
-        hint = ""
+        delivery = ""
         if page.detail.run.open_escalation:
             # no „Fortsetzen“ here: the run goes on only after your decision (§6.7)
-            hint = (
-                '<span class="small muted cmp-hint">Zustellung, sobald du die Eskalation '
-                "entschieden hast</span>"
-            )
+            delivery = "Zustellung, sobald du die Eskalation entschieden hast"
         elif page.status is RunStatus.PAUSED:
-            hint = '<span class="small muted cmp-hint">Zustellung beim Fortsetzen</span>'
+            delivery = "Zustellung beim Fortsetzen"
         elif info.mode is ChannelMode.ROUNDS:
-            hint = '<span class="small muted cmp-hint">kommt in den nächsten Posteingang</span>'
+            delivery = "kommt in den nächsten Posteingang"
+        hint = (
+            f'<span class="small muted cmp-hint" id="cmp-hint">{esc(KIND_HINT)}'
+            + (f" · {esc(delivery)}" if delivery else "")
+            + '<span class="cmp-suggest" aria-live="polite"></span></span>'
+        )
         form = (
             ui.element("form")
             .classes("composer")
@@ -277,13 +316,15 @@ class ChannelView:
                 f'<label class="sr-only" for="cmp-kind">Art</label><select id="cmp-kind" '
                 f'name="kind">{kinds}</select>'
                 f'<label class="sr-only" for="cmp-body">Nachricht (Markdown und LaTeX)</label>'
-                f'<textarea id="cmp-body" name="body" rows="1" '
+                f'<textarea id="cmp-body" name="body" rows="1" aria-describedby="cmp-hint" '
                 f'placeholder="Nachricht an #{esc(info.name)} …" '
                 'title="Markdown und LaTeX ($…$) möglich. Senden mit ⌘↩">'
                 f"</textarea>{hint}",
                 tag="div",
                 classes="cmp-fields",
             )
+            form.on("input", js_handler=SUGGEST_QUESTION_JS)
+            form.on("change", js_handler=SUGGEST_QUESTION_JS)
             send = (
                 ui.element("button")
                 .classes("btn primary")
