@@ -757,8 +757,8 @@ class ProfilePage:
                         attrs='autocomplete="off"',
                     )
                 parts["login"] = ui.element("div")
-            fields["concurrency"].input.props(f'value="{4 if k is AuthKind.CLAUDE_OAUTH else 2}"')
-            fields["concurrency"].value = str(4 if k is AuthKind.CLAUDE_OAUTH else 2)
+            # `set_value`: a value from Python replaces what you typed (W3-08.1 N1)
+            fields["concurrency"].set_value(str(4 if k is AuthKind.CLAUDE_OAUTH else 2))
             # one help text under the field, in the size of all help texts (K7)
             fields["concurrency"].set_help(f"{CONCURRENCY_TEXT} {CONCURRENCY_HINT[k]}")
             self.dialog.set_confirm(LOGIN_LABEL.get(k, "Speichern und testen"))
