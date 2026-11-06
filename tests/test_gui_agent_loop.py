@@ -10,7 +10,12 @@ from test_gui_real import page_html, see
 from test_gui_runs_real import EVENT_FORM, make_api, real_user, until, until_final, wf
 
 from arr.models import RunStatus
-from arr.service.api_models import AgentDisplayState, SecretScanInfo, WaitReason
+from arr.service.api_models import (
+    AgentDisplayState,
+    PostMessageRequest,
+    SecretScanInfo,
+    WaitReason,
+)
 from arr.service.gui.components.agent_card import card_html, remaining
 from arr.service.gui.components.stage_bar import stage_bar_html
 from arr.service.gui.pages.runs import run_row
@@ -79,22 +84,26 @@ async def test_a7_waits_show_reason_and_time_left(wf: Path) -> None:
 
 
 async def test_a7_idle_agent_shows_the_next_round(wf: Path) -> None:
+    """The idle window is long (the page may be slow under load, B11); once the page shows
+    it, a user message wakes b and the run ends."""
     scripts = {
         "a": turns([post("main", "Mein Ergebnis", kind="result")]),
         "b": turns([say("überlege")], [done()]),
     }
     api = make_api(wf, scripts)
     async with real_user(api) as user:
-        run_id = (await api.start_run(form(idle_after_s=10))).run_id  # window for a slow page
+        run_id = (await api.start_run(form(idle_after_s=120))).run_id
         await user.open(f"/runs/{run_id}")
-        await see(user, "untätig · Runde 1 von", retries=400)
-        await see(user, "Ruhe, Runde 1", retries=200)
+        await see(user, "untätig · Runde 1 von", retries=1200)
+        await see(user, "Ruhe, Runde 1", retries=600)
 
         async def b_idle_with_until() -> bool:
             b = {x.id: x for x in await api.list_agents(run_id)}["b"]
             return b.waiting is not None and b.waiting.until is not None
 
         await until(b_idle_with_until, what="b waits for the round")
+        request = PostMessageRequest(body="@b bist du fertig?")
+        await api.post_message(run_id, "main", request)
         assert await final_status(api, run_id) is RunStatus.DONE
 
 
