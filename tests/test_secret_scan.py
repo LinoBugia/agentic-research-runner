@@ -371,3 +371,77 @@ def test_w3_08_1_n2_counter_check_without_searching_on_the_chain_is_lost(
     run = _run_dir(tmp_path)
     _write(run / "agents/a/work/deploy.sh", "\n".join(CHAINED) + "\n")
     assert scan_run_dir(run).clean, "the old search loses all three"
+
+
+LONG_LINES = {
+    "chain": lambda n: "f(" + "key=len," * (n // 8) + ")",  # NB1: code values, one after another
+    "name_run": lambda n: "KEY" * (n // 3),  # many names, no `=`
+    "long_ident": lambda n: "key=" + "aA" * (n // 2) + ")",  # one huge name as value
+}
+"""W3-07.2 NB1: lines an agent can write that took quadratic time (no secret in them)."""
+
+
+@pytest.mark.parametrize("shape", list(LONG_LINES))
+@pytest.mark.parametrize(("size", "limit_s"), [(1 << 20, 1.0), (4 << 20, 4.0)], ids=["1MB", "4MB"])
+def test_w3_07_2_nb1_a_long_line_is_scanned_in_linear_time(
+    shape: str, size: int, limit_s: float
+) -> None:
+    """1 MB in under 1 s, 4 MB in under 4 s; on `dcb40b5` 200 KB of `chain` took 10.8 s."""
+    from arr.runs.secret_scan import _NAMED_PATTERNS
+
+    rule = dict(_NAMED_PATTERNS)["env_assignment"]
+    line = LONG_LINES[shape](size)
+    started = time.perf_counter()
+    assert not rule.search(line)
+    assert time.perf_counter() - started < limit_s
+
+
+def test_w3_07_2_nb1_a_long_chained_line_in_a_run_is_scanned_at_once(tmp_path: Path) -> None:
+    run = _run_dir(tmp_path)
+    _write(run / "agents/a/work/gen.py", LONG_LINES["chain"](1 << 20) + "\n")
+    _write(run / "agents/a/work/env.sh", LONG_LINES["chain"](1 << 20) + ",API_KEY=fakefake123\n")
+    started = time.perf_counter()
+    found = [(f.file, f.line, f.kind) for f in scan_run_dir(run).findings]
+    assert time.perf_counter() - started < 2.0
+    assert found == [("agents/a/work/env.sh", 1, "env_assignment")], "the chain is still found"
+
+
+def _search_before_w3_07_2(line: str) -> bool:
+    """The search of `dcb40b5` (quadratic): from one character after each code value."""
+    from arr.permissions.policy import _SECRET_ASSIGN_RE
+    from arr.runs import secret_scan
+
+    pos = 0
+    while (m := _SECRET_ASSIGN_RE.search(line, pos)) is not None:
+        if secret_scan._is_secret(m.group(1), m.group(2)):
+            return True
+        pos = m.start(2) + 1
+    return False
+
+
+PIECES = (
+    "KEY", "key", "api_key", "Api_Key", "TOKEN", "x_token", "=", "=", "len", ",", "(", ")",
+    " ", '"', "'", "«entfernt»", "\\u00abentfernt\\u00bb", "lambda", "x", "a1B2c3D4e5F6g7H8i9",
+    ".", ";", "é", "1", "A", "aaaaaaaaaaaaaaaa", "[", "]", "}", "\\", "|", "&", "\t", "_",
+    "counts.get", "itemgetter(1)", "PASSWORD", "ſ", "-", "--set ",
+)  # fmt: skip
+"""Pieces of random lines: names, values, quotes, placeholders, delimiters, code (all fake)."""
+
+
+def test_w3_07_2_nb1_the_linear_search_finds_the_same() -> None:
+    import random
+
+    from arr.runs.secret_scan import _NAMED_PATTERNS, _RANDOM_SEGMENT_RE, _random_segment
+
+    rule = dict(_NAMED_PATTERNS)["env_assignment"]
+    rnd = random.Random(7)
+    hits = 0
+    for _ in range(20_000):
+        line = "".join(rnd.choice(PIECES) for _ in range(rnd.randint(1, 14)))
+        expected = _search_before_w3_07_2(line)
+        assert bool(rule.search(line)) is expected, f"line {line!r}"
+        hits += expected
+    assert hits > 500, "both outcomes are covered"
+    for _ in range(20_000):
+        ident = "".join(rnd.choice(("a", "A", "1", "_", ".", "é", "Z9")) for _ in range(40))
+        assert _random_segment(ident) is bool(_RANDOM_SEGMENT_RE.search(ident)), ident

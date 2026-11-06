@@ -102,6 +102,20 @@ _PLACEHOLDER_END = ("", '"', "'", "\\", ",", ")", "]", "}")
 (`TOKEN=«entfernt»<secret>` written by an agent stays a hit, W3-08.1)."""
 
 
+_VALUE_GROUP = r"""=(\"[^\"]*\"|'[^']*'|[^\s;&|]+)"""
+_NAME_GROUP = _SECRET_ASSIGN_RE.pattern.removeprefix(r"(?i)\b(").removesuffix(")" + _VALUE_GROUP)
+assert _SECRET_ASSIGN_RE.pattern == r"(?i)\b(" + _NAME_GROUP + ")" + _VALUE_GROUP, "policy changed"
+_NAME_RE = re.compile(r"(?i)" + _NAME_GROUP)
+"""The name part of `_SECRET_ASSIGN_RE` (KEY, TOKEN, …), checked with `fullmatch` on one word."""
+_WORD_EQ_RE = re.compile(r"(?i)(?<!\w)[A-Z0-9_]+=")
+"""A whole word of name characters right before `=`: where `_SECRET_ASSIGN_RE` can match."""
+_STOP_RE = re.compile(r"[\s;&|]")
+"""A character that ends an unquoted value (and so the value group cannot start with it)."""
+_ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_]{16,}")
+_DIGIT_RE = re.compile(r"\d")
+_UPPER_RE = re.compile(r"[A-Z]")
+
+
 class _SecretAssignment:
     """`env_assignment`: `_SECRET_ASSIGN_RE` without Python code and redacted values (U2).
 
@@ -112,15 +126,66 @@ class _SecretAssignment:
     (`password=hunter2)`), token-like names. After a value counted as code or redacted the
     search goes on inside it, so a chained assignment is found (`--set key=value,API_KEY=…`,
     W3-08.1 N2).
+
+    Linear in the length of the line (W3-07.2 NB1): it looks at every `NAME=` once and decides
+    on the start of the value, in the line itself; it never takes the rest of the value. The
+    result is that of `_SECRET_ASSIGN_RE.search` from one character after each code value.
     """
 
     def search(self, line: str) -> bool:
-        pos = 0
-        while (m := _SECRET_ASSIGN_RE.search(line, pos)) is not None:
-            if _is_secret(m.group(1), m.group(2)):
+        quotes = _Quotes(line)
+        for word in _WORD_EQ_RE.finditer(line):
+            name = word.group()[:-1]
+            start = word.end()
+            if not _NAME_RE.fullmatch(name) or start == len(line):
+                continue
+            if _STOP_RE.match(line, start):
+                continue  # `KEY= …`: no value, so no assignment
+            if _secret_at(name, line, start, quotes):
                 return True
-            pos = m.start(2) + 1
         return False
+
+
+class _Quotes:
+    """Is there a closing quote after a position? Asked with growing positions: linear."""
+
+    def __init__(self, line: str) -> None:
+        self.line = line
+        self.known: dict[str, tuple[int, int]] = {}  # quote → (searched from, found at or -1)
+
+    def closes_after(self, quote: str, pos: int) -> bool:
+        cached = self.known.get(quote)
+        if cached is None or cached[0] > pos or -1 < cached[1] < pos:
+            cached = (pos, self.line.find(quote, pos))
+            self.known[quote] = cached
+        return cached[1] != -1
+
+
+def _redacted_at(line: str, start: int, quotes: _Quotes) -> bool:
+    """`_redacted` of the value that starts at `start`, decided on the line (see `_redacted`):
+    the character after the placeholder belongs to the value unless it ends an unquoted one."""
+    quote = line[start] if line[start] in "\"'" else ""
+    text_at = start + len(quote)
+    for mark in _PLACEHOLDERS:
+        if not line.startswith(mark, text_at):
+            continue
+        after = text_at + len(mark)
+        if after == len(line):
+            return True  # the value ends with the placeholder
+        if _STOP_RE.match(line, after) and not (quote and quotes.closes_after(quote, after)):
+            return True  # an unquoted value ends here
+        if line[after] in _PLACEHOLDER_END:
+            return True
+    return False
+
+
+def _secret_at(name: str, line: str, start: int, quotes: _Quotes) -> bool:
+    """`_is_secret` for the value that starts at `start`, without taking it out of the line."""
+    if _redacted_at(line, start, quotes):
+        return False
+    if name != name.lower():
+        return True
+    return _secret_code(_CODE_VALUE_RE.match(line, start))
 
 
 def _redacted(value: str) -> bool:
@@ -137,15 +202,30 @@ def _is_secret(name: str, value: str) -> bool:
         return False
     if name != name.lower():
         return True  # API_KEY=…, apiKey=…: an environment variable or a `toString`, no kwarg
-    code = _CODE_VALUE_RE.match(value)
+    return _secret_code(_CODE_VALUE_RE.match(value))
+
+
+def _secret_code(code: re.Match[str] | None) -> bool:
+    """A lower-case name: is its value (matched by `_CODE_VALUE_RE`) a secret, not code?"""
     if code is None:
         return True
     if code.group("lam"):
         return False
     ident = code.group("name")
-    if code.group("end") and "." not in ident and re.search(r"\d", ident):
+    if code.group("end") and "." not in ident and _DIGIT_RE.search(ident):
         return True  # a bare word with digits: `password=hunter2)`, hex tokens
-    return bool(_RANDOM_SEGMENT_RE.search(ident))
+    return _random_segment(ident)
+
+
+def _random_segment(ident: str) -> bool:
+    """`_RANDOM_SEGMENT_RE.search(ident)` in one pass: a run of 16+ ASCII word characters
+    after which, up to the next dot, a digit and a capital follow."""
+    for segment in ident.split("."):
+        digit = max((m.start() for m in _DIGIT_RE.finditer(segment)), default=-1)
+        upper = max((m.start() for m in _UPPER_RE.finditer(segment)), default=-1)
+        if any(min(digit, upper) >= run.start() for run in _ASCII_WORD_RE.finditer(segment)):
+            return True
+    return False
 
 
 _NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str] | _SecretAssignment], ...] = (
