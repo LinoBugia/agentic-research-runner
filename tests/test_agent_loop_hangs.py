@@ -45,7 +45,7 @@ from arr.room import store as room_store
 from arr.room import waiting
 from arr.room.store import RoomStore
 from arr.room.types import MessageVia
-from arr.runs import pacing
+from arr.runs import orchestrator, pacing
 from arr.runs.context import DiscussionEnd, DiscussionOutcome, RunContext
 from arr.runs.orchestrator import Orchestrator, ProfileGate
 
@@ -573,3 +573,58 @@ async def test_h18_rounds_of_the_other_go_on_during_a_long_wait(workfolder: Path
     waits = [e for e in log_entries(manager.run_dir, "waiting") if e["data"].get("agent") == D1]
     assert rounds and rounds[0]["data"]["agents"] == [D2]
     assert rounds[0]["ts"] - waits[0]["ts"] < 4.5, "not held up by D1's 6 s wait"
+
+
+# --- W3-07.2 NB2: a backend that ignores interrupt() --------------------------------------------
+
+
+class IgnoresInterrupt(FakeBackend):
+    """Like a CLI that does not react to `interrupt()` (review W3-07.1, R2)."""
+
+    async def interrupt(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize("naive", [False, True], ids=["guarded", "naive"])
+async def test_nb2_a_turn_that_ignores_the_interrupt_ends_hard(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """arr ends the turn (L7), the backend ignores `interrupt()`: a second try, then a hard
+    stop, each in the log; the round turn after it runs. Counter-check: with one `interrupt()`
+    only, as on `dcb40b5`, only `wall_time` ends it."""
+    monkeypatch.setattr(waiting, "STREAK_MAX_S", 1.0)
+    monkeypatch.setattr(orchestrator, "END_TURN_RETRY_S", 1e9 if naive else 0.5)
+    monkeypatch.setattr(orchestrator, "END_TURN_HARD_S", 0.5)
+    loop = [room("wait_for_messages", seconds=0.5) for _ in range(200)]
+    scripts = {D1: turns(loop + [done()], [done()]), D2: turns([done()])}
+    results: list[DiscussionOutcome] = []
+
+    async def topology(ctx: RunContext) -> None:
+        results.append(await ctx.discuss("main", "Los."))
+
+    manager = make_manager(
+        workfolder, topology, scripts,
+        groupchats=[channel("main", [D1, D2], mode="event", **IDLE)],
+        run_extra={"limits": {"wall_time": "5s" if naive else "30s"}},
+    )  # fmt: skip
+
+    def factory(prepared: Any) -> FakeBackend:
+        view = RoomStore(prepared.run_dir).for_agent(prepared.id, prepared.work_dir)
+        return IgnoresInterrupt(prepared.file.config, scripts[prepared.id], run_id="r", room=view)
+
+    manager.backend_factory = factory
+    await asyncio.wait_for(manager.run(), 40)
+    line = summary(manager, results[0] if results else None, 0.0)
+    ends = [e["data"] for e in log_entries(manager.run_dir, "end_turn")]
+    if naive:
+        assert line["hang"] and ends == [{"agent": D1, "reason": "nobody"}]
+        return
+    assert not line["hang"] and line["ended_by"] is DiscussionEnd.ALL_DONE
+    assert ends == [
+        {"agent": D1, "reason": "nobody"},
+        {"agent": D1, "reason": "nobody", "attempt": 2},
+        {"agent": D1, "reason": "nobody", "hard": True},
+    ]
+    statuses = [e["data"]["status"] for e in log_entries(manager.run_dir, "turn_end")
+                if e["data"]["agent"] == D1]  # fmt: skip
+    assert statuses == ["interrupted", "ok"], "the next turn runs normally"

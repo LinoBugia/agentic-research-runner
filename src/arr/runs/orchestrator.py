@@ -90,6 +90,10 @@ RATE_LIMIT_BACKOFF_S = 60.0
 """Pause of a profile after a rate limit without `resets_at`."""
 
 INTERRUPT_TIMEOUT_S = 5.0
+END_TURN_RETRY_S = 10.0
+"""arr ends a turn (L7, L12) with `interrupt()`; still running after this, it tries again."""
+END_TURN_HARD_S = 10.0
+"""Still running this long after the second `interrupt()`: arr cancels the turn (W3-07.2 NB2)."""
 
 
 class StopReason(StrEnum):
@@ -286,9 +290,13 @@ class _ActiveTurn:
     retry_at_calls: int = 0
     delivery: asyncio.Task[None] | None = None
     """The hint on its way to this agent (at most one at a time, W2-05)."""
-    ending: bool = False
-    """arr ends the turn: the agent called `wait_for_messages` again after `nobody` (L7) or
-    `capacity` (L12)."""
+    ending: int = 0
+    """arr ends the turn, the agent called `wait_for_messages` again after `nobody` (L7) or
+    `capacity` (L12): 1 after the first `interrupt()`, 2 after the second, 3 cancelled."""
+    ending_since: float = 0.0
+    """Loop time of the last step of `ending`."""
+    consume: asyncio.Task[None] | None = None
+    """The task that reads the backend's events; cancelling it ends the turn hard."""
 
 
 @dataclass(slots=True)
@@ -581,15 +589,22 @@ class Orchestrator(RunContext):
         self.log.write("turn", agent=agent_id, turn=number, stage=stage)
         started = loop.time()
         record = _TurnRecord()
-        try:
+
+        async def consume() -> None:
             async with contextlib.aclosing(backend.run_turn(full_prompt, stage=stage)) as events:
                 async for event in events:
                     events_log.log(event)
                     await self._on_event(handle, gate, active, record, event)
+
+        active.consume = asyncio.create_task(consume())
+        try:
+            await active.consume
         except asyncio.CancelledError:
             if record.status is None:
                 self._close_log(agent_id, record, TurnStatus.INTERRUPTED, "Turn abgebrochen.")
-            raise
+            outer = asyncio.current_task()
+            if active.ending < 3 or (outer is not None and outer.cancelling()):
+                raise  # the run stops; only arr's own hard end of the turn stays here
         except Exception as exc:
             logger.exception("Turn von %s fehlgeschlagen", agent_id)
             record.error = f"{type(exc).__name__}: {exc}"
@@ -1097,18 +1112,35 @@ class Orchestrator(RunContext):
         self._yielding = wanted
 
     def _end_requested_turns(self) -> None:
-        """End the turns whose agent called `wait_for_messages` once too often (L7, L12)."""
+        """End the turns whose agent called `wait_for_messages` once too often (L7, L12).
+
+        First with `interrupt()`; is the turn still running after `END_TURN_RETRY_S`, with a
+        second one; after another `END_TURN_HARD_S` arr cancels the task that reads the
+        backend's events, like the stop of a run does (W3-07.2 NB2). Each step is logged.
+        """
         requests = {
             agent_id: guard.end_turn
             for agent_id, guard in self.room.wait_guards().items()
             if guard.end_turn is not None
         }
+        now = asyncio.get_running_loop().time()
         for agent_id, reason in requests.items():
             active = self._active.get(agent_id)
-            if active is None or active.ending:
+            if active is None or active.ending >= 3:
                 continue
-            active.ending = True
-            self.log.write("end_turn", agent=agent_id, reason=reason)
+            if active.ending == 0:
+                self.log.write("end_turn", agent=agent_id, reason=reason)
+            elif active.ending == 1 and now - active.ending_since >= END_TURN_RETRY_S:
+                self.log.write("end_turn", agent=agent_id, reason=reason, attempt=2)
+            elif active.ending == 2 and now - active.ending_since >= END_TURN_HARD_S:
+                self.log.write("end_turn", agent=agent_id, reason=reason, hard=True)
+                active.ending, active.ending_since = 3, now
+                if active.consume is not None:
+                    active.consume.cancel()  # like the stop of a run: the turn is cancelled
+                continue
+            else:
+                continue
+            active.ending, active.ending_since = active.ending + 1, now
             task = asyncio.get_running_loop().create_task(self._interrupt(agent_id, active.backend))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)

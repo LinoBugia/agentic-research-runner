@@ -949,7 +949,10 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
             return f"✓ {data.get('agent')} ist fertig: {reason}"
         case "end_turn":
             why = END_TURN_TEXT.get(str(data.get("reason")), str(data.get("reason")))
-            return f"⏹ arr beendet den Turn von {data.get('agent')}: {why}"
+            if data.get("hard"):
+                return f"⏹ arr bricht den Turn von {data.get('agent')} hart ab: {why}"
+            again = " (zweiter Versuch)" if data.get("attempt") == 2 else ""
+            return f"⏹ arr beendet den Turn von {data.get('agent')}{again}: {why}"
         case "wait_end":
             return (
                 f"⏹ {data.get('agent')} wartet nicht mehr: Diskussion in "
