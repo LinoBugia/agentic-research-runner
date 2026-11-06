@@ -32,7 +32,7 @@ from arr.errors import ArrError
 from arr.models import Effort, Provider
 from arr.permissions.policy import ROOM_TOOL_PREFIX, SandboxProfile, claude_options
 from arr.room.server import AGENT_ID_ENV, RUN_DIR_ENV
-from arr.room.waiting import WAIT_MAX_ENV, WAIT_MAX_S
+from arr.room.waiting import PROVIDER_ENV, WAIT_MAX_ENV, WAIT_MAX_S
 from arr.runs.prepare import PreparedAgent
 
 ROOM_SERVER = ROOM_TOOL_PREFIX.removeprefix("mcp__").removesuffix("__")
@@ -233,6 +233,7 @@ def room_server(agent: PreparedAgent, outside_path: str | None = None) -> dict[s
             AGENT_ID_ENV: agent.id,
             RUN_DIR_ENV: str(agent.run_dir),
             WAIT_MAX_ENV: f"{WAIT_MAX_S[Provider.CLAUDE]:g}",
+            PROVIDER_ENV: Provider.CLAUDE.value,
             **path,
         },
     }

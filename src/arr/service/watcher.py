@@ -66,6 +66,7 @@ TICK_EVERY_S = 1.0
 WARN_RATIO = 0.8
 _AGENT_KINDS = frozenset(
     {"turn", "turn_end", "rate_limit", "wake", "hint", "waiting", "agent_done", "turn_silent"}
+    | {"wait_end", "end_turn"}
 )
 """Log kinds that change an agent card (docs/09 §4.6: waits, done, silent turns)."""
 _RUN_KINDS = frozenset(

@@ -41,7 +41,7 @@ from arr.resolve import load_yaml_model
 from arr.room.store import RoomStore
 from arr.room.types import Message as RoomMessage
 from arr.runs.inspect import describe_checkpoint, open_approvals, run_lock_held, run_reason
-from arr.runs.launch import ORPHAN_MIN_AGE_S, describe_entry
+from arr.runs.launch import CHANNEL_WAIT_TEXT, ORPHAN_MIN_AGE_S, describe_entry
 from arr.runs.prepare import AgentFile, RunMeta, load_agent_file, load_run_meta
 from arr.runs.slim import SLIM_MARKER
 from arr.service.api_models import (
@@ -1164,6 +1164,8 @@ def flow_view(entries: Sequence[Mapping[str, Any]]) -> _FlowView:
             view.waits[agent] = entry
         elif kind == "turn_silent":
             view.silent[agent] = entry
+        elif kind == "wait_end":
+            view.waits.pop(agent, None)
         elif kind == "turn":
             view.waits.pop(agent, None)
             view.silent.pop(agent, None)
@@ -1273,6 +1275,9 @@ def discussion_state(view: _FlowView) -> DiscussionState | None:
             text = "wartet auf deine Freigabe"
         case "capacity":
             text = "wartet auf freien Platz"
+        case "mixed":
+            parts = [CHANNEL_WAIT_TEXT.get(str(p), str(p)) for p in data.get("parts") or []]
+            text = "wartet auf " + " und ".join(parts)
         case "wake":
             text = "weckt einen Agenten"
         case _:
@@ -1586,7 +1591,10 @@ def agent_states(record: RunRecord, resolved: ResolvedRun | None = None) -> list
     final = record.final
     channels = {c.name: c for c in resolved.groupchats}
     view = flow_view(record.log.entries)
-    waits = {str(r["agent"]): dict(r) for r in record.room.rows("SELECT * FROM agent_wait")}
+    waits = {
+        str(r["agent"]): dict(r)
+        for r in record.room.rows("SELECT * FROM agent_wait WHERE kind='wait_for_messages'")
+    }
     out = []
     for config in resolved.agents:
         agent = record.agents.get(config.id)

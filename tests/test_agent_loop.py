@@ -33,15 +33,18 @@ from run_kit import (
     wait,
 )
 
+from arr.backends.base import TurnOutcome, TurnStatus
 from arr.backends.fake import FakeBackend
 from arr.models import AgentStatus, GroupChatConfig, RunStatus
 from arr.permissions.types import PermissionRequest
+from arr.room import waiting
 from arr.room.address import Address, address, mentions
 from arr.room.server import build_server
 from arr.room.store import WAIT_UNTIL_MAX_MIN, AgentRoom, RoomStore
 from arr.room.types import Message, MessageKind, MessageVia, RoomError, WaitKind
 from arr.room.waiting import (
     DEFAULT_WAIT_MAX_S,
+    PROVIDER_ENV,
     WAIT_MAX_ENV,
     WAIT_MAX_S,
     WaitEnd,
@@ -49,8 +52,10 @@ from arr.room.waiting import (
     wait_max_s,
 )
 from arr.runs.context import DiscussionEnd, DiscussionOutcome, RunContext
+from arr.runs.launch import describe_entry
 from arr.runs.orchestrator import Orchestrator
 from arr.runs.pacing import PacingSettings
+from arr.service.real_api.rundir import discussion_state, flow_view
 
 
 @pytest.fixture
@@ -180,7 +185,7 @@ def test_wait_until_is_capped_and_checks_the_file_at_once(store: RoomStore) -> N
     state = view.wait_until(500, "out/fertig.flag")
     assert state.kind is WaitKind.UNTIL and state.file == "out/fertig.flag"
     assert state.until - before <= WAIT_UNTIL_MAX_MIN * 60 + 1
-    assert store.waits()["a"] == state
+    assert store.waits(WaitKind.UNTIL)["a"] == state
     with pytest.raises(RoomError, match="Arbeitsordner"):
         view.wait_until(5, "/etc/passwd")
     with pytest.raises(RoomError, match="größer als 0"):
@@ -218,7 +223,7 @@ async def test_wait_for_messages_ends_on_a_message_to_me(store: RoomStore) -> No
         "@b siehst du das?",
     ], "the unread messages (after the brief), now read"
     assert b.unread_counts() == ({"main": 0}, 0)
-    assert "b" not in store.waits(), "the wait row is gone"
+    assert "b" not in store.waits(WaitKind.MESSAGES), "the wait row is gone"
 
 
 async def test_wait_for_messages_ends_on_file_and_on_deadline(store: RoomStore) -> None:
@@ -226,7 +231,7 @@ async def test_wait_for_messages_ends_on_file_and_on_deadline(store: RoomStore) 
 
     async def write() -> None:
         await asyncio.sleep(0.2)
-        assert store.waits()["a"].kind is WaitKind.MESSAGES, "visible while it waits"
+        assert "a" in store.waits(WaitKind.MESSAGES), "visible while it waits"
         (a.work_dir / "out").mkdir()
         (a.work_dir / "out" / "fertig.flag").write_text("")
 
@@ -263,6 +268,122 @@ async def test_room_tools_over_mcp(
 
 
 # --------------------------------------------------------------------------------------------
+# W3-07.1: limits across calls (L7, L12), texts per backend (B4), a NUL byte (B6)
+# --------------------------------------------------------------------------------------------
+
+
+async def test_l7_five_minutes_without_a_message_then_the_turn_ends(store: RoomStore) -> None:
+    a = store.for_agent("a")
+    stopped = False
+    first = await wait_for_messages(a, 10, max_s=10, poll_s=0.02, streak_max_s=0.3)
+    assert first.ended_by is WaitEnd.NOBODY and 0.3 <= first.waited_s < 1.0
+    assert a.wait_guard().end_turn is None
+    started = time.monotonic()
+    second = await wait_for_messages(
+        a, 10, max_s=5, poll_s=0.02, streak_max_s=0.3, abort=lambda: stopped
+    )
+    assert second.ended_by is WaitEnd.TURN_END and time.monotonic() - started >= 5 * 0.9
+    assert a.wait_guard().end_turn == "nobody", "the orchestrator ends the turn"
+    store.for_agent("b").post_message("main", "@a hier")
+    third = await wait_for_messages(a, 10, max_s=10, poll_s=0.02, streak_max_s=0.3)
+    assert third.ended_by is WaitEnd.MESSAGE, "a new message to it restarts the limit"
+    fourth = await wait_for_messages(a, 0.1, max_s=10, poll_s=0.02, streak_max_s=0.3)
+    assert fourth.ended_by is WaitEnd.TIMEOUT
+    store.reset_wait_guard("a")  # a new turn
+    assert a.wait_guard().waited == 0 and a.wait_guard().end_turn is None
+
+
+async def test_l7_the_turn_end_blocks_until_the_interrupt(store: RoomStore) -> None:
+    a = store.for_agent("a")
+    store.set_wait_guard("a", waited=waiting.STREAK_MAX_S, last_end="nobody")
+    calls = 0
+
+    def abort() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls > 3
+
+    outcome = await wait_for_messages(a, 10, max_s=30, poll_s=0.02, abort=abort)
+    assert outcome.ended_by is WaitEnd.TURN_END and outcome.waited_s < 1
+
+
+async def test_l12_wait_returns_at_once_while_another_waits_for_the_place(
+    store: RoomStore,
+) -> None:
+    a = store.for_agent("a")
+
+    async def contended() -> None:
+        await asyncio.sleep(0.2)
+        store.set_wait_guard("a", yield_to="max")
+
+    task = asyncio.create_task(contended())
+    during = await wait_for_messages(a, 10, max_s=10, poll_s=0.02)
+    await task
+    assert during.ended_by is WaitEnd.CAPACITY and during.waited_s < 1, "also mid-wait"
+    again = await wait_for_messages(a, 10, max_s=0.2, poll_s=0.02)
+    assert again.ended_by is WaitEnd.TURN_END and a.wait_guard().end_turn == "capacity"
+    store.reset_wait_guard("a")
+    store.set_wait_guard("a", yield_to=None)
+    assert (await wait_for_messages(a, 0.1, max_s=10, poll_s=0.02)).ended_by is WaitEnd.TIMEOUT
+
+
+async def test_l7_l12_texts_over_mcp(store: RoomStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(waiting, "STREAK_MAX_S", 0.2)
+    monkeypatch.setenv(WAIT_MAX_ENV, "0.5")
+    async with Client(build_server(store.for_agent("a"))) as client:
+        tools = {t.name: t for t in (await client.list_tools()).tools}
+        assert "ohne neue Nachricht an dich" in tools["wait_for_messages"].description
+        text = (await client.call_tool("wait_for_messages", {"seconds": 1})).content[0].text
+        assert "Niemand antwortet" in text and "`wait_until`" in text
+        text = (await client.call_tool("wait_for_messages", {"seconds": 1})).content[0].text
+        assert "arr beendet deinen Turn" in text
+        store.reset_wait_guard("a")
+        store.set_wait_guard("a", yield_to="max")
+        text = (await client.call_tool("wait_for_messages", {"seconds": 1})).content[0].text
+        assert "wartet auf einen freien Platz in deinem Profil" in text
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_b4_wait_until_with_a_file_only_for_claude(
+    store: RoomStore, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    monkeypatch.setenv(PROVIDER_ENV, provider)
+    async with Client(build_server(store.for_agent("a"))) as client:
+        tool = {t.name: t for t in (await client.list_tools()).tools}["wait_until"]
+        params = set(tool.input_schema["properties"])
+        background = "Hintergrund" in (tool.description or "")
+        if provider == "codex":
+            assert params == {"minutes"} and not background
+        else:
+            assert params == {"minutes", "until_file"} and background
+
+
+async def test_b6_a_nul_byte_in_a_path_is_a_german_error(store: RoomStore) -> None:
+    view = store.for_agent("a")
+    with pytest.raises(RoomError, match="Nullzeichen"):
+        view.until_file_exists("out/\0fertig.flag")
+    with pytest.raises(RoomError, match="Nullzeichen"):
+        view.post_message("main", "Anhang", refs=["notes\0.md"])
+    async with Client(build_server(view)) as client:
+        result = await client.call_tool("wait_until", {"minutes": 1, "until_file": "a\0b"})
+        assert result.is_error and "Nullzeichen" in result.content[0].text
+        assert "Interner Fehler" not in result.content[0].text
+    assert "a" not in store.waits(WaitKind.UNTIL), "nothing is stored"
+
+
+def test_b9_mixed_waits_in_the_log_and_the_head() -> None:
+    entry = {
+        "kind": "waiting",
+        "data": {"channel": "main", "reason": "mixed", "parts": ["agents", "capacity"]},
+    }
+    line = describe_entry(entry)
+    assert line == "Diskussion in #main wartet auf wartende Agenten und einen freien Platz"
+    view = flow_view([{"kind": "discussion_start", "data": {"channel": "main"}}, entry])
+    state = discussion_state(view)
+    assert state is not None and state.text == "wartet auf wartende Agenten und einen freien Platz"
+
+
+# --------------------------------------------------------------------------------------------
 # 09 §4.7, Nachtrag F1/F3: prompts
 # --------------------------------------------------------------------------------------------
 
@@ -285,7 +406,13 @@ def test_codex_prompt_runs_long_scripts_in_the_foreground() -> None:
     assert "eigenen Werkzeug `wait`" in text, "kept apart from Codex' own `wait`"
     assert "is not a function" in text and "neuen `exec`" in text
     assert "Vordergrund" in text
-    assert "setsid" not in text and "until_file" not in text and "wait_until" not in text
+    assert "setsid" not in text and "until_file" not in text
+    assert "`wait_until(minutes)`" in text, "only to wait for an answer (L7, L12), no file"
+    assert "5 min ohne neue Nachricht" in text
+
+
+def test_claude_prompt_names_the_limit_of_waiting_in_a_turn() -> None:
+    assert "5 min ohne neue Nachricht" in prompt_text("claude.md")
 
 
 def test_brief_names_at_name_waiting_and_how_to_finish(store: RoomStore) -> None:
@@ -585,7 +712,7 @@ async def test_a5_wait_until_ends_the_turn_and_arr_wakes(workfolder: Path, trigg
     expected = {"message": ["mention"], "file": ["file"], "timeout": ["timeout"]}[trigger]
     assert wake["data"]["agent"] == D1 and wake["data"]["reasons"] == expected
     assert turn_starts(manager.run_dir, D1)[1]["data"]["prompt"].startswith("## Posteingang")
-    assert manager.room.waits() == {}, "the wait is cleared"
+    assert not any(manager.room.waits(k) for k in WaitKind), "the wait is cleared"
 
 
 async def test_wait_until_never_waits_past_wall_time(workfolder: Path) -> None:
@@ -753,25 +880,62 @@ async def test_a9_turns_per_agent_ends_only_that_agent(workfolder: Path) -> None
     assert manager.orchestrator.agents[D1].turns_used == 2
 
 
-async def test_a9_turns_per_agent_stops_the_run_when_nobody_is_left(workfolder: Path) -> None:
+async def test_b3_quota_used_up_exactly_ends_with_all_done_not_limit(workfolder: Path) -> None:
+    """B3: the last turn uses up the quota and no further turn is needed: no `limit`."""
     talk = post("main", "weiter")
     scripts = {D1: turns([talk], repeat_last=True), D2: turns([talk], repeat_last=True)}
-    results: list[DiscussionOutcome] = []
+    manager, outcome, _ = await discuss(
+        workfolder, scripts, IDLE, run_extra={"limits": {"turns_per_agent": 2}}
+    )
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE
+    assert log_entries(manager.run_dir, "limit") == []
+    assert {a: manager.orchestrator.agents[a].turns_used for a in (D1, D2)} == {D1: 2, D2: 2}
 
+
+async def test_b3_solo_turn_using_up_the_quota_logs_no_limit(workfolder: Path) -> None:
     async def topology(ctx: RunContext) -> None:
-        results.append(await ctx.discuss("main", "Los."))
+        await ctx.turn(D1, "Mach es.")
 
     manager = make_manager(
-        workfolder,
-        topology,
-        scripts,
-        groupchats=[channel("main", [D1, D2], mode="event", **IDLE)],
-        run_extra={"limits": {"turns_per_agent": 2}},
-    )
+        workfolder, topology, {D1: turns([say("fertig")])},
+        run_extra={"limits": {"turns_per_agent": 1}},
+    )  # fmt: skip
     assert await asyncio.wait_for(manager.run(), 20) is RunStatus.DONE
-    assert results[0].ended_by in (DiscussionEnd.LIMIT, DiscussionEnd.ALL_DONE)
-    [limit] = log_entries(manager.run_dir, "limit")
-    assert limit["data"]["limit"] == "turns_per_agent"
+    assert log_entries(manager.run_dir, "limit") == []
+
+
+@pytest.mark.parametrize("naive", [False, True], ids=["guarded", "naive"])
+async def test_m13_another_turn_for_exhausted_agents_stops_the_run(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """Review M13: the halt in `_refuse` once every agent is exhausted. Counter-check
+    `naive`: without the halt the topology goes on and no `limit` is logged."""
+    if naive:
+        monkeypatch.setattr(Orchestrator, "_start_halt", lambda self, *a, **k: None)
+    outcomes: list[TurnOutcome] = []
+
+    async def topology(ctx: RunContext) -> None:
+        for _ in range(2):
+            outcomes.append(await ctx.turn(D1, "Weiter."))
+            outcomes.append(await ctx.turn(D2, "Weiter."))
+
+    scripts = {
+        D1: turns([say("eins")], repeat_last=True),
+        D2: turns([say("eins")], repeat_last=True),
+    }
+    manager = make_manager(
+        workfolder, topology, scripts, run_extra={"limits": {"turns_per_agent": 1}}
+    )
+    await asyncio.wait_for(manager.run(), 20)
+    statuses = [o.status for o in outcomes]
+    assert statuses[:2] == [TurnStatus.OK, TurnStatus.OK]
+    assert statuses[2] is TurnStatus.LIMIT, "the third turn is refused"
+    limits = [e["data"] for e in log_entries(manager.run_dir, "limit")]
+    if naive:
+        assert limits == [] and not manager.orchestrator.stop_requested
+    else:
+        assert [lim["limit"] for lim in limits] == ["turns_per_agent"]
+        assert manager.orchestrator.stop_requested and statuses[3] is TurnStatus.LIMIT
 
 
 # --- Hints: what `wait_for_messages` handed over is not hinted again ------------------------
@@ -785,6 +949,33 @@ async def test_messages_read_while_waiting_are_not_hinted_again(workfolder: Path
     manager, _, _ = await discuss(workfolder, scripts)
     assert log_entries(manager.run_dir, "hint") == []
     assert not [e for e in log_entries(manager.run_dir, "wake") if e["data"]["agent"] == D1]
+
+
+@pytest.mark.parametrize("naive", [False, True], ids=["guarded", "naive"])
+async def test_m10_no_hints_while_waiting_for_messages(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """Review M10: a message that does not end the wait (not to D1) is no hint during
+    `wait_for_messages`; it waits for the next inbox. Counter-check `naive`: without the
+    skip in `deliver_hints` it arrives as a hint during the wait."""
+    if naive:
+        monkeypatch.setattr(Orchestrator, "in_turn_wait", lambda self, agent_id: None)
+    scripts = {
+        D1: turns([room("wait_for_messages", seconds=2), done()]),
+        D2: turns([wait(0.3), post("main", "Notiz für alle"), done()]),
+    }
+    manager, _, _ = await discuss(workfolder, scripts)
+    [started] = [
+        e["ts"]
+        for e in log_entries(manager.run_dir, "waiting")
+        if e["data"].get("agent") == D1 and e["data"]["reason"] == "wait_for_messages"
+    ] or [time.time()]
+    hints = [e for e in log_entries(manager.run_dir, "hint") if e["data"]["agent"] == D1]
+    during = [h for h in hints if h["ts"] < started + 1.8]
+    if naive:
+        assert during, "without the skip the note comes as a hint mid-wait"
+    else:
+        assert during == []
 
 
 # --- Ist §9: further cases ------------------------------------------------------------------

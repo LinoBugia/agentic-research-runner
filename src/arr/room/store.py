@@ -61,6 +61,7 @@ from arr.room.types import (
     Vote,
     VoteChoice,
     VoteRule,
+    WaitGuard,
     WaitKind,
     WaitState,
 )
@@ -82,10 +83,13 @@ _COPY_CHUNK = 1024 * 1024
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK  # NONBLOCK: a FIFO must not hang
 AGENT_STATUSES = (AgentStatus.WORKING, AgentStatus.DONE)
+"""Statuses an agent may set itself; `idle` and `blocked` are set by the orchestrator."""
 WAIT_UNTIL_MAX_MIN = 30.0
 """`wait_until` waits at most this long (docs/09 §4.3); the orchestrator also caps it at the
 wall time of the run."""
-"""Statuses an agent may set itself; `idle` and `blocked` are set by the orchestrator."""
+WAIT_UNTIL_REPEAT = 3
+"""`wait_until` in a row that ended by their deadline, without a message to the agent and
+without its file; after that arr refuses another one (L10)."""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS channel(name TEXT PRIMARY KEY, created REAL, config TEXT,
@@ -115,12 +119,20 @@ CREATE TABLE IF NOT EXISTS poll(proposal_id INTEGER PRIMARY KEY, channel TEXT, r
 CREATE TABLE IF NOT EXISTS floor(id INTEGER PRIMARY KEY, ts REAL, channel TEXT,
     moderator TEXT, agent TEXT, prompt TEXT, msg_id INTEGER, handled INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_report(agent TEXT PRIMARY KEY, status TEXT, ts REAL);
-CREATE TABLE IF NOT EXISTS agent_wait(agent TEXT PRIMARY KEY, kind TEXT, since REAL,
-    until REAL, file TEXT);
+CREATE TABLE IF NOT EXISTS agent_wait(agent TEXT, kind TEXT, since REAL, until REAL,
+    file TEXT, PRIMARY KEY (agent, kind));
+CREATE TABLE IF NOT EXISTS wait_guard(agent TEXT PRIMARY KEY, waited REAL NOT NULL DEFAULT 0,
+    seen INTEGER, last_end TEXT, yield_to TEXT, end_turn TEXT,
+    until_streak INTEGER NOT NULL DEFAULT 0);
 """
 """Tables of docs/02 §5 plus `channel.state`, `msg.via`/`msg.delivery`, `poll`, `floor`,
-`agent_report` (the status an agent reported itself) and `agent_wait` (docs/09 §4.3).
-Rooms of runs before W3-07 lack the last two; readers treat that as „no rows“."""
+`agent_report` (the status an agent reported itself), `agent_wait` (one row per agent and
+kind of wait, docs/09 §4.3) and `wait_guard` (the limits of waiting, L7, L10, L12). Rooms of
+runs before W3-07 lack the last three; readers treat that as „no rows“."""
+
+WAIT_GUARD_FIELDS = frozenset(
+    {"waited", "seen", "last_end", "yield_to", "end_turn", "until_streak"}
+)
 
 CONVERSATION_RULES = (
     "Eine Nachricht, ein Gedanke. Setze `kind` korrekt.",
@@ -834,11 +846,12 @@ class RoomStore:
             return {}
         return {r["agent"]: (AgentStatus(r["status"]), r["ts"]) for r in rows}
 
-    def waits(self) -> dict[str, WaitState]:
-        """Current waits of the agents (`wait_for_messages`, `wait_until`), by agent."""
+    def waits(self, kind: WaitKind) -> dict[str, WaitState]:
+        """Current waits of `kind` (`wait_for_messages` or `wait_until`), by agent."""
         try:
             with self._read() as con:
-                rows = con.execute("SELECT * FROM agent_wait").fetchall()
+                rows = con.execute("SELECT * FROM agent_wait WHERE kind=?", (kind.value,))
+                rows = rows.fetchall()
         except sqlite3.OperationalError:  # a room from before W3-07
             return {}
         return {
@@ -859,6 +872,34 @@ class RoomStore:
             sql, args = sql + " AND kind=?", [*args, kind.value]
         with self._write() as con:
             con.execute(sql, args)
+
+    def wait_guards(self) -> dict[str, WaitGuard]:
+        """The limits of waiting per agent (table `wait_guard`, docs/09 §4.3)."""
+        try:
+            with self._read() as con:
+                rows = con.execute("SELECT * FROM wait_guard").fetchall()
+        except sqlite3.OperationalError:  # a room from before W3-07
+            return {}
+        return {r["agent"]: WaitGuard(**dict(r)) for r in rows}
+
+    def set_wait_guard(self, agent: str, **fields: Any) -> None:
+        """Set columns of `agent`'s row in `wait_guard` (`WAIT_GUARD_FIELDS`), creating it."""
+        unknown = set(fields) - WAIT_GUARD_FIELDS
+        if unknown or not fields:
+            raise ValueError(f"wait_guard: unknown or no fields {sorted(unknown)}")
+        names = sorted(fields)
+        with self._write() as con:
+            con.execute(
+                f"INSERT INTO wait_guard(agent, {', '.join(names)}) "
+                f"VALUES(?{', ?' * len(names)}) ON CONFLICT(agent) DO UPDATE SET "
+                + ", ".join(f"{n}=excluded.{n}" for n in names),
+                (agent, *(fields[n] for n in names)),
+            )
+
+    def reset_wait_guard(self, agent: str) -> None:
+        """A new turn: the time waited in the turn, its last end and an end request start
+        over; `yield_to` and `until_streak` belong to the orchestrator and stay."""
+        self.set_wait_guard(agent, waited=0.0, seen=None, last_end=None, end_turn=None)
 
     def open_questions_by(self, agent: str) -> list[Message]:
         """Questions `agent` asked that are still open (no `answer` of the addressee yet)."""
@@ -1157,6 +1198,11 @@ class AgentRoom:
 
     @staticmethod
     def _source_parts(rel: str) -> list[str]:
+        if "\0" in rel:
+            raise RoomError(
+                "Der Pfad enthält ein Nullzeichen. Gib einen gewöhnlichen Pfad relativ zu "
+                "deinem Arbeitsordner an, z. B. „notes/lemma.md“."
+            )
         if not rel or rel.startswith("/"):
             raise RoomError(
                 f"„{rel}“: Gib den Pfad relativ zu deinem Arbeitsordner an, z. B. „notes/lemma.md“."
@@ -1688,7 +1734,7 @@ class AgentRoom:
         with self.store._write() as con:
             con.execute(
                 "INSERT INTO agent_wait(agent, kind, since, until, file) VALUES(?,?,?,?,?) "
-                "ON CONFLICT(agent) DO UPDATE SET kind=excluded.kind, since=excluded.since, "
+                "ON CONFLICT(agent, kind) DO UPDATE SET since=excluded.since, "
                 "until=excluded.until, file=excluded.file",
                 (self.agent_id, kind.value, state.since, state.until, state.file),
             )
@@ -1700,11 +1746,29 @@ class AgentRoom:
 
     def wait_until(self, minutes: float, until_file: str | None = None) -> WaitState:
         """Ask to be woken after `minutes` (at most 30), on a message or when `until_file` is
-        there; the agent ends its turn afterwards (docs/09 §4.3)."""
+        there; the agent ends its turn afterwards (docs/09 §4.3).
+
+        Refused after `WAIT_UNTIL_REPEAT` of them in a row ended by their deadline (L10).
+        """
         if not isinstance(minutes, int | float) or not math.isfinite(minutes) or minutes <= 0:
             raise RoomError("„minutes“ muss eine Zahl größer als 0 sein, z. B. 10.")
+        if self.wait_guard().until_streak >= WAIT_UNTIL_REPEAT:
+            raise RoomError(
+                f"Du hast {WAIT_UNTIL_REPEAT}-mal hintereinander mit `wait_until` gewartet, ohne "
+                "dass eine Nachricht an dich oder deine Datei kam. Ein weiteres `wait_until` "
+                "lehnt arr ab: Arbeite weiter, gib dein Ergebnis ab oder beende den Turn. arr "
+                "weckt dich bei einer Nachricht an dich."
+            )
         minutes = min(float(minutes), WAIT_UNTIL_MAX_MIN)
         return self.begin_wait(WaitKind.UNTIL, minutes * 60, until_file)
+
+    def wait_guard(self) -> WaitGuard:
+        """My row of `wait_guard` (defaults without one)."""
+        return self.store.wait_guards().get(self.agent_id) or WaitGuard(agent=self.agent_id)
+
+    def update_wait_guard(self, **fields: Any) -> None:
+        """Set columns of my row of `wait_guard`."""
+        self.store.set_wait_guard(self.agent_id, **fields)
 
     def messages_for_me(self) -> list[Message]:
         """Unread messages in my readable channels that concern me (`address`).
@@ -1712,6 +1776,14 @@ class AgentRoom:
         Unread, not „new since the call“: an answer that came before `wait_for_messages`
         was called must end the wait at once.
         """
+        return self._for_me(unread=True)
+
+    def newest_for_me(self) -> int:
+        """Id of the newest message to me, read or not (0 without one): a new one resets the
+        time `wait_for_messages` may wait in a turn (L7)."""
+        return max((m.id for m in self._for_me(unread=False)), default=0)
+
+    def _for_me(self, *, unread: bool) -> list[Message]:
         with self.store._read() as con:
             found = []
             for ch in self._readable(con):
@@ -1719,7 +1791,7 @@ class AgentRoom:
                     _row_to_message(r)
                     for r in con.execute(
                         "SELECT * FROM msg WHERE channel=? AND id>? AND sender!=? ORDER BY id",
-                        (ch.name, self._cursor(con, ch.name), self.agent_id),
+                        (ch.name, self._cursor(con, ch.name) if unread else 0, self.agent_id),
                     )
                 ]
             senders: dict[int, str] = {}

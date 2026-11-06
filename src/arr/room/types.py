@@ -227,6 +227,25 @@ class WaitState(Record):
     file: str | None = None
 
 
+class WaitGuard(Record):
+    """Row of table `wait_guard`: the limits of waiting of one agent (docs/09 §4.3).
+
+    The room tools write `waited` (seconds in `wait_for_messages` this turn without a new
+    message to the agent, L7), `seen` (the newest message to it at the last call), `last_end`
+    (how the last call ended) and `end_turn` (why arr shall end the turn). The orchestrator
+    writes `yield_to` (a profile whose free place another agent waits for, L12) and
+    `until_streak` (`wait_until` in a row that ended by their deadline, L10).
+    """
+
+    agent: str
+    waited: float = 0.0
+    seen: int | None = None
+    last_end: str | None = None
+    yield_to: str | None = None
+    end_turn: str | None = None
+    until_streak: int = 0
+
+
 class RoomError(Exception):
     """Expected failure of a room tool, e.g. not a member or message too long (docs/06 §9).
 

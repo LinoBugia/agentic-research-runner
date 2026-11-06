@@ -14,9 +14,10 @@ Who is when on turn (docs/06 §5.1, §5.2, docs/09 §4) is a *discussion phase*:
 per round. `event` gives everyone the kick-off; then a message that concerns an idle,
 waiting or (for a question) finished member wakes it at once (`arr.room.address`: `to`,
 `@name`, `reply_to`, a question to all), `any` after `debounce_s`; a `wait_until` ends with
-its file or deadline; with nobody working or waiting, a *round* starts after `idle_after_s`,
-at most `rounds` of them. Wake-up limit, ping-pong guard and `quiet_after_s` stay as safety
-nets. Every wait is logged (`waiting`, `round`, `wake_scheduled`). Outside a discussion phase
+its file or deadline; with nobody working and an idle member, a *round* starts after
+`idle_after_s`, at most `rounds` of them, also while others wait long (L11). Wake-up limit
+(also for the wake-ups of `wait_until`, L10), ping-pong guard and `quiet_after_s` stay as
+safety nets. Every wait is logged (`waiting`, `round`, `wake_scheduled`). Outside a discussion phase
 nobody is woken automatically; hints and the inbox work always.
 """
 
@@ -32,7 +33,7 @@ from arr.backends.base import TurnOutcome
 from arr.errors import ArrError
 from arr.models import AgentStatus, ChannelMode, GroupChatConfig, RoundOrder, WakeOn
 from arr.room.address import Address, address
-from arr.room.store import ORCHESTRATOR, USER
+from arr.room.store import ORCHESTRATOR, USER, WAIT_UNTIL_REPEAT
 from arr.room.types import DeliveryStatus, Inbox, Message, MessageKind
 from arr.runs.context import DiscussionEnd, DiscussionOutcome, TurnJob
 
@@ -285,7 +286,9 @@ _WAKE_PROMPT = (
     "du etwas beitragen kannst. Bist du fertig, gib dein Ergebnis ab oder melde `done`."
 )
 _SELF_WAKES = frozenset({"file", "timeout"})
-"""Wake-ups the agent asked for with `wait_until`; they do not count as wake-ups."""
+"""Wake-ups the agent asked for with `wait_until`; they count against `max_wakeups_per_agent`
+like all others (L10), but the ping-pong guard does not stop them."""
+_CHANNEL_WAIT_ORDER = ("agents", "approval", "capacity")
 
 
 async def run_discussion(
@@ -378,9 +381,10 @@ class _Wake:
 class _ChannelWait:
     """What the discussion waits for, logged as `waiting {channel, …}` on every change."""
 
-    reason: str  # none | idle | agents | approval | capacity | wake
+    reason: str  # none | idle | agents | approval | capacity | wake | mixed
     until: float | None = None  # Unix time
     next: str | None = None  # idle: what comes at `until`: `round` or `end`
+    parts: tuple[str, ...] = ()  # mixed: the waits of the running turns, e.g. agents, capacity
 
 
 class _EventDiscussion:
@@ -392,6 +396,11 @@ class _EventDiscussion:
     last idle round, with `quiet` when `quiet_after_s` passed without a message although a
     round ran, or with `stopped`/`limit`. Every state that waits has a deadline: the turn's
     own limits, `approvals.timeout`, the `wait_until` deadline, `idle_after_s`.
+
+    A member waiting long holds nobody up (L11): rounds and `quiet` go on for the idle ones,
+    and the end of the discussion ends its wait (`wait_end`). Its wake-ups count against
+    `max_wakeups_per_agent`, and after `WAIT_UNTIL_REPEAT` deadlines in a row without a
+    message or its file it is idle instead of woken (L10).
     """
 
     def __init__(
@@ -553,26 +562,25 @@ class _EventDiscussion:
 
     def _fire(self, tg: asyncio.TaskGroup, member: str, wake: _Wake) -> None:
         own = set(wake.reasons) <= _SELF_WAKES
-        if not own:
-            if member in self.no_autowake:
+        if not own and member in self.no_autowake:
+            return
+        if "file" in wake.reasons:
+            self.orch.reset_until_streak(member)
+        elif wake.reasons == ["timeout"]:
+            streak = self.orch.count_until_timeout(member)
+            if streak >= WAIT_UNTIL_REPEAT:
+                self._skip(member, "wait_until_repeat", WAIT_UNTIL_REPEAT)
+                self.orch.end_long_wait(member)  # it is idle now, the rounds take it
                 return
-            count = self.orch.wakeups(self.config.name, member)
-            if count >= self.config.max_wakeups_per_agent:
-                if member not in self.skipped:
-                    self.skipped.add(member)
-                    self.orch.log.write(
-                        "wake_skipped",
-                        channel=self.config.name,
-                        agent=member,
-                        reason="max_wakeups_per_agent",
-                        limit=self.config.max_wakeups_per_agent,
-                    )
-                self.orch.end_long_wait(member)  # no wake-up left: it is idle, rounds go on
-                return
-            count = self.orch.count_wakeup(self.config.name, member)
-            self.outcome.wakeups[member] = count
-        else:
-            count = self.orch.wakeups(self.config.name, member)
+        count = self.orch.wakeups(self.config.name, member)
+        if count >= self.config.max_wakeups_per_agent:
+            if member not in self.skipped:
+                self.skipped.add(member)
+                self._skip(member, "max_wakeups_per_agent", self.config.max_wakeups_per_agent)
+            self.orch.end_long_wait(member)  # no wake-up left: it is idle, rounds go on
+            return
+        count = self.orch.count_wakeup(self.config.name, member)
+        self.outcome.wakeups[member] = count
         reason = ", ".join(_WAKE_REASONS[r] for r in wake.reasons)
         self.orch.log.write(
             "wake",
@@ -585,20 +593,25 @@ class _EventDiscussion:
         self.orch.mark_delivered(wake.messages, DeliveryStatus.WOKEN, member)
         self._start(tg, member, _WAKE_PROMPT.format(channel=self.config.name, reason=reason))
 
+    def _skip(self, member: str, reason: str, limit: int) -> None:
+        self.orch.log.write(
+            "wake_skipped", channel=self.config.name, agent=member, reason=reason, limit=limit
+        )
+
     def _idle_members(self) -> list[str]:
-        """Members a round is for: not done, not waiting; unread messages to them first."""
-        members = [
+        """Members a round is for: not done, not working, not waiting long (L11)."""
+        return [
             m
             for m in self.members
             if self.orch.agent_status(m) is not AgentStatus.DONE
             and self.orch.long_wait(m) is None
             and not self._busy(m)
         ]
-        unread = {m: self.orch.addressed_unread(m, self.config.name) for m in members}
-        return sorted(members, key=lambda m: unread[m] == 0)
 
     def _start_round(self, tg: asyncio.TaskGroup) -> None:
         members = self._idle_members()
+        unread = {m: self.orch.addressed_unread(m, self.config.name) for m in members}
+        members.sort(key=lambda m: unread[m] == 0)  # unread messages to them first
         number = self.outcome.rounds = self.outcome.rounds + 1
         self.last_round = self.last_activity = self.loop.time()
         self.orch.log.write(
@@ -612,16 +625,29 @@ class _EventDiscussion:
         return all(self.orch.agent_status(m) is AgentStatus.DONE for m in self.members)
 
     def _working_wait(self) -> _ChannelWait:
-        """What the discussion waits for while turns run (only the running ones count)."""
-        running = [m for m in self.members if self._busy(m)]
-        if all(self.orch.waits_for_capacity(m) for m in running):
-            return _ChannelWait("capacity")
-        if all(self.orch.agent_status(m) is AgentStatus.BLOCKED for m in running):
-            return _ChannelWait("approval")
-        waits = [self.orch.in_turn_wait(m) for m in running]
-        if all(w is not None for w in waits):
-            return _ChannelWait("agents", min(w.until for w in waits if w is not None))
-        return _ChannelWait("none")
+        """What the discussion waits for while turns run (only the running ones count).
+
+        Each running turn waits for a free place, an approval or messages, or it works; one
+        working turn makes it `none`. Different waits make `mixed` with their `parts` (B9).
+        """
+        parts: set[str] = set()
+        untils: list[float] = []
+        for member in (m for m in self.members if self._busy(m)):
+            if self.orch.waits_for_capacity(member):
+                parts.add("capacity")
+            elif self.orch.agent_status(member) is AgentStatus.BLOCKED:
+                parts.add("approval")
+            elif (wait := self.orch.in_turn_wait(member)) is not None:
+                parts.add("agents")
+                untils.append(wait.until)
+            else:
+                return _ChannelWait("none")
+        until = min(untils, default=None)
+        if len(parts) == 1:
+            reason = parts.pop()
+            return _ChannelWait(reason, until if reason == "agents" else None)
+        ordered = tuple(p for p in _CHANNEL_WAIT_ORDER if p in parts)
+        return _ChannelWait("mixed", until, parts=ordered)
 
     def _report(self, wait: _ChannelWait) -> None:
         if wait != self.reported:
@@ -634,6 +660,7 @@ class _EventDiscussion:
                 next=wait.next,
                 round=self.outcome.rounds,
                 of=self.rounds,
+                **({"parts": list(wait.parts)} if wait.parts else {}),
             )
 
     def _step(self, tg: asyncio.TaskGroup, now: float) -> DiscussionEnd | float | None:
@@ -651,13 +678,17 @@ class _EventDiscussion:
         if self._all_done():
             return DiscussionEnd.ALL_DONE
         long_waits = [w for m in self.members if (w := self.orch.long_wait(m)) is not None]
+        wake_at: float | None = None  # loop time at which a `wait_until` may wake
         if long_waits:
             until = min(w.until for w in long_waits)
-            self._report(_ChannelWait("agents", until))
-            files = any(w.file for w in long_waits)
-            deadline = now + max(0.0, until - time.time())
-            return min(deadline, now + 1.0) if files else deadline
-        # idle: nobody works or waits, no wake-up due, not all done (docs/09 §4.4)
+            wake_at = now + max(0.0, until - time.time())
+            if any(w.file for w in long_waits):
+                wake_at = min(wake_at, now + 1.0)
+            if not self._idle_members():  # only members waiting long are left
+                self._report(_ChannelWait("agents", until))
+                return wake_at
+        # idle: rounds and quiet for the members that neither work nor wait (docs/09 §4.4,
+        # L11: a member waiting long holds nobody up)
         quiet_at = self.last_message + self.config.quiet_after_s
         if self.last_round is not None and self.last_round >= self.last_message and now >= quiet_at:
             return DiscussionEnd.QUIET
@@ -666,12 +697,26 @@ class _EventDiscussion:
             if now >= round_at:
                 return DiscussionEnd.ROUNDS
             self._report(_ChannelWait("idle", time.time() + round_at - now, "end"))
-            return round_at
+            return min(round_at, wake_at or round_at)
         if now >= round_at:
             self._start_round(tg)
             return None
         self._report(_ChannelWait("idle", time.time() + round_at - now, "round"))
-        return min(round_at, quiet_at) if self.last_round is not None else round_at
+        due = min(round_at, quiet_at) if self.last_round is not None else round_at
+        return min(due, wake_at or due)
+
+    def _end_long_waits(self, ended_by: DiscussionEnd) -> None:
+        """The discussion is over: so are the `wait_until` of its members (L11)."""
+        for member in self.members:
+            if self.orch.long_wait(member) is not None:
+                self.orch.end_long_wait(member)
+                self.orch.log.write(
+                    "wait_end",
+                    channel=self.config.name,
+                    agent=member,
+                    reason="discussion_end",
+                    ended_by=ended_by.value,
+                )
 
     async def run(self) -> DiscussionOutcome:
         self.orch.listen(self)
@@ -711,6 +756,7 @@ class _EventDiscussion:
                         await asyncio.wait_for(self.changed.wait(), timeout)
         finally:
             self.orch.unlisten(self)
+            self._end_long_waits(self.outcome.ended_by)
             if self.reported is not None:
                 self._report(_ChannelWait("none"))
         return self.outcome

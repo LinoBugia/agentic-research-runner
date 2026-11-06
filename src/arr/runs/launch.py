@@ -807,6 +807,16 @@ DONE_TEXT = {
     "reported": "meldet fertig",
     "limit": "Turns aufgebraucht (turns_per_agent)",
 }
+CHANNEL_WAIT_TEXT = {
+    "agents": "wartende Agenten",
+    "approval": "deine Freigabe",
+    "capacity": "einen freien Platz",
+}
+"""What a discussion waits for, parts of `waiting {channel, reason: mixed}` (docs/09 §4.6)."""
+END_TURN_TEXT = {
+    "nobody": "wartete 5 min ohne neue Nachricht",
+    "capacity": "ein anderer Agent wartet auf seinen Platz",
+}
 END_TEXT = {
     "all_done": "alle fertig",
     "rounds": "Runden gespielt",
@@ -845,6 +855,9 @@ def _describe_waiting(data: Mapping[str, Any]) -> str | None:
             return f"Diskussion in {channel} wartet auf deine Freigabe"
         case "capacity":
             return f"Diskussion in {channel} wartet auf einen freien Platz"
+        case "mixed":
+            parts = [CHANNEL_WAIT_TEXT.get(str(p), str(p)) for p in data.get("parts") or []]
+            return f"Diskussion in {channel} wartet auf {' und '.join(parts)}{until}"
     return None
 
 
@@ -934,6 +947,14 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
         case "agent_done":
             reason = DONE_TEXT.get(str(data.get("reason")), str(data.get("reason")))
             return f"✓ {data.get('agent')} ist fertig: {reason}"
+        case "end_turn":
+            why = END_TURN_TEXT.get(str(data.get("reason")), str(data.get("reason")))
+            return f"⏹ arr beendet den Turn von {data.get('agent')}: {why}"
+        case "wait_end":
+            return (
+                f"⏹ {data.get('agent')} wartet nicht mehr: Diskussion in "
+                f"#{data.get('channel')} ist zu Ende"
+            )
         case "turn_silent":
             minutes = int(data.get("seconds") or 0) // 60
             return f"⚠ {data.get('agent')}: seit {minutes} min kein Ereignis im Turn"

@@ -375,8 +375,9 @@ async def test_turns_per_agent_limit(workfolder: Path) -> None:
         run_extra={"limits": {"turns_per_agent": 2}},
     )
     assert await manager.run() is RunStatus.DONE
-    # L4: the quota ends the agent; with no agent left the run stops after its last turn
-    assert [o.status for o in outcomes] == [TurnStatus.OK, TurnStatus.OK]
+    # L4 and B3: the quota ends the agent with its last turn; the run stops only when an
+    # exhausted agent would get another turn and no agent is left (like on main)
+    assert [o.status for o in outcomes] == [TurnStatus.OK, TurnStatus.OK, TurnStatus.LIMIT]
     assert manager.orchestrator.agents["solo"].turns_used == 2
     [limit] = log_entries(manager.run_dir, "limit")
     assert limit["data"] == {"limit": "turns_per_agent", "agent": "solo"}

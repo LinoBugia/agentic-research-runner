@@ -555,6 +555,7 @@ def test_launch_env_and_thread_config(layout: dict[str, Path], tmp_path: Path) -
         "RUN_DIR": str(run),
         "PATH": env["PATH"],
         "ARR_WAIT_MAX_S": "25",  # under the 30 s hand-back of `exec` (spike W3-07, F3)
+        "ARR_PROVIDER": "codex",  # tool descriptions per backend (W3-07.1, B4)
     }
     assert room["default_tools_approval_mode"] == "approve"
     assert launch.cwd == str(layout["work"])

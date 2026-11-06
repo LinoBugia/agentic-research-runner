@@ -25,9 +25,10 @@ from pydantic import ValidationError
 
 from arr.errors import ArrError
 from arr.log import setup_logging
+from arr.models import Provider
 from arr.room.store import USER, AgentRoom, RoomStore
 from arr.room.types import ChannelInfo, Inbox, Message, RoomError
-from arr.room.waiting import WaitEnd, WaitOutcome, wait_max_s
+from arr.room.waiting import PROVIDER_ENV, STREAK_MAX_S, WaitEnd, WaitOutcome, wait_max_s
 from arr.room.waiting import wait_for_messages as wait_for_messages_
 
 log = logging.getLogger("arr.room.server")  # fixed name, also under `python -m`
@@ -186,6 +187,23 @@ def render_wait(outcome: WaitOutcome) -> str:
         return head + "\n\n" + render_messages(outcome.messages)
     if outcome.ended_by is WaitEnd.FILE:
         return f"Warten beendet {waited}: Die Datei „{outcome.file}“ ist da."
+    if outcome.ended_by is WaitEnd.NOBODY:
+        return (
+            f"Warten beendet {waited}: Niemand antwortet, du hast in diesem Turn "
+            f"{STREAK_MAX_S / 60:.0f} min ohne neue Nachricht an dich gewartet. Arbeite weiter, "
+            "gib dein Ergebnis ab oder warte mit `wait_until` (beendet deinen Turn; arr weckt "
+            "dich bei einer Nachricht an dich). Rufst du `wait_for_messages` noch einmal auf, "
+            "beendet arr deinen Turn."
+        )
+    if outcome.ended_by is WaitEnd.CAPACITY:
+        return (
+            f"Warten beendet {waited}: Ein anderer Agent wartet auf einen freien Platz in "
+            "deinem Profil, und du belegst einen. Warte mit `wait_until`: Das beendet deinen "
+            "Turn und gibt den Platz frei; arr weckt dich bei einer Nachricht an dich. Rufst "
+            "du `wait_for_messages` noch einmal auf, beendet arr deinen Turn."
+        )
+    if outcome.ended_by is WaitEnd.TURN_END:
+        return "arr beendet deinen Turn. arr weckt dich bei einer Nachricht an dich."
     text = f"Warten beendet {waited}: Frist abgelaufen, keine Nachricht an dich."
     if outcome.asked_s > outcome.limit_s:
         text += (
@@ -385,7 +403,9 @@ def build_server(room: AgentRoom) -> MCPServer:
         description=f"Im Turn auf eine Antwort warten, höchstens {limit:.0f} s je Aufruf. Endet "
         "sofort bei einer Nachricht an dich (`@name`, `to`, Antwort auf deine Nachricht, "
         "Frage), wenn die Datei `until_file` (relativ zu deinem Arbeitsordner) da ist, oder "
-        "nach `seconds`. Gibt die neuen Nachrichten zurück. Beliebig oft hintereinander."
+        "nach `seconds`. Gibt die neuen Nachrichten zurück. Mehrmals hintereinander erlaubt, "
+        f"in einem Turn zusammen höchstens {STREAK_MAX_S / 60:.0f} min ohne neue Nachricht an "
+        "dich."
     )
     async def wait_for_messages(seconds: float = limit, until_file: str | None = None) -> str:
         try:
@@ -398,18 +418,34 @@ def build_server(room: AgentRoom) -> MCPServer:
             raise ToolError(await asyncio.to_thread(_with_footer, room, INTERNAL_ERROR)) from None
         return await asyncio.to_thread(_with_footer, room, render_wait(outcome))
 
-    @server.tool(
-        description="Lange warten, z. B. auf eine Rechnung, die im Hintergrund läuft: `minutes` "
-        "(höchstens 30), optional `until_file` (relativ zu deinem Arbeitsordner). Danach "
-        "beendest du deinen Turn; arr weckt dich bei einer Nachricht an dich, wenn die Datei "
-        "da ist, oder nach Ablauf."
-    )
-    def wait_until(minutes: float, until_file: str | None = None) -> str:
-        def call() -> str:
-            state = room.wait_until(minutes, until_file)
-            return render_wait_until(state.until, state.file)
+    if os.environ.get(PROVIDER_ENV) == Provider.CODEX:
+        # Codex computes long scripts in the foreground; no `until_file` (L9, F1)
+        @server.tool(
+            description="Lange warten, wenn gerade niemand antwortet: `minutes` (höchstens "
+            "30). Danach beendest du deinen Turn; arr weckt dich bei einer Nachricht an dich "
+            "oder nach Ablauf."
+        )
+        def wait_until(minutes: float) -> str:
+            def call() -> str:
+                state = room.wait_until(minutes)
+                return render_wait_until(state.until, state.file)
 
-        return _respond(room, "wait_until", call)
+            return _respond(room, "wait_until", call)
+
+    else:
+
+        @server.tool(
+            description="Lange warten, z. B. auf eine Rechnung, die im Hintergrund läuft: "
+            "`minutes` (höchstens 30), optional `until_file` (relativ zu deinem "
+            "Arbeitsordner). Danach beendest du deinen Turn; arr weckt dich bei einer "
+            "Nachricht an dich, wenn die Datei da ist, oder nach Ablauf."
+        )
+        def wait_until(minutes: float, until_file: str | None = None) -> str:
+            def call() -> str:
+                state = room.wait_until(minutes, until_file)
+                return render_wait_until(state.until, state.file)
+
+            return _respond(room, "wait_until", call)
 
     @server.tool(description="Aktuellen Auftrag mit Stufe und Kontextpaket noch einmal abrufen.")
     def get_assignment() -> str:

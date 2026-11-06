@@ -214,6 +214,12 @@ class ProfileGate:
         capacity = self._capacity(now)
         return capacity is None or self.active < capacity
 
+    def contended(self) -> bool:
+        """True while a turn waits for a slot that a running turn could free (L12); not
+        during a rate-limit pause, which no freed slot shortens."""
+        waiting = any(not w.done() for w in self._waiters)
+        return waiting and self._clock() >= self.paused_until
+
     def blocked_until(self) -> float | None:
         """End of a rate-limit pause or throttle, None if only the slots are taken."""
         now = self._clock()
@@ -280,6 +286,9 @@ class _ActiveTurn:
     retry_at_calls: int = 0
     delivery: asyncio.Task[None] | None = None
     """The hint on its way to this agent (at most one at a time, W2-05)."""
+    ending: bool = False
+    """arr ends the turn: the agent called `wait_for_messages` again after `nobody` (L7) or
+    `capacity` (L12)."""
 
 
 @dataclass(slots=True)
@@ -364,6 +373,12 @@ class Orchestrator(RunContext):
         self._waits: dict[str, WaitState] = {}
         self._capacity: set[str] = set()
         self._exhausted: set[str] = set()
+        self._tasks: set[asyncio.Task[None]] = set()
+        """Interrupts of turns arr ends itself (a reference keeps them alive)."""
+        self._yielding: dict[str, str] = {}
+        """Agents asked to free their place (`wait_guard.yield_to`, L12), with the profile."""
+        self._until_streak: dict[str, int] = {}
+        """`wait_until` in a row that ended by their deadline (`wait_guard.until_streak`, L10)."""
         self._last_seen = 0
         for msg in room.messages_after(0):
             self._senders[msg.id] = msg.sender
@@ -525,12 +540,12 @@ class Orchestrator(RunContext):
         return self._not_run(handle) if self.stop_requested else None
 
     def _exhaust(self, handle: AgentHandle) -> None:
-        """`turns_per_agent` reached: the agent is `done` (reason `limit`), once."""
-        if handle.id in self._exhausted:
-            return
-        self._exhausted.add(handle.id)
-        self._set_status(handle, AgentStatus.DONE, note="limit")
-        self.log.write("agent_done", agent=handle.id, reason="limit", turns=handle.turns_used)
+        """An exhausted agent would get another turn: it is `done` (reason `limit`, once);
+        when every agent is exhausted, the run stops with `limit` (B3: not before)."""
+        if handle.id not in self._exhausted:
+            self._exhausted.add(handle.id)
+            self._set_status(handle, AgentStatus.DONE, note="limit")
+            self.log.write("agent_done", agent=handle.id, reason="limit", turns=handle.turns_used)
         if self._exhausted >= set(self._handles):
             self._start_halt(StopReason.LIMIT, LimitKind.TURNS_PER_AGENT, agent=handle.id)
 
@@ -552,6 +567,8 @@ class Orchestrator(RunContext):
         before = max((r.id for r in self.room.results(agent=agent_id)), default=0)
         was_done = handle.status is AgentStatus.DONE
         self._end_long_wait(agent_id)
+        self._yielding.pop(agent_id, None)
+        self.room.reset_wait_guard(agent_id)
         since, mark = time.time(), self.last_message_id()
         self._set_status(handle, AgentStatus.WORKING)
         loop = asyncio.get_running_loop()
@@ -710,7 +727,8 @@ class Orchestrator(RunContext):
     ) -> None:
         """After a turn: `done`, `waiting` or `idle` (docs/09 §4.2, §4.3, §4.5).
 
-        In this order: the turn quota is used up → `done` (`limit`); the agent reported
+        In this order: the turn quota is used up → `done` (`limit`, the run goes on: it stops
+        only when an exhausted agent would get another turn, `_refuse`); the agent reported
         `working` in this turn → `waiting` after `wait_until`, else `idle`; it reported `done`
         → `done`; it called `wait_until` → `waiting`; it submitted a result (`submit_result`
         or a message `result`) and has no open question of its own → `done`; it was `done`
@@ -721,8 +739,8 @@ class Orchestrator(RunContext):
         agent_id = handle.id
         report = self.room.reports().get(agent_id)
         reported = report[0] if report is not None and report[1] >= since else None
-        wait = self.room.waits().get(agent_id)
-        long_wait = wait if wait and wait.kind is WaitKind.UNTIL and wait.since >= since else None
+        wait = self.room.waits(WaitKind.UNTIL).get(agent_id)
+        long_wait = wait if wait is not None and wait.since >= since else None
         limit = self.config.limits.turns_per_agent
         reason = None
         if limit is not None and handle.turns_used >= limit:
@@ -749,8 +767,6 @@ class Orchestrator(RunContext):
         self._set_status(handle, status, note=reason or "")
         if reason is not None and not (was_done and reason == "reported"):
             self.log.write("agent_done", agent=agent_id, reason=reason, turn=handle.turns_used)
-        if reason == "limit" and self._exhausted >= set(self._handles):
-            self._start_halt(StopReason.LIMIT, LimitKind.TURNS_PER_AGENT, agent=agent_id)
 
     def _posted_result(self, agent_id: str, mark: int) -> bool:
         return any(
@@ -1055,18 +1071,66 @@ class Orchestrator(RunContext):
                     self._active[agent_id].pending.append(msg)
             if msg.sender == USER:
                 self.room.set_delivery(msg.id, DeliveryStatus.NEXT_INBOX)
+            if msg.sender != ORCHESTRATOR:
+                for agent_id in self._recipients(msg):
+                    if address(msg, agent_id, self.sender_of) is not None:
+                        self.reset_until_streak(agent_id)  # L10: a message to it
             for listener in list(self._listeners):
                 listener.on_message(msg)
         self._sync_blocked()
         self._sync_waits()
+        self._sync_yield()
+        self._end_requested_turns()
         self._check_silence()
+
+    def _sync_yield(self) -> None:
+        """L12: ask working agents to free their place while another turn waits for one of
+        their profile; `wait_for_messages` then returns at once (`arr.room.waiting`)."""
+        wanted = {
+            agent_id: gate.name
+            for agent_id in self._active
+            if (gate := self._gates[self._handles[agent_id].config.auth]).contended()
+        }
+        for agent_id in set(self._yielding) | set(wanted):
+            if self._yielding.get(agent_id) != wanted.get(agent_id):
+                self.room.set_wait_guard(agent_id, yield_to=wanted.get(agent_id))
+        self._yielding = wanted
+
+    def _end_requested_turns(self) -> None:
+        """End the turns whose agent called `wait_for_messages` once too often (L7, L12)."""
+        requests = {
+            agent_id: guard.end_turn
+            for agent_id, guard in self.room.wait_guards().items()
+            if guard.end_turn is not None
+        }
+        for agent_id, reason in requests.items():
+            active = self._active.get(agent_id)
+            if active is None or active.ending:
+                continue
+            active.ending = True
+            self.log.write("end_turn", agent=agent_id, reason=reason)
+            task = asyncio.get_running_loop().create_task(self._interrupt(agent_id, active.backend))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    def count_until_timeout(self, agent_id: str) -> int:
+        """A `wait_until` of the agent ended by its deadline: one more in a row (L10)."""
+        count = self._until_streak.get(agent_id, 0) + 1
+        self._until_streak[agent_id] = count
+        self.room.set_wait_guard(agent_id, until_streak=count)
+        return count
+
+    def reset_until_streak(self, agent_id: str) -> None:
+        """A message to the agent or its file came: `wait_until` is allowed again (L10)."""
+        if self._until_streak.pop(agent_id, 0):
+            self.room.set_wait_guard(agent_id, until_streak=0)
 
     def _sync_waits(self) -> None:
         """Log every new `wait_for_messages` of a working agent as `waiting` (docs/09 §4.6)."""
         waits = {
             agent: wait
-            for agent, wait in self.room.waits().items()
-            if wait.kind is WaitKind.MESSAGES and agent in self._active
+            for agent, wait in self.room.waits(WaitKind.MESSAGES).items()
+            if agent in self._active
         }
         for agent_id, wait in waits.items():
             known = self._waits.get(agent_id)
@@ -1129,7 +1193,7 @@ class Orchestrator(RunContext):
                 if not active.delivery.done():
                     continue
                 active.delivery = None
-            if agent_id in self._waits:
+            if self.in_turn_wait(agent_id) is not None:
                 continue  # `wait_for_messages` hands over what concerns the agent itself
             active.pending[:] = self._unseen(agent_id, active.pending)
             if not active.pending or active.blocked or active.tool_calls < active.retry_at_calls:
