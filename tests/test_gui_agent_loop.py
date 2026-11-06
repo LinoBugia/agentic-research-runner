@@ -55,7 +55,8 @@ async def test_a7_waits_show_reason_and_time_left(wf: Path) -> None:
             ],
             [done()],
         ),
-        "b": turns([wait(1.5), post("main", "Ja.", kind="answer", reply_to=2), done()]),
+        # b answers after 6 s: a window in which a slow page still shows the wait
+        "b": turns([wait(6), post("main", "Ja.", kind="answer", reply_to=2), done()]),
     }
     api = make_api(wf, scripts)
     async with real_user(api) as user:
