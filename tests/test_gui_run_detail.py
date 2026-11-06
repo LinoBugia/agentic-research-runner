@@ -23,6 +23,9 @@ from arr.service.api_models import (
     AgentTranscriptEvent,
     ChannelMessageEvent,
     Message,
+    Result,
+    ResultKind,
+    ResultStatus,
     TranscriptKind,
 )
 from arr.service.gui.app import STATIC_DIR, STATIC_URL
@@ -34,6 +37,8 @@ from arr.service.gui.components.approval_card import (
 from arr.service.gui.components.base import markdown_html
 from arr.service.gui.components.stage_bar import stage_bar_html
 from arr.service.gui.pages.run_detail import KATEX_URL
+from arr.service.gui.pages.run_detail_channel import SENT_JS, SUGGEST_QUESTION_JS
+from arr.service.gui.pages.run_detail_results import run_links_html
 from arr.service.mock_api import R_EXPLORE, R_LEMMA, R_RAMSEY, R_SATZ2, Dataset, MockApi, _ev
 
 GOLDBACH = "20261024-1230_collatz_exploration_90aa"
@@ -320,6 +325,61 @@ async def test_results_link_jumps_to_a_result(api: MockApi) -> None:
         assert 'data-open-at="e004"' in html(user, "run-detail")
 
 
+def _result(result_id: int, path: str | None) -> Result:
+    return Result(
+        id=result_id,
+        ts=1.7e9,
+        agent="diskutant-1",
+        kind=ResultKind.OTHER,
+        title="Ergebnis",
+        path=path,
+        status=ResultStatus.UNRATED,
+    )
+
+
+def test_w3_08_u4_relative_links_of_a_run_file_open_the_result_or_stay_text() -> None:
+    """U4: `results/001-….md` in `output/summary.md` opens result 1 (stored there, or only
+    copied there by the finalizer: by its number); other relative links and images are text
+    with their path, external links and anchors stay."""
+    results = [_result(1, "output/results/001-diskutant-2-result.md"), _result(2, None)]
+    source = (
+        "Siehe [Ergebnis 1](results/001-diskutant-2-result.md) und "
+        "[Ergebnis 2](results/002-diskutant-1-summary.md#schluss).\n\n"
+        "[Aufgabe](../task.md), [Skript](results/collatz.py), ![Graph](plots/g.png), "
+        "[OEIS](https://oeis.org/A006577?a=1&b=2), [oben](#ergebnis), [Start](/runs)"
+    )
+    out = run_links_html(markdown_html(source), "output/summary.md", results)
+    assert '<a href="?ansicht=ergebnisse&amp;ergebnis=1" data-sel="ergebnis:1"' in out
+    assert '<a href="?ansicht=ergebnisse&amp;ergebnis=2" data-sel="ergebnis:2"' in out
+    assert '<span class="run-file" title="Im Run-Ordner: task.md">Aufgabe</span>' in out
+    assert 'title="Im Run-Ordner: output/results/collatz.py">Skript</span>' in out
+    assert 'title="Bild im Run-Ordner: output/plots/g.png">Graph</span>' in out
+    assert '<a href="https://oeis.org/A006577?a=1&b=2">OEIS</a>' in out  # unchanged
+    assert '<a href="#ergebnis">oben</a>' in out and '<a href="/runs">Start</a>' in out
+    assert 'href="results/' not in out and "<img" not in out and 'href="../' not in out
+    # a result's own file links to its neighbour: relative to `output/results/`
+    own = run_links_html(markdown_html("[davor](002-x.md)"), results[0].path, results)
+    assert 'data-sel="ergebnis:2"' in own
+    # W3-08.1: the number counts only in `output/results/`, not in any folder named `results`
+    work = run_links_html(
+        markdown_html("[Notiz](results/002-notiz.md)"), "agents/x/work/proof.md", results
+    )
+    assert "data-sel" not in work
+    assert 'title="Im Run-Ordner: agents/x/work/results/002-notiz.md">Notiz</span>' in work
+
+
+async def test_w3_08_u4_summary_link_opens_the_result_in_the_run(api: MockApi) -> None:
+    """U4 in the page: the link in „Zusammenfassung“ selects the result (no 404 under /runs/)."""
+    api._run(R_LEMMA).summary_md = "Der Beweis steht in [Ergebnis 4](results/004-prover-proof.md)."
+    async with gui_user(api) as user:
+        await user.open(f"/runs/{R_LEMMA}")
+        view = html(user, "run-detail")
+        assert 'href="?ansicht=ergebnisse&amp;ergebnis=4" data-sel="ergebnis:4"' in view
+        assert 'href="results/' not in view and 'data-open-at=""' in view
+        user.find(marker="run-detail").trigger("click", "ergebnis:4")  # the link's data-sel
+        await until(lambda: 'data-open-at="e004"' in html(user, "run-detail"))
+
+
 # --- 8 overview ----------------------------------------------------------------------------------
 
 
@@ -355,6 +415,29 @@ async def test_compact_card_allows_once_and_shows_a_confirmation(api: MockApi) -
         await until(lambda: "Erlaubt" in html(user, "overview"))  # confirmation, same card
         await until(lambda: "Wartet auf dich · 0" in html(user, "overview"), seconds=4)
         assert "2 warten auf dich" in html(user, "chips")
+
+
+async def test_w3_08_u6_composer_says_what_a_note_and_a_question_do(scenario: User) -> None:
+    """U6: the hint stands under the input (linked by aria-describedby) next to the delivery
+    note; `@name` and a single addressee suggest „Frage“ in the browser (logic in Node:
+    tests/test_gui_static_js.py)."""
+    await scenario.open(f"/runs/{R_EXPLORE}?kanal=main")
+    await until(lambda: "cmp-body" in html(scenario, "run-detail"))
+    view = html(scenario, "run-detail")
+    assert (
+        '<span class="small muted cmp-hint" id="cmp-hint">Notiz weckt niemanden. Für eine '
+        "Antwort: Frage wählen oder @name schreiben."
+    ) in view
+    assert 'aria-describedby="cmp-hint"' in view and 'class="cmp-suggest"' in view
+    with scenario.client:
+        [form] = [e for e in _walk(scenario.client.layout) if e.tag == "form"]
+        handlers = {(lis.type, lis.js_handler) for lis in form._event_listeners.values()}
+    assert ("input", SUGGEST_QUESTION_JS) in handlers
+    assert ("change", SUGGEST_QUESTION_JS) in handlers
+    assert "arr.rd.sent();" in SENT_JS and "new Event('input', {bubbles: true})" in SENT_JS
+    scenario.find(marker="pause").click()
+    await until(lambda: "Zustellung beim Fortsetzen" in html(scenario, "run-detail"))
+    assert "@name schreiben. · Zustellung beim Fortsetzen" in html(scenario, "run-detail")
 
 
 # --- 9 states ------------------------------------------------------------------------------------

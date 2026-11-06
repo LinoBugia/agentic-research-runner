@@ -35,6 +35,7 @@ from arr.permissions.policy import (
     _SECRET_FLAG_RE,
     _SECRET_PATTERNS,
     _URL_CREDS_RE,
+    REDACTED,
 )
 from arr.runs.orchestrator import OrchestratorLog
 from arr.runs.prepare import run_venv_location
@@ -82,12 +83,70 @@ PATTERN_KINDS = (
 )
 """Names of `policy._SECRET_PATTERNS` in their order; „muster“ if the tuple changes shape."""
 
-_NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+_CODE_VALUE_RE = re.compile(
+    r"(?P<lam>lambda\b)"
+    r"|(?P<name>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)(?:(?P<call>[(\[])|(?P<end>[),\]}]))"
+)
+"""Start of a value that is Python code, not a literal (W3-08 U2, W3-08.1): `lambda`, a call or
+index (`itemgetter(1)`, `os.environ["X"]`), a dotted name (`counts.get)`) or a bare name
+without digits (`len)`); a name only before Python syntax, never at the end of the value."""
+
+_RANDOM_SEGMENT_RE = re.compile(r"(?=[^.]*\d)(?=[^.]*[A-Z])[A-Za-z0-9_]{16,}")
+"""A name segment with digits and capitals of 16+ characters looks like a token, not code."""
+
+_PLACEHOLDERS = (REDACTED, json.dumps(REDACTED).strip('"'))
+"""`policy.redact`'s placeholder, raw and JSON-escaped: an already removed value."""
+
+_PLACEHOLDER_END = ("", '"', "'", "\\", ",", ")", "]", "}")
+"""What may follow the placeholder: the end of the value or a delimiter, nothing else
+(`TOKEN=«entfernt»<secret>` written by an agent stays a hit, W3-08.1)."""
+
+
+class _SecretAssignment:
+    """`env_assignment`: `_SECRET_ASSIGN_RE` without Python code and redacted values (U2).
+
+    Only a lower-case name left of `=` can be a Python keyword argument (`key=lambda …`,
+    `key=itemgetter(1)`, `key=counts.get)`); its value is code in the forms of
+    `_CODE_VALUE_RE`. `key=«entfernt»` in `approvals.jsonl` was redacted before. Everything
+    else stays a hit: `API_KEY=…`, `apiKey=…`, quoted values, bare words with digits
+    (`password=hunter2)`), token-like names.
+    """
+
+    def search(self, line: str) -> bool:
+        return any(_is_secret(m.group(1), m.group(2)) for m in _SECRET_ASSIGN_RE.finditer(line))
+
+
+def _redacted(value: str) -> bool:
+    """Exactly the placeholder (quoted or not), followed by nothing or a delimiter."""
+    text = value[1:] if value[:1] in "\"'" else value
+    return any(
+        text.startswith(mark) and text[len(mark) : len(mark) + 1] in _PLACEHOLDER_END
+        for mark in _PLACEHOLDERS
+    )
+
+
+def _is_secret(name: str, value: str) -> bool:
+    if _redacted(value):
+        return False
+    if name != name.lower():
+        return True  # API_KEY=…, apiKey=…: an environment variable or a `toString`, no kwarg
+    code = _CODE_VALUE_RE.match(value)
+    if code is None:
+        return True
+    if code.group("lam"):
+        return False
+    ident = code.group("name")
+    if code.group("end") and "." not in ident and re.search(r"\d", ident):
+        return True  # a bare word with digits: `password=hunter2)`, hex tokens
+    return bool(_RANDOM_SEGMENT_RE.search(ident))
+
+
+_NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str] | _SecretAssignment], ...] = (
     tuple(zip(PATTERN_KINDS, _SECRET_PATTERNS, strict=True))
     if len(PATTERN_KINDS) == len(_SECRET_PATTERNS)
     else tuple(("muster", pattern) for pattern in _SECRET_PATTERNS)
 ) + (
-    ("env_assignment", _SECRET_ASSIGN_RE),
+    ("env_assignment", _SecretAssignment()),
     ("cli_flag", _SECRET_FLAG_RE),
     ("auth_header", _AUTH_HEADER_RE),
     ("url_credentials", _URL_CREDS_RE),

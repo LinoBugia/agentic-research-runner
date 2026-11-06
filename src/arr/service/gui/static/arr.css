@@ -355,3 +355,8 @@ section[id] { scroll-margin-top: calc(var(--top-h) + 16px); }
 .stagebar .sub.disc { color: var(--text-2); }
 .tag.scan-hit { background: var(--wait-bg); color: var(--wait); font-weight: 600; }
 .scan-ok { color: var(--ok); }
+
+/* ---------- W3-08: risk as text (U8), run files (U4), note or question (U6) ---------- */
+.risk-line .dots { letter-spacing: 1px; margin-right: 2px; }
+.run-file { border-bottom: 1px dotted var(--border-strong); cursor: help; }
+.composer .cmp-suggest:not(:empty) { display: block; color: var(--text); }

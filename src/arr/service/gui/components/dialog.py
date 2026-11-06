@@ -13,6 +13,7 @@ from typing import Any
 from nicegui import ui
 
 from arr.service.gui.components.base import button, esc, raw
+from arr.service.gui.components.form import NativeInput, on_value
 
 _ids = itertools.count(1)
 
@@ -83,9 +84,11 @@ class ConfirmDialog:
                             f'<label for="{heading_id}-in">{esc(input_label)} '
                             '<span class="opt">optional</span></label>'
                         )
-                        area = ui.element("textarea").props(f'id="{heading_id}-in" rows="3"')
-                        area._props["value"] = input_value
-                        area.on("input", self._set_value, js_handler="(e) => emit(e.target.value)")
+                        # the text belongs to the browser: live updates of the page do not
+                        # reset it (W3-08.1, same cause as U1)
+                        area = NativeInput("textarea").props(f'id="{heading_id}-in" rows="3"')
+                        area.set_value(input_value)
+                        on_value(area, self._set_value)
                         area.mark("dialog-input")
         self.confirm_button.clear()
         with self.confirm_button:
@@ -108,8 +111,8 @@ class ConfirmDialog:
         """Close the dialog; arr.js gives the focus back to the trigger."""
         ui.run_javascript(f"arr.closeDialog('{self.id}')")
 
-    def _set_value(self, event: Any) -> None:
-        self._value = str(event.args or "")
+    def _set_value(self, value: str) -> None:
+        self._value = value
 
     async def _confirm(self) -> None:
         handler, self._on_confirm = self._on_confirm, None

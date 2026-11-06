@@ -1,6 +1,6 @@
 # Security model
 
-> Status: 2026-11-04 · Platform implemented: macOS · Maintained with every change to sandbox, permissions or logins, every security review and every update of macOS, Claude Code CLI or Codex.
+> Status: 2026-11-05 · Platform implemented: macOS · Maintained with every change to sandbox, permissions or logins, every security review and every update of macOS, Claude Code CLI or Codex.
 
 This document describes how `arr` keeps research agents from harming the machine they run on, which ways out we know of, and which of them are closed. It is written so that the general part can serve as a template for other operating systems and for servers. The platform part currently covers macOS only.
 
@@ -86,6 +86,7 @@ These hold on every platform.
 | 3g | Codex `apply_patch` with `Move to` writes outside the run and onto the deny list; the approval request named only the source, so `arr` approved it and Codex applied it outside the sandbox | closed (W3-06.5) |
 | 3h | Codex applies moves and patches inside the run without asking, also to protected names below the top level such as `sub/.git` or `sub/.codex` | not closable with the pinned Codex version; measured: no effect outside the sandbox, the same as `mv` in the shell |
 | 3i | `arr` answers an approval method it does not know with an empty result instead of an error | the pinned Codex version has no such method; fix planned for wave 4 |
+| 4 | Processes an agent starts in the background (`&`, `nohup`, `disown`, or a process detached with its own session) keep running after the run ends and after the kill switch. They stay inside the sandbox but keep using CPU and writing to the run folder | **open**, measured in W3-07. Prompts allow only Claude's `run_in_background`, which the CLI ends with the run; Codex agents run long scripts in the foreground. A follow-up makes run end and kill switch end every process of the run; layer 7 closes it fully |
 
 Closing the ways we found does not prove that there are no others. Every review so far has found new ones.
 
@@ -116,6 +117,7 @@ On servers the Hugging Face lesson applies directly. A single allowed network pa
 ## 7. Operating rules now
 
 - Real runs are supervised. Hard problems run unsupervised only after layer 7.
+- After stopping a run, check that none of its processes are left (way 4).
 - No shared work folder for Claude and Codex agents in one run.
 - Agents cannot commit to git inside a run, because `.git` is write-protected for them. That is the price of the wall.
 - Every change to sandbox, permissions or logins gets an escape test with a counter-test, and an independent review.
