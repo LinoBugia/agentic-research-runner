@@ -109,11 +109,18 @@ class _SecretAssignment:
     `key=itemgetter(1)`, `key=counts.get)`); its value is code in the forms of
     `_CODE_VALUE_RE`. `key=«entfernt»` in `approvals.jsonl` was redacted before. Everything
     else stays a hit: `API_KEY=…`, `apiKey=…`, quoted values, bare words with digits
-    (`password=hunter2)`), token-like names.
+    (`password=hunter2)`), token-like names. After a value counted as code or redacted the
+    search goes on inside it, so a chained assignment is found (`--set key=value,API_KEY=…`,
+    W3-08.1 N2).
     """
 
     def search(self, line: str) -> bool:
-        return any(_is_secret(m.group(1), m.group(2)) for m in _SECRET_ASSIGN_RE.finditer(line))
+        pos = 0
+        while (m := _SECRET_ASSIGN_RE.search(line, pos)) is not None:
+            if _is_secret(m.group(1), m.group(2)):
+                return True
+            pos = m.start(2) + 1
+        return False
 
 
 def _redacted(value: str) -> bool:

@@ -337,3 +337,37 @@ def test_w3_08_1_u2_only_the_exact_placeholder_counts_as_redacted(tmp_path: Path
     ]
     _write(run / "approvals.jsonl", "\n".join(lines) + "\n")
     assert scan_run_dir(run).clean
+
+
+CHAINED = (
+    "helm install x --set key=value,API_KEY=fakefake123",
+    "f(key=len,API_KEY=fakefake123)",
+    "X_TOKEN=«entfernt»,API_KEY=fakefake123",
+)
+"""W3-08.1 N2: a secret chained after a value counted as code or redacted, all fake."""
+
+
+@pytest.mark.parametrize("line", CHAINED)
+def test_w3_08_1_n2_a_chained_assignment_after_code_is_found(tmp_path: Path, line: str) -> None:
+    run = _run_dir(tmp_path)
+    _write(run / "agents/a/work/deploy.sh", line + "\n")
+    found = [(f.file, f.line, f.kind) for f in scan_run_dir(run).findings]
+    assert found == [("agents/a/work/deploy.sh", 1, "env_assignment")]
+    assert "fakefake123" not in format_report(scan_run_dir(run))
+
+
+def test_w3_08_1_n2_counter_check_without_searching_on_the_chain_is_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from arr.permissions.policy import _SECRET_ASSIGN_RE
+    from arr.runs import secret_scan
+
+    def first_only(self: object, line: str) -> bool:
+        return any(
+            secret_scan._is_secret(m.group(1), m.group(2)) for m in _SECRET_ASSIGN_RE.finditer(line)
+        )
+
+    monkeypatch.setattr(secret_scan._SecretAssignment, "search", first_only)
+    run = _run_dir(tmp_path)
+    _write(run / "agents/a/work/deploy.sh", "\n".join(CHAINED) + "\n")
+    assert scan_run_dir(run).clean, "the old search loses all three"
