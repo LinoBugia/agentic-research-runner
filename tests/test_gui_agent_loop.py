@@ -84,7 +84,7 @@ async def test_a7_idle_agent_shows_the_next_round(wf: Path) -> None:
     }
     api = make_api(wf, scripts)
     async with real_user(api) as user:
-        run_id = (await api.start_run(form(idle_after_s=4))).run_id
+        run_id = (await api.start_run(form(idle_after_s=10))).run_id  # window for a slow page
         await user.open(f"/runs/{run_id}")
         await see(user, "untätig · Runde 1 von", retries=400)
         await see(user, "Ruhe, Runde 1", retries=200)
