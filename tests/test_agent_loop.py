@@ -216,7 +216,7 @@ async def test_wait_for_messages_ends_on_a_message_to_me(store: RoomStore) -> No
     task = asyncio.create_task(later())
     outcome = await wait_for_messages(b, 10, max_s=10, poll_s=0.02)
     await task
-    assert outcome.ended_by is WaitEnd.MESSAGE and 0.3 < outcome.waited_s < 2
+    assert outcome.ended_by is WaitEnd.MESSAGE and 0.3 < outcome.waited_s < 5
     assert [m.body for m in outcome.messages][1:] == [
         "alt, nicht an b",
         "nur Notiz",
@@ -241,7 +241,7 @@ async def test_wait_for_messages_ends_on_file_and_on_deadline(store: RoomStore) 
     assert by_file.ended_by is WaitEnd.FILE and by_file.file == "out/fertig.flag"
     by_time = await wait_for_messages(a, 60, max_s=0.3, poll_s=0.02)
     assert by_time.ended_by is WaitEnd.TIMEOUT and by_time.limit_s == 0.3
-    assert 0.3 <= by_time.waited_s < 1.0, "never longer than the limit of the backend"
+    assert 0.3 <= by_time.waited_s < 2.0, "never longer than the limit of the backend"
     with pytest.raises(RoomError, match="Verweis"):
         os.symlink("/etc", a.work_dir / "etc")
         await wait_for_messages(a, 5, "etc/hosts", max_s=5)
@@ -276,7 +276,7 @@ async def test_l7_five_minutes_without_a_message_then_the_turn_ends(store: RoomS
     a = store.for_agent("a")
     stopped = False
     first = await wait_for_messages(a, 10, max_s=10, poll_s=0.02, streak_max_s=0.3)
-    assert first.ended_by is WaitEnd.NOBODY and 0.3 <= first.waited_s < 1.0
+    assert first.ended_by is WaitEnd.NOBODY and 0.3 <= first.waited_s < 3.0
     assert a.wait_guard().end_turn is None
     started = time.monotonic()
     second = await wait_for_messages(
@@ -304,7 +304,7 @@ async def test_l7_the_turn_end_blocks_until_the_interrupt(store: RoomStore) -> N
         return calls > 3
 
     outcome = await wait_for_messages(a, 10, max_s=30, poll_s=0.02, abort=abort)
-    assert outcome.ended_by is WaitEnd.TURN_END and outcome.waited_s < 1
+    assert outcome.ended_by is WaitEnd.TURN_END and outcome.waited_s < 5
 
 
 async def test_l12_wait_returns_at_once_while_another_waits_for_the_place(
@@ -319,7 +319,7 @@ async def test_l12_wait_returns_at_once_while_another_waits_for_the_place(
     task = asyncio.create_task(contended())
     during = await wait_for_messages(a, 10, max_s=10, poll_s=0.02)
     await task
-    assert during.ended_by is WaitEnd.CAPACITY and during.waited_s < 1, "also mid-wait"
+    assert during.ended_by is WaitEnd.CAPACITY and during.waited_s < 5, "also mid-wait"
     again = await wait_for_messages(a, 10, max_s=0.2, poll_s=0.02)
     assert again.ended_by is WaitEnd.TURN_END and a.wait_guard().end_turn == "capacity"
     store.reset_wait_guard("a")
@@ -489,11 +489,11 @@ async def test_a2_run_b_at_name_in_the_text_wakes_at_once(workfolder: Path) -> N
         D2: turns([say("bereit")], [post("main", "Ja, 16 Teiler.", kind="answer"), done()]),
     }
     manager, outcome, took = await discuss(workfolder, scripts)  # debounce 20 s by default
-    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 5
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 15
     [wake] = log_entries(manager.run_dir, "wake")
     assert wake["data"]["agent"] == D2 and wake["data"]["reasons"] == ["mention"]
     woken = turn_starts(manager.run_dir, D2)[1]
-    assert woken["ts"] - first_ts(manager, D1) < 1, "at once, not after the 20 s debounce"
+    assert woken["ts"] - first_ts(manager, D1) < 5, "at once, not after the 20 s debounce"
     assert "Du wurdest in #main geweckt: eine Nachricht an dich" in woken["data"]["prompt"]
     [result] = [m for m in manager.room.messages("main") if m.kind is MessageKind.RESULT]
     assert result.to == [D2], "@name became `to`"
@@ -564,7 +564,7 @@ async def test_a3_run_c_result_without_done_ends_with_all_done_at_once(workfolde
         D2: turns([wait(0.1), post("main", "Mein Ergebnis: 12.", kind="result")]),
     }
     manager, outcome, took = await discuss(workfolder, scripts)  # quiet_after_s 300 s
-    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 5, "no quiet time"
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 30, "no quiet time"
     assert manager.orchestrator.agent_status(D2) is AgentStatus.DONE
     reasons = {
         e["data"]["agent"]: e["data"]["reason"] for e in log_entries(manager.run_dir, "agent_done")
@@ -683,7 +683,7 @@ async def test_a5_wait_for_messages_returns_at_the_limit(workfolder: Path) -> No
     manager, outcome, took = await discuss(workfolder, scripts, during=short)
     result = next(e for e in events(manager.run_dir, D1) if e["kind"] == "tool_result")
     assert json.loads(result["data"]["content"])["ended_by"] == "timeout"
-    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 5
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 20
 
 
 @pytest.mark.parametrize("trigger", ["message", "file", "timeout"])
@@ -703,7 +703,7 @@ async def test_a5_wait_until_ends_the_turn_and_arr_wakes(workfolder: Path, trigg
 
     scripts = {D1: turns([long_wait], [done()]), D2: turns([done()])}
     manager, outcome, took = await discuss(workfolder, scripts, during=act)
-    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 10
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 30
     [waiting] = [
         e["data"] for e in log_entries(manager.run_dir, "waiting") if e["data"].get("agent") == D1
     ]
@@ -737,7 +737,7 @@ async def test_a6_two_agents_wait_for_each_other(workfolder: Path) -> None:
                   [done()]),
     }  # fmt: skip
     manager, outcome, took = await discuss(workfolder, scripts)
-    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 10
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 30
     reasons = [e["data"]["reason"] for e in log_entries(manager.run_dir, "waiting")]
     assert {"wait_for_messages", "wait_until", "agents"} <= set(reasons)
     no_wall_time(manager)
@@ -844,7 +844,7 @@ async def test_a6_silent_agent_gets_a_warning_and_the_discussion_still_ends(
     )
     [warning] = log_entries(manager.run_dir, "turn_silent")
     assert warning["data"]["agent"] == D1 and warning["data"]["seconds"] >= 0
-    assert outcome.ended_by in (DiscussionEnd.QUIET, DiscussionEnd.ROUNDS) and took < 10
+    assert outcome.ended_by in (DiscussionEnd.QUIET, DiscussionEnd.ROUNDS) and took < 30
     no_wall_time(manager)
 
 

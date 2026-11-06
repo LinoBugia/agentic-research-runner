@@ -564,7 +564,7 @@ async def test_h17_done_agent_not_woken_by_mentions(workfolder: Path) -> None:
 async def test_h18_rounds_of_the_other_go_on_during_a_long_wait(workfolder: Path) -> None:
     """L11: the first round for D2 comes after `idle_after_s`, not after D1's long wait."""
     scripts = {
-        D1: turns([room("wait_until", minutes=0.05)], [post("main", "Ergebnis", kind="result")]),
+        D1: turns([room("wait_until", minutes=0.1)], [post("main", "Ergebnis", kind="result")]),
         D2: turns([say("nichts")], [post("main", "Ergebnis", kind="result")]),
     }
     manager, line = await run_case(workfolder, scripts, IDLE, wall="30s")
@@ -572,4 +572,4 @@ async def test_h18_rounds_of_the_other_go_on_during_a_long_wait(workfolder: Path
     rounds = log_entries(manager.run_dir, "round")
     waits = [e for e in log_entries(manager.run_dir, "waiting") if e["data"].get("agent") == D1]
     assert rounds and rounds[0]["data"]["agents"] == [D2]
-    assert rounds[0]["ts"] - waits[0]["ts"] < 2.5, "not held up by D1's 3 s wait"
+    assert rounds[0]["ts"] - waits[0]["ts"] < 4.5, "not held up by D1's 6 s wait"

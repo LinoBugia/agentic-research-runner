@@ -333,8 +333,10 @@ async def test_event_wakes_at_once_for_a_question_without_debounce(workfolder: P
         ),
         "b": turns([say("bereit")], [post("main", "Ja, beides geprüft."), done()]),
     }
+    # a debounce far above the bound below, so a slow event loop cannot blur the two (B11)
+    config = {**EVENT, "debounce_s": 5.0}
     manager, outcome = await run_discussion(
-        workfolder, scripts, EVENT, prompt="Prüft Lemma A.", stage="diskussion"
+        workfolder, scripts, config, prompt="Prüft Lemma A.", stage="diskussion"
     )
     assert outcome.ended_by is DiscussionEnd.ALL_DONE and outcome.wakeups == {"b": 1}
     [wake] = log_entries(manager.run_dir, "wake")
@@ -345,7 +347,7 @@ async def test_event_wakes_at_once_for_a_question_without_debounce(workfolder: P
     assert "Gilt Lemma A für n = 9?" in woken, "the open question is in the inbox"
     first_post = min(m.ts for m in manager.room.messages("main") if m.sender == "a")
     wake_start = [e for e in events(manager.run_dir, "b") if e["kind"] == "turn_start"][1]["ts"]
-    assert wake_start - first_post < 0.2, "woken at once, not after the debounce time"
+    assert wake_start - first_post < 2, "woken at once, not after the debounce time"
     [scheduled] = log_entries(manager.run_dir, "wake_scheduled")
     assert scheduled["data"]["agent"] == "b" and scheduled["data"]["reason"] == "question"
     checkpoint = log_entries(manager.run_dir, "checkpoint")[-1]["data"]
