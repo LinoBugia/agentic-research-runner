@@ -10,8 +10,12 @@ hands it to the topology (`async def run(ctx: RunContext) -> None`, E8). The orc
 - pauses between turns, stops (`halt`): open approvals are cancelled, running turns
   interrupted;
 - watches the room: hints mid-turn, `blocked` while an approval waits, delivery state of
-  `user` messages, and the discussion phases of `arr.runs.pacing` (`discuss`);
-- writes `orchestrator.jsonl`.
+  `user` messages, waits of the agents, turns without events, and the discussion phases of
+  `arr.runs.pacing` (`discuss`);
+- sets the status after a turn (docs/09 §4.2): `done` when the agent reported it, submitted a
+  result without an open question of its own, or was `done` before and only answered a
+  question; `waiting` after `wait_until`; `idle` otherwise;
+- writes `orchestrator.jsonl`; every wait is an entry `waiting` (docs/09 §4.6).
 
 See docs/01-architektur.md §6, docs/02-workfolder-und-runs.md §4, §7, docs/06-gruppenchats.md.
 """
@@ -42,8 +46,18 @@ from arr.errors import ArrError
 from arr.models import AgentStatus, ResolvedRun, Rubric
 from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.types import ApprovalType, EscalationOption
-from arr.room.store import ORCHESTRATOR, USER, AgentRoom, RoomStore
-from arr.room.types import DeliveryStatus, Message, MessageKind, Rating, Result
+from arr.room.address import address
+from arr.room.store import ORCHESTRATOR, USER, WAIT_UNTIL_MAX_MIN, AgentRoom, RoomStore
+from arr.room.types import (
+    DeliveryStatus,
+    Message,
+    MessageKind,
+    Rating,
+    Result,
+    RoomError,
+    WaitKind,
+    WaitState,
+)
 from arr.runs.context import AgentHandle, DiscussionOutcome, RunContext, TurnJob
 from arr.runs.eventlog import EventLogger
 from arr.runs.pacing import (
@@ -59,6 +73,7 @@ from arr.runs.prepare import PreparedRun
 __all__ = [
     "PLAN_STAGE",
     "LimitKind",
+    "LongWait",
     "Orchestrator",
     "OrchestratorLog",
     "ProfileGate",
@@ -75,6 +90,10 @@ RATE_LIMIT_BACKOFF_S = 60.0
 """Pause of a profile after a rate limit without `resets_at`."""
 
 INTERRUPT_TIMEOUT_S = 5.0
+END_TURN_RETRY_S = 10.0
+"""arr ends a turn (L7, L12) with `interrupt()`; still running after this, it tries again."""
+END_TURN_HARD_S = 10.0
+"""Still running this long after the second `interrupt()`: arr cancels the turn (W3-07.2 NB2)."""
 
 
 class StopReason(StrEnum):
@@ -92,6 +111,8 @@ class LimitKind(StrEnum):
     BUDGET_USD = "budget_usd"
 
 
+_AGENT_LIMIT_TEXT = "Dieser Agent hat seine Turns aufgebraucht (turns_per_agent)."
+
 _LIMIT_TEXT = {
     LimitKind.WALL_TIME: "Die Gesamtlaufzeit des Runs ist erreicht.",
     LimitKind.TURNS_PER_AGENT: "Die Zahl der Turns pro Agent ist erreicht.",
@@ -106,6 +127,9 @@ class OrchestratorLog:
     `turn_end`, `limit`, `stop`, `pause`, `resume`, `rate_limit`, `hint`, `wake`,
     `wake_skipped`, `ping_pong`, `channel_open`, `discussion_start`, `discussion_end`,
     `escalation`, `escalation_decided`, `error`; `prepare_run` writes `warning`.
+    Since W3-07 (docs/09 §4.6): `waiting` (`agent` or `channel`, `reason`, `until`; reason
+    `none` for a channel means it no longer waits), `round`, `wake_scheduled`, `agent_done`
+    (an agent became `done` after a turn, with `reason`) and `turn_silent`.
     """
 
     def __init__(self, run_dir: Path) -> None:
@@ -186,6 +210,29 @@ class ProfileGate:
                 with contextlib.suppress(ValueError):
                     self._waiters.remove(waiter)
 
+    def has_slot(self) -> bool:
+        """True if `acquire` would get a slot at once (for the `waiting` entry)."""
+        now = self._clock()
+        if now < self.paused_until:
+            return False
+        capacity = self._capacity(now)
+        return capacity is None or self.active < capacity
+
+    def contended(self) -> bool:
+        """True while a turn waits for a slot that a running turn could free (L12); not
+        during a rate-limit pause, which no freed slot shortens."""
+        waiting = any(not w.done() for w in self._waiters)
+        return waiting and self._clock() >= self.paused_until
+
+    def blocked_until(self) -> float | None:
+        """End of a rate-limit pause or throttle, None if only the slots are taken."""
+        now = self._clock()
+        if now < self.paused_until:
+            return self.paused_until
+        if now < self.throttled_until:
+            return self.throttled_until
+        return None
+
     def release(self) -> None:
         """Give a slot back."""
         self.active -= 1
@@ -222,16 +269,34 @@ class _Listener(Protocol):
     def kick(self) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class LongWait:
+    """An agent ended its turn with `wait_until` (docs/09 §4.3); `until` is a Unix time."""
+
+    until: float
+    file: str | None = None
+
+
 @dataclass(slots=True)
 class _ActiveTurn:
     backend: AgentBackend
     gate: HintGate
+    last_event: float = 0.0
+    """Loop time of the last event of the turn (warning after `turn_silence_warn_s`)."""
+    silent_warned: bool = False
     tool_calls: int = 0
     pending: list[Message] = field(default_factory=list)
     blocked: bool = False
     retry_at_calls: int = 0
     delivery: asyncio.Task[None] | None = None
     """The hint on its way to this agent (at most one at a time, W2-05)."""
+    ending: int = 0
+    """arr ends the turn, the agent called `wait_for_messages` again after `nobody` (L7) or
+    `capacity` (L12): 1 after the first `interrupt()`, 2 after the second, 3 cancelled."""
+    ending_since: float = 0.0
+    """Loop time of the last step of `ending`."""
+    consume: asyncio.Task[None] | None = None
+    """The task that reads the backend's events; cancelling it ends the turn hard."""
 
 
 @dataclass(slots=True)
@@ -310,6 +375,18 @@ class Orchestrator(RunContext):
         self._stop_reason: StopReason | None = None
         self._limit: LimitKind | None = None
         self._halt_task: asyncio.Task[None] | None = None
+        self.wall_end: float | None = None
+        """Unix time at which `wall_time` ends (set by the RunManager); caps `wait_until`."""
+        self._long_waits: dict[str, LongWait] = {}
+        self._waits: dict[str, WaitState] = {}
+        self._capacity: set[str] = set()
+        self._exhausted: set[str] = set()
+        self._tasks: set[asyncio.Task[None]] = set()
+        """Interrupts of turns arr ends itself (a reference keeps them alive)."""
+        self._yielding: dict[str, str] = {}
+        """Agents asked to free their place (`wait_guard.yield_to`, L12), with the profile."""
+        self._until_streak: dict[str, int] = {}
+        """`wait_until` in a row that ended by their deadline (`wait_guard.until_streak`, L10)."""
         self._last_seen = 0
         for msg in room.messages_after(0):
             self._senders[msg.id] = msg.sender
@@ -402,7 +479,20 @@ class Orchestrator(RunContext):
             if (refused := self._refuse(handle)) is not None:
                 return refused
             gate = self._gates[handle.config.auth]
-            if not await gate.acquire(lambda: self.stop_requested):
+            if not gate.has_slot():  # docs/09 §4.5: waiting for a free place is visible
+                self._capacity.add(agent_id)
+                self.log.write(
+                    "waiting",
+                    agent=agent_id,
+                    reason="capacity",
+                    profile=gate.name,
+                    until=gate.blocked_until(),
+                )
+            try:
+                acquired = await gate.acquire(lambda: self.stop_requested)
+            finally:
+                self._capacity.discard(agent_id)
+            if not acquired:
                 return self._not_run(handle)
             try:
                 await self._runnable.wait()
@@ -437,14 +527,35 @@ class Orchestrator(RunContext):
         )
 
     def _refuse(self, handle: AgentHandle) -> TurnOutcome | None:
-        """An outcome without running if the run stops or a limit forbids the turn."""
+        """An outcome without running if the run stops or a limit forbids the turn.
+
+        `turns_per_agent` ends only this agent (L4, docs/09 §4.5): it is `done` and its turn
+        returns `limit`; the run stops only when every agent has used up its turns.
+        """
         if not self.stop_requested:
             limits = self.config.limits
             if limits.turns_per_agent is not None and handle.turns_used >= limits.turns_per_agent:
-                self._start_halt(StopReason.LIMIT, LimitKind.TURNS_PER_AGENT, agent=handle.id)
+                self._exhaust(handle)
+                if not self.stop_requested:
+                    return TurnOutcome(
+                        agent_id=handle.id,
+                        turn=handle.turns_used + 1,
+                        status=TurnStatus.LIMIT,
+                        error=_AGENT_LIMIT_TEXT,
+                    )
             elif limits.budget_usd is not None and self.cost_usd >= limits.budget_usd:
                 self._start_halt(StopReason.LIMIT, LimitKind.BUDGET_USD, cost_usd=self.cost_usd)
         return self._not_run(handle) if self.stop_requested else None
+
+    def _exhaust(self, handle: AgentHandle) -> None:
+        """An exhausted agent would get another turn: it is `done` (reason `limit`, once);
+        when every agent is exhausted, the run stops with `limit` (B3: not before)."""
+        if handle.id not in self._exhausted:
+            self._exhausted.add(handle.id)
+            self._set_status(handle, AgentStatus.DONE, note="limit")
+            self.log.write("agent_done", agent=handle.id, reason="limit", turns=handle.turns_used)
+        if self._exhausted >= set(self._handles):
+            self._start_halt(StopReason.LIMIT, LimitKind.TURNS_PER_AGENT, agent=handle.id)
 
     async def _run_turn(
         self,
@@ -462,25 +573,38 @@ class Orchestrator(RunContext):
         full_prompt = self._prompt_with_inbox(agent_id, prompt)
         self.room.add_assignment(agent_id, number, prompt, stage=stage, context=context)
         before = max((r.id for r in self.room.results(agent=agent_id)), default=0)
+        was_done = handle.status is AgentStatus.DONE
+        self._end_long_wait(agent_id)
+        self._yielding.pop(agent_id, None)
+        self.room.reset_wait_guard(agent_id)
+        since, mark = time.time(), self.last_message_id()
         self._set_status(handle, AgentStatus.WORKING)
+        loop = asyncio.get_running_loop()
         active = _ActiveTurn(
             backend,
             HintGate(self.pacing.hint_interval_s, self.pacing.hint_tool_calls),
+            last_event=loop.time(),
         )
         self._active[agent_id] = active
         self.log.write("turn", agent=agent_id, turn=number, stage=stage)
-        loop = asyncio.get_running_loop()
         started = loop.time()
         record = _TurnRecord()
-        try:
+
+        async def consume() -> None:
             async with contextlib.aclosing(backend.run_turn(full_prompt, stage=stage)) as events:
                 async for event in events:
                     events_log.log(event)
                     await self._on_event(handle, gate, active, record, event)
+
+        active.consume = asyncio.create_task(consume())
+        try:
+            await active.consume
         except asyncio.CancelledError:
             if record.status is None:
                 self._close_log(agent_id, record, TurnStatus.INTERRUPTED, "Turn abgebrochen.")
-            raise
+            outer = asyncio.current_task()
+            if active.ending < 3 or (outer is not None and outer.cancelling()):
+                raise  # the run stops; only arr's own hard end of the turn stays here
         except Exception as exc:
             logger.exception("Turn von %s fehlgeschlagen", agent_id)
             record.error = f"{type(exc).__name__}: {exc}"
@@ -489,10 +613,14 @@ class Orchestrator(RunContext):
             self._active.pop(agent_id, None)
             if active.delivery is not None and not active.delivery.done():
                 active.delivery.cancel()  # the backend has already let the hint go
-            self._finish_status(handle)
+            self.room.clear_wait(agent_id, WaitKind.MESSAGES)
+            self._waits.pop(agent_id, None)
+            submitted = any(r.id > before for r in self.room.results(agent=agent_id))
+            self._finish_status(handle, since=since, mark=mark, was_done=was_done, result=submitted)
             self._write_session(agent_id, backend)
+            undelivered = self._unseen(agent_id, active.pending)
             for listener in list(self._listeners):
-                listener.on_turn_end(agent_id, active.pending)
+                listener.on_turn_end(agent_id, undelivered)
         if record.status is None:
             message = "Der Turn endete ohne Abschluss (turn_end fehlt)."
             record.error = record.error or message
@@ -531,6 +659,8 @@ class Orchestrator(RunContext):
         event: AgentEvent,
     ) -> None:
         record.number = event.turn
+        active.last_event = asyncio.get_running_loop().time()
+        active.silent_warned = False
         data = event.data
         match event.kind:
             case EventKind.TOOL_CALL:
@@ -603,17 +733,129 @@ class Orchestrator(RunContext):
             ]
         return render_turn_prompt(agent_id, prompt, inbox, user_messages)
 
-    def _set_status(self, handle: AgentHandle, status: AgentStatus) -> None:
+    def _set_status(self, handle: AgentHandle, status: AgentStatus, note: str = "") -> None:
         handle.status = status
-        self.room.set_agent_status(handle.id, status)
+        self.room.set_agent_status(handle.id, status, note)
 
-    def _finish_status(self, handle: AgentHandle) -> None:
-        """After a turn: `done` if the agent reported it, else `idle`."""
-        states = {s.agent: s.status for s in self.room.agent_states()}
-        if states.get(handle.id) is AgentStatus.DONE:
-            handle.status = AgentStatus.DONE
+    def _finish_status(
+        self, handle: AgentHandle, *, since: float, mark: int, was_done: bool, result: bool
+    ) -> None:
+        """After a turn: `done`, `waiting` or `idle` (docs/09 §4.2, §4.3, §4.5).
+
+        In this order: the turn quota is used up → `done` (`limit`, the run goes on: it stops
+        only when an exhausted agent would get another turn, `_refuse`); the agent reported
+        `working` in this turn → `waiting` after `wait_until`, else `idle`; it reported `done`
+        → `done`; it called `wait_until` → `waiting`; it submitted a result (`submit_result`
+        or a message `result`) and has no open question of its own → `done`; it was `done`
+        before the turn (woken by a question) → `done` again; else `idle`. The status the
+        agent reported comes from `agent_report`, so an approval in the same turn, which
+        sets `blocked` and `working` in `agent_state`, cannot lose a `done` (Ist §1).
+        """
+        agent_id = handle.id
+        report = self.room.reports().get(agent_id)
+        reported = report[0] if report is not None and report[1] >= since else None
+        wait = self.room.waits(WaitKind.UNTIL).get(agent_id)
+        long_wait = wait if wait is not None and wait.since >= since else None
+        limit = self.config.limits.turns_per_agent
+        reason = None
+        if limit is not None and handle.turns_used >= limit:
+            status, reason = AgentStatus.DONE, "limit"
+            self._exhausted.add(agent_id)
+        elif reported is AgentStatus.WORKING:
+            status = AgentStatus.WAITING if long_wait else AgentStatus.IDLE
+        elif reported is AgentStatus.DONE:
+            status, reason = AgentStatus.DONE, "reported"
+        elif long_wait is not None:
+            status = AgentStatus.WAITING
+        elif (result or self._posted_result(agent_id, mark)) and not self.room.open_questions_by(
+            agent_id
+        ):
+            status, reason = AgentStatus.DONE, "result"
+        elif was_done:
+            status, reason = AgentStatus.DONE, "reported"
         else:
-            self._set_status(handle, AgentStatus.IDLE)
+            status = AgentStatus.IDLE
+        if status is AgentStatus.WAITING and long_wait is not None:
+            self._start_long_wait(handle, long_wait)
+            return
+        self.room.clear_wait(agent_id, WaitKind.UNTIL)
+        self._set_status(handle, status, note=reason or "")
+        if reason is not None and not (was_done and reason == "reported"):
+            self.log.write("agent_done", agent=agent_id, reason=reason, turn=handle.turns_used)
+
+    def _posted_result(self, agent_id: str, mark: int) -> bool:
+        return any(
+            m.sender == agent_id and m.kind is MessageKind.RESULT
+            for m in self.room.messages_after(mark)
+        )
+
+    def _start_long_wait(self, handle: AgentHandle, wait: WaitState) -> None:
+        """`wait_until`: the agent waits with its turn ended, at most 30 min and never past
+        `wall_time`; a discussion wakes it (`arr.runs.pacing`)."""
+        until = min(wait.until, time.time() + WAIT_UNTIL_MAX_MIN * 60)
+        if self.wall_end is not None:
+            until = min(until, self.wall_end)
+        self._long_waits[handle.id] = LongWait(until, wait.file)
+        self._set_status(handle, AgentStatus.WAITING)
+        self.log.write(
+            "waiting", agent=handle.id, reason=WaitKind.UNTIL.value, until=until, file=wait.file
+        )
+        self.log.write("wake_scheduled", agent=handle.id, reason="timeout", due=until)
+
+    def _end_long_wait(self, agent_id: str) -> None:
+        self._long_waits.pop(agent_id, None)
+        self.room.clear_wait(agent_id)
+
+    def long_wait(self, agent_id: str) -> LongWait | None:
+        """The `wait_until` of an agent whose turn has ended, None if it does not wait."""
+        return self._long_waits.get(agent_id)
+
+    def end_long_wait(self, agent_id: str) -> None:
+        """End a `wait_until` early, e.g. before a wake-up turn or when no wake-up is left."""
+        if self._long_waits.pop(agent_id, None) is not None:
+            self.room.clear_wait(agent_id, WaitKind.UNTIL)
+            handle = self._handles[agent_id]
+            if handle.status is AgentStatus.WAITING and not self.is_busy(agent_id):
+                self._set_status(handle, AgentStatus.IDLE)
+
+    def until_file_exists(self, agent_id: str, rel: str) -> bool:
+        """`until_file` of an agent is there (only the existence; links count as absent)."""
+        try:
+            return self._views[agent_id].until_file_exists(rel)
+        except RoomError:
+            return False
+
+    def in_turn_wait(self, agent_id: str) -> WaitState | None:
+        """The running `wait_for_messages` of an agent (as last seen by `poll`)."""
+        return self._waits.get(agent_id)
+
+    def exhausted(self, agent_id: str) -> bool:
+        """True once the agent has used up `turns_per_agent` (it is `done`, reason `limit`)."""
+        return agent_id in self._exhausted
+
+    def waits_for_capacity(self, agent_id: str) -> bool:
+        """True while a turn of the agent waits for a free place of its auth profile."""
+        return agent_id in self._capacity
+
+    def addressed_unread(self, agent_id: str, channel: str) -> int:
+        """Unread messages in `channel` that concern the agent (`address`)."""
+        cursor = self.room.cursor(agent_id, channel)
+        return sum(
+            1
+            for m in self.room.messages(channel, after_id=cursor)
+            if address(m, agent_id, self.sender_of) is not None
+        )
+
+    def _unseen(self, agent_id: str, messages: Sequence[Message]) -> list[Message]:
+        """Messages the agent has not read yet (its cursor is below them)."""
+        cursors: dict[str, int] = {}
+        out = []
+        for msg in messages:
+            if msg.channel not in cursors:
+                cursors[msg.channel] = self.room.cursor(agent_id, msg.channel)
+            if msg.id > cursors[msg.channel]:
+                out.append(msg)
+        return out
 
     def _write_session(self, agent_id: str, backend: AgentBackend) -> None:
         try:
@@ -844,14 +1086,121 @@ class Orchestrator(RunContext):
                     self._active[agent_id].pending.append(msg)
             if msg.sender == USER:
                 self.room.set_delivery(msg.id, DeliveryStatus.NEXT_INBOX)
+            if msg.sender != ORCHESTRATOR:
+                for agent_id in self._recipients(msg):
+                    if address(msg, agent_id, self.sender_of) is not None:
+                        self.reset_until_streak(agent_id)  # L10: a message to it
             for listener in list(self._listeners):
                 listener.on_message(msg)
         self._sync_blocked()
+        self._sync_waits()
+        self._sync_yield()
+        self._end_requested_turns()
+        self._check_silence()
+
+    def _sync_yield(self) -> None:
+        """L12: ask working agents to free their place while another turn waits for one of
+        their profile; `wait_for_messages` then returns at once (`arr.room.waiting`)."""
+        wanted = {
+            agent_id: gate.name
+            for agent_id in self._active
+            if (gate := self._gates[self._handles[agent_id].config.auth]).contended()
+        }
+        for agent_id in set(self._yielding) | set(wanted):
+            if self._yielding.get(agent_id) != wanted.get(agent_id):
+                self.room.set_wait_guard(agent_id, yield_to=wanted.get(agent_id))
+        self._yielding = wanted
+
+    def _end_requested_turns(self) -> None:
+        """End the turns whose agent called `wait_for_messages` once too often (L7, L12).
+
+        First with `interrupt()`; is the turn still running after `END_TURN_RETRY_S`, with a
+        second one; after another `END_TURN_HARD_S` arr cancels the task that reads the
+        backend's events, like the stop of a run does (W3-07.2 NB2). Each step is logged.
+        """
+        requests = {
+            agent_id: guard.end_turn
+            for agent_id, guard in self.room.wait_guards().items()
+            if guard.end_turn is not None
+        }
+        now = asyncio.get_running_loop().time()
+        for agent_id, reason in requests.items():
+            active = self._active.get(agent_id)
+            if active is None or active.ending >= 3:
+                continue
+            if active.ending == 0:
+                self.log.write("end_turn", agent=agent_id, reason=reason)
+            elif active.ending == 1 and now - active.ending_since >= END_TURN_RETRY_S:
+                self.log.write("end_turn", agent=agent_id, reason=reason, attempt=2)
+            elif active.ending == 2 and now - active.ending_since >= END_TURN_HARD_S:
+                self.log.write("end_turn", agent=agent_id, reason=reason, hard=True)
+                active.ending, active.ending_since = 3, now
+                if active.consume is not None:
+                    active.consume.cancel()  # like the stop of a run: the turn is cancelled
+                continue
+            else:
+                continue
+            active.ending, active.ending_since = active.ending + 1, now
+            task = asyncio.get_running_loop().create_task(self._interrupt(agent_id, active.backend))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    def count_until_timeout(self, agent_id: str) -> int:
+        """A `wait_until` of the agent ended by its deadline: one more in a row (L10)."""
+        count = self._until_streak.get(agent_id, 0) + 1
+        self._until_streak[agent_id] = count
+        self.room.set_wait_guard(agent_id, until_streak=count)
+        return count
+
+    def reset_until_streak(self, agent_id: str) -> None:
+        """A message to the agent or its file came: `wait_until` is allowed again (L10)."""
+        if self._until_streak.pop(agent_id, 0):
+            self.room.set_wait_guard(agent_id, until_streak=0)
+
+    def _sync_waits(self) -> None:
+        """Log every new `wait_for_messages` of a working agent as `waiting` (docs/09 §4.6)."""
+        waits = {
+            agent: wait
+            for agent, wait in self.room.waits(WaitKind.MESSAGES).items()
+            if agent in self._active
+        }
+        for agent_id, wait in waits.items():
+            known = self._waits.get(agent_id)
+            if known is None or known.since != wait.since:
+                self.log.write(
+                    "waiting",
+                    agent=agent_id,
+                    reason=WaitKind.MESSAGES.value,
+                    until=wait.until,
+                    file=wait.file,
+                )
+        self._waits = waits
+
+    def _check_silence(self) -> None:
+        """Warn once per silence when a turn has no event for `turn_silence_warn_s` (L5)."""
+        now = asyncio.get_running_loop().time()
+        for agent_id, active in self._active.items():
+            if active.blocked or active.silent_warned:
+                continue
+            silent = now - active.last_event
+            if silent >= self.pacing.turn_silence_warn_s:
+                active.silent_warned = True
+                self.log.write(
+                    "turn_silent",
+                    agent=agent_id,
+                    seconds=round(silent),
+                    since=time.time() - silent,
+                )
 
     def _sync_blocked(self) -> None:
         """`blocked` while a permission request of the agent waits (docs/06 §5.2)."""
         waiting = {
             item.agent_id for item in self.inbox.pending() if item.type is ApprovalType.PERMISSION
+        }
+        deadlines = {
+            item.agent_id: item.deadline
+            for item in self.inbox.pending()
+            if item.type is ApprovalType.PERMISSION
         }
         for agent_id, active in list(self._active.items()):
             blocked = agent_id in waiting
@@ -859,6 +1208,10 @@ class Orchestrator(RunContext):
                 active.blocked = blocked
                 status = AgentStatus.BLOCKED if blocked else AgentStatus.WORKING
                 self._set_status(self._handles[agent_id], status)
+                if blocked:
+                    self.log.write(
+                        "waiting", agent=agent_id, reason="approval", until=deadlines.get(agent_id)
+                    )
 
     async def deliver_hints(self) -> None:
         """Start the delivery of queued hints to working agents (docs/06 §4).
@@ -872,6 +1225,9 @@ class Orchestrator(RunContext):
                 if not active.delivery.done():
                     continue
                 active.delivery = None
+            if self.in_turn_wait(agent_id) is not None:
+                continue  # `wait_for_messages` hands over what concerns the agent itself
+            active.pending[:] = self._unseen(agent_id, active.pending)
             if not active.pending or active.blocked or active.tool_calls < active.retry_at_calls:
                 continue
             urgent = any(is_question_to(m, agent_id) for m in active.pending)

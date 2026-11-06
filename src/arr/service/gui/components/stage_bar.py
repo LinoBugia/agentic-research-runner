@@ -4,12 +4,16 @@ One segment per stage with symbol, status word for screen readers and a sub line
 (`exploration`: „3 Ideen · Turn 5–7 von 8“) or attempt chips (`waterfall`: „V1 6,0“, current
 attempt blue). A summary segment „✓ 1–3 erledigt“ with the scores of the finished stages is
 always rendered but hidden; static/run_detail.js shows it instead of the finished segments when
-the segments do not fit into the row (§6.8).
+the segments do not fit into the row (§6.8). During a discussion phase the running segment
+says what the discussion waits for: „Runde 2 von 3“, „Ruhe, Ende · noch 0:25“ (docs/09 §4.6).
 """
 
+import time
+
 from arr.models import TopologyKind
-from arr.service.api_models import Attempt, StageInfo, StageStatus
+from arr.service.api_models import Attempt, DiscussionState, StageInfo, StageStatus
 from arr.service.gui import format as fmt
+from arr.service.gui.components.agent_card import until_html
 from arr.service.gui.components.base import esc, icon
 from arr.service.gui.texts import TOPOLOGY_LABEL
 
@@ -35,7 +39,15 @@ def attempt_chip(attempt: Attempt, *, running: bool = False) -> str:
     )
 
 
-def _segment(stage: StageInfo) -> str:
+def discussion_html(discussion: DiscussionState, now: float) -> str:
+    """„#main: Runde 2 von 3“ or „#main: Ruhe, Ende · noch 0:25“ (docs/09 §4.6)."""
+    return (
+        f'<span class="sub disc" data-mark="discussion">#{esc(discussion.channel)}: '
+        f"{esc(discussion.text)}{until_html(discussion.until, now)}</span>"
+    )
+
+
+def _segment(stage: StageInfo, discussion: str = "") -> str:
     css, ico, word = _LOOK[stage.status]
     now = stage.status in (StageStatus.RUNNING, StageStatus.WAITING_USER)
     current = ' aria-current="step"' if now else ""
@@ -51,6 +63,8 @@ def _segment(stage: StageInfo) -> str:
         sub = f'<span class="attempts">{chips}</span>'
     else:
         sub = f'<span class="sub">{esc(stage.detail or "")}</span>' if stage.detail else ""
+    if now and discussion:
+        sub += discussion
     return (
         f'<li class="stage {css}"{current}><span class="nm">{sym}{esc(name)}'
         f'<span class="sr-only"> ({word})</span></span>{sub}</li>'
@@ -84,8 +98,14 @@ def _summary(done: list[StageInfo]) -> str:
     )
 
 
-def stage_bar_html(stages: list[StageInfo], topology: TopologyKind) -> str:
+def stage_bar_html(
+    stages: list[StageInfo],
+    topology: TopologyKind,
+    discussion: DiscussionState | None = None,
+    now: float | None = None,
+) -> str:
     """The progress bar as an ordered list (`aria-current="step"` on the current stage)."""
+    extra = discussion_html(discussion, time.time() if now is None else now) if discussion else ""
     ordered = sorted(stages, key=lambda s: s.index)
     # only a leading run of finished stages can be summed up
     leading = []
@@ -94,6 +114,9 @@ def stage_bar_html(stages: list[StageInfo], topology: TopologyKind) -> str:
             break
         leading.append(stage)
     summary = _summary(leading) if len(leading) >= 2 and len(leading) < len(ordered) else ""
-    segments = "".join(_segment(s) for s in ordered)
+    segments = "".join(_segment(s, extra) for s in ordered)
+    live = (StageStatus.RUNNING, StageStatus.WAITING_USER)
+    if extra and not any(s.status in live for s in ordered):
+        segments += f'<li class="stage now">{extra}</li>'  # no running stage: show it anyway
     label = f"Ablauf der Topologie {TOPOLOGY_LABEL[topology]}, {len(ordered)} Stufen"
     return f'<ol class="stagebar" aria-label="{esc(label)}">{summary}{segments}</ol>'

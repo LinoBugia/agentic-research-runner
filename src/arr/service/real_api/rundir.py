@@ -19,7 +19,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -41,7 +41,7 @@ from arr.resolve import load_yaml_model
 from arr.room.store import RoomStore
 from arr.room.types import Message as RoomMessage
 from arr.runs.inspect import describe_checkpoint, open_approvals, run_lock_held, run_reason
-from arr.runs.launch import ORPHAN_MIN_AGE_S, describe_entry
+from arr.runs.launch import CHANNEL_WAIT_TEXT, ORPHAN_MIN_AGE_S, describe_entry
 from arr.runs.prepare import AgentFile, RunMeta, load_agent_file, load_run_meta
 from arr.runs.slim import SLIM_MARKER
 from arr.service.api_models import (
@@ -52,6 +52,7 @@ from arr.service.api_models import (
     AgentDisplayState,
     AgentsByState,
     AgentState,
+    AgentWait,
     ApprovalTop,
     AttachmentInfo,
     Attempt,
@@ -61,6 +62,7 @@ from arr.service.api_models import (
     ChannelInfo,
     ChannelMemberInfo,
     DeliveryInfo,
+    DiscussionState,
     FileChange,
     LastMessage,
     LogEntry,
@@ -76,6 +78,8 @@ from arr.service.api_models import (
     RunLimits,
     RunResults,
     RunSummary,
+    ScanFinding,
+    SecretScanInfo,
     SizeInfo,
     StageInfo,
     StageRef,
@@ -84,6 +88,7 @@ from arr.service.api_models import (
     TranscriptKind,
     TranscriptPage,
     Vendor,
+    WaitReason,
 )
 from arr.service.real_api.transcript import (
     TOOL_CALL,
@@ -439,6 +444,10 @@ class AgentRecord:
     transcript: TranscriptIndex
 
 
+SCAN_GRACE_S = 60.0
+"""A finished run is read again for this long until its `secret_scan` entry is there."""
+
+
 class RunRecord:
     """What the store knows about one run folder (see the module docstring)."""
 
@@ -509,8 +518,16 @@ class RunRecord:
                 changed = True
         if changed:
             self.version += 1
-        self.settled = self.final
+        self.settled = self.final and self._scan_over()
         return changed
+
+    def _scan_over(self) -> bool:
+        """The secret scan comes after the final status (U3): wait for its entry, at most
+        `SCAN_GRACE_S` after the end (a run without scan settles as well)."""
+        if any(e.get("kind") == "secret_scan" for e in reversed(self.log.entries[-5:])):
+            return True
+        ended = self.meta.ended if self.meta is not None else None
+        return ended is None or time.time() - ended > SCAN_GRACE_S
 
     def _discover_agents(self) -> bool:
         agents_dir = self.run_dir / "agents"
@@ -1071,7 +1088,207 @@ def run_summary(
         last_message=last,
         error=run_error(record, base_url),
         info=" · ".join(info_parts) or None,
+        secret_scan=secret_scan(entries),
         gui_url=f"{base_url}/runs/{record.run_id}",
+    )
+
+
+def secret_scan(entries: Sequence[Mapping[str, Any]]) -> SecretScanInfo | None:
+    """The last `secret_scan` of the run (U3): clean, or the hits with file and line only."""
+    for entry in reversed(entries):
+        if entry.get("kind") != "secret_scan":
+            continue
+        data = _data(entry)
+        findings = []
+        for item in data.get("findings") or []:
+            if not isinstance(item, Mapping):
+                continue
+            line = item.get("line")
+            findings.append(
+                ScanFinding(
+                    file=str(item.get("file") or "?"),
+                    line=line if isinstance(line, int) else 0,
+                    kind=str(item.get("kind") or "?"),
+                )
+            )  # only these three fields: a value is never taken over
+        files = data.get("files")
+        return SecretScanInfo(
+            clean=bool(data.get("clean")) and not findings,
+            files=files if isinstance(files, int) and files >= 0 else 0,
+            findings=findings,
+        )
+    return None
+
+
+# --------------------------------------------------------------------------------------------
+# Waits and the discussion (docs/09 §4.6)
+# --------------------------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _FlowView:
+    """What `orchestrator.jsonl` says about waits: per agent and of the open discussion."""
+
+    waits: dict[str, Mapping[str, Any]] = field(default_factory=dict)
+    """The agent's current `waiting` entry: a new turn ends every wait, a turn end every wait
+    but `wait_until` (it starts with the turn end)."""
+    silent: dict[str, Mapping[str, Any]] = field(default_factory=dict)
+    """`turn_silent` of a turn that is still running."""
+    channel: str | None = None
+    channel_wait: Mapping[str, Any] | None = None
+    round: int = 0
+    of: int | None = None
+
+
+def flow_view(entries: Sequence[Mapping[str, Any]]) -> _FlowView:
+    """Read the waits from the log: the last state per agent and of a running discussion."""
+    view = _FlowView()
+    for entry in entries:
+        kind = entry.get("kind")
+        data = _data(entry)
+        agent = data.get("agent") if isinstance(data.get("agent"), str) else None
+        if kind == "discussion_start":
+            view.channel, view.channel_wait = data.get("channel"), None
+            view.round, view.of = 0, None
+        elif kind == "discussion_end":
+            view.channel, view.channel_wait = None, None
+        elif kind == "round" and data.get("channel") == view.channel:
+            number, of = data.get("number"), data.get("of")
+            view.round = number if isinstance(number, int) else view.round
+            view.of = of if isinstance(of, int) else view.of
+        elif kind == "waiting" and data.get("channel") and data.get("channel") == view.channel:
+            view.channel_wait = entry
+        elif agent is None:
+            continue
+        elif kind == "waiting":
+            view.waits[agent] = entry
+        elif kind == "turn_silent":
+            view.silent[agent] = entry
+        elif kind == "wait_end":
+            view.waits.pop(agent, None)
+        elif kind == "turn":
+            view.waits.pop(agent, None)
+            view.silent.pop(agent, None)
+        elif kind == "turn_end":
+            view.silent.pop(agent, None)
+            if _data(view.waits.get(agent, {})).get("reason") != "wait_until":
+                view.waits.pop(agent, None)
+    return view
+
+
+def _number_of(value: Any) -> float | None:
+    return float(value) if isinstance(value, int | float) else None
+
+
+def _asked(record: RunRecord, agent_id: str) -> list[str]:
+    """Addressees of the agent's latest message with `to` (whom it waits for)."""
+    rows = record.room.rows(
+        "SELECT to_agents FROM msg WHERE sender=? AND to_agents NOT IN ('[]', '') "
+        "ORDER BY id DESC LIMIT 1",
+        (agent_id,),
+    )
+    try:
+        names = json.loads(rows[0]["to_agents"]) if rows else []
+    except (ValueError, TypeError):
+        return []
+    return [str(n) for n in names] if isinstance(names, list) else []
+
+
+def agent_wait(
+    record: RunRecord,
+    agent_id: str,
+    status: AgentStatus | None,
+    view: _FlowView,
+    waits: Mapping[str, Mapping[str, Any]],
+) -> AgentWait | None:
+    """Why the agent waits and until when, None if it does not wait (docs/09 §4.6)."""
+    if record.final or status is AgentStatus.DONE:
+        return None
+    row = waits.get(agent_id)
+    if row is not None and row.get("kind") == "wait_for_messages":
+        file = row.get("file")
+        asked = _asked(record, agent_id)
+        text = f"wartet auf Antwort von {', '.join(asked)}" if asked else "wartet auf Nachrichten"
+        if file:
+            text += f" oder auf „{file}“"
+        return AgentWait(
+            reason=WaitReason.MESSAGES, text=text, until=_number_of(row.get("until")), file=file
+        )
+    last = view.waits.get(agent_id)
+    data = _data(last) if last is not None else {}
+    waiting = last is not None
+    if status is AgentStatus.WAITING and waiting and data.get("reason") == "wait_until":
+        file = data.get("file") if isinstance(data.get("file"), str) else None
+        text = f"wartet auf „{file}“" if file else "wartet auf Nachrichten (Turn beendet)"
+        return AgentWait(
+            reason=WaitReason.UNTIL, text=text, until=_number_of(data.get("until")), file=file
+        )
+    if waiting and data.get("reason") == "capacity":
+        return AgentWait(
+            reason=WaitReason.CAPACITY,
+            text=f"wartet auf freien Platz im Profil {data.get('profile')}",
+            until=_number_of(data.get("until")),
+        )
+    channel = _data(view.channel_wait) if view.channel_wait is not None else {}
+    if status is AgentStatus.IDLE and channel.get("reason") == "idle":
+        if channel.get("next") == "end":
+            return AgentWait(
+                reason=WaitReason.END,
+                text="untätig · Diskussion endet",
+                until=_number_of(channel.get("until")),
+            )
+        return AgentWait(
+            reason=WaitReason.ROUND,
+            text=f"untätig · Runde {view.round + 1} von {view.of or '?'}",
+            until=_number_of(channel.get("until")),
+        )
+    return None
+
+
+def agent_warning(agent_id: str, view: _FlowView) -> str | None:
+    """„seit 12 min kein Ereignis“ while a turn is silent (L5, docs/09 §4.5)."""
+    last = view.silent.get(agent_id)
+    if last is None:
+        return None
+    minutes = int(_data(last).get("seconds") or 0) // 60
+    return f"seit {minutes} min kein Ereignis im Turn"
+
+
+def discussion_state(view: _FlowView) -> DiscussionState | None:
+    """Head of the run detail: „Runde 2 von 3“, „Ruhe, Ende in …“, „wartet auf Freigabe“."""
+    if view.channel is None:
+        return None
+    data = _data(view.channel_wait) if view.channel_wait is not None else {}
+    reason = str(data.get("reason") or "none")
+    of = view.of if view.of is not None else data.get("of")
+    of = of if isinstance(of, int) else None
+    rounds = f"Runde {view.round} von {of}" if view.round and of else None
+    match reason:
+        case "idle":
+            if data.get("next") == "end":
+                text = "Ruhe, Ende"
+            else:
+                text = f"Ruhe, Runde {view.round + 1}" + (f" von {of}" if of else "")
+        case "agents":
+            text = "wartet auf wartende Agenten"
+        case "approval":
+            text = "wartet auf deine Freigabe"
+        case "capacity":
+            text = "wartet auf freien Platz"
+        case "mixed":
+            parts = [CHANNEL_WAIT_TEXT.get(str(p), str(p)) for p in data.get("parts") or []]
+            text = "wartet auf " + " und ".join(parts)
+        case "wake":
+            text = "weckt einen Agenten"
+        case _:
+            text = rounds or "Diskussion läuft"
+    return DiscussionState(
+        channel=str(view.channel),
+        reason=reason,
+        text=text,
+        until=_number_of(data.get("until")) if reason != "none" else None,
+        round=view.round,
+        of=of,
     )
 
 
@@ -1210,6 +1427,7 @@ def run_detail(
         )
     questions = sum(1 for m in record.room.open_questions() if "user" in m.to)
     foreign = not owned and summary.status.is_active and run_lock_held(record.run_dir)
+    discussion = None if record.final else discussion_state(flow_view(record.log.entries))
     return RunDetail(
         run=summary,
         open_approvals_top=top,
@@ -1223,6 +1441,7 @@ def run_detail(
             open_escalation=summary.open_escalation,
         ),
         stages=stage_infos(record, resolved),
+        discussion=discussion,
         handoff_text=handoff_text(record),
         run_dir=str(record.run_dir),
         task_md=record.task_md,
@@ -1371,6 +1590,11 @@ def agent_states(record: RunRecord, resolved: ResolvedRun | None = None) -> list
     items = open_items(record)
     final = record.final
     channels = {c.name: c for c in resolved.groupchats}
+    view = flow_view(record.log.entries)
+    waits = {
+        str(r["agent"]): dict(r)
+        for r in record.room.rows("SELECT * FROM agent_wait WHERE kind='wait_for_messages'")
+    }
     out = []
     for config in resolved.agents:
         agent = record.agents.get(config.id)
@@ -1428,6 +1652,14 @@ def agent_states(record: RunRecord, resolved: ResolvedRun | None = None) -> list
                 state=state,
                 state_since=room_state.ts if room_state is not None else None,
                 blocked_by=blocked,
+                waiting=agent_wait(
+                    record,
+                    config.id,
+                    room_state.status if room_state is not None else None,
+                    view,
+                    waits,
+                ),
+                warning=None if final else agent_warning(config.id, view),
                 activity=_activity(agent, final=final) if agent is not None else None,
                 turn=index.max_turn() if index is not None else 0,
                 turns_limit=resolved.limits.turns_per_agent,

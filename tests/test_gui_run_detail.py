@@ -36,6 +36,7 @@ from arr.service.gui.components.approval_card import (
 )
 from arr.service.gui.components.base import markdown_html
 from arr.service.gui.components.stage_bar import stage_bar_html
+from arr.service.gui.layout import Frame
 from arr.service.gui.pages.run_detail import KATEX_URL
 from arr.service.gui.pages.run_detail_channel import SENT_JS, SUGGEST_QUESTION_JS
 from arr.service.gui.pages.run_detail_results import run_links_html
@@ -236,7 +237,17 @@ async def test_load_channel_counts_older_messages(load_api: MockApi) -> None:
         assert "⤼</span> prover-2 passt" in view
 
 
-async def test_send_message_to_one_agent_shows_delivery(api: MockApi, scenario: User) -> None:
+async def test_send_message_to_one_agent_shows_delivery(
+    api: MockApi, scenario: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scripts: list[str] = []
+    original = Frame.js
+
+    def record(frame: Frame, code: str) -> None:
+        scripts.append(code)
+        original(frame, code)
+
+    monkeypatch.setattr(Frame, "js", record)
     await scenario.open(f"/runs/{R_EXPLORE}")
     composer = html(scenario, "run-detail")
     assert '<option value="explorer-2">explorer-2</option>' in composer
@@ -249,6 +260,7 @@ async def test_send_message_to_one_agent_shows_delivery(api: MockApi, scenario: 
     assert "✓ zugestellt als Hinweis mitten im Turn" in view  # explorer-2 works
     msg = api.state.runs[R_EXPLORE].channels["main"].extra[-1]
     assert msg.to == ["explorer-2"] and msg.kind is MessageKind.QUESTION
+    assert SENT_JS in scripts, "the composer is emptied and its hint updated (W3-08.1 N3)"
 
 
 # --- 6 transcript ------------------------------------------------------------------------------

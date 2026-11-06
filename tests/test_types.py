@@ -59,6 +59,7 @@ ROOM_TOOLS = [  # docs/06-gruppenchats.md §9
     "call_vote",
     "pin",
     "close_discussion",
+    "wait_until",  # docs/09 §4.3
 ]
 
 

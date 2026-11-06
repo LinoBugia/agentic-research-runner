@@ -203,6 +203,6 @@ def test_status_enums() -> None:
     assert {s for s in RunStatus if s.is_active} == ACTIVE_RUN_STATUSES
     assert {s for s in RunStatus if s.is_final} == {"done", "stopped", "failed", "interrupted"}
     assert not RunStatus.DRAFT.is_active and not RunStatus.DRAFT.is_final
-    assert [s.value for s in AgentStatus] == ["working", "idle", "done", "blocked"]
+    assert [s.value for s in AgentStatus] == ["working", "idle", "done", "blocked", "waiting"]
     assert Starter.USER_AGENT == "user_agent"
     assert (Provider.CLAUDE.vendor, Provider.CODEX.vendor) == ("anthropic", "openai")

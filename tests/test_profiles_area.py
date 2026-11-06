@@ -1359,6 +1359,23 @@ async def test_the_key_leaves_the_page_with_the_dialog(
         assert "typed-and-then-left-alone" not in everything(user)
 
 
+async def test_concurrency_follows_the_kind_also_after_typing(api: RealApi) -> None:
+    """W3-08.1 N1: type „2“, switch the kind (4), switch again (2): the browser shows the
+    value Python stores, it does not keep the „4“ as your own text."""
+    async with gui_user(api) as user:  # type: ignore[arg-type]
+        await user.open("/profile?neu=1")
+        await see(user, "Neues Auth-Profil")
+        user.find(marker="field-new-concurrency").trigger("input", "2")
+        user.find(marker="radio-kind-claude_oauth").trigger("change")
+        user.find(marker="radio-kind-claude_api_key").trigger("change")
+        await see(user, "Speichern und testen")
+        [field] = user.find(marker="field-new-concurrency").elements
+        with user.client:
+            data = field._to_dict()
+        assert field._props["value"] == "2"
+        assert "preserved_props" not in data, "Python's value goes to the browser"
+
+
 async def test_help_text_fits_the_kind(api: RealApi) -> None:
     async with gui_user(api) as user:  # type: ignore[arg-type]
         await user.open("/profile?neu=1")

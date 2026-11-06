@@ -410,10 +410,20 @@
     if (s >= 60) return Math.floor(s / 60) + " min" + (s % 60 ? " " + (s % 60) + " s" : "");
     return s + " s";
   }
+  // time left of a wait, same as agent_card.remaining: „0:32“, „12 min“ (W3-07)
+  function remaining(seconds) {
+    const s = Math.max(0, Math.floor(seconds));
+    if (s >= 600) return Math.ceil(s / 60) + " min";
+    return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+  }
   function tick() {
     const t = now();
     document.querySelectorAll(".rd [data-since]").forEach((el) => {
       const text = duration(t - parseFloat(el.getAttribute("data-since")));
+      if (el.textContent !== text) el.textContent = text;
+    });
+    document.querySelectorAll(".rd [data-until]").forEach((el) => {
+      const text = remaining(parseFloat(el.getAttribute("data-until")) - t);
       if (el.textContent !== text) el.textContent = text;
     });
   }

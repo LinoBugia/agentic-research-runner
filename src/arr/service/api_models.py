@@ -546,6 +546,59 @@ class RunError(ApiModel):
     action: Action | None = None
 
 
+class ScanFinding(ApiModel):
+    """One hit of the secret scan: file and line, never the value (U3, docs/01 §8)."""
+
+    file: str
+    line: int
+    kind: str
+
+
+class SecretScanInfo(ApiModel):
+    """Result of the secret scan after the finalizer (`secret_scan` in `orchestrator.jsonl`, U3).
+
+    `clean` false: `findings` names file, line and kind of every hit; values are never kept.
+    """
+
+    clean: bool
+    files: int = Field(default=0, ge=0, description="Files scanned")
+    findings: list[ScanFinding] = Field(default_factory=list)
+
+
+class WaitReason(StrEnum):
+    """Why an agent waits (docs/09 §4.3, §4.5, §4.6); shown instead of a bare „wartet“."""
+
+    MESSAGES = "wait_for_messages"  # inside its turn
+    UNTIL = "wait_until"  # turn ended, arr wakes it
+    CAPACITY = "capacity"  # its turn waits for a free place of the auth profile
+    ROUND = "round"  # idle; the next round of the discussion comes
+    END = "end"  # idle; the discussion ends unless something happens
+
+
+class AgentWait(ApiModel):
+    """What an agent waits for and until when (`until`, Unix time; the GUI counts down)."""
+
+    reason: WaitReason
+    text: str = Field(description="e.g. „wartet auf Antwort von diskutant-1“")
+    until: float | None = None
+    file: str | None = None
+
+
+class DiscussionState(ApiModel):
+    """State of the running discussion phase for the head of the run detail (docs/09 §4.6).
+
+    `reason` as in the log entry `waiting {channel}`: `none` (agents work), `idle`, `agents`,
+    `approval`, `capacity`, `wake`. `text` e.g. „Runde 2 von 3“, „Ruhe, Ende in 4:10“.
+    """
+
+    channel: str
+    reason: str
+    text: str
+    until: float | None = None
+    round: int = Field(default=0, ge=0)
+    of: int | None = None
+
+
 class RunSummary(ApiModel):
     """A run in lists: start page, runs list, projects, storage (docs/08 §5.0 `RunSummary`).
 
@@ -586,6 +639,7 @@ class RunSummary(ApiModel):
     info: str | None = None
     adjusted_by_user: bool = False
     changes: list[ChangeInfo] = Field(default_factory=list)
+    secret_scan: SecretScanInfo | None = None
     gui_url: str
 
     @model_validator(mode="after")
@@ -668,6 +722,7 @@ class RunDetail(ApiModel):
     decider: Decider
     actions_allowed: list[RunAction] = Field(default_factory=list)
     stages: list[StageInfo] = Field(default_factory=list)
+    discussion: DiscussionState | None = None
     handoff_text: str = Field(description="„Für Claude Code kopieren“")
     run_dir: str
     task_md: str | None = None
@@ -759,6 +814,8 @@ class AgentState(ApiModel):
     state: AgentDisplayState
     state_since: float | None = None
     blocked_by: BlockedBy | None = None
+    waiting: AgentWait | None = None
+    warning: str | None = Field(default=None, description="e.g. „seit 12 min kein Ereignis“")
     activity: Activity | None = None
     turn: int = Field(default=0, ge=0)
     turns_limit: int | None = None

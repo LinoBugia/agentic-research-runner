@@ -185,6 +185,8 @@ def test_a5_options_follow_the_architecture(setup: Setup) -> None:
         "AGENT_ID": "e1",
         "RUN_DIR": str(setup.run.run_dir),
         "PATH": options.env["PATH"],  # with the git stub first (W3-06.4)
+        "ARR_WAIT_MAX_S": "45",  # one `wait_for_messages` call (spike W3-07, F3)
+        "ARR_PROVIDER": "claude",  # tool descriptions per backend (W3-07.1, B4)
     }
     prompt = options.system_prompt
     assert prompt["type"] == "preset" and prompt["preset"] == "claude_code"
