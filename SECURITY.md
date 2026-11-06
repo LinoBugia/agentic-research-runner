@@ -1,6 +1,6 @@
 # Security model
 
-> Status: 2026-11-05 · Platform implemented: macOS · Maintained with every change to sandbox, permissions or logins, every security review and every update of macOS, Claude Code CLI or Codex.
+> Status: 2026-11-06 · Platform implemented: macOS · Maintained with every change to sandbox, permissions or logins, every security review and every update of macOS, Claude Code CLI or Codex.
 
 This document describes how `arr` keeps research agents from harming the machine they run on, which ways out we know of, and which of them are closed. It is written so that the general part can serve as a template for other operating systems and for servers. The platform part currently covers macOS only.
 
@@ -68,6 +68,7 @@ These hold on every platform.
 - **Outside processes:** The CLI's `PATH` contains no write root; the run's virtual environment appears only in the agent's own shell environment. The chat server starts with `python -I`. The Codex app server gets a `HOME` of its own, outside the run's temp folder. CLI, app server and chat server find a `git` stub first on their `PATH` that does nothing, so no `git` runs outside the sandbox; agents keep the real `git` in their shell. The CLI runs with Node's compile cache off.
 - **File tools:** One deny list in the permission engine covers `.git`, `.gitattributes`, `.gitmodules`, `.claude`, `.codex`, `.agents`, `.mcp.json`, shell start files and similar names, checked case-insensitively before and after resolving links. Write, Edit, MultiEdit, NotebookEdit and Codex file changes on these paths are denied, and no approval lifts that. The same list goes to the Claude sandbox as `denyWrite`. Codex `apply_patch` cannot be switched off, so the Codex profile makes the top-level names read-only and a patch there becomes an approval request that is denied.
 - **Codex approvals:** Every Codex file change is checked with all its paths, the target of a move included. `arr` denies, without asking anyone: any move (the agent can use `mv` in its shell instead), any request for an extra write root (`grantRoot`), any write outside the run or onto the deny list, and any change of an unknown kind or with unknown fields. `arr` runs no tool on behalf of the app server. An approved command still runs inside the sandbox, on both backends.
+- **Waiting on a marker file:** An agent may wait for a file in its own work folder (`until_file`, for long scripts). This is the one place where something outside the sandbox looks at an agent-chosen path. The room server and the orchestrator only check whether the file exists: relative path inside the work folder, no `..`, no absolute path, no link followed, no content read, nothing started. Tests cover link chains, races between check and use, hard links and FIFOs.
 - **Codex project config:** `arr` records the state of the work folder's `.codex/` at run start and starts no further thread once it has changed.
 - **Tests:** Escape tests run the real CLIs against a fake model server in a test `HOME` with random bait files, and check results by exit code only. A `security` stub keeps the real keychain out of every lab.
 
