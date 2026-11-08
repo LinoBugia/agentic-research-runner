@@ -736,17 +736,17 @@ async def test_h23_question_to_the_user_nobody_answers(
 
 
 async def test_h24_a_late_answer_of_the_user_wakes_the_asker(workfolder: Path) -> None:
-    """L16 with L13: the asker has ended its turn (its open question keeps it from `done`);
-    the user's answer in the channel goes to it and wakes it at once."""
+    """L16 with L13: the asker waits for the user, then ends its turn idle (no result); the
+    user's answer with `@name` in the channel wakes it at once."""
 
     async def user(manager: Any) -> None:
         orch = manager.orchestrator
         await eventually(lambda: bool(log_entries(manager.run_dir, "round")), within=10)
-        orch.room.post("main", "Band 10–35.", sender="user", via=MessageVia.GUI)
+        orch.room.post("main", "@diskutant-1 Band 10–35.", sender="user", via=MessageVia.GUI)
 
     ask = post("main", "@user welches Band?", kind="question")
     scripts = {
-        D1: turns([ask, post("main", "Vorläufig 10–35.", kind="result")], [say("warte")],
+        D1: turns([ask, say("Ich warte auf den User.")], [say("warte")],
                   [post("main", "Danke, bleibt so.", kind="result")]),
         D2: turns([post("main", "Mein Teil.", kind="result")]),
     }  # fmt: skip

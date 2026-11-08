@@ -400,3 +400,35 @@ async def test_w3_09_a3_question_card_with_an_answer_field_reaches_the_agent(wf:
             assert time.monotonic() < end
             await asyncio.sleep(0.05)
         await api.run_action(started.run_id, RunAction.STOP)
+
+
+async def test_w3_09_1_b6_a_failed_post_leaves_the_question_open(
+    wf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The answer goes into the channel first; if that fails, the item stays open and the
+    user can answer again (B6)."""
+    from run_kit import post, room
+
+    from arr.errors import ArrError
+    from arr.room.store import RoomStore
+    from arr.service.api_models import ApiException
+
+    ask = post("main", "@user Welches Band?", kind="question")
+    script = turns([ask, room("wait_for_messages", seconds=20), say("danke"), wait(30)])
+    async with service(wf, {"a": script}) as (_user, api):
+        started = await api.start_run(question_run({"id": "a"}))
+        item = await open_item(api)
+        original = RoomStore.post
+
+        def broken(self: RoomStore, *args: Any, **kwargs: Any) -> Any:
+            raise ArrError("Der Kanal ist gerade nicht erreichbar.")
+
+        monkeypatch.setattr(RoomStore, "post", broken)
+        answer = DecisionRequest(action=DecisionAction.ANSWER, comment="10–35")
+        with pytest.raises(ApiException):
+            await api.decide_approval(item.id, answer)
+        assert (await api.get_approval(item.id)).status is ApprovalStatus.OPEN
+        monkeypatch.setattr(RoomStore, "post", original)
+        decided = await api.decide_approval(item.id, answer)
+        assert decided.item.status is ApprovalStatus.DECIDED and decided.item.answer == "10–35"
+        await api.run_action(started.run_id, RunAction.STOP)

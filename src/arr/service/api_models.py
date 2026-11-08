@@ -833,7 +833,9 @@ class AgentState(ApiModel):
     ratings_count: int = Field(default=0, ge=0)
     work_dir: str
     reachable: bool = Field(
-        default=False, description="L13: done, a message to it wakes it („fertig · ansprechbar“)"
+        default=False,
+        description="L13: done while a discussion of its channels runs, a message to it wakes it "
+        "(„fertig · ansprechbar“)",
     )
 
     @model_validator(mode="after")

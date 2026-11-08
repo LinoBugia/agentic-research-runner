@@ -89,6 +89,9 @@ ORCHESTRATOR_LOG = "orchestrator.jsonl"
 PLAN_STAGE = "plan"
 """Checkpoint with all planned stages, written at start (`stages=[…]`)."""
 
+WORKED_ON = "{agent} hat ohne Antwort weitergearbeitet."
+"""Note of a question to the user that closes because its asker submitted a result."""
+
 RATE_LIMIT_BACKOFF_S = 60.0
 """Pause of a profile after a rate limit without `resets_at`."""
 
@@ -277,12 +280,14 @@ class _Listener(Protocol):
 @dataclass(frozen=True, slots=True)
 class LongWait:
     """An agent ended its turn with `wait_until` (docs/09 §4.3); `until` and `since` are Unix
-    times, `result_from` the agent whose next result ends the wait (L14)."""
+    times, `result_from` the agent whose next result ends the wait (L14), `mark` the newest
+    message when its turn began (results are looked for only after it, W3-09.1 B11)."""
 
     until: float
     file: str | None = None
     result_from: str | None = None
     since: float = 0.0
+    mark: int = 0
 
 
 @dataclass(slots=True)
@@ -760,10 +765,14 @@ class Orchestrator(RunContext):
         only when an exhausted agent would get another turn, `_refuse`); the agent reported
         `working` in this turn → `waiting` after `wait_until`, else `idle`; it reported `done`
         → `done`; it called `wait_until` → `waiting`; it submitted a result (`submit_result`
-        or a message `result`) and has no open question of its own → `done`; it was `done`
-        before the turn (woken by a message to it, L13) → `done` again; else `idle`. The status the
-        agent reported comes from `agent_report`, so an approval in the same turn, which
-        sets `blocked` and `working` in `agent_state`, cannot lose a `done` (Ist §1).
+        or a message `result`) and has no open question to another agent → `done`; it was
+        `done` before the turn (woken by a message to it, L13) → `done` again; else `idle`.
+        The status the agent reported comes from `agent_report`, so an approval in the same
+        turn, which sets `blocked` and `working` in `agent_state`, cannot lose a `done` (Ist §1).
+
+        An open question to the user does not keep it from `done` by a result (User 08.11.,
+        W3-09.1): it worked on without the answer, so the question closes, in the room and in
+        the inbox („hat ohne Antwort weitergearbeitet“); a later answer to it wakes it (L13).
         """
         agent_id = handle.id
         report = self.room.reports().get(agent_id)
@@ -781,10 +790,11 @@ class Orchestrator(RunContext):
             status, reason = AgentStatus.DONE, "reported"
         elif long_wait is not None:
             status = AgentStatus.WAITING
-        elif (result or self._posted_result(agent_id, mark)) and not self.room.open_questions_by(
-            agent_id
-        ):
+        elif (result or self._posted_result(agent_id, mark)) and not [
+            q for q in self.room.open_questions_by(agent_id) if not is_user_question(q)
+        ]:
             status, reason = AgentStatus.DONE, "result"
+            self._close_user_questions_of(agent_id, WORKED_ON.format(agent=agent_id), "result")
         elif was_done:
             status, reason = AgentStatus.DONE, "reported"
         else:
@@ -810,7 +820,8 @@ class Orchestrator(RunContext):
         until = min(wait.until, time.time() + WAIT_UNTIL_MAX_MIN * 60)
         if self.wall_end is not None:
             until = min(until, self.wall_end)
-        self._long_waits[handle.id] = LongWait(until, wait.file, wait.result_from, wait.since)
+        mark = self._turn_marks.get(handle.id, 0)
+        self._long_waits[handle.id] = LongWait(until, wait.file, wait.result_from, wait.since, mark)
         self._set_status(handle, AgentStatus.WAITING)
         if wait.result_from is not None:
             self.log.write(
@@ -850,16 +861,21 @@ class Orchestrator(RunContext):
         except RoomError:
             return False
 
-    def new_result(self, agent_id: str, since: float) -> Result | Message | None:
+    def new_result(self, agent_id: str, since: float, after: int = 0) -> Result | Message | None:
         """The first result `agent_id` submitted after `since` (Unix time): `submit_result` or
-        a message `result` (L14); None if there is none yet."""
+        a message `result` with an ID above `after`, in any channel (L14); None if there is none
+        yet. What of it the waiting agent may see decides `arr.runs.pacing`."""
         for result in self.room.results(agent=agent_id):
             if result.ts > since:
                 return result
-        for msg in self.room.messages_after(0):
+        for msg in self.room.messages_after(after):
             if msg.sender == agent_id and msg.kind is MessageKind.RESULT and msg.ts > since:
                 return msg
         return None
+
+    def view(self, agent_id: str) -> AgentRoom:
+        """The room as the agent sees it (its channels, aliases)."""
+        return self._views[agent_id]
 
     def turn_mark(self, agent_id: str) -> int:
         """Newest message ID when the agent's latest turn began (0 before its first turn)."""
@@ -1130,7 +1146,7 @@ class Orchestrator(RunContext):
                 for agent_id in self._recipients(msg):
                     if address(msg, agent_id, self.sender_of) is not None:
                         self.reset_until_streak(agent_id)  # L10: a message to it
-            if is_user_question(msg) and msg.sender in self._handles:
+            if is_user_question(msg) and msg.open and msg.sender in self._handles:
                 self._open_user_question(msg)
             elif msg.sender == USER and self._questions:
                 self._close_answered_questions(msg)
@@ -1160,13 +1176,11 @@ class Orchestrator(RunContext):
         )
 
     def _close_answered_questions(self, answer: Message) -> None:
-        """The user wrote in the channel: the questions it closed are answered (L16)."""
+        """The user wrote in the channel: the questions this message answers (`reply_to` on
+        it, or to its asker; the room has closed them) are answered (L16). A note to nobody
+        answers nothing, also when an answer follows in the same poll (W3-09.1)."""
         for msg_id, item_id in list(self._questions.items()):
-            try:
-                still_open = self.room.message(msg_id).open
-            except ArrError:
-                still_open = False
-            if still_open:
+            if answer.reply_to != msg_id and self.sender_of(msg_id) not in answer.to:
                 continue
             del self._questions[msg_id]
             self.inbox.answered(item_id, answer.body, via="channel")  # False if in the inbox
@@ -1175,11 +1189,28 @@ class Orchestrator(RunContext):
             )
 
     def close_user_questions(self, note: str) -> None:
-        """The run ends: questions to the user nobody answered are closed (L16)."""
+        """The run ends: questions to the user nobody answered are closed (L16), in the inbox
+        and in the room (nobody answers them any more)."""
         for msg_id, item_id in list(self._questions.items()):
             del self._questions[msg_id]
+            self.room.close_question(msg_id)
             if self.inbox.close_question(item_id, note):
                 self.log.write("user_question", msg=msg_id, item=item_id, state="closed")
+
+    def _close_user_questions_of(self, agent_id: str, note: str, reason: str) -> None:
+        """The agent worked on without the user's answer: its open questions to the user close
+        in the room and, if they are items already, in the inbox with `note` (W3-09.1)."""
+        for question in self.room.open_questions_by(agent_id):
+            if not is_user_question(question):
+                continue
+            if question.id not in self._questions:  # asked and worked on before a poll
+                self._open_user_question(question)
+            self.room.close_question(question.id)
+            item_id = self._questions.pop(question.id, None)
+            if item_id is not None and self.inbox.close_question(item_id, note):
+                self.log.write(
+                    "user_question", msg=question.id, item=item_id, state="closed", reason=reason
+                )
 
     def _sync_yield(self) -> None:
         """L12: ask working agents to free their place while another turn waits for one of

@@ -42,6 +42,7 @@ from arr.room.types import DeliveryStatus, Inbox, Message, MessageKind, Result
 from arr.runs.context import DiscussionEnd, DiscussionOutcome, TurnJob
 
 if TYPE_CHECKING:
+    from arr.room.store import AgentRoom
     from arr.runs.orchestrator import Orchestrator
 
 logger = logging.getLogger(__name__)
@@ -233,13 +234,15 @@ class HintGate:
 
 
 class PingPongTracker:
-    """Counts messages between two agents without progress and flags the pair once.
+    """Counts the exchange between two agents without progress and flags the pair once.
 
     A message goes from its sender to one other agent if `to` names exactly that agent or
-    it replies to a message of that agent; a message to the user (L16) goes to no agent. A
-    claim, proof or decision between the two resets their count; more than `limit` messages
-    without one flag the pair (only once). `sender_of` looks up the sender of older messages
-    that the tracker has not seen.
+    it replies to a message of that agent; a message to the user (L16) goes to no agent. Only
+    an exchange counts, a message in the other direction than the last one of the pair: many
+    messages of one agent to another in a row count once (W3-09.1, B3), so a burst of requests
+    to a finished agent does not lock it out. A claim, proof or decision between the two resets
+    their count; more than `limit` changes of direction without one flag the pair (only once).
+    `sender_of` looks up the sender of older messages that the tracker has not seen.
     """
 
     def __init__(self, limit: int, sender_of: Callable[[int], str | None]) -> None:
@@ -247,6 +250,8 @@ class PingPongTracker:
         self._sender_of = sender_of
         self._senders: dict[int, str] = {}
         self._counts: dict[frozenset[str], int] = {}
+        self._last: dict[frozenset[str], str] = {}
+        """Sender of the last counted message of a pair."""
         self.flagged: set[frozenset[str]] = set()
 
     def _other(self, msg: Message) -> str | None:
@@ -269,7 +274,11 @@ class PingPongTracker:
         pair = frozenset({msg.sender, other})
         if msg.kind in PROGRESS_KINDS:
             self._counts[pair] = 0
+            self._last.pop(pair, None)
             return None
+        if self._last.get(pair) == msg.sender:
+            return None  # the same direction again: no exchange (B3)
+        self._last[pair] = msg.sender
         self._counts[pair] = self._counts.get(pair, 0) + 1
         if self._counts[pair] > self.limit and pair not in self.flagged:
             self.flagged.add(pair)
@@ -404,9 +413,12 @@ class _Wake:
     reasons: list[str] = field(default_factory=list)
     messages: list[int] = field(default_factory=list)
     awaited: str | None = None
-    """`result_from`/`result_missing`: the agent it waited for (L14)."""
+    """`result_from`/`result_missing`: the agent it waited for, as the waiting agent sees it
+    (its alias behind an anonymous channel, L14, W3-09.1 B2)."""
     result: str | None = None
-    """`result_from`: the result, shown in the wake-up prompt."""
+    """`result_from`: the result, shown in the wake-up prompt (only what it may read, B1)."""
+    final: bool = False
+    """L15: woken once for an unread message before the end, also behind the ping-pong guard."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,15 +521,16 @@ class _EventDiscussion:
 
     # -- rules ---------------------------------------------------------------------------
 
-    def _trigger(self, msg: Message, member: str) -> str | None:
+    def _trigger(self, msg: Message, member: str, *, guarded: bool = True) -> str | None:
         """Wake reason of `msg` for `member`, or None (docs/09 §4.1, §4.2).
 
         Own messages and messages of the orchestrator never wake. A finished member wakes
         for every direct message to it (L13: a question, `@name`, a reply to its message), not
         for a question to all or `any`; an exhausted one (`turns_per_agent`) never; a member
-        that waits with `wait_until` only for messages that concern it.
+        that waits with `wait_until` only for messages that concern it. With `guarded` the
+        ping-pong guard (`no_autowake`) holds; L15 asks without it.
         """
-        if msg.sender in (member, ORCHESTRATOR) or member in self.no_autowake:
+        if msg.sender in (member, ORCHESTRATOR) or (guarded and member in self.no_autowake):
             return None
         if self.orch.exhausted(member):
             return None
@@ -586,19 +599,20 @@ class _EventDiscussion:
             if wait is None or self._busy(member) or member in self.wakes:
                 continue
             awaited = wait.result_from
-            result = self.orch.new_result(awaited, wait.since) if awaited else None
+            result = self.orch.new_result(awaited, wait.since, wait.mark) if awaited else None
             if wait.file is not None and self.orch.until_file_exists(member, wait.file):
                 self._schedule(member, "file")
             elif awaited is not None and result is not None:
                 wake = self._schedule(member, "result_from", result_from=awaited)
-                wake.awaited, wake.result = awaited, _result_text(result)
+                wake.awaited = self.orch.view(member).shown_name(awaited)
+                wake.result = _result_text(result, wake.awaited, self.orch.view(member))
             elif (
                 awaited is not None
                 and self.orch.agent_status(awaited) is AgentStatus.DONE
                 and not self._busy(awaited)
             ):
                 wake = self._schedule(member, "result_missing", result_from=awaited)
-                wake.awaited = awaited
+                wake.awaited = self.orch.view(member).shown_name(awaited)
             elif wait.until <= now:
                 self._schedule(member, "timeout")
 
@@ -621,7 +635,7 @@ class _EventDiscussion:
 
     def _fire(self, tg: asyncio.TaskGroup, member: str, wake: _Wake) -> None:
         own = set(wake.reasons) <= _SELF_WAKES
-        if not own and member in self.no_autowake:
+        if not (own or wake.final) and member in self.no_autowake:
             return
         if _AWAITED & set(wake.reasons):
             self.orch.reset_until_streak(member)
@@ -691,8 +705,9 @@ class _EventDiscussion:
 
         Unread is a message after the member's cursor in this channel and after the start of
         its last turn (what was in a turn's inbox counts as seen); it must wake the member at
-        all (`_trigger`: ping-pong guard, exhausted, `wake_on`). Each message wakes its
-        addressee at most once this way, so the end comes. True if a wake-up was scheduled.
+        all (`_trigger` without the ping-pong guard: exhausted, `wake_on`). The guard does not
+        hold here (W3-09.1, B3): each message wakes its addressee at most once this way, and
+        `max_wakeups_per_agent` holds, so the end comes. True if a wake-up was scheduled.
         """
         found = False
         for member in self.members:
@@ -704,11 +719,11 @@ class _EventDiscussion:
                     continue
                 if address(msg, member, self.orch.sender_of) not in DIRECT:
                     continue
-                reason = self._trigger(msg, member)
+                reason = self._trigger(msg, member, guarded=False)
                 if reason is None:
                     continue
                 self.final_wakes.add((member, msg.id))
-                self._schedule(member, reason, msg, unread=msg.id)
+                self._schedule(member, reason, msg, unread=msg.id).final = True
                 found = True
         return found
 
@@ -852,15 +867,23 @@ class _EventDiscussion:
         return self.outcome
 
 
-def _result_text(result: Result | Message) -> str:
-    """A result for the wake-up of `until_result_from` (L14): title, file, start of the body."""
+def _result_text(result: Result | Message, shown: str, view: "AgentRoom") -> str | None:
+    """A result for the wake-up of `until_result_from` (L14): title, file, start of the body.
+
+    Only what the waiting agent may read itself (W3-09.1, B1, B2): a result of `submit_result`
+    (run-wide) or a message `result` in a channel of its own, else None (the wake-up then only
+    says that a result came). Names as it sees them (`shown`); a result file is named only if
+    its path does not carry the ID of an agent hidden behind an alias.
+    """
     if isinstance(result, Message):
-        head = f"Ergebnis von {result.sender} (Nachricht #{result.id} in #{result.channel}):"
+        if not view.can_read(result.channel):
+            return None
+        head = f"Ergebnis von {shown} (Nachricht #{result.id} in #{result.channel}):"
         body = result.body
     else:
-        head = f"Ergebnis #{result.id} von {result.agent}: „{result.title}“"
+        head = f"Ergebnis #{result.id} von {shown}: „{result.title}“"
         if result.path:
-            head += f" (Datei: {result.path})"
+            head += f" (Datei: {result.path})" if shown == result.agent else " (als Datei)"
         body = result.body or ""
     if len(body) > RESULT_EXCERPT_CHARS:
         body = body[:RESULT_EXCERPT_CHARS] + " …"

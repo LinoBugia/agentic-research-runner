@@ -1721,7 +1721,9 @@ def agent_states(record: RunRecord, resolved: ResolvedRun | None = None) -> list
                 results_count=results_count.get(config.id, 0),
                 ratings_count=ratings_count.get(config.id, 0),
                 work_dir=work_dir,
-                reachable=not final and state is AgentDisplayState.DONE and bool(config.channels),
+                reachable=not final
+                and state is AgentDisplayState.DONE
+                and view.channel in config.channels,
             )
         )
     return out

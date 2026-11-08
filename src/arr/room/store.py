@@ -663,9 +663,9 @@ class RoomStore:
         updates it with `set_delivery`. `to` holds real agent IDs of channel members.
 
         The user answers open questions to the user in the channel (L16): a message with
-        `reply_to` on such a question, or one to its asker, closes it. A message of the user
-        without addressee and without `reply_to` goes to the askers of the open questions to
-        the user in that channel and closes them, so the answer reaches who asked.
+        `reply_to` on such a question, or one to its asker (`to`, `@name`), closes it. A message
+        without addressee and without `reply_to` answers nothing: a note to all stays a note to
+        all (User 08.11., W3-09.1).
         """
         if sender not in RESERVED_SENDERS:
             raise ValueError(f"post() writes as orchestrator or user, not as {sender!r}")
@@ -691,12 +691,10 @@ class RoomStore:
                 named = mentions(body, ch.members, USER, lambda n: n if n in ch.members else None)
                 to = [*to, *named]
                 asked = self._open_user_questions(con, channel)
-                if not to and reply_to is None:
-                    to = [q.sender for q in asked if q.sender in ch.members]
             if reply_to is not None:
                 self._check_reply_to(con, ch.name, reply_to, ArrError)
             for question in asked:
-                if reply_to == question.id or (reply_to is None and question.sender in to):
+                if reply_to == question.id or question.sender in to:
                     con.execute("UPDATE msg SET open=0 WHERE id=?", (question.id,))
             msg_id = self._insert_msg(
                 con,
@@ -719,6 +717,11 @@ class RoomStore:
             sql, args = sql + " AND channel=?", (channel,)
         found = [_row_to_message(r) for r in con.execute(sql + " ORDER BY id", args)]
         return [m for m in found if is_user_question(m)]
+
+    def close_question(self, msg_id: int) -> None:
+        """Close a question nobody will answer any more (its asker worked on, the run ended)."""
+        with self._write() as con:
+            con.execute("UPDATE msg SET open=0 WHERE id=? AND kind='question'", (msg_id,))
 
     def open_user_questions(self, channel: str | None = None) -> list[Message]:
         """Open questions to the user (L16), oldest first; real sender IDs."""
@@ -1234,6 +1237,20 @@ class AgentRoom:
                 f"Du bist nicht Moderator von #{ch.name}. „{tool}“ ist dort nicht erlaubt."
             )
         return ch
+
+    def shown_name(self, agent: str) -> str:
+        """How this agent sees `agent`: its alias when an anonymous channel of mine hides it,
+        else its ID (W3-09.1, B2; the same rule as `_check_result_from`)."""
+        with self.store._read() as con:
+            for ch in self._readable(con):
+                if ch.anonymous and agent in ch.members:
+                    return ch.display(agent)
+        return agent
+
+    def can_read(self, channel: str) -> bool:
+        """True if this agent may read `channel` (a member, not waiting for `open_from`)."""
+        with self.store._read() as con:
+            return any(ch.name == channel for ch in self._readable(con))
 
     def moderated_channels(self) -> list[str]:
         """Channels this agent moderates (the server offers moderator tools only then)."""
@@ -1839,6 +1856,11 @@ class AgentRoom:
         if name is None or not str(name).strip():
             return None
         wanted = str(name).strip().removeprefix("@")
+        if not wanted.strip("@ "):  # only `@`: no name (B4)
+            raise RoomError(
+                "„until_result_from“ nennt keinen Agenten. Nenne einen Agenten, z. B. so, wie "
+                "du ihn mit `@name` ansprichst, oder lass das Feld weg."
+            )
         with self.store._read() as con:
             channels = self._readable(con)
             hidden = {a for ch in channels if ch.anonymous for a in ch.members}
@@ -1848,7 +1870,8 @@ class AgentRoom:
             if agent is None:
                 shown = [ch.display(a) for ch in channels for a in ch.members]
                 shown += [a for a in self.store.agent_ids() if a not in hidden]
-                names = [n for n in dict.fromkeys(shown) if n != self.agent_id]
+                me = {self.agent_id} | {ch.display(self.agent_id) for ch in channels}  # B5
+                names = [n for n in dict.fromkeys(shown) if n not in me]
                 raise RoomError(
                     f"Den Agenten „{wanted}“ gibt es in diesem Run nicht. Du kannst auf das "
                     f"Ergebnis von {', '.join(names) or 'niemandem'} warten."

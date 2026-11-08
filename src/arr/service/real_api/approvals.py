@@ -15,9 +15,9 @@ for that; without a decision it expires in the inbox (counts as denied). Runs of
 decided in their terminal, here they are read-only.
 
 Questions of agents to the user (`@user`, docs/09 L16) are items „Frage“: `decide_approval`
-with `answer` closes the item and posts the text as the user's answer into the channel, with
-`reply_to` on the question and to the asking agent, so `wait_for_messages` hands it over and
-a finished agent is woken (L13).
+with `answer` posts the text as the user's answer into the channel, with `reply_to` on the
+question and to the asking agent, so `wait_for_messages` hands it over and a finished agent is
+woken (L13); then it closes the item. If the post fails, the item stays open (W3-09.1, B6).
 """
 
 import logging
@@ -653,14 +653,17 @@ class ApprovalsArea:
         room = self._answer_room(item) if item.type is ApprovalType.QUESTION else None
         decision = _decision(item, request)
         self._rule_stored = True
+        if room is not None:  # into the channel first: if that fails, the item stays open (B6)
+            _post_answer(room, item, decision.comment or "")
         try:
             inbox.resolve(approval_id, decision)
         except ArrError as exc:
             still_open = any(i.id == approval_id for i in inbox.pending())
-            code = ErrorCode.INVALID if still_open else ErrorCode.CONFLICT
-            raise ApiException.of(code, exc.message) from exc
-        if room is not None:
-            _post_answer(room, item, decision.comment or "")
+            if room is not None and inbox.get(approval_id).status is ApprovalStatus.DECIDED:
+                pass  # the orchestrator saw the answer in the channel first: answered
+            else:
+                code = ErrorCode.INVALID if still_open else ErrorCode.CONFLICT
+                raise ApiException.of(code, exc.message) from exc
         record = self.state.store.get(item.run.id)
         decided = self._fresh_items(record).get(approval_id) if record is not None else None
         if decided is None:

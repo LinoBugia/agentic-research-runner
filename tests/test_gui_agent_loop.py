@@ -220,3 +220,30 @@ def test_w3_09_card_of_a_finished_agent_says_reachable() -> None:
     )
     card = card_html(agent.model_copy(update={"waiting": waiting}), now=1000)
     assert "wartet auf Ergebnis von b" in card and "10 min" in card
+
+
+async def test_w3_09_1_b9_m35_reachable_only_while_a_discussion_runs(wf: Path) -> None:
+    """The API sets `reachable` for a finished agent while the discussion of its channel runs
+    (M35), not in the summary afterwards, when nobody is woken (B9), and not after the run."""
+    summary = room("submit_result", kind="summary", title="Zusammenfassung", body="Kurz.")
+    scripts = {
+        "a": turns([wait(3), post("main", "Mein Teil.", kind="result")], [wait(3), summary]),
+        "b": turns([post("main", "Teil b.", kind="result")]),
+    }
+    data = form()
+    data["topology"]["params"]["summarizer"] = "a"
+    api = make_api(wf, scripts)
+    async with real_user(api):
+        run_id = (await api.start_run(data)).run_id
+
+        async def b_reachable(want: bool) -> bool:
+            b = {x.id: x for x in await api.list_agents(run_id)}.get("b")  # none while preparing
+            return b is not None and b.state is AgentDisplayState.DONE and b.reachable is want
+
+        async def in_summary() -> bool:
+            return (await api.get_run(run_id)).discussion is None and await b_reachable(False)
+
+        await until(lambda: b_reachable(True), what="b done and reachable in the discussion")
+        await until(in_summary, what="b done, not reachable in the summary")
+        assert await final_status(api, run_id) is RunStatus.DONE
+        assert not {x.id: x for x in await api.list_agents(run_id)}["b"].reachable

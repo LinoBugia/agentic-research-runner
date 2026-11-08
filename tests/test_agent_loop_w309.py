@@ -7,6 +7,7 @@ FakeBackend agents: run `…_7beb` replayed (V6), the end without an unread dire
 The hang cases of L13–L16 are in `test_agent_loop_hangs.py`.
 """
 
+import asyncio
 import json
 import time
 from importlib import resources
@@ -28,7 +29,7 @@ from run_kit import (
 )
 from test_agent_loop import IDLE, discuss, turn_starts
 
-from arr.models import AgentStatus, GroupChatConfig, ResolvedRun, WorkspaceMode
+from arr.models import AgentStatus, GroupChatConfig, ResolvedRun, RunStatus, WorkspaceMode
 from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.policy import ApprovalLog, PolicyEngine
 from arr.permissions.types import (
@@ -47,8 +48,8 @@ from arr.runs import pacing
 from arr.runs.context import DiscussionEnd
 from arr.runs.eventlog import render_transcript
 from arr.runs.manager import QUESTION_CLOSED
-from arr.runs.orchestrator import Orchestrator
-from arr.runs.pacing import is_question_to, render_turn_prompt
+from arr.runs.orchestrator import Orchestrator, StopReason
+from arr.runs.pacing import PacingSettings, is_question_to, render_turn_prompt
 from arr.runs.prepare import _research_block
 from arr.service.api_models import AgentWait, WaitReason
 from arr.service.real_api.rundir import agent_wait, flow_view
@@ -123,18 +124,23 @@ def test_a3_run_7beb_a_question_to_the_user_never_goes_to_an_agent(store: RoomSt
 
 
 def test_a3_the_user_answers_in_the_channel_and_the_asker_gets_it(store: RoomStore) -> None:
-    """A message of the user without addressee goes to who asked the user and closes it."""
+    """Entscheidung 1 (User 08.11., W3-09.1): only `reply_to` on the question or `to`/`@name`
+    of the asker answer it; a message to nobody answers nothing and goes to nobody."""
     a = store.for_agent("a")
     asked = a.post_message("main", "@user welches Band?", MessageKind.QUESTION)
     other = store.for_agent("b").post_message("main", "@user und du?", MessageKind.QUESTION)
-    answer = store.post("main", "Beide Bänder.", sender="user", via=MessageVia.GUI)
-    assert answer.to == ["a", "b"] and answer.reply_to is None
-    assert store.open_user_questions() == []
-    assert [m.id for m in a.messages_for_me()][-1] == answer.id, "it concerns the asker"
+    note = store.post("main", "Eine Notiz für alle.", sender="user", via=MessageVia.GUI)
+    assert note.to == [] and note.reply_to is None
+    assert {q.id for q in store.open_user_questions()} == {asked.id, other.id}
+    assert note.id not in [m.id for m in a.messages_for_me()], "it does not concern the asker"
+    by_name = store.post("main", "@a Band 10–35.", sender="user", via=MessageVia.GUI)
+    assert by_name.to == ["a"] and not store.message(asked.id).open
+    assert [m.id for m in a.messages_for_me()][-1] == by_name.id
+    store.post("main", "Ja.", sender="user", reply_to=other.id, via=MessageVia.GUI)
+    assert store.open_user_questions() == [], "reply_to on the question answers it"
     later = a.post_message("main", "@user noch eine?", MessageKind.QUESTION)
     store.post("main", "@c bitte du", sender="user", via=MessageVia.GUI)
     assert store.message(later.id).open, "a message to someone else answers nothing"
-    assert {asked.id, other.id} & {q.id for q in store.open_user_questions()} == set()
 
 
 def test_a3_question_items_in_the_inbox(tmp_path: Path) -> None:
@@ -266,9 +272,11 @@ def test_a5_the_research_block_names_own_part_and_the_others(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize(
-    ("status", "shown"), [("allowed", False), ("allowed_warning", False), ("rejected", True)]
+    ("status", "shown"), [("allowed", False), ("allowed_warning", True), ("rejected", True)]
 )
 def test_a6_v5_rate_limit_only_shown_when_it_holds_up(status: str, shown: bool) -> None:
+    """`allowed` changes nothing and is not served; `allowed_warning` throttles the profile and
+    is served for a neutral hint (W3-09.1, B10); „erreicht“ only for `rejected`."""
     line = {"seq": 3, "ts": 10.0, "turn": 1, "kind": "rate_limit",
             "data": {"status": status, "resets_at": 1794150600.0, "utilization": 0.05}}  # fmt: skip
     event = to_event(line, None, run_dir=None, agent_id=D1)
@@ -302,11 +310,15 @@ REQUEST = (
 
 
 def run_7beb() -> dict[str, Any]:
-    """The four turns of `…_7beb` that matter, in the order of the run (V6, V7)."""
+    """The turns of `…_7beb` that matter, in the order of the run (V6, V7).
+
+    diskutant-1 gives no result in its first turn: in the run its open question to the user
+    kept it idle; since W3-09.1 a result would make it done (Entscheidung 2), so the replay
+    keeps it idle the plain way, and its next turn is the round with the request.
+    """
     return {
         D1: turns(
-            [post("main", ASK_USER, kind="question"), wait(0.3),
-             post("main", "Eigene Messung E_P: Rouché für P≈1000.", kind="result")],
+            [post("main", ASK_USER, kind="question"), wait(0.3), say("Messung E_P läuft.")],
             [wait(0.2), post("main", REQUEST, to=[D2]),
              done("E_P in beiden Bändern gemessen, Ergebnis abgegeben.")],
         ),
@@ -447,7 +459,7 @@ async def test_a3_the_answer_in_the_channel_reaches_the_waiting_agent(workfolder
     async def user(orch: Orchestrator) -> None:
         await eventually(lambda: bool(orch.inbox.pending()), within=10)
         await eventually(lambda: orch.in_turn_wait(D1) is not None, within=10)
-        orch.room.post("main", "Band 10–35.", sender="user", via=MessageVia.GUI)
+        orch.room.post("main", "@diskutant-1 Band 10–35.", sender="user", via=MessageVia.GUI)
 
     ask = post("main", "@user Welches Band hat Vorrang?", kind="question")
     scripts = {
@@ -458,7 +470,8 @@ async def test_a3_the_answer_in_the_channel_reaches_the_waiting_agent(workfolder
     assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 20
     [item] = manager.inbox.items()
     assert item.type is ApprovalType.QUESTION and item.agent_id == D1
-    assert item.status is ApprovalStatus.DECIDED and item.decision.comment == "Band 10–35."
+    assert item.status is ApprovalStatus.DECIDED
+    assert item.decision.comment == "@diskutant-1 Band 10–35."
     results = [e for e in events_of(manager, D1) if e["kind"] == "tool_result"]
     ended = [json.loads(e["data"]["content"]) for e in results
              if e["data"]["content"].startswith('{"ended_by"')]  # fmt: skip
@@ -513,3 +526,439 @@ def test_direct_messages_for_the_prompt_keep_the_aliases(tmp_path: Path) -> None
     assert seen.id == sent.id and seen.sender == "Mitglied B" and seen.to == ["Mitglied A"]
     text = render_turn_prompt("a", "Los.", store.for_agent("a").inbox(), [], [seen])
     assert "Mitglied B" in text and "[#2 b " not in text
+
+
+# ============================================================================================
+# W3-09.1 Nacharbeit (Review B1–B6, B9, B11, Entscheidungen des Users vom 08.11.)
+# ============================================================================================
+
+
+def prompts_of(manager: Any, agent_id: str) -> list[str]:
+    return [t["data"]["prompt"] for t in turn_starts(manager.run_dir, agent_id)]
+
+
+async def discuss_two_channels(
+    workfolder: Path, scripts: dict[str, Any], side: list[str]
+) -> tuple[Any, Any]:
+    """A discussion in #main (D1, D2) with a second channel #side of `side` members."""
+    from run_kit import channel, make_manager
+
+    results: list[Any] = []
+
+    async def topology(ctx: Any) -> None:
+        results.append(await ctx.discuss("main", "Löst die Aufgabe."))
+
+    manager = make_manager(
+        workfolder,
+        topology,
+        scripts,
+        groupchats=[channel("main", [D1, D2], mode="event", **IDLE), channel("side", side)],
+        run_extra={"limits": {"wall_time": "30s"}},
+    )
+    await manager.run()
+    return manager, results[0]
+
+
+# --- Punkt 1 (B1): a result from a channel the waiter cannot read shows no text ----------
+
+
+@pytest.mark.parametrize("naive", [False, True], ids=["b1", "naive"])
+async def test_w3_09_1_b1_a_result_in_a_foreign_channel_wakes_without_its_text(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """S5: D2 posts its `result` in #side without D1. D1 is woken, its prompt says only that
+    a result came. Counter-check: if every channel counted as readable, the text leaks."""
+    from arr.room.store import AgentRoom
+
+    if naive:
+        monkeypatch.setattr(AgentRoom, "can_read", lambda self, channel: True)
+    secret = "NUR-IN-SIDE-4711"
+    scripts = {
+        D1: turns([room("wait_until", minutes=0.5, until_result_from=D2)], [done()]),
+        D2: turns([wait(0.5), post("side", f"Teilergebnis: {secret}", kind="result"), done()]),
+        D3: turns([say("ruhig")]),
+    }
+    manager, outcome = await discuss_two_channels(workfolder, scripts, [D2, D3])
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE
+    assert wakes(manager)[0] == (D1, ["result_from"])
+    woken = prompts_of(manager, D1)[1]
+    assert f"{D2} hat ein Ergebnis abgegeben" in woken
+    assert (secret in woken) is naive, "text_leaked"
+
+
+# --- Punkt 2 (B2): names in the wake-up prompt as the waiting agent sees them ------------
+
+
+@pytest.mark.parametrize("naive", [False, True], ids=["b2", "naive"])
+async def test_w3_09_1_b2_wake_prompt_in_an_anonymous_channel_keeps_the_alias(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """S5b: D1 waits for „Mitglied B“; the wake-up prompt names „Mitglied B“, never the real
+    ID, also not in the path of the result file. Counter-check: with real IDs it leaks."""
+    from arr.room.store import AgentRoom
+
+    if naive:
+        monkeypatch.setattr(AgentRoom, "shown_name", lambda self, agent: agent)
+    (workfolder / "projects" / "demo" / "lemma.md").write_text("Beweis.\n", "utf-8")
+    scripts = {
+        D1: turns([room("wait_until", minutes=0.5, until_result_from="Mitglied B")], [done()]),
+        D2: turns([wait(0.5), room("submit_result", kind="lemma", title="Lemma",
+                                   path="lemma.md")]),
+    }  # fmt: skip
+    manager, outcome, _ = await discuss(workfolder, scripts, {**IDLE, "anonymous": True})
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE
+    woken = prompts_of(manager, D1)[1]
+    assert (D2 in woken) is naive, "real_id_in_prompt"
+    if not naive:
+        assert "Mitglied B hat ein Ergebnis abgegeben" in woken and "(als Datei)" in woken
+
+
+def test_w3_09_1_b2_m20_b5_the_real_id_of_a_hidden_member_is_refused(tmp_path: Path) -> None:
+    """M20: `until_result_from` with the real ID behind an alias is refused without
+    confirming it; B5: the offer names neither the hidden ID nor the own alias; M55: an agent
+    without a shared channel counts by its ID."""
+    run = tmp_path / "run"
+    for agent_id in (D1, D2, D3):
+        (run / "agents" / agent_id / "work").mkdir(parents=True)
+    store = RoomStore.create(run)
+    store.setup_channels(
+        [
+            GroupChatConfig(name="blind", members=[D1, D2], anonymous=True),
+            GroupChatConfig(name="side", members=[D2, D3]),
+        ]
+    )
+    d1 = store.for_agent(D1)
+    assert d1.wait_until(1, until_result_from="Mitglied B").result_from == D2
+    with pytest.raises(RoomError) as info:
+        d1.wait_until(1, until_result_from=D2)
+    text = str(info.value)
+    assert "Mitglied B" in text and "Mitglied A" not in text, "B5: not oneself"
+    assert text.count(D2) == 1, "only the echo of the name, no confirmation"
+    assert d1.wait_until(1, until_result_from=D3).result_from == D3, "M55: no shared channel"
+    assert d1.shown_name(D2) == "Mitglied B" and d1.shown_name(D3) == D3
+
+
+# --- Punkt 3 (B3): a burst of requests to a finished agent wakes it --------------------------
+
+
+def old_ping_pong(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard before W3-09.1: every message of a pair counts, L15 heeds the guard."""
+
+    def observe(self: Any, msg: Any) -> Any:
+        self._senders[msg.id] = msg.sender
+        if msg.sender in ("orchestrator", USER):
+            return None
+        other = self._other(msg)
+        if other is None or other == msg.sender:
+            return None
+        pair = frozenset({msg.sender, other})
+        self._counts[pair] = self._counts.get(pair, 0) + 1
+        if self._counts[pair] > self.limit and pair not in self.flagged:
+            self.flagged.add(pair)
+            return pair
+        return None
+
+    trigger = pacing._EventDiscussion._trigger
+    monkeypatch.setattr(pacing.PingPongTracker, "observe", observe)
+    monkeypatch.setattr(
+        pacing._EventDiscussion,
+        "_trigger",
+        lambda self, msg, member, guarded=True: trigger(self, msg, member),
+    )
+
+
+@pytest.mark.parametrize("count", [7, 10])
+@pytest.mark.parametrize("naive", [False, True], ids=["b3", "naive"])
+async def test_w3_09_1_b3_many_requests_to_a_finished_agent_wake_it(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool, count: int
+) -> None:
+    """S2b: D1 sends the finished D2 7 or 10 requests in one turn. D2 is woken and every
+    request stands in one of its prompts. Counter-check with the old guard: never woken."""
+    if naive:
+        old_ping_pong(monkeypatch)
+    scripts = {
+        D1: turns([wait(0.4)] + [post("main", f"@{D2} Bitte {i}") for i in range(count)]
+                  + [done()]),
+        D2: turns([post("main", "Ergebnis", kind="result")], [say("gesehen")], repeat_last=True),
+    }  # fmt: skip
+    manager, outcome, _ = await discuss(workfolder, scripts, IDLE)
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE
+    turns_d2 = manager.orchestrator.agents[D2].turns_used
+    if naive:
+        assert turns_d2 == 1 and log_entries(manager.run_dir, "ping_pong")
+        return
+    assert turns_d2 >= 2 and not log_entries(manager.run_dir, "ping_pong")
+    seen = "\n".join(prompts_of(manager, D2)[1:])
+    assert all(f"Bitte {i}" in seen for i in range(count)), "every request in a prompt"
+
+
+def test_w3_09_1_b3_only_an_exchange_counts() -> None:
+    """One-sided messages count once; back and forth counts each change; M07: a message to the
+    user goes to no agent."""
+    from arr.room.types import Message
+    from arr.runs.pacing import PingPongTracker
+
+    def m(i: int, sender: str, to: str) -> Message:
+        return Message(id=i, ts=0.0, channel="main", sender=sender, body="x", to=[to])
+
+    tracker = PingPongTracker(2, lambda _i: None)
+    assert all(tracker.observe(m(i, "a", "b")) is None for i in range(1, 20))
+    assert tracker.observe(m(20, "b", "a")) is None
+    assert tracker.observe(m(21, "a", "b")) == frozenset({"a", "b"}), "third change"
+    assert tracker._other(m(22, "a", USER)) is None, "M07"
+
+
+async def test_w3_09_1_b3_l15_wakes_a_member_behind_the_guard_once(workfolder: Path) -> None:
+    """After a real ping-pong the guard stops automatic wake-ups; before `all_done`, L15 still
+    wakes each member once per unread direct message, and the discussion ends."""
+    pacing_settings = PacingSettings(poll_interval_s=0.01, ping_pong_limit=2)
+    scripts = {
+        D1: turns([wait(0.1), post("main", "@diskutant-2 Nein.")],
+                  [wait(0.1), post("main", "@diskutant-2 Nein.")],
+                  [wait(0.1), post("main", "@diskutant-2 Gut, Schluss."), done()],
+                  repeat_last=True),
+        D2: turns([say("bereit")], [wait(0.1), post("main", "@diskutant-1 Doch.")],
+                  [post("main", "Ergebnis", kind="result")], repeat_last=True),
+    }  # fmt: skip
+    manager, outcome, took = await discuss(workfolder, scripts, IDLE, pacing=pacing_settings)
+    assert outcome.ended_by in (DiscussionEnd.ALL_DONE, DiscussionEnd.ROUNDS) and took < 20
+    assert log_entries(manager.run_dir, "ping_pong"), "the guard stepped in"
+
+
+# --- Punkt 4 (Entscheidung 1): a note to all answers no question to the user ------------------
+
+
+async def test_w3_09_1_e1_a_note_without_addressee_answers_nothing(workfolder: Path) -> None:
+    """S13: the user writes a note to all while a question to the user is open. It stays a
+    note to all (`to` empty, no wake-up of the asker), the question stays open. Counter-check:
+    the same text with `@name` answers it and wakes the asker."""
+
+    async def user(orch: Orchestrator) -> None:
+        await eventually(lambda: bool(orch.inbox.pending()), within=10)
+        await eventually(lambda: bool(log_entries(orch.prepared.run_dir, "round")), within=10)
+        orch.room.post("main", "Nur eine Notiz für alle.", sender="user", via=MessageVia.GUI)
+        await eventually(lambda: orch.agents[D1].turns_used >= 2, within=10)
+        orch.room.post("main", "@diskutant-1 Band 10–35.", sender="user", via=MessageVia.GUI)
+
+    ask = post("main", "@user welches Band?", kind="question")
+    scripts = {
+        D1: turns([ask, say("Ich warte.")], [say("weiter warten")],
+                  [post("main", "Danke.", kind="result")], repeat_last=True),
+        D2: turns([post("main", "Mein Teil.", kind="result")]),
+    }  # fmt: skip
+    manager, outcome, _ = await discuss(workfolder, scripts, IDLE, during=user)
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE
+    note, answer = [m for m in manager.room.messages("main") if m.sender == USER]
+    assert note.to == [] and answer.to == [D1]
+    woken = [e["data"] for e in log_entries(manager.run_dir, "wake") if e["data"]["agent"] == D1]
+    assert note.id not in [i for w in woken for i in w["messages"]], "the note woke nobody"
+    assert any(answer.id in w["messages"] for w in woken), "the answer woke the asker"
+    [item] = manager.inbox.items()
+    assert item.status is ApprovalStatus.DECIDED and item.decision.comment == answer.body
+
+
+# --- Punkt 5 (Entscheidung 2): a result while the question is open makes the asker done ------
+
+
+@pytest.mark.parametrize("naive", [False, True], ids=["e2", "naive"])
+async def test_w3_09_1_e2_a_result_closes_the_question_and_makes_the_asker_done(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """S9b: the asker gives its result while its question to the user is open: one turn,
+    `done`, the item closes „hat ohne Antwort weitergearbeitet“, a late answer wakes it (L13).
+    Counter-check with the rule before: not done, idle rounds until `rounds`."""
+    from arr.runs import orchestrator
+
+    if naive:
+        monkeypatch.setattr(orchestrator, "is_user_question", lambda msg: False)
+
+    async def user(orch: Orchestrator) -> None:
+        await eventually(lambda: orch.agent_status(D1) is AgentStatus.DONE, within=10)
+        assert orch.is_busy(D2), "the discussion still runs"
+        orch.room.post("main", "@diskutant-1 Band 10–35.", sender="user", via=MessageVia.GUI)
+
+    ask = post("main", "@user welches Band?", kind="question")
+    scripts = {
+        D1: turns([ask, post("main", "Vorläufig 10–35.", kind="result")], [say("passt")],
+                  repeat_last=True),
+        D2: turns([wait(2.0), post("main", "Mein Teil.", kind="result")]),
+    }  # fmt: skip
+    if naive:
+        manager, outcome, _ = await discuss(workfolder, scripts, IDLE)
+        assert outcome.ended_by is DiscussionEnd.ROUNDS
+        assert manager.orchestrator.agents[D1].turns_used > 2, "idle rounds for the asker"
+        return
+    manager, outcome, _ = await discuss(workfolder, scripts, IDLE, during=user)
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE
+    done_by = [e["data"] for e in log_entries(manager.run_dir, "agent_done")]
+    assert {"agent": D1, "reason": "result", "turn": 1} in done_by
+    [item] = manager.inbox.items()
+    assert item.status is ApprovalStatus.OBSOLETE
+    lines = (manager.run_dir / "approvals.jsonl").read_text("utf-8").splitlines()
+    [closed] = [e for e in map(json.loads, lines) if e["event"] == "obsolete"]
+    assert closed["note"] == f"{D1} hat ohne Antwort weitergearbeitet."
+    [ask_msg] = [m for m in manager.room.messages("main") if m.kind is MessageKind.QUESTION]
+    assert not ask_msg.open, "the question is closed in the room as well"
+    woken = [e["data"]["reasons"] for e in log_entries(manager.run_dir, "wake")
+             if e["data"]["agent"] == D1]  # fmt: skip
+    assert woken == [["mention"]], "the late answer wakes it"
+    assert manager.orchestrator.agent_status(D1) is AgentStatus.DONE
+
+
+async def test_w3_09_1_e2_set_status_done_keeps_the_question_until_the_run_ends(
+    workfolder: Path,
+) -> None:
+    """S20: `set_status("done")` stays as it was: done at once, the question closes only
+    with the run („Der Run ist zu Ende …“)."""
+    ask = post("main", "@user welches Band?", kind="question")
+    scripts = {D1: turns([ask, done()]), D2: turns([done()])}
+    manager, outcome, took = await discuss(workfolder, scripts, IDLE)
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 10
+    lines = (manager.run_dir / "approvals.jsonl").read_text("utf-8").splitlines()
+    [closed] = [e for e in map(json.loads, lines) if e["event"] == "obsolete"]
+    assert closed["note"] == QUESTION_CLOSED
+
+
+# --- Punkt 7 (B4, B6, B11) -------------------------------------------------------------------
+
+
+def test_w3_09_1_b4_only_at_signs_name_no_agent(store: RoomStore) -> None:
+    a = store.for_agent("a")
+    for bad in ("@", "@@", "@ "):
+        with pytest.raises(RoomError, match="nennt keinen Agenten") as info:
+            a.wait_until(1, until_result_from=bad)
+        assert "gibt es in diesem Run nicht" not in str(info.value)
+    assert a.wait_until(1, until_result_from="").result_from is None
+
+
+async def test_w3_09_1_b11_m47_an_older_result_does_not_wake(workfolder: Path) -> None:
+    """S22: D2 already gave a result but is not done (open question). D1 waits for its
+    result: the old one does not wake it, the next one does (M47)."""
+    scripts = {
+        D1: turns([wait(0.6), room("wait_until", minutes=0.5, until_result_from=D2)], [done()]),
+        D2: turns([post("main", f"@{D3} stimmt das?", kind="question"),
+                   room("submit_result", kind="x", title="Alt", body="alt")],
+                  [wait(0.8), room("submit_result", kind="x", title="Neu", body="neu"), done()],
+                  repeat_last=True),
+        D3: turns([wait(2.0), post("main", "Ja.", kind="answer", reply_to=2), done()]),
+    }  # fmt: skip
+    manager, outcome, _ = await discuss(workfolder, scripts, IDLE)
+    woken = prompts_of(manager, D1)[1]
+    assert "„Neu“" in woken and "„Alt“" not in woken
+
+
+def test_w3_09_1_b11_new_result_looks_only_after_the_mark(tmp_path: Path) -> None:
+    """`new_result` reads the messages after the mark of the waiting turn, not the whole run."""
+    from arr.runs.orchestrator import Orchestrator as Orch
+
+    run = tmp_path / "run"
+    for agent_id in ("a", "b"):
+        (run / "agents" / agent_id / "work").mkdir(parents=True)
+    store = RoomStore.create(run)
+    store.setup_channels([GroupChatConfig(name="main", members=["a", "b"])])
+    early = store.for_agent("b").post_message("main", "alt", MessageKind.RESULT)
+    late = store.for_agent("b").post_message("main", "neu", MessageKind.RESULT)
+    fake: Any = type("O", (), {"room": store})()
+    assert Orch.new_result(fake, "b", 0.0, early.id).id == late.id
+    assert Orch.new_result(fake, "b", 0.0, late.id) is None
+
+
+# --- Punkt 8: tests for the mutations without a red test --------------------------------------
+
+
+async def test_w3_09_1_m06_a_result_resets_the_count_of_deadlines(workfolder: Path) -> None:
+    """L10: after deadlines in a row, the awaited result resets the count (M06)."""
+    waits = room("wait_until", minutes=0.005, until_result_from=D2)
+    scripts = {
+        D1: turns([waits], [waits],
+                  [room("wait_until", minutes=0.5, until_result_from=D2)], [done()]),
+        D2: turns([wait(1.5), room("submit_result", kind="x", title="T", body="B")]),
+    }  # fmt: skip
+    manager, outcome, _ = await discuss(workfolder, scripts, IDLE)
+    reasons = [r for agent, rs in wakes(manager) if agent == D1 for r in rs]
+    assert "timeout" in reasons and "result_from" in reasons
+    assert reasons.index("timeout") < reasons.index("result_from")
+    guard = manager.room.wait_guards().get(D1)
+    assert guard is None or guard.until_streak == 0
+
+
+def test_w3_09_1_m08_m53_a_question_to_the_user_is_no_question_to_the_agent(
+    store: RoomStore,
+) -> None:
+    """Hint and inbox of an agent named in `to` of a question to the user (M08, M53)."""
+    from arr.runs.pacing import compose_hint
+
+    both = store.for_agent("a").post_message(
+        "main", "@user @b was meint ihr?", MessageKind.QUESTION, to=["b"]
+    )
+    assert both.to == ["b", USER] and not is_question_to(both, "b")
+    assert "Frage" not in compose_hint("b", [both])
+    assert store.for_agent("b").inbox().open_questions == []
+
+
+def test_w3_09_1_m30_an_answer_needs_a_text() -> None:
+    for comment in (None, "", "   "):
+        with pytest.raises(ValueError, match="Text"):
+            Decision(action=DecisionAction.ANSWER, decided_by=DecidedBy.USER, comment=comment)
+
+
+async def test_w3_09_1_m29_stop_with_an_open_question(workfolder: Path) -> None:
+    """A stop while a question to the user is open: no error, the item is obsolete (M29)."""
+
+    async def stop(orch: Orchestrator) -> None:
+        await eventually(lambda: bool(orch.inbox.pending()), within=10)
+        await orch.halt(StopReason.USER)
+
+    ask = post("main", "@user welches Band?", kind="question")
+    scripts = {D1: turns([ask, wait(20)]), D2: turns([wait(20)])}
+    results: list[Any] = []
+
+    async def topology(ctx: Any) -> None:
+        helper = asyncio.create_task(stop(ctx))
+        results.append(await ctx.discuss("main", "Los."))
+        await helper
+
+    from run_kit import channel, make_manager
+
+    manager = make_manager(
+        workfolder, topology, scripts,
+        groupchats=[channel("main", [D1, D2], mode="event", **IDLE)],
+        run_extra={"limits": {"wall_time": "30s"}},
+    )  # fmt: skip
+    assert await asyncio.wait_for(manager.run(), 30) is RunStatus.STOPPED
+    assert log_entries(manager.run_dir, "error") == []
+    [item] = manager.inbox.items()
+    assert item.status is ApprovalStatus.OBSOLETE
+
+
+def test_w3_09_1_m51_a_question_is_no_escalation() -> None:
+    from arr.service.real_api.rundir import _item_is_escalation, describe_item
+
+    question = {"agent_id": D1, "channel": "main", "msg_id": 2, "text": "Band?"}
+    entry = {"event": "open", "item_id": "apr_1", "question": question}
+    assert not _item_is_escalation(entry)
+    assert describe_item(entry) == f"{D1} fragt dich: Band?"
+    assert _item_is_escalation({"event": "open", "item_id": "apr_2"})
+
+
+def test_w3_09_1_m34_the_card_skips_an_allowed_rate_limit(tmp_path: Path) -> None:
+    """The „jetzt“ line of the card: an `allowed` window after a tool shows the tool; a
+    `rejected` one shows „Nutzungslimit erreicht“ (M34)."""
+    from arr.service.real_api.rundir import AgentRecord, _activity
+    from arr.service.real_api.transcript import TranscriptIndex
+
+    def activity(status: str) -> Any:
+        path = tmp_path / f"{status}.jsonl"
+        lines = [
+            {"seq": 1, "ts": 1.0, "turn": 1, "kind": "tool_call",
+             "data": {"id": "t1", "name": "Bash", "input": {"command": "ls"}}},
+            {"seq": 2, "ts": 2.0, "turn": 1, "kind": "rate_limit",
+             "data": {"status": status, "resets_at": 1794150600.0}},
+        ]  # fmt: skip
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines), "utf-8")
+        index = TranscriptIndex(path)
+        index.refresh()
+        return _activity(AgentRecord(D1, tmp_path, None, index), final=False)
+
+    assert activity("allowed").label == "Bash"
+    assert activity("rejected").label == "Nutzungslimit erreicht"

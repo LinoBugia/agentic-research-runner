@@ -44,6 +44,9 @@ _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
 RATE_LIMIT_PASSING = frozenset({"", "allowed", "allowed_warning"})
 """`rate_limit` statuses that hold no turn up: the window is reported, nothing is reached
 (Nachtest V5). `ProfileGate` pauses a profile only for the others, e.g. `rejected`."""
+RATE_LIMIT_ALLOWED = frozenset({"", "allowed"})
+"""`rate_limit` statuses that change nothing at all; `allowed_warning` throttles the profile
+to one turn at a time (`ProfileGate.report`), so the GUI shows it as a hint (W3-09.1)."""
 
 
 # --------------------------------------------------------------------------------------------
