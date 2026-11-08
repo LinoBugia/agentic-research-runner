@@ -29,6 +29,7 @@ from arr.service.gui.components.base import button, esc, raw
 from arr.service.gui.components.page_state import forced_state, state_api
 from arr.service.gui.components.table import Column, Group, Row, table_html
 from arr.service.gui.layout import Frame
+from arr.service.gui.pages.run_detail_inputs import REPEAT_LABEL, repeat_href
 from arr.service.gui.texts import (
     RUN_FILTER_LABELS,
     RUN_FILTER_SLUGS,
@@ -51,6 +52,7 @@ COLUMNS = [
     Column("Tokens · Kosten", align="right", title="≈ = rechnerischer API-Preis bei Abo-Profilen"),
     Column("Größe", align="right"),
     Column("📌", title="Angeheftet", sr_label="Angeheftet"),
+    Column("", css="nw col-act", sr_label="Aktionen"),
 ]
 
 
@@ -114,6 +116,10 @@ def run_row(run: RunSummary, now: float, approval_href: str | None) -> Row:
             '<span title="angeheftet">📌</span><span class="sr-only">angeheftet</span>'
             if run.pinned
             else "",
+            # V8: „Neuer Run“ with the inputs of this run; it starts only there
+            f'<a class="btn btn-sm ghost" href="{esc(repeat_href(run.id))}" '
+            f'data-mark="repeat-{esc(run.id)}" title="„Neuer Run“ mit den Eingaben dieses Runs" '
+            f'aria-label="Run „{esc(run.name)}“ wiederholen">{REPEAT_LABEL}</a>',
         ],
         href=f"/runs/{run.id}",
         row_id=f"row-{run.id}",

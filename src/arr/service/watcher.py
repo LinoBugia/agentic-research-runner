@@ -103,6 +103,13 @@ class _Seen:
     agent_rows: dict[str, tuple[str, float, int]] = field(default_factory=dict)
     last_tick: float = 0.0
     warned: set[LimitKind] = field(default_factory=set)
+    status_retry: bool = False
+    """The last `run.status` could not be built: send it in the next tick (V4)."""
+    retry_previous: RunStatus | None = None
+    resync: bool = False
+    """A pass over this run failed half way: the next one sends every agent and the run."""
+    failing: bool = False
+    """The last pass failed; logged once, not every 0.25 s."""
 
 
 class RunWatcher:
@@ -164,15 +171,33 @@ class RunWatcher:
                 continue
             if not (seen.active or record.status.is_active):
                 if full and record.status is not seen.status:
-                    self._publish_status(record, seen.status)
-                    seen.status = record.status
+                    if self._publish_status(record, seen.status):  # else again next pass
+                        seen.status = record.status
                     counts_dirty = True
                 continue
             if not full:
                 record.refresh_meta()
             previous = seen.status if record.status is not seen.status else None
-            self._observe(record, seen, now, previous=previous, force_status=previous is not None)
-            if previous is not None:
+            if previous is None and seen.status_retry:
+                previous = seen.retry_previous
+            try:
+                self._observe(
+                    record,
+                    seen,
+                    now,
+                    previous=previous,
+                    force_status=previous is not None or seen.status_retry,
+                )
+            except Exception:  # noqa: BLE001 - the cursors moved on: catch up in the next pass
+                if not seen.failing:
+                    log.warning(
+                        "Beobachter: Durchlauf für %s unvollständig", record.run_id, exc_info=True
+                    )
+                seen.failing = seen.resync = True
+                seen.status_retry, seen.retry_previous = True, previous
+            else:
+                seen.failing = False
+            if record.status is not seen.status:
                 counts_dirty = True
                 seen.status = record.status
             # a finished run is followed until it settles: the secret scan comes after it (U3)
@@ -228,6 +253,12 @@ class RunWatcher:
         agents_dirty: set[str] = set()
         run_dirty = force_status
         resolved = record.load_resolved()
+        if seen.resync:
+            seen.resync = False
+            agents_dirty.update(record.agents)
+            if resolved is not None:
+                agents_dirty.update(a.id for a in resolved.agents)
+            run_dirty = True
 
         # orchestrator.jsonl
         entries = record.log.entries
@@ -369,7 +400,11 @@ class RunWatcher:
                 if state.id in agents_dirty:
                     self._emit(AgentStateEvent, run_id=record.run_id, agent=state)
         if run_dirty:
-            self._publish_status(record, previous, states=states)
+            sent = self._publish_status(record, previous, states=states)
+            if not sent and not seen.status_retry:
+                log.info("Beobachter: Status von %s gerade nicht lesbar", record.run_id)
+            seen.status_retry = not sent
+            seen.retry_previous = None if sent else previous
 
         # usage tick and limit warnings of running runs
         if record.status is RunStatus.RUNNING and now - seen.last_tick >= self.tick_every_s:
@@ -449,7 +484,8 @@ class RunWatcher:
         previous: RunStatus | None,
         *,
         states: list[AgentState] | None = None,
-    ) -> None:
+    ) -> bool:
+        """Send `run.status`; False when the run cannot be read just now (tried again)."""
         try:
             summary = run_summary(
                 record,
@@ -458,8 +494,9 @@ class RunWatcher:
                 agents=states if states is not None else agent_states(record),
             )
         except (ArrError, ValueError):
-            return
+            return False
         self._emit(RunStatusEvent, run_id=record.run_id, run=summary, previous=previous)
+        return True
 
     def _emit(self, cls: type[Any], *, run_id: str | None, **fields: Any) -> None:
         event = cls(seq=self.state.hub.next_seq(), ts=time.time(), run_id=run_id, **fields)

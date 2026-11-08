@@ -100,8 +100,19 @@ def link_html(label: str, href: str, *, classes: str = "") -> str:
 # `$…$` and `$$…$$` become a span with readable Unicode text (W1-06) that carries the LaTeX
 # source in `data-tex`; pages that load static/math.js typeset it with KaTeX as MathML (G7,
 # W1-07). Without JavaScript or KaTeX the Unicode text stays.
+#
+# Inline `$…$` follows Pandoc (W3-10 U9): the opening `$` has no space to its right, the
+# closing one none to its left and no digit after it, and a formula never spans a blank line.
+# So amounts like „≈ 0,28 $ … ≈ 0,14 $“ stay text, `$σ(n)$` is a formula. `\$` is a dollar,
+# and code (`…`, fenced blocks) is never a formula.
 
-_MATH_RE = re.compile(r"\$\$(.+?)\$\$|\$(.+?)\$", re.S)
+_MATH_RE = re.compile(
+    r"\$\$(.+?)\$\$"
+    r"|(?<![\\$])\$(?![\s$])((?:\\.|[^$\\])+?)(?<![\s\\])\$(?![\d$])",
+    re.S,
+)
+_CODE_RE = re.compile(r"(`{3,}|~{3,}).*?\1|`[^`\n]+`", re.S)
+_BLANK_LINE = re.compile(r"\n[ \t]*\n")
 _TEX = {
     r"\pmod": " mod ",
     r"\bmod": " mod ",
@@ -145,8 +156,21 @@ def markdown_html(source: str) -> str:
         )
         return f"ARRMATH{len(spans) - 1}END"
 
-    marked = _MATH_RE.sub(keep, source)
+    codes: list[str] = []
+
+    def code(match: re.Match[str]) -> str:
+        codes.append(match.group(0))
+        return f"ARRCODE{len(codes) - 1}END"
+
+    def keep_inline(match: re.Match[str]) -> str:
+        if match.group(2) is not None and _BLANK_LINE.search(match.group(2)):
+            return match.group(0)  # two paragraphs are no formula
+        return keep(match)
+
+    marked = _MATH_RE.sub(keep_inline, _CODE_RE.sub(code, source)).replace("\\$", "ARRDOLLAR")
+    marked = re.sub(r"ARRCODE(\d+)END", lambda m: codes[int(m.group(1))], marked)
     # `_` inside a word is no emphasis: run IDs and snake_case keep their underscores
     extras = {"fenced-code-blocks": None, "middle-word-em": False}
     rendered = markdown2.markdown(marked, safe_mode="escape", extras=extras)
+    rendered = rendered.replace("ARRDOLLAR", "$")
     return re.sub(r"ARRMATH(\d+)END", lambda m: spans[int(m.group(1))], rendered)

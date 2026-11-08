@@ -2215,3 +2215,88 @@ usage of active runs for lists); run streams carry all types."""
 
 ApprovalTop.model_rebuild()
 WorkfolderSettingsInfo.model_rebuild()
+
+
+# --------------------------------------------------------------------------------------------
+# Inputs of a run and „Wiederholen“ (W3-10: UX-Abnahme 3 V8, V9)
+#   GET  /api/runs/{id}/inputs                   RunInputs               [get_run_inputs]
+# --------------------------------------------------------------------------------------------
+
+
+class RunInputParam(ApiModel):
+    """A parameter of a run with the value it ran with (docs/08 §5.4 section 3)."""
+
+    name: str
+    value: Any = None
+    default: Any = None
+    doc: str | None = None
+    changed: bool = Field(default=False, description="Differs from the default of the skill")
+
+
+class RunInputAgent(ApiModel):
+    """An agent as the run got it (resolved `run.yaml`); only the profile's name, no secret."""
+
+    id: str
+    role_label: str
+    role: str | None = None
+    provider: Provider
+    vendor: Vendor
+    model: str
+    model_label: str
+    profile: str
+    effort: Effort | None = None
+    workspace_mode: WorkspaceMode = WorkspaceMode.COPY
+    workspace_name: str | None = None
+    web: bool = False
+    shell: bool = True
+    read_dirs: list[str] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
+    channels: list[str] = Field(default_factory=list)
+
+
+class RunInputChannel(ApiModel):
+    """A channel of the run with its rhythm (docs/06 §2)."""
+
+    name: str
+    purpose: str | None = None
+    members: list[str] = Field(default_factory=list)
+    mode: ChannelMode
+    order: str | None = None
+    moderator: str | None = None
+    open_from: str | None = None
+    anonymous: bool = False
+    wake_on: list[str] = Field(default_factory=list)
+    debounce_s: float | None = None
+    idle_after_s: float | None = None
+    quiet_after_s: float | None = None
+    max_wakeups_per_agent: int | None = None
+
+
+class RunInputs(ApiModel):
+    """What a run was started with: the area „Eingaben“ of the run detail (V9) and the input of
+    „Neuer Run“ that repeats it (V8). Texts pass the secret filter, so no secret is in them."""
+
+    run_id: str
+    name: str
+    available: bool = Field(description="False while `run.yaml` is not written yet")
+    project: str
+    skill: str | None = None
+    topology: TopologyKind | None = None
+    task_md: str | None = None
+    params: list[RunInputParam] = Field(default_factory=list)
+    agents: list[RunInputAgent] = Field(default_factory=list)
+    channels: list[RunInputChannel] = Field(default_factory=list)
+    limits: LimitsInfo = Field(default_factory=LimitsInfo)
+    decider: Decider = Decider.USER
+    approval_timeout_s: int | None = None
+    run_yaml: str | None = Field(default=None, description="Resolved `run.yaml`, read only")
+    repeat: dict[str, Any] = Field(
+        default_factory=dict, description="Input of „Neuer Run“ (`resolve_run`, `start_run`)"
+    )
+    repeat_notes: list[str] = Field(
+        default_factory=list, description="What the repeat cannot take over, German"
+    )
+
+
+REPEAT_SUFFIX = " (Wiederholung)"
+"""Name of a repeated run: the old name with this (W3-10 V8)."""

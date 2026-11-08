@@ -59,6 +59,7 @@ from arr.service.api_client import (  # noqa: E402 - re-exported for the GUI and
 )
 from arr.service.api_models import (
     BUILTIN_FIXED_RULES,
+    REPEAT_SUFFIX,
     Action,
     ActionResult,
     Activity,
@@ -153,6 +154,10 @@ from arr.service.api_models import (
     RunDetail,
     RunError,
     RunFilter,
+    RunInputAgent,
+    RunInputChannel,
+    RunInputParam,
+    RunInputs,
     RunLimits,
     RunRef,
     RunResults,
@@ -5708,6 +5713,78 @@ class MockApi:
     async def get_changes(self, run_id: str) -> list[AgentChanges]:
         """File changes per agent [S]."""
         return list(self._detail(run_id).file_changes)
+
+    async def get_run_inputs(self, run_id: str) -> RunInputs:
+        """Inputs of a run and the input of „Neuer Run“ that repeats it (W3-10)."""
+        run = self._detail(run_id)
+        skill = next((s for s in self.state.skills if s.name == run.skill), None)
+        values = {p.name: p.default for p in skill.params} if skill is not None else {}
+        params = [
+            RunInputParam(name=p.name, value=p.default, default=p.default, doc=p.doc)
+            for p in (skill.params if skill is not None else [])
+        ]
+        agents = [
+            RunInputAgent(
+                id=a.id,
+                role_label=a.role_label,
+                role=a.role_file,
+                provider=a.provider,
+                vendor=a.vendor,
+                model=a.model,
+                model_label=a.model_label,
+                profile=a.auth_profile,
+                effort=a.effort,
+                workspace_mode=a.workspace_mode,
+                web=a.tools.web,
+                shell=a.tools.shell,
+                read_dirs=list(a.read_dirs),
+                skills=list(a.skills),
+                channels=list(a.channels),
+            )
+            for a in run.agents.values()
+        ]
+        channels = [
+            RunInputChannel(
+                name=c.info.name,
+                purpose=c.info.purpose,
+                members=[m.agent for m in c.info.members],
+                mode=c.info.mode,
+                moderator=c.info.moderator,
+            )
+            for c in run.channels.values()
+        ]
+        limits = {
+            "wall_time_s": run.wall_time_s,
+            "turns_per_agent": run.turns_per_agent,
+            "budget_usd": run.budget_usd,
+        }
+        lines = [f"project: {run.project}", f"skill: {run.skill or ''}", "agents:"]
+        lines += [f"  - id: {a.id}\n    model: {a.model}\n    auth: {a.profile}" for a in agents]
+        return RunInputs(
+            run_id=run.id,
+            name=run.name,
+            available=True,
+            project=run.project,
+            skill=run.skill,
+            topology=run.topology,
+            task_md=run.task_md,
+            params=params,
+            agents=agents,
+            channels=channels,
+            limits=limits,
+            decider=run.decider,
+            run_yaml="\n".join(lines) + "\n",
+            repeat={
+                "project": run.project,
+                "skill": run.skill or "",
+                "name": f"{run.name.removesuffix(REPEAT_SUFFIX)}{REPEAT_SUFFIX}",
+                "task_md": run.task_md or "",
+                "params": values,
+                "agents": {},
+                "limits": limits,
+                "decider": run.decider.value,
+            },
+        )
 
     # --- ApiClient: profiles, projects, skills ------------------------------------------------
 
