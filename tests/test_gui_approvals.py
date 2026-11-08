@@ -366,7 +366,8 @@ async def test_w3_09_a3_question_card_with_an_answer_field_reaches_the_agent(wf:
     from run_kit import events, post, room
 
     ask = post("main", "@user Welches Höhenband hat Vorrang, 10–35 oder 35–60?", kind="question")
-    script = turns([ask, room("wait_for_messages", seconds=20), say("danke")])
+    # the turn goes on after the answer, so the stop at the end meets a running run
+    script = turns([ask, room("wait_for_messages", seconds=20), say("danke"), wait(30)])
     async with service(wf, {"a": script}) as (user, api):
         started = await api.start_run(question_run({"id": "a"}))
         item = await open_item(api)
