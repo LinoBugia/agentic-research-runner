@@ -9,6 +9,7 @@ secret filter of the service (`get_run_inputs`). „Wiederholen“ opens „Neue
 it filled in (V8).
 """
 
+import re
 from typing import TYPE_CHECKING, Any
 
 from arr.models import ChannelMode, WorkspaceMode
@@ -58,6 +59,15 @@ def value_text(value: Any) -> str:
     if isinstance(value, float):
         return fmt.decimal(value, 2).rstrip("0").rstrip(",")
     return CHOICE_LABELS.get(str(value), str(value))
+
+
+_TASK_TITLE = re.compile(r"\A\s*#{1,6}[ \t]*Aufgabe[ \t]*#*[ \t]*(?:\n|\Z)", re.IGNORECASE)
+
+
+def _without_title(task: str) -> str:
+    """The task without its own heading „# Aufgabe“: the section is called so already (W3-10.1
+    finding 10). „Kopieren“ keeps the whole text."""
+    return _TASK_TITLE.sub("", task, count=1)
 
 
 def _section(title: str, body: str, *, anchor: str, extra: str = "") -> str:
@@ -209,7 +219,7 @@ def inputs_html(inputs: RunInputs) -> str:
         else ""
     )
     task_body = (
-        f'<div class="prose in-task">{markdown_html(task)}</div>'
+        f'<div class="prose in-task">{markdown_html(_without_title(task))}</div>'
         if task
         else '<p class="small muted">Keine Aufgabe gespeichert.</p>'
     )

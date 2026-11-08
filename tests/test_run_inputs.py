@@ -195,3 +195,40 @@ async def test_inputs_of_a_stopped_slimmed_and_a_queued_run(wf: Path) -> None:
     finally:
         lock.release()
         await api.close()
+
+
+# --- W3-10.1 point 2: no secret anywhere in the inputs ----------------------------------------
+
+HIDDEN = "sk-ant-api03-W3101FIELDS000000000"
+HIDDEN_MARK = "W3101FIELDS"
+
+
+def _edit_run_yaml(run_dir: Path, change: Any) -> None:
+    data = yaml.safe_load((run_dir / "run.yaml").read_text("utf-8"))
+    change(data)
+    (run_dir / "run.yaml").write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False), "utf-8"
+    )
+
+
+def _secret_fields(data: dict[str, Any]) -> None:
+    data["topology"]["params"] = {"token": HIDDEN}
+    data["groupchats"][0]["purpose"] = f"Zweck {HIDDEN}"
+    data["agents"][0]["read_dirs"] = [f"/tmp/{HIDDEN}"]
+    data["agents"][0]["role"] = f"roles/{HIDDEN}.md"
+
+
+async def test_a_secret_in_any_field_of_the_inputs_never_comes_back(wf: Path) -> None:
+    run_dir = make_run_folder(wf, status=RunStatus.DONE, name=f"Name {HIDDEN}")
+    _edit_run_yaml(run_dir, _secret_fields)
+    api = make_api(wf)
+    try:
+        inputs = await api.get_run_inputs(run_dir.name)
+    finally:
+        await api.close()
+    assert inputs.available
+    dumped = inputs.model_dump_json()
+    assert HIDDEN_MARK not in dumped, "params, purpose, read_dirs, role, name, repeat, run.yaml"
+    assert "«entfernt»" in (inputs.run_yaml or ""), "run.yaml is filtered value by value"
+    assert "Zweck «entfernt»" in inputs.channels[0].purpose
+    assert any("Geheimnis" in note for note in inputs.repeat_notes)

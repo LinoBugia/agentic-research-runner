@@ -383,3 +383,9 @@ section[id] { scroll-margin-top: calc(var(--top-h) + 16px); }
 .nr-repeat-notes { margin: 0 0 12px; }
 .nr-repeat-notes ul { margin: 4px 0 0; padding-left: 18px; }
 .nr-agents td .error { display: block; white-space: normal; max-width: 420px; font-size: 12px; color: var(--err); font-weight: 600; margin-top: 4px; }
+
+/* ---------- W3-10.1: „Antwort an X“ above the channel input ---------- */
+.cmp-answer { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 6px 16px; border-top: 1px solid var(--border); background: var(--surface); font-size: 13px; }
+.cmp-answer:empty { display: none; }
+.cmp-answer .txt { flex: 1; min-width: 0; }
+.cmp-answer.on { background: var(--surface-2); }

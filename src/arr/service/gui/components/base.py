@@ -7,6 +7,7 @@ NiceGUI events (`button`), so focus and keyboard behaviour stay under our contro
 
 import html
 import re
+import secrets
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -105,14 +106,22 @@ def link_html(label: str, href: str, *, classes: str = "") -> str:
 # closing one none to its left and no digit after it, and a formula never spans a blank line.
 # So amounts like „≈ 0,28 $ … ≈ 0,14 $“ stay text, `$σ(n)$` is a formula. `\$` is a dollar,
 # and code (`…`, fenced blocks) is never a formula.
+#
+# Code and formulas reach markdown2 as placeholders (W3-10.1): control characters with a random
+# nonce per call, so no text of an agent can stand for one (`ARRMATH0END` in a summary made the
+# page fail with 500), and an unknown index stays text. Code is rendered here, not by markdown2:
+# its table of code pieces is replaced over the whole text once per piece, quadratic for long
+# texts with many pieces (400 KB in 9 s); placeholders keep it linear.
 
 _MATH_RE = re.compile(
     r"\$\$(.+?)\$\$"
     r"|(?<![\\$])\$(?![\s$])((?:\\.|[^$\\])+?)(?<![\s\\])\$(?![\d$])",
     re.S,
 )
-_CODE_RE = re.compile(r"(`{3,}|~{3,}).*?\1|`[^`\n]+`", re.S)
+_CODE_RE = re.compile(r"(`{3,}|~{3,}).*?\1|``(?:[^`\n]|`(?!`))+``|`[^`\n]+`", re.S)
 _BLANK_LINE = re.compile(r"\n[ \t]*\n")
+_PH_OPEN, _PH_CLOSE = "\x02", "\x03"
+"""Placeholders are `\\x02<kind><nonce><index>\\x03`; markdown2 passes them through as text."""
 _TEX = {
     r"\pmod": " mod ",
     r"\bmod": " mod ",
@@ -144,33 +153,76 @@ def _tex_to_text(tex: str) -> str:
 
 def markdown_html(source: str) -> str:
     """Render Markdown safely (raw HTML escaped) with `$…$` shown as math text."""
-    spans: list[str] = []
+    nonce = secrets.token_hex(6)
+    pieces: dict[str, list[str]] = {"B": [], "C": [], "M": []}
+    raws: dict[str, list[str]] = {"B": [], "C": []}  # code source, for code in a formula
+
+    def hold(kind: str, html_text: str, raw_text: str = "") -> str:
+        pieces[kind].append(html_text)
+        if kind in raws:
+            raws[kind].append(raw_text)
+        return f"{_PH_OPEN}{kind}{nonce}{len(pieces[kind]) - 1}{_PH_CLOSE}"
+
+    def code(match: re.Match[str]) -> str:
+        whole, fence = match.group(0), match.group(1)
+        if fence is None:  # `code` or ``code with ` inside``
+            ticks = 2 if whole.startswith("``") else 1
+            inner = whole[ticks:-ticks]
+            if ticks == 2 and inner.startswith(" ") and inner.endswith(" ") and inner.strip():
+                inner = inner[1:-1]
+            return hold("C", f"<code>{esc(inner)}</code>", whole)
+        line_start = source.rfind("\n", 0, match.start()) + 1
+        indent = source[line_start : match.start()]
+        inner = whole[len(fence) : -len(fence)]
+        info, newline, body = inner.partition("\n")
+        if indent.strip() or not newline:  # ``` inside a line: a code span
+            return hold("C", f"<code>{esc(inner.strip())}</code>", whole)
+        lines = body.split("\n")
+        if lines and not lines[-1].strip():
+            lines.pop()  # the indentation before the closing fence
+        width = len(indent)
+        text = "\n".join(line[width:] if line[:width].isspace() else line for line in lines)
+        lang = info.strip().split(" ")[0]
+        cls = f' class="language-{esc(lang)}"' if lang else ""
+        block = hold("B", f"<pre><code{cls}>{esc(text)}\n</code></pre>", whole)
+        return f"\n\n{indent}{block}\n\n"  # a block of its own, also inside a list item
+
+    def unmask(text: str) -> str:
+        """Code placeholders back to their source (code written inside a formula)."""
+
+        def source_of(m: re.Match[str]) -> str:
+            table = raws[m.group(1)]
+            return table[int(m.group(2))] if int(m.group(2)) < len(table) else m.group(0)
+
+        return re.sub(rf"{_PH_OPEN}([BC]){nonce}(\d+){_PH_CLOSE}", source_of, text)
 
     def keep(match: re.Match[str]) -> str:
         display = match.group(1) is not None
-        tex = match.group(1) or match.group(2) or ""
+        tex = unmask(match.group(1) or match.group(2) or "")
         cls = "math math-display" if display else "math"
-        spans.append(
+        return hold(
+            "M",
             f'<span class="{cls}" title="{esc(tex)}" data-tex="{esc(tex)}">'
-            f"{esc(_tex_to_text(tex))}</span>"
+            f"{esc(_tex_to_text(tex))}</span>",
         )
-        return f"ARRMATH{len(spans) - 1}END"
-
-    codes: list[str] = []
-
-    def code(match: re.Match[str]) -> str:
-        codes.append(match.group(0))
-        return f"ARRCODE{len(codes) - 1}END"
 
     def keep_inline(match: re.Match[str]) -> str:
         if match.group(2) is not None and _BLANK_LINE.search(match.group(2)):
             return match.group(0)  # two paragraphs are no formula
         return keep(match)
 
-    marked = _MATH_RE.sub(keep_inline, _CODE_RE.sub(code, source)).replace("\\$", "ARRDOLLAR")
-    marked = re.sub(r"ARRCODE(\d+)END", lambda m: codes[int(m.group(1))], marked)
+    dollar = f"{_PH_OPEN}D{nonce}{_PH_CLOSE}"
+    marked = _MATH_RE.sub(keep_inline, _CODE_RE.sub(code, source))
+    marked = marked.replace("\\$", dollar)
     # `_` inside a word is no emphasis: run IDs and snake_case keep their underscores
     extras = {"fenced-code-blocks": None, "middle-word-em": False}
     rendered = markdown2.markdown(marked, safe_mode="escape", extras=extras)
-    rendered = rendered.replace("ARRDOLLAR", "$")
-    return re.sub(r"ARRMATH(\d+)END", lambda m: spans[int(m.group(1))], rendered)
+
+    def back(match: re.Match[str]) -> str:
+        table = pieces[match.group(1)]
+        index = int(match.group(2))
+        return table[index] if index < len(table) else match.group(0)
+
+    rendered = re.sub(rf"<p>({_PH_OPEN}B{nonce}\d+{_PH_CLOSE})</p>", r"\1", rendered)
+    rendered = re.sub(rf"{_PH_OPEN}([BCM]){nonce}(\d+){_PH_CLOSE}", back, rendered)
+    return rendered.replace(dollar, "$")

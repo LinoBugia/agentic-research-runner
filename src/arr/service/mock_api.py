@@ -5651,10 +5651,14 @@ class MockApi:
             kind=request.kind,
             body=request.body,
             to=request.to,
+            reply_to=getattr(request, "reply_to", None),
             open=request.kind is MessageKind.QUESTION and bool(request.to),
             delivery=DeliveryInfo(status=status, ts=now),
         )
         ch.extra.append(msg)
+        asked = ch.fixed.get(msg.reply_to) if msg.reply_to is not None else None
+        if asked is not None and asked.open and "user" in asked.to:  # the answer closes it
+            ch.fixed[asked.id] = asked.model_copy(update={"open": False})
         self._publish(ChannelMessageEvent(seq=0, ts=now, run_id=run.id, message=msg))
         return msg
 

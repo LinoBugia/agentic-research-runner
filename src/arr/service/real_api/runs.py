@@ -40,7 +40,7 @@ from arr.models import (
     Starter,
     WorkfolderSettings,
 )
-from arr.permissions.policy import redact
+from arr.permissions.policy import REDACTED, _redact_data, redact
 from arr.resolve import dump_yaml_model, load_group_spec, validate_model
 from arr.room.types import DeliveryStatus, MessageVia
 from arr.room.types import Message as RoomMessage
@@ -310,6 +310,29 @@ def _delivery_settled(message: RoomMessage) -> bool:
     )
 
 
+SECRET_NOTE = (
+    "Ein Wert der Eingaben (Name, Parameter, Agent oder Kanal) sah wie ein Geheimnis aus und "
+    f"steht hier als „{REDACTED}“; trag ihn bei Bedarf neu ein."
+)
+
+
+def _without_secrets(inputs: RunInputs) -> RunInputs:
+    """Every text of the answer through the secret filter (V9 „ein Secret steht nie darin“,
+    W3-10.1): names, parameter values, agents, channels and the repeat, not only the task.
+    `run.yaml` is filtered value by value (`_redact_yaml`) already."""
+    data = inputs.model_dump(mode="json", exclude={"run_yaml", "repeat_notes", "task_md"})
+    clean = _redact_data(data)
+    for agent in clean["agents"]:  # derived from the role file: „Sk-ant-…“ is no key any more
+        if agent.get("role"):
+            agent["role_label"] = role_label(agent["role"], agent["role_label"])
+    notes = list(inputs.repeat_notes)
+    if clean != data:  # the task in `repeat` is filtered already and does not count again
+        notes.append(SECRET_NOTE)
+    return RunInputs.model_validate(
+        {**clean, "task_md": inputs.task_md, "run_yaml": inputs.run_yaml, "repeat_notes": notes}
+    )
+
+
 def _redact_yaml(text: str) -> str:
     """`redact` for each value of a YAML file: across lines, `fake-auth` followed by the next
     key looks like the flag `-auth <value>` and would hide the next line."""
@@ -557,7 +580,7 @@ class RunsArea:
         """What the run was started with (V9) and the input of „Neuer Run“ that repeats it
         (V8): `run.yaml`, `task.md`, the parameters with the docs of the skill."""
         record = self._record(run_id)
-        return await asyncio.to_thread(self._run_inputs, record)
+        return await asyncio.to_thread(lambda: _without_secrets(self._run_inputs(record)))
 
     def _run_inputs(self, record: RunRecord) -> RunInputs:
         meta = record.meta
@@ -822,6 +845,7 @@ class RunsArea:
                 sender="user",
                 kind=request.kind,
                 to=list(request.to),
+                reply_to=getattr(request, "reply_to", None),  # `PostReplyRequest` (W3-10.1)
                 via=MessageVia.GUI,
             )
         except ArrError as exc:

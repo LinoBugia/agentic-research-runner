@@ -2300,3 +2300,10 @@ class RunInputs(ApiModel):
 
 REPEAT_SUFFIX = " (Wiederholung)"
 """Name of a repeated run: the old name with this (W3-10 V8)."""
+
+
+class PostReplyRequest(PostMessageRequest):
+    """A message of the user that answers another one (W3-10.1, „Antwort an X“): `reply_to` is
+    the ID of the question; the room closes it when the user is among its addressees."""
+
+    reply_to: int | None = Field(default=None, ge=1)

@@ -157,6 +157,9 @@ class RunDetailPage:
         self._retry_at = 0.0
         self._reconciling = False
         self._connects = 0
+        self._reconcile_failing = False
+        self.gone_html = ""
+        """§8.4 banner once the run folder is gone (W3-10.1)."""
 
     # --- shortcuts -------------------------------------------------------------------------
 
@@ -416,7 +419,7 @@ class RunDetailPage:
 
     def _render_attention(self) -> None:
         """Banner „Wartet auf dich“ (at every width) and the hint „Fragen an dich“ (K13, K15)."""
-        failure = self._run_error_html() + self._scan_html()
+        failure = self.gone_html + self._run_error_html() + self._scan_html()
         top = self.detail.open_approvals_top
         questions = self.detail.questions_to_user
         first_q = next((m for m in self.questions.values() if "user" in m.to), None)
@@ -907,6 +910,8 @@ class RunDetailPage:
         self._render_overview_cards()
         if isinstance(self.view, TranscriptView):
             self.view.refresh_waiting()
+        elif isinstance(self.view, ChannelView):
+            self.view.refresh_answer_hint()  # a question of the inbox came or went (W3-10.1)
 
     # --- actions ------------------------------------------------------------------------------
 
@@ -1066,10 +1071,31 @@ class RunDetailPage:
                 for agent in agents.values():
                     self._update_agent(agent)
             await self._catch_up_view()  # the pump draws what is dirty, never two at once
-        except ApiException:
-            log.info("Run-Detail: Abgleich mit %s fehlgeschlagen", self.run_id, exc_info=True)
+            self._reconcile_failing = False
+        except ApiException as exc:
+            if exc.error.code is ErrorCode.NOT_FOUND:
+                self._folder_gone()
+            elif not self._reconcile_failing:  # once, not every 5 s
+                log.info("Run-Detail: Abgleich mit %s fehlgeschlagen", self.run_id, exc_info=True)
+                self._reconcile_failing = True
         finally:
             self._reconciling = False
+
+    def _folder_gone(self) -> None:
+        """The run folder vanished while the page was open: say so (§8.4), stop comparing."""
+        if self.gone_html:
+            return
+        log.warning("Run-Detail: Run-Ordner von %s nicht mehr lesbar", self.run_id, exc_info=True)
+        self.reconcile_timer.deactivate()
+        self.gone_html = banner_html(
+            "err",
+            f"Run-Ordner nicht lesbar: {self.run_id}.",
+            " Vermutlich wurde der Ordner außerhalb von arr verschoben oder gelöscht. Die "
+            f"Anzeige ist seit {fmt.clock(self.api.now())} nicht aktuell.",
+            [("Zu den Runs", "/runs"), ("Neu laden", f"/runs/{self.run_id}")],
+            small=True,
+        )
+        self._render_attention()
 
     async def _catch_up_view(self) -> None:
         """Messages or transcript entries the open view has not shown yet."""
@@ -1126,11 +1152,12 @@ class RunDetailPage:
 
     def _update_agent(self, agent: AgentState) -> None:
         old = self.agents.get(agent.id)
-        if old == agent and agent.id in self.cards:
-            return  # the same state again (a duplicate event, the comparison): nothing to draw
-        self.agents[agent.id] = agent
         card = self.cards.get(agent.id)
-        if card is not None:
+        if old == agent and card is not None and card.agent == agent:
+            return  # the card shows this state already (a duplicate event, the comparison)
+        self.agents[agent.id] = agent
+        if card is not None and card.agent != agent:
+            # against what the card has drawn, not against `self.agents` (W3-10.1, NB3)
             card.update(agent)
         if old is None or old.state is not agent.state:
             self.dirty.update({"order", "overview", "attention"})  # „n laufende Turns …“
@@ -1155,12 +1182,38 @@ class RunDetailPage:
                 self.detail.questions_to_user += 1
                 self.dirty.add("attention")
         self.channels[msg.channel] = info.model_copy(update=update)
+        asked = self.questions.get((msg.channel, msg.reply_to or 0))
+        if new and asked is not None and msg.sender in asked.to:
+            self.answered(msg.channel, asked.id)  # the addressee answered: the room closed it
         view = self.view
         if isinstance(view, ChannelView) and view.name == msg.channel:
             view.info = self.channels[msg.channel]
             view.add_live(msg)
             view.refresh_head()
+            if new and msg.open and "user" in msg.to:
+                view.refresh_answer_hint()
         self._render_channel_item(msg.channel)
+
+    def answered(self, channel: str, msg_id: int) -> None:
+        """A question is answered: out of the open questions, the hints and the counts."""
+        asked = self.questions.pop((channel, msg_id), None)
+        if asked is None:
+            return
+        info = self.channels.get(channel)
+        if info is not None:
+            open_now = max(0, info.open_questions - 1)
+            self.channels[channel] = info.model_copy(update={"open_questions": open_now})
+        if "user" in asked.to:
+            self.detail.questions_to_user = max(0, self.detail.questions_to_user - 1)
+            self.dirty.add("attention")
+        self.dirty.add("overview")
+        view = self.view
+        if isinstance(view, ChannelView) and view.name == channel:
+            view.info = self.channels.get(channel, view.info)
+            if msg_id in view.rows:  # the question row loses its „offen“
+                view.add_live(asked.model_copy(update={"open": False}))
+            view.refresh_head()
+            view.refresh_answer_hint()
 
     async def _flush(self) -> None:
         """Draw what changed; a failure keeps all of it for the next try (V4)."""

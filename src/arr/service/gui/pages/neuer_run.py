@@ -401,8 +401,6 @@ class NeuerRunPage:
             return
         names = [p.name for p in self.projects]
         project = self.want_project if self.want_project in names else ""
-        if self.repeat_of is not None:
-            project = self.want_project  # a project that is gone shows its error (§8.4)
         if not project:
             recent = [r.project for r in runs if r.project in names]
             project = recent[0] if recent else names[0]
@@ -442,7 +440,7 @@ class NeuerRunPage:
                 },
                 "limits": {"wall_time_s": 20 * 60, "budget_usd": 3},
             }
-        if self.template:
+        if self.template:  # a repeat keeps its project and skill, also gone ones (§8.4)
             limits = {k: v for k, v in (self.template.pop("limits", None) or {}).items() if v}
             self.input.update(self.template)
             self.input["limits"].update(limits)

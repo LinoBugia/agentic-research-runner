@@ -9,6 +9,12 @@ input bar below sends to everyone or one member; the delivery state appears unde
 Under the input a hint says what a note does and what a question does (W3-08 U6). `@name` of a
 member (or `@alle`) in the text, like a single addressee (static/run_detail.js), suggests the
 kind „Frage“ unless you picked the kind yourself; a line says why.
+
+A message without an addressee answers no question (decision of the user, 08.11.). While an
+agent's question to you is open in the channel (inbox item `question`, or the open message
+to `user`), a line above the input offers „Antwort an <agent> senden“ (W3-10.1). Accepted, the
+message goes as an answer to that agent with `reply_to` the question; declined, it stays a
+note to everyone. After the answer the line goes.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -22,6 +28,7 @@ from arr.service.api_models import (
     ChannelInfo,
     Message,
     PostMessageRequest,
+    PostReplyRequest,
     RunAction,
 )
 from arr.service.gui import format as fmt
@@ -89,6 +96,20 @@ _MODE = {
 }
 
 
+def _excerpt(text: str, limit: int = 90) -> str:
+    """One line of a question for the hint."""
+    line = " ".join(text.split())
+    return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
+
+
+def button_element(label: str) -> ui.element:
+    """A small button of the input bar („Antwort an X senden“)."""
+    element = ui.element("button").classes("btn btn-sm").props('type="button"')
+    with element:
+        raw(esc(label), tag="span")
+    return element
+
+
 def unread_count(info: ChannelInfo, seen: int | None) -> int:
     """„n neu“: messages after the last seen ID; without browser state the service hint."""
     last = info.last_message_id or 0
@@ -114,6 +135,9 @@ class ChannelView:
         self.empty_note: ui.html | None = None
         self.head: ui.html | None = None
         self.last_id = info.last_message_id or 0
+        self.answer_box: ui.element | None = None
+        self.answer_to: tuple[str, int] | None = None
+        """The open question you chose to answer: (agent, message ID)."""
 
     @property
     def name(self) -> str:
@@ -310,6 +334,8 @@ class ChannelView:
             + (f" · {esc(delivery)}" if delivery else "")
             + '<span class="cmp-suggest" aria-live="polite"></span></span>'
         )
+        self.answer_box = ui.element("div").classes("cmp-answer").mark("answer-hint")
+        self.refresh_answer_hint()
         form = (
             ui.element("form")
             .classes("composer")
@@ -363,16 +389,93 @@ class ChannelView:
             kind = MessageKind(args.get("kind") or "note")
         except ValueError:
             kind = MessageKind.NOTE
-        try:
-            msg = await self.page.api.post_message(
-                self.page.run_id, self.name, PostMessageRequest(body=body, kind=kind, to=to)
+        target = self.answer_to
+        request: PostMessageRequest = PostMessageRequest(body=body, kind=kind, to=to)
+        if target is not None:  # accepted „Antwort an X“: to the asker, on the question
+            request = PostReplyRequest(
+                body=body, kind=MessageKind.ANSWER, to=[target[0]], reply_to=target[1]
             )
+        try:
+            msg = await self.page.api.post_message(self.page.run_id, self.name, request)
         except ApiException as exc:
             self.page.frame.toast(exc.error.message, error=True)
             return
         # the emptied field tells the form: the suggestion „Frage“ goes away (W3-08.1)
         self.page.frame.js(SENT_JS)
         self.add_live(msg, own=True)
+        if target is not None:
+            self.answer_to = None
+            self.page.answered(self.name, target[1])
+
+    # --- „Antwort an X“ (W3-10.1) -----------------------------------------------------------
+
+    def user_questions(self) -> list[tuple[str, int, str]]:
+        """Open questions of agents to the user in this channel, newest first:
+        (agent, message ID, text). From the inbox (`question`, W3-09) and from the channel."""
+        found: dict[int, tuple[str, str]] = {}
+        for item in self.page.open_items.values():
+            msg_id = getattr(item, "msg_id", None)
+            agent = getattr(item, "agent", None)
+            if (
+                str(item.type) == "question"
+                and getattr(item, "channel", None) == self.name
+                and isinstance(msg_id, int)
+                and agent is not None
+            ):
+                found[msg_id] = (agent.id, getattr(item, "question_text", None) or item.title)
+        for (channel, msg_id), msg in self.page.questions.items():
+            if channel == self.name and msg.open and "user" in msg.to and msg.sender != "user":
+                found.setdefault(msg_id, (msg.sender, msg.body))
+        return sorted(((a, m, t) for m, (a, t) in found.items()), key=lambda q: -q[1])
+
+    def refresh_answer_hint(self) -> None:
+        """The line „Offene Frage von X: Antwort an X senden“ above the input."""
+        box = self.answer_box
+        if box is None or box.is_deleted:
+            return
+        box.clear()
+        questions = self.user_questions()
+        if self.answer_to is not None and self.answer_to[1] not in {q[1] for q in questions}:
+            self.answer_to = None  # answered meanwhile (in the inbox, another tab)
+        if not questions:
+            box.classes(remove="on")
+            return
+        chosen = self.answer_to
+        agent, msg_id, text = next(
+            (q for q in questions if chosen and q[1] == chosen[1]), questions[0]
+        )
+        aliases = {m.agent: m.alias for m in self.info.members if m.alias}
+        name = esc(aliases.get(agent) or agent)
+        excerpt = esc(_excerpt(text))
+        more = len(questions) - 1
+        others = f" · und {more} weitere" if more and chosen is None else ""
+        box.classes(add="on") if chosen else box.classes(remove="on")
+        with box:
+            if chosen is None:
+                raw(
+                    f'<span aria-hidden="true">?</span> Offene Frage von <b>{name}</b>: '
+                    f"„{excerpt}“{others}",
+                    tag="span",
+                    classes="txt",
+                )
+                accept = button_element(f"Antwort an {aliases.get(agent) or agent} senden")
+                accept.mark("answer-accept")
+                accept.on("click", lambda _e, a=agent, m=msg_id: self._choose_answer((a, m)))
+            else:
+                raw(
+                    f'<span aria-hidden="true">↩</span> Geht als Antwort an <b>{name}</b> auf '
+                    f"„{excerpt}“.",
+                    tag="span",
+                    classes="txt",
+                )
+                decline = button_element("Doch als Notiz an alle")
+                decline.mark("answer-decline")
+                decline.on("click", lambda _e: self._choose_answer(None))
+
+    def _choose_answer(self, target: tuple[str, int] | None) -> None:
+        self.answer_to = target
+        self.refresh_answer_hint()
+        self.page.frame.js("document.getElementById('cmp-body')?.focus()")
 
     # --- live -------------------------------------------------------------------------------
 

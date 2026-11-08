@@ -7,6 +7,7 @@ and waiting tool calls are open, outputs show at most 10 lines and blobs only as
 """
 
 import re
+from typing import Any
 
 from arr.service.api_models import ToolStatus, TranscriptEvent, TranscriptKind
 from arr.service.gui import format as fmt
@@ -139,6 +140,23 @@ def _sentences(text: str) -> int:
     return max(1, len([s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s]))
 
 
+def rate_limit_text(data: dict[str, Any]) -> str:
+    """V5, W3-09 B10: „erreicht“ only for `rejected`. `allowed_warning` throttles the profile to
+    one turn (`ProfileGate`), so it is a neutral hint with the window; `allowed` only names it."""
+    status = str(data.get("status") or "")
+    resets = data.get("resets_at")
+    at = fmt.clock(resets) if isinstance(resets, int | float) else None
+    if status == "rejected":
+        return "Nutzungslimit erreicht" + (f" · weiter um {at}" if at else "")
+    window = f"Fenster bis {at}" if at else ""
+    if status == "allowed_warning":
+        parts = [p for p in (window, "Profil auf einen Turn gedrosselt") if p]
+        return "Hinweis zum Nutzungslimit: " + ", ".join(parts)
+    if status in ("", "allowed"):
+        return "Hinweis zum Nutzungslimit" + (f": {window}" if window else "")
+    return f"Meldung zum Nutzungslimit („{status}“)" + (f": {window}" if window else "")
+
+
 def event_html(ev: TranscriptEvent, *, agent_id: str, stage_label: str | None = None) -> str:
     """Any transcript entry except a waiting tool call (that one carries a K5 card)."""
     kind = ev.kind
@@ -194,11 +212,9 @@ def event_html(ev: TranscriptEvent, *, agent_id: str, stage_label: str | None = 
             "</div></details>"
         )
     if kind is TranscriptKind.RATE_LIMIT:
-        resets = ev.data.get("resets_at")
-        until = f" · weiter um {fmt.clock(resets)}" if isinstance(resets, int | float) else ""
         return (
             f'<div class="ev hint" id="{dom}"><div class="line">{_t(ev)}{_i("speed")}'
-            f'<span class="s">Nutzungslimit erreicht{until}</span></div></div>'
+            f'<span class="s">{esc(rate_limit_text(ev.data))}</span></div></div>'
         )
     # usage: counted in the turn summary, no line of its own
     return f'<div class="ev end" id="{dom}" hidden></div>'
