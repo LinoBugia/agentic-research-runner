@@ -13,6 +13,11 @@ click behind the guard of W3-01; it puts a decision of `user` into the `Approval
 run's `RunManager`. The inbox wakes the waiting agent. `GuiDecider` only keeps the item open
 for that; without a decision it expires in the inbox (counts as denied). Runs of `arr run` are
 decided in their terminal, here they are read-only.
+
+Questions of agents to the user (`@user`, docs/09 L16) are items „Frage“: `decide_approval`
+with `answer` closes the item and posts the text as the user's answer into the channel, with
+`reply_to` on the question and to the asking agent, so `wait_for_messages` hands it over and
+a finished agent is woken (L13).
 """
 
 import logging
@@ -43,6 +48,9 @@ from arr.permissions.types import (
     PermissionRequest,
     RequestCategory,
 )
+from arr.room.store import RoomStore
+from arr.room.types import MessageKind, MessageVia
+from arr.runs.manager import QUESTION_CLOSED
 from arr.runs.prepare import AgentFile, load_agent_file
 from arr.service.api_models import (
     ApiException,
@@ -64,6 +72,7 @@ from arr.service.real_api.base import ServiceState, not_allowed, not_found
 from arr.service.real_api.rundir import (
     RunRecord,
     item_entries,
+    item_question,
     item_title,
     model_label,
     role_label,
@@ -94,6 +103,7 @@ _UNKNOWN_RISK = RiskInfo(level=RiskLevel.MEDIUM, text="Das Risiko ist nicht beka
 _ACTIONS = {
     ApprovalType.PERMISSION: {DecisionAction.ALLOW, DecisionAction.DENY},
     ApprovalType.ESCALATION: {DecisionAction.OPTION},
+    ApprovalType.QUESTION: {DecisionAction.ANSWER},
 }
 _SCOPE_WORDS = {
     DecisionScope.ONCE: "einmalig",
@@ -141,7 +151,7 @@ def _item_lines(entries: Sequence[Mapping[str, Any]]) -> dict[str, _Lines]:
         if event == "open":
             if item_id not in items:
                 items[item_id] = _Lines(entry, number=escalations)
-                escalations += entry.get("request") is None
+                escalations += entry.get("request") is None and entry.get("question") is None
         elif item_id not in items:
             continue
         elif event == "decision":
@@ -307,6 +317,9 @@ class ApprovalReader:
         request = lines.opened.get("request")
         if isinstance(request, Mapping):
             return self._permission(record, lines, request, common)
+        question = item_question(lines.opened)
+        if question is not None:
+            return self._question(record, lines, question, common)
         return self._escalation(record, lines, common)
 
     @staticmethod
@@ -420,6 +433,31 @@ class ApprovalReader:
             rule_effects=effects,
             also_hosts=_package_hosts(request),
             no_sandbox=is_codex_escalation(request),
+            **common,
+        )
+
+    def _question(
+        self,
+        record: RunRecord,
+        lines: _Lines,
+        question: Mapping[str, Any],
+        common: dict[str, Any],
+    ) -> ApprovalItem:
+        """An item „Frage“: who asks, in which channel, the text and the answer (L16)."""
+        agent = self._agent_ref(record, {"agent_id": question.get("agent_id")})
+        decision = common.get("decision")
+        answer = decision.comment if isinstance(decision, DecisionInfo) else None
+        if common["status"] is ApprovalStatus.OBSOLETE and lines.closed is None:
+            common["status_text"] = f"Nicht mehr nötig: {QUESTION_CLOSED}"
+        msg_id = question.get("msg_id")
+        return ApprovalItem(
+            type=ApprovalType.QUESTION,
+            title=item_title(lines.opened),
+            agent=agent,
+            question_text=str(question.get("text") or "") or "(ohne Text)",
+            channel=str(question.get("channel") or "") or None,
+            msg_id=msg_id if isinstance(msg_id, int) else None,
+            answer=answer,
             **common,
         )
 
@@ -612,6 +650,7 @@ class ApprovalsArea:
         inbox = self._inbox(item.run.id)
         if inbox is None:
             raise not_allowed(TERMINAL_HINT)
+        room = self._answer_room(item) if item.type is ApprovalType.QUESTION else None
         decision = _decision(item, request)
         self._rule_stored = True
         try:
@@ -620,6 +659,8 @@ class ApprovalsArea:
             still_open = any(i.id == approval_id for i in inbox.pending())
             code = ErrorCode.INVALID if still_open else ErrorCode.CONFLICT
             raise ApiException.of(code, exc.message) from exc
+        if room is not None:
+            _post_answer(room, item, decision.comment or "")
         record = self.state.store.get(item.run.id)
         decided = self._fresh_items(record).get(approval_id) if record is not None else None
         if decided is None:
@@ -628,6 +669,14 @@ class ApprovalsArea:
         if not self._rule_stored:
             message = f"{message}. {RULE_NOT_STORED}"
         return DecisionResponse(item=decided, run_id=item.run.id, message=message)
+
+    def _answer_room(self, item: ApprovalItem) -> RoomStore:
+        """The room an answer to a question goes into (L16); only of a running run."""
+        handle = self.state.registry.get(item.run.id)
+        room = handle.manager.room if handle is not None and handle.manager is not None else None
+        if room is None or item.agent is None or item.channel is None:
+            raise not_allowed(NOT_RUNNING)
+        return room
 
     async def revoke_approval(self, approval_id: str) -> ApprovalItem:
         """Withdraw a decision of a running run; later equal requests ask again (docs/07 §4)."""
@@ -651,7 +700,9 @@ class ApprovalsArea:
 
 def _decision(item: ApprovalItem, request: DecisionRequest) -> Decision:
     comment = (request.comment or "").strip() or None
-    if request.action is DecisionAction.OPTION:
+    if request.action is DecisionAction.ANSWER:
+        reason = "In der Inbox beantwortet."
+    elif request.action is DecisionAction.OPTION:
         reason = "In der Oberfläche gewählt."
     elif request.action is DecisionAction.ALLOW:
         reason = "In der Oberfläche erlaubt."
@@ -667,9 +718,31 @@ def _decision(item: ApprovalItem, request: DecisionRequest) -> Decision:
     )
 
 
+def _post_answer(room: RoomStore, item: ApprovalItem, text: str) -> None:
+    """The user's answer from the inbox as a message in the channel: `answer` with `reply_to` on
+    the question and to the asking agent, so it reaches it (L16)."""
+    assert item.agent is not None and item.channel is not None
+    try:
+        room.post(
+            item.channel,
+            text,
+            sender="user",
+            kind=MessageKind.ANSWER,
+            to=[item.agent.id],
+            reply_to=item.msg_id,
+            via=MessageVia.GUI,
+        )
+    except ArrError as exc:
+        log.warning("Antwort auf %s nicht in den Kanal gestellt: %s", item.id, exc.message)
+        raise ApiException.of(ErrorCode.INVALID, exc.message) from exc
+
+
 def _message(item: ApprovalItem, request: DecisionRequest) -> str:
     """Text of the toast after a decision (docs/08 §5.2 „abgeschlossen“)."""
     decision = item.decision
+    if item.type is ApprovalType.QUESTION:
+        who = item.agent.id if item.agent else "den Agenten"
+        return f"Antwort an {who} gesendet: {item.run.name}"
     if item.type is ApprovalType.ESCALATION:
         label = next((o.label for o in item.options if o.key is request.option_key), "")
         return f"{label}: {item.run.name}"

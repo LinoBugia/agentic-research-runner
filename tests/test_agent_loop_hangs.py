@@ -11,6 +11,16 @@ new guard has a counter-check (`naive`) that switches it off and shows the hang 
 - L12: `wait_for_messages` returns at once while another agent waits for the place (H10).
 - B3: a quota used up exactly ends with `all_done`, not `limit` (H14, H14b).
 - B5: `wait_for_messages` after `wait_until` in the same turn keeps the `wait_until` (H15).
+
+W3-09 (docs/09 L13–L16) adds H17 anew and H19–H24, each ending within its own deadline:
+
+- L13: every direct message wakes a finished agent; ping-pong guard and wake-up limit bound it
+  (H17, H19).
+- L14: `until_result_from` for a result that never comes, and two agents waiting for each
+  other, end by their deadlines and L10 (H20, H21).
+- L15: an unread direct message to an agent that never reads wakes it once (H22).
+- L16: a question to the user nobody answers ends by L7 and with the run; a late answer wakes
+  the asker (H23, H24).
 """
 
 import asyncio
@@ -551,14 +561,18 @@ async def test_h16_until_file_becomes_a_link(workfolder: Path, tmp_path: Path) -
     assert line["took_s"] >= 1.5
 
 
-async def test_h17_done_agent_not_woken_by_mentions(workfolder: Path) -> None:
+async def test_h17_done_agent_woken_by_mentions_and_done_again(workfolder: Path) -> None:
+    """L13: notes with `@name` wake the finished agent (until W3-09 they did not); after each
+    turn it is done again, and the discussion ends with `all_done`."""
     scripts = {
         D1: turns([post("main", "Ergebnis", kind="result")], [say("?")], repeat_last=True),
         D2: turns([wait(0.3)] + [post("main", f"@diskutant-1 Notiz {i}") for i in range(5)]
                   + [done()]),
     }  # fmt: skip
     manager, line = await run_case(workfolder, scripts, IDLE, wall="30s")
-    assert not line["hang"] and manager.orchestrator.agents[D1].turns_used == 1
+    assert not line["hang"] and line["ended_by"] is DiscussionEnd.ALL_DONE
+    assert 2 <= manager.orchestrator.agents[D1].turns_used <= 6, "woken, but bounded"
+    assert manager.orchestrator.agent_status(D1) is AgentStatus.DONE
 
 
 async def test_h18_rounds_of_the_other_go_on_during_a_long_wait(workfolder: Path) -> None:
@@ -628,3 +642,117 @@ async def test_nb2_a_turn_that_ignores_the_interrupt_ends_hard(
     statuses = [e["data"]["status"] for e in log_entries(manager.run_dir, "turn_end")
                 if e["data"]["agent"] == D1]  # fmt: skip
     assert statuses == ["interrupted", "ok"], "the next turn runs normally"
+
+
+# --- W3-09: H19–H24 for L13–L16 ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("naive", [False, True], ids=["guarded", "naive"])
+async def test_h19_two_finished_agents_reply_to_each_other_forever(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """L13 lets finished agents wake each other with every reply; the ping-pong guard and the
+    wake-up limit stay and end it. Counter-check without both: only `wall_time` ends it."""
+    config = dict(IDLE)
+    if naive:
+        monkeypatch.setattr(pacing.PingPongTracker, "observe", lambda self, msg: None)
+        config["max_wakeups_per_agent"] = 10**6
+    scripts = {  # each answers after the other's turn is over, so every reply wakes
+        D1: turns([post("main", "Ergebnis 1", kind="result")],
+                  [wait(0.1), post("main", "@diskutant-2 und du?")], repeat_last=True),
+        D2: turns([wait(0.2), post("main", "@diskutant-1 noch etwas?"), done()],
+                  [wait(0.1), post("main", "@diskutant-1 und du?")], repeat_last=True),
+    }  # fmt: skip
+    manager, line = await run_case(workfolder, scripts, config, wall="4s" if naive else "30s")
+    if naive:
+        assert line["hang"]
+        return
+    assert not line["hang"]
+    stopped = log_entries(manager.run_dir, "ping_pong") or log_entries(
+        manager.run_dir, "wake_skipped"
+    )
+    assert stopped, "a guard ended it"
+
+
+async def test_h20_waiting_for_a_result_that_never_comes(workfolder: Path) -> None:
+    """L14 with L10: the awaited agent never delivers and is never done; three deadlines in a
+    row make the waiting agent idle, another `wait_until` is refused, the rounds end it."""
+    scripts = {
+        D1: turns([room("wait_until", minutes=0.005, until_result_from=D2)], repeat_last=True),
+        D2: turns([say("nichts")], repeat_last=True),
+    }
+    manager, line = await run_case(workfolder, scripts, IDLE)
+    assert not line["hang"] and line["ended_by"] is DiscussionEnd.ROUNDS
+    skipped = [e["data"]["reason"] for e in log_entries(manager.run_dir, "wake_skipped")]
+    assert skipped == ["wait_until_repeat"]
+    reasons = {e["data"]["reason"] for e in log_entries(manager.run_dir, "waiting")
+               if e["data"].get("agent") == D1}  # fmt: skip
+    assert "result_from" in reasons
+
+
+async def test_h21_two_agents_wait_for_each_others_result(workfolder: Path) -> None:
+    """L14: a wait for each other ends by the deadlines; neither waits past it, no hang."""
+    scripts = {
+        D1: turns([room("wait_until", minutes=0.01, until_result_from=D2)], repeat_last=True),
+        D2: turns([room("wait_until", minutes=0.01, until_result_from=D1)], repeat_last=True),
+    }
+    manager, line = await run_case(workfolder, scripts, IDLE, wall="30s")
+    assert not line["hang"] and line["took_s"] < 25
+    reasons = {r for e in log_entries(manager.run_dir, "wake") for r in e["data"]["reasons"]}
+    assert reasons == {"timeout"}
+
+
+async def test_h22_an_agent_that_never_reads_its_message(workfolder: Path) -> None:
+    """L15: the unread request wakes its finished addressee once, then the discussion ends,
+    although it never reads it."""
+    scripts = {
+        D1: turns([wait(0.2), post("main", "@diskutant-2 bitte lies das"), done()]),
+        D2: turns([wait(0.8), post("main", "Ergebnis", kind="result")], [say("hm")],
+                  repeat_last=True),
+    }  # fmt: skip
+    manager, line = await run_case(workfolder, scripts, IDLE, wall="30s")
+    assert not line["hang"] and line["ended_by"] is DiscussionEnd.ALL_DONE
+    assert manager.orchestrator.agents[D2].turns_used == 2
+
+
+@pytest.mark.parametrize("naive", [False, True], ids=["guarded", "naive"])
+async def test_h23_question_to_the_user_nobody_answers(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """L16 with L7: the agent waits for the user call after call; after the limit its turn
+    ends, the discussion goes on and ends, the question closes with the run. Counter-check
+    without L7: only `wall_time` ends it."""
+    monkeypatch.setattr(waiting, "STREAK_MAX_S", 1e9 if naive else 1.2)
+    ask = post("main", "@user welches Band?", kind="question")
+    loop = [room("wait_for_messages", seconds=0.5) for _ in range(60)]
+    scripts = {D1: turns([ask, *loop], [done()]), D2: turns([done()])}
+    manager, line = await run_case(workfolder, scripts, IDLE, wall="4s" if naive else "30s")
+    if naive:
+        assert line["hang"]
+        return
+    assert not line["hang"] and line["ended_by"] is DiscussionEnd.ALL_DONE
+    [item] = manager.inbox.items()
+    assert item.status.value == "obsolete"
+
+
+async def test_h24_a_late_answer_of_the_user_wakes_the_asker(workfolder: Path) -> None:
+    """L16 with L13: the asker has ended its turn (its open question keeps it from `done`);
+    the user's answer in the channel goes to it and wakes it at once."""
+
+    async def user(manager: Any) -> None:
+        orch = manager.orchestrator
+        await eventually(lambda: bool(log_entries(manager.run_dir, "round")), within=10)
+        orch.room.post("main", "Band 10–35.", sender="user", via=MessageVia.GUI)
+
+    ask = post("main", "@user welches Band?", kind="question")
+    scripts = {
+        D1: turns([ask, post("main", "Vorläufig 10–35.", kind="result")], [say("warte")],
+                  [post("main", "Danke, bleibt so.", kind="result")]),
+        D2: turns([post("main", "Mein Teil.", kind="result")]),
+    }  # fmt: skip
+    manager, line = await run_case(workfolder, scripts, IDLE, during=user, wall="30s")
+    assert not line["hang"] and line["ended_by"] is DiscussionEnd.ALL_DONE
+    woken = [e["data"] for e in log_entries(manager.run_dir, "wake") if e["data"]["agent"] == D1]
+    assert woken and "mention" in woken[-1]["reasons"]
+    [item] = manager.inbox.items()
+    assert item.status.value == "decided"

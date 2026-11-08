@@ -1,10 +1,12 @@
-"""K5 approval card: three types plus the compact variant (docs/08-ux-konzept.md G2, K5, §5.2).
+"""K5 approval card: four types plus the compact variant (docs/08-ux-konzept.md G2, K5, §5.2).
 
 Everything needed for the decision is on the card without expanding: who, what (command),
 where, why (agent's reason), why at you (mandate check or gatekeeper), risk, consequences,
 deadline; run starts show the block „Abweichungen von deinen Standards“ with the vendors that
-receive content (E19). The card is a `data-primary-scope` for ⌘↩; its heading is the focus
-target of deep links; grant buttons ignore Space/Enter (arr.js).
+receive content (E19). A question of an agent to the user (`@user`, docs/09 L16) shows who
+asks, in which channel, the question, and a field for the answer, which goes into the channel.
+The card is a `data-primary-scope` for ⌘↩; its heading is the focus target of deep links;
+grant buttons ignore Space/Enter (arr.js).
 """
 
 import math
@@ -36,6 +38,7 @@ from arr.service.gui.components.base import (
 )
 from arr.service.gui.components.copy_field import copy_html
 from arr.service.gui.components.dialog import ConfirmDialog
+from arr.service.gui.components.form import NativeInput, on_value
 from arr.service.gui.texts import (
     APPROVAL_TYPE,
     CATEGORY,
@@ -194,6 +197,8 @@ class ApprovalCard:
                 self._permission_body()
             elif item.type is ApprovalType.ESCALATION:
                 self._escalation_body()
+            elif item.type is ApprovalType.QUESTION:
+                self._question_body()
             else:
                 self._run_start_body()
 
@@ -234,6 +239,12 @@ class ApprovalCard:
             via = ESCALATED_BY.get(item.escalated_by.decider) if item.escalated_by else None
             parts.append(f"<span>· {esc(via) + ' · ' if via else ''}{_origin(item, now)}</span>")
             parts.append(deadline_html(item, now))
+        elif item.type is ApprovalType.QUESTION:
+            channel = f" · #{esc(item.channel)}" if item.channel else ""
+            parts.append(
+                f"<span>· {run_link}{channel} · {_origin(item, now)} · offen bis zum Ende des "
+                "Runs</span>"
+            )
         elif item.type is ApprovalType.ESCALATION:
             topology = TOPOLOGY_LABEL[item.topology] if item.topology else "Ablauf"
             stage = f" · Stufe {item.stage}" if item.stage else ""
@@ -470,6 +481,73 @@ class ApprovalCard:
         set_disabled(self.decide_button, False)
         self.decide_button.props(remove="title")
 
+    # --- question to the user (L16) ----------------------------------------------------------
+
+    def _question_html(self) -> str:
+        item = self.item
+        agent = item.agent
+        assert agent is not None
+        where = f" in #{esc(item.channel)}" if item.channel else ""
+        rows = [
+            (
+                "Wer",
+                f'<span class="mono">{esc(agent.id)}</span> · {esc(agent.role_label)} · '
+                f"{esc(agent.model_label)} · {link_html(item.run.name, f'/runs/{item.run.id}')}"
+                f"{where}",
+            ),
+            ("Frage", f'<div class="quote question-text">{esc(item.question_text or "")}</div>'),
+            (
+                "Was passiert",
+                f"Deine Antwort geht als Nachricht an {esc(agent.id)} in den Kanal. Antwortest "
+                "du dort, schließt sich die Frage hier auch. Ohne Antwort schließt sie sich mit "
+                "dem Ende des Runs.",
+            ),
+        ]
+        kv = "".join(f"<dt>{esc(k)}</dt><dd>{v}</dd>" for k, v in rows)
+        channel = f"?kanal={item.channel}" if item.channel else ""
+        link = link_html("Im Kanal ansehen", f"/runs/{item.run.id}{channel}")
+        return f'<dl class="kv">{kv}</dl><div class="row small" style="margin-top:8px">{link}</div>'
+
+    def _question_body(self) -> None:
+        item = self.item
+        agent = item.agent
+        assert agent is not None
+        self.body = raw(self._question_html(), classes="ab")
+        if item.terminal:
+            self._terminal_foot()
+            return
+        with ui.element("div").classes("af answer"):
+            label = f"Deine Antwort an {agent.id}"
+            area = NativeInput("textarea").props(
+                f'rows="3" aria-label="{esc(label)}" placeholder="{esc(label)}"'
+            )
+            on_value(area, self._set_answer)
+            area.mark("answer")
+            with ui.element("div").classes("decide"):
+                self.decide_button = button(
+                    "Antworten",
+                    self._click_answer,
+                    classes="btn primary",
+                    primary=True,
+                    key_hint="⌘↩",
+                    disabled=True,
+                    title="Schreib zuerst deine Antwort.",
+                ).mark("answer-send")
+                self.buttons.append(self.decide_button)
+
+    def _set_answer(self, value: str) -> None:
+        self.comment = value
+        ready = bool(value.strip())
+        set_disabled(self.decide_button, not ready)
+        if ready:
+            self.decide_button.props(remove="title")
+
+    def _click_answer(self) -> Awaitable[None] | None:
+        # checked at click time: an empty answer is never sent
+        if not self.comment.strip():
+            return None
+        return self._decide(DecisionAction.ANSWER)
+
     # --- run start --------------------------------------------------------------------------
 
     def _run_start_body(self) -> None:
@@ -654,7 +732,13 @@ class ApprovalCard:
             self.busy = False
             if not self.element.is_deleted:
                 for b in self.buttons:
-                    set_disabled(b, b is getattr(self, "decide_button", None) and not self.option)
+                    set_disabled(b, b is getattr(self, "decide_button", None) and not self._ready())
+
+    def _ready(self) -> bool:
+        """The decide button of an escalation or question may be clicked."""
+        if self.item.type is ApprovalType.QUESTION:
+            return bool(self.comment.strip())
+        return self.option is not None
 
 
 TERMINAL_HINT = "Dieser Run läuft im Terminal. Entscheide die Anfrage dort, hier siehst du sie nur."
@@ -706,6 +790,8 @@ def compact_card(
         elif item.type is ApprovalType.RUN_START:
             starter = STARTER.get(item.requested_by, "dir") if item.requested_by else "dir"
             head.append(f"<span>{esc(starter)} · {esc(item.run.project)}</span>")
+        elif item.type is ApprovalType.QUESTION:
+            head.append(f"<span>#{esc(item.channel or '')}</span>")
         else:
             head.append("<span>Run pausiert</span>")
         raw("".join(head), classes="ah")
@@ -767,6 +853,13 @@ def compact_card(
                         primary=True,
                         grant=True,
                     )
+        elif item.type is ApprovalType.QUESTION:
+            raw(f'<div class="quote">{esc(item.question_text or "")}</div>', classes="ab small")
+            raw(
+                f'<div class="decide"><a class="btn btn-sm primary" href="{esc(details)}">'
+                "Antworten</a></div>",
+                classes="af",
+            )
         elif item.type is ApprovalType.RUN_START:
             summary = " · ".join(d.label for d in item.deviations)
             raw(

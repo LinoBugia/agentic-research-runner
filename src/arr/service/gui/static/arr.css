@@ -360,3 +360,9 @@ section[id] { scroll-margin-top: calc(var(--top-h) + 16px); }
 .risk-line .dots { letter-spacing: 1px; margin-right: 2px; }
 .run-file { border-bottom: 1px dotted var(--border-strong); cursor: help; }
 .composer .cmp-suggest:not(:empty) { display: block; color: var(--text); }
+
+/* ---------- W3-09: done and reachable (L13), questions to you (L16) ---------- */
+.agent .now.reachable { color: var(--text-2); }
+.appr .question-text { white-space: pre-wrap; }
+.appr .af.answer { align-items: flex-end; }
+.appr .af.answer textarea { flex: 1 1 320px; min-height: 64px; max-width: 100%; font: inherit; padding: var(--s2); border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--surface); color: var(--text); }

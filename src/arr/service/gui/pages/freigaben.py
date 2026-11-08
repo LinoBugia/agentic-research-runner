@@ -60,7 +60,16 @@ def _request_text(item: ApprovalItem) -> str:
         what = item.command or item.path or item.url or ""
         agent = esc(item.agent.id)
         return f'<span class="mono">{agent}</span> · <span class="mono">{esc(what)}</span>'
+    if item.type is ApprovalType.QUESTION and item.agent:
+        text = " ".join((item.question_text or "").split())
+        if len(text) > QUESTION_EXCERPT:
+            text = text[: QUESTION_EXCERPT - 1] + "…"
+        return f'<span class="mono">{esc(item.agent.id)}</span> · „{esc(text)}“'
     return esc(item.title)
+
+
+QUESTION_EXCERPT = 120
+"""Characters of a question to the user in a row of the history."""
 
 
 class FreigabenPage:
@@ -238,6 +247,8 @@ class FreigabenPage:
         link = ("Zum Run", f"/runs/{item.run.id}")
         if item.type is ApprovalType.PERMISSION and item.agent:
             link = ("Zum Agenten", f"/runs/{item.run.id}?agent={item.agent.id}")
+        elif item.type is ApprovalType.QUESTION and item.channel:
+            link = ("Zum Kanal", f"/runs/{item.run.id}?kanal={item.channel}")
         # The card stays in place as a confirmation of the same height for DECIDED_SECONDS, so
         # nothing slides under the pointer or the focus (W1-06.2 N1); then the next one moves up.
         positive = request.action is not DecisionAction.DENY
@@ -313,7 +324,8 @@ class FreigabenPage:
             if decision.rationale:
                 who += f'<span class="note">„{esc(decision.rationale)}“</span>'
             if decision.comment:
-                who += f'<span class="note">Kommentar: „{esc(decision.comment)}“</span>'
+                word = "Antwort" if decision.action is DecisionAction.ANSWER else "Kommentar"
+                who += f'<span class="note">{word}: „{esc(decision.comment)}“</span>'
         status = outcome(item)
         extra = (
             f'<span class="small muted" style="display:block">{esc(item.status_text)}</span>'

@@ -13,8 +13,11 @@ hands it to the topology (`async def run(ctx: RunContext) -> None`, E8). The orc
   `user` messages, waits of the agents, turns without events, and the discussion phases of
   `arr.runs.pacing` (`discuss`);
 - sets the status after a turn (docs/09 §4.2): `done` when the agent reported it, submitted a
-  result without an open question of its own, or was `done` before and only answered a
-  question; `waiting` after `wait_until`; `idle` otherwise;
+  result without an open question of its own, or was `done` before and was woken by a message
+  to it (L13); `waiting` after `wait_until`; `idle` otherwise;
+- turns a question of an agent to the user (`@user`, L16) into an open item „Frage“ of the
+  approval inbox and closes it when the user answers in the channel or in the inbox, or when
+  the run ends;
 - writes `orchestrator.jsonl`; every wait is an entry `waiting` (docs/09 §4.6).
 
 See docs/01-architektur.md §6, docs/02-workfolder-und-runs.md §4, §7, docs/06-gruppenchats.md.
@@ -46,7 +49,7 @@ from arr.errors import ArrError
 from arr.models import AgentStatus, ResolvedRun, Rubric
 from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.types import ApprovalType, EscalationOption
-from arr.room.address import address
+from arr.room.address import address, is_user_question
 from arr.room.store import ORCHESTRATOR, USER, WAIT_UNTIL_MAX_MIN, AgentRoom, RoomStore
 from arr.room.types import (
     DeliveryStatus,
@@ -129,7 +132,9 @@ class OrchestratorLog:
     `escalation`, `escalation_decided`, `error`; `prepare_run` writes `warning`.
     Since W3-07 (docs/09 §4.6): `waiting` (`agent` or `channel`, `reason`, `until`; reason
     `none` for a channel means it no longer waits), `round`, `wake_scheduled`, `agent_done`
-    (an agent became `done` after a turn, with `reason`) and `turn_silent`.
+    (an agent became `done` after a turn, with `reason`) and `turn_silent`. Since W3-09:
+    `waiting` with reason `result_from` and the awaited agent in `result_from` (L14), and
+    `user_question` (`agent`, `channel`, `msg`, `item`, `state` open/answered/closed, L16).
     """
 
     def __init__(self, run_dir: Path) -> None:
@@ -271,10 +276,13 @@ class _Listener(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class LongWait:
-    """An agent ended its turn with `wait_until` (docs/09 §4.3); `until` is a Unix time."""
+    """An agent ended its turn with `wait_until` (docs/09 §4.3); `until` and `since` are Unix
+    times, `result_from` the agent whose next result ends the wait (L14)."""
 
     until: float
     file: str | None = None
+    result_from: str | None = None
+    since: float = 0.0
 
 
 @dataclass(slots=True)
@@ -387,6 +395,10 @@ class Orchestrator(RunContext):
         """Agents asked to free their place (`wait_guard.yield_to`, L12), with the profile."""
         self._until_streak: dict[str, int] = {}
         """`wait_until` in a row that ended by their deadline (`wait_guard.until_streak`, L10)."""
+        self._turn_marks: dict[str, int] = {}
+        """Newest message ID when the agent's latest turn began: its inbox showed all up to it."""
+        self._questions: dict[int, str] = {}
+        """Open questions to the user (L16): message ID → item of the approval inbox."""
         self._last_seen = 0
         for msg in room.messages_after(0):
             self._senders[msg.id] = msg.sender
@@ -570,6 +582,7 @@ class Orchestrator(RunContext):
         events_log = self.loggers[agent_id]
         handle.turns_used += 1
         number = handle.turns_used
+        self._turn_marks[agent_id] = self.last_message_id()
         full_prompt = self._prompt_with_inbox(agent_id, prompt)
         self.room.add_assignment(agent_id, number, prompt, stage=stage, context=context)
         before = max((r.id for r in self.room.results(agent=agent_id)), default=0)
@@ -731,7 +744,8 @@ class Orchestrator(RunContext):
             user_messages += [
                 m for m in self.room.messages(channel.name, after_id=cursor) if m.sender == USER
             ]
-        return render_turn_prompt(agent_id, prompt, inbox, user_messages)
+        direct = [m for m in view.messages_for_me() if m.sender != ORCHESTRATOR]
+        return render_turn_prompt(agent_id, prompt, inbox, user_messages, direct)
 
     def _set_status(self, handle: AgentHandle, status: AgentStatus, note: str = "") -> None:
         handle.status = status
@@ -747,7 +761,7 @@ class Orchestrator(RunContext):
         `working` in this turn → `waiting` after `wait_until`, else `idle`; it reported `done`
         → `done`; it called `wait_until` → `waiting`; it submitted a result (`submit_result`
         or a message `result`) and has no open question of its own → `done`; it was `done`
-        before the turn (woken by a question) → `done` again; else `idle`. The status the
+        before the turn (woken by a message to it, L13) → `done` again; else `idle`. The status the
         agent reported comes from `agent_report`, so an approval in the same turn, which
         sets `blocked` and `working` in `agent_state`, cannot lose a `done` (Ist §1).
         """
@@ -791,15 +805,26 @@ class Orchestrator(RunContext):
 
     def _start_long_wait(self, handle: AgentHandle, wait: WaitState) -> None:
         """`wait_until`: the agent waits with its turn ended, at most 30 min and never past
-        `wall_time`; a discussion wakes it (`arr.runs.pacing`)."""
+        `wall_time`; a discussion wakes it (`arr.runs.pacing`). With `until_result_from` the
+        log says `result_from` and whose result (L14)."""
         until = min(wait.until, time.time() + WAIT_UNTIL_MAX_MIN * 60)
         if self.wall_end is not None:
             until = min(until, self.wall_end)
-        self._long_waits[handle.id] = LongWait(until, wait.file)
+        self._long_waits[handle.id] = LongWait(until, wait.file, wait.result_from, wait.since)
         self._set_status(handle, AgentStatus.WAITING)
-        self.log.write(
-            "waiting", agent=handle.id, reason=WaitKind.UNTIL.value, until=until, file=wait.file
-        )
+        if wait.result_from is not None:
+            self.log.write(
+                "waiting",
+                agent=handle.id,
+                reason="result_from",
+                result_from=wait.result_from,
+                until=until,
+                file=wait.file,
+            )
+        else:
+            self.log.write(
+                "waiting", agent=handle.id, reason=WaitKind.UNTIL.value, until=until, file=wait.file
+            )
         self.log.write("wake_scheduled", agent=handle.id, reason="timeout", due=until)
 
     def _end_long_wait(self, agent_id: str) -> None:
@@ -824,6 +849,21 @@ class Orchestrator(RunContext):
             return self._views[agent_id].until_file_exists(rel)
         except RoomError:
             return False
+
+    def new_result(self, agent_id: str, since: float) -> Result | Message | None:
+        """The first result `agent_id` submitted after `since` (Unix time): `submit_result` or
+        a message `result` (L14); None if there is none yet."""
+        for result in self.room.results(agent=agent_id):
+            if result.ts > since:
+                return result
+        for msg in self.room.messages_after(0):
+            if msg.sender == agent_id and msg.kind is MessageKind.RESULT and msg.ts > since:
+                return msg
+        return None
+
+    def turn_mark(self, agent_id: str) -> int:
+        """Newest message ID when the agent's latest turn began (0 before its first turn)."""
+        return self._turn_marks.get(agent_id, 0)
 
     def in_turn_wait(self, agent_id: str) -> WaitState | None:
         """The running `wait_for_messages` of an agent (as last seen by `poll`)."""
@@ -1090,6 +1130,10 @@ class Orchestrator(RunContext):
                 for agent_id in self._recipients(msg):
                     if address(msg, agent_id, self.sender_of) is not None:
                         self.reset_until_streak(agent_id)  # L10: a message to it
+            if is_user_question(msg) and msg.sender in self._handles:
+                self._open_user_question(msg)
+            elif msg.sender == USER and self._questions:
+                self._close_answered_questions(msg)
             for listener in list(self._listeners):
                 listener.on_message(msg)
         self._sync_blocked()
@@ -1097,6 +1141,45 @@ class Orchestrator(RunContext):
         self._sync_yield()
         self._end_requested_turns()
         self._check_silence()
+
+    def _open_user_question(self, msg: Message) -> None:
+        """L16: a question of an agent to the user becomes an item „Frage“ in the inbox."""
+        try:
+            item = self.inbox.open_question(self.run_id, msg.sender, msg.channel, msg.id, msg.body)
+        except Exception:  # the question stays in the channel; nothing else may fail
+            logger.exception("Frage an den User (#%s) nicht in die Inbox gelegt", msg.id)
+            return
+        self._questions[msg.id] = item.id
+        self.log.write(
+            "user_question",
+            agent=msg.sender,
+            channel=msg.channel,
+            msg=msg.id,
+            item=item.id,
+            state="open",
+        )
+
+    def _close_answered_questions(self, answer: Message) -> None:
+        """The user wrote in the channel: the questions it closed are answered (L16)."""
+        for msg_id, item_id in list(self._questions.items()):
+            try:
+                still_open = self.room.message(msg_id).open
+            except ArrError:
+                still_open = False
+            if still_open:
+                continue
+            del self._questions[msg_id]
+            self.inbox.answered(item_id, answer.body, via="channel")  # False if in the inbox
+            self.log.write(
+                "user_question", msg=msg_id, item=item_id, state="answered", answer=answer.id
+            )
+
+    def close_user_questions(self, note: str) -> None:
+        """The run ends: questions to the user nobody answered are closed (L16)."""
+        for msg_id, item_id in list(self._questions.items()):
+            del self._questions[msg_id]
+            if self.inbox.close_question(item_id, note):
+                self.log.write("user_question", msg=msg_id, item=item_id, state="closed")
 
     def _sync_yield(self) -> None:
         """L12: ask working agents to free their place while another turn waits for one of

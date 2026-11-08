@@ -215,9 +215,9 @@ class WaitKind(StrEnum):
 class WaitState(Record):
     """Row of table `agent_wait`: an agent waits for a message, a file or its deadline.
 
-    `file` is relative to the agent's working folder (`until_file`); `since`/`until` are Unix
-    times. Written by the room tools, cleared when the wait ends or the next turn starts
-    (docs/09-agent-loop.md §4.3).
+    `file` is relative to the agent's working folder (`until_file`); `result_from` is the agent
+    whose next result ends a `wait_until` (L14); `since`/`until` are Unix times. Written by the
+    room tools, cleared when the wait ends or the next turn starts (docs/09-agent-loop.md §4.3).
     """
 
     agent: str
@@ -225,6 +225,7 @@ class WaitState(Record):
     since: float
     until: float
     file: str | None = None
+    result_from: str | None = None
 
 
 class WaitGuard(Record):
@@ -320,8 +321,14 @@ class RoomAPI(Protocol):
         """Submit a result for the current stage; `path` is relative to the working folder."""
         ...
 
-    def wait_until(self, minutes: float, until_file: str | None = None) -> WaitState:
-        """Ask to be woken after `minutes` (at most 30), on a message to me or `until_file`.
+    def wait_until(
+        self,
+        minutes: float,
+        until_file: str | None = None,
+        until_result_from: str | None = None,
+    ) -> WaitState:
+        """Ask to be woken after `minutes` (at most 30), on a message to me, when `until_file`
+        is there or when the agent `until_result_from` submits a result (L14).
 
         The agent ends its turn afterwards; the orchestrator wakes it (docs/09 §4.3). The
         blocking `wait_for_messages` is built on this view in `arr.room.waiting`.

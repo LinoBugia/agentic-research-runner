@@ -102,6 +102,9 @@ INTERRUPTIBLE_STATUSES = frozenset(
 STOPPABLE_STATUSES = frozenset({RunStatus.PREPARING, RunStatus.RUNNING, RunStatus.PAUSED})
 """Statuses in which `RunManager.stop` acts; in `finalizing` and after it is ignored."""
 
+QUESTION_CLOSED = "Der Run ist zu Ende, die Frage blieb ohne Antwort."
+"""Note of a question to the user that closes with the end of the run (L16)."""
+
 STOP_GRACE_S = 10.0
 """How long a stopped topology may take to return before it is cancelled."""
 CLOSE_TIMEOUT_S = 10.0
@@ -581,6 +584,10 @@ class RunManager:
                 await self._stop_task
         if self.orchestrator is not None:
             await self.orchestrator.wait_halted()
+            try:  # L16: questions to the user nobody answered end with the run
+                self.orchestrator.close_user_questions(QUESTION_CLOSED)
+            except Exception:
+                logger.exception("Offene Fragen an den User ließen sich nicht schließen")
         await asyncio.gather(*(self._close(a, b) for a, b in self.backends.items()))
         for events_log in self.loggers.values():
             events_log.close()

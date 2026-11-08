@@ -5,9 +5,10 @@ its switch in the app settings is off (read at every event, so a change counts a
 missing switch means on). The other switches of §5.11 have no event here yet. Agents
 determine parts of a request, so the text goes to `osascript` as an argument (`on run argv`)
 and is never built into the script. It names agent, run and the kind of request; the full
-command never appears (lock screen), secrets are removed. Without `osascript`, or with
-`ARR_NOTIFY=off` (tests), nothing happens. A failing notification never holds anything up.
-A click on it opens no deep link, `osascript` cannot do that (W5-02).
+command never appears (lock screen), secrets are removed. A question of an agent to the user
+(docs/09 L16) names agent and run and the start of the question, cut at `MAX_TEXT`. Without
+`osascript`, or with `ARR_NOTIFY=off` (tests), nothing happens. A failing notification never
+holds anything up. A click on it opens no deep link, `osascript` cannot do that (W5-02).
 """
 
 import asyncio
@@ -81,6 +82,10 @@ def _clean(text: str) -> str:
 
 
 def _approval_text(item: ApprovalItem, now: float) -> str:
+    if item.type is ApprovalType.QUESTION:
+        agent = item.agent.id if item.agent else "Ein Agent"
+        # the run before the question: `MAX_TEXT` cuts the end, never who asks where
+        return f"{agent} fragt dich ({item.run.name}): {item.question_text or ''}"
     if item.type is ApprovalType.ESCALATION:
         return f"Eskalation in {item.run.name}: Stufe „{item.stage}“. Der Run pausiert."
     if item.type is ApprovalType.RUN_START:

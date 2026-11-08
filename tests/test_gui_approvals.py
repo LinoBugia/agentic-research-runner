@@ -348,3 +348,54 @@ async def test_n3_a_line_in_the_file_takes_no_card_from_the_open_tab(wf: Path) -
         assert item.title in html and (await api.get_counts()).waiting == 1
         with user.client:
             assert list(ElementFilter(marker="allow"))
+
+
+# --- W3-09 L16: a question of an agent to the user, answered in the inbox -------------------
+
+
+def question_run(agent: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **run_input(agent),
+        "groupchats": [{"name": "main", "members": [agent["id"]], "mode": "event"}],
+    }
+
+
+async def test_w3_09_a3_question_card_with_an_answer_field_reaches_the_agent(wf: Path) -> None:
+    """The question appears as „Frage“ with who, where and the text; the answer typed into the
+    card goes to the agent, whose `wait_for_messages` ends with it."""
+    from run_kit import events, post, room
+
+    ask = post("main", "@user Welches Höhenband hat Vorrang, 10–35 oder 35–60?", kind="question")
+    script = turns([ask, room("wait_for_messages", seconds=20), say("danke")])
+    async with service(wf, {"a": script}) as (user, api):
+        started = await api.start_run(question_run({"id": "a"}))
+        item = await open_item(api)
+        assert item.type.value == "question" and item.agent is not None and item.agent.id == "a"
+        assert item.channel == "main" and "Höhenband" in (item.question_text or "")
+        await user.open(f"/freigaben/{item.id}")
+        html = await see(user, "a fragt dich")
+        assert "Welches Höhenband hat Vorrang" in html and "#main" in html
+        assert "Deine Antwort geht als Nachricht an a in den Kanal" in html
+        with user.client:
+            [send] = list(ElementFilter(marker="answer-send"))
+            assert "disabled" in send._props, "no answer without a text"
+        user.find(marker="answer").trigger("input", "Beide, zuerst 10–35.")
+        user.find(marker="answer-send").click()
+        end = time.monotonic() + 10
+        while (await api.get_approval(item.id)).status is ApprovalStatus.OPEN:
+            assert time.monotonic() < end
+            await asyncio.sleep(0.02)
+        answered = await api.get_approval(item.id)
+        assert answered.status is ApprovalStatus.DECIDED
+        assert answered.answer == "Beide, zuerst 10–35."
+        run_dir = wf / "runs" / started.run_id
+
+        def ended_by_message() -> bool:
+            results = [e for e in events(run_dir, "a") if e["kind"] == "tool_result"]
+            return any('"ended_by": "message"' in e["data"]["content"] for e in results)
+
+        end = time.monotonic() + 10
+        while not ended_by_message():
+            assert time.monotonic() < end
+            await asyncio.sleep(0.05)
+        await api.run_action(started.run_id, RunAction.STOP)

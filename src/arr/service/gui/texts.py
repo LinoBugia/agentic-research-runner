@@ -65,6 +65,7 @@ APPROVAL_TYPE = {
     ApprovalType.PERMISSION: "Berechtigung",
     ApprovalType.ESCALATION: "Eskalation",
     ApprovalType.RUN_START: "Run-Start",
+    ApprovalType.QUESTION: "Frage",
 }
 
 CATEGORY = {
@@ -164,6 +165,8 @@ def outcome(item: ApprovalItem) -> Status:
         return Status("st-wait", "front_hand", "offen")
     revoked = item.status is ApprovalStatus.REVOKED
     action = item.decision.action
+    if action is DecisionAction.ANSWER:
+        return Status("st-ok", "check", "beantwortet")
     if action is DecisionAction.DENY:
         status = Status("st-err", "close", "abgelehnt")
     elif action is DecisionAction.ADJUST:
@@ -204,4 +207,5 @@ APPROVAL_FILTERS = {
     "run-starts": ("Run-Starts", ApprovalType.RUN_START),
     "berechtigungen": ("Berechtigungen", ApprovalType.PERMISSION),
     "eskalationen": ("Eskalationen", ApprovalType.ESCALATION),
+    "fragen": ("Fragen", ApprovalType.QUESTION),
 }

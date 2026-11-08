@@ -41,6 +41,10 @@ TRANSCRIPT_MD_FILE = "transcript.md"
 
 _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
 
+RATE_LIMIT_PASSING = frozenset({"", "allowed", "allowed_warning"})
+"""`rate_limit` statuses that hold no turn up: the window is reported, nothing is reached
+(Nachtest V5). `ProfileGate` pauses a profile only for the others, e.g. `rejected`."""
+
 
 # --------------------------------------------------------------------------------------------
 # JSON encoding that never fails
@@ -394,8 +398,21 @@ def _render_event(rec: Mapping[str, Any], state: _RenderState) -> str | None:
         case "rate_limit":
             used = data.get("utilization")
             shown = isinstance(used, int | float) and math.isfinite(used)
-            extra = f", Auslastung {round(used * 100)} %" if shown else ""
-            return f"*Rate-Limit: {data.get('status', '?')}{extra}*"
+            extra = [f"Auslastung {round(used * 100)} %"] if shown else []
+            resets = data.get("resets_at")
+            status = str(data.get("status") or "")
+            if status in RATE_LIMIT_PASSING:  # V5: only a hint, nothing is reached
+                if isinstance(resets, int | float):
+                    extra.append(f"Fenster bis {_clock(resets, state.tz)}")
+                word = "Warnung" if status == "allowed_warning" else "Hinweis"
+                return (
+                    f"*{word} zum Nutzungslimit: weiter erlaubt"
+                    + "".join(f", {e}" for e in extra)
+                    + "*"
+                )
+            if isinstance(resets, int | float):
+                extra.append(f"weiter um {_clock(resets, state.tz)}")
+            return f"*Nutzungslimit erreicht ({status})" + "".join(f", {e}" for e in extra) + "*"
         case "error":
             tail = "behebbar" if data.get("recoverable") else "nicht behebbar"
             return f"**Fehler** ({data.get('type', '?')}, {tail}): {data.get('message', '')}"

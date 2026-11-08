@@ -488,6 +488,52 @@ def _role_label(agent: AgentConfig) -> str:
     return Path(agent.role).stem if agent.role else agent.base_id
 
 
+def _parts(resolved: ResolvedRun, agent_id: str) -> list[str]:
+    """What an agent's part of the run is, from `run.yaml` (docs/09 §4.7): its stages, rating,
+    moderating, summarizing."""
+    parts = []
+    for stage in resolved.stages:
+        if stage.agent == agent_id:
+            produces = f", liefert `{stage.produces}`" if stage.produces else ""
+            parts.append(f"Stufe „{stage.name}“{produces}")
+    if agent_id in resolved.raters:
+        parts.append("bewertet Ergebnisse")
+    parts += [f"moderiert #{c.name}" for c in resolved.groupchats if c.moderator == agent_id]
+    if resolved.params.get("summarizer") == agent_id:
+        parts.append("fasst die Diskussion zusammen")
+    return parts
+
+
+def _team_items(resolved: ResolvedRun, agent: AgentConfig) -> list[str]:
+    """Own part and the others with role and part (docs/09 §4.7, User 08.11.).
+
+    Agents that share an anonymous channel with `agent` are left out: there it knows them only
+    by their alias, and a list with IDs and roles would tell who is behind which one.
+    """
+    hidden = {
+        member
+        for c in resolved.groupchats
+        if c.anonymous and agent.id in c.members
+        for member in c.members
+    }
+    items = []
+    mine = _parts(resolved, agent.id)
+    if mine:
+        items.append(f"- Dein Teil: {'; '.join(mine)}.")
+    others = [a for a in resolved.agents if a.id != agent.id and a.id not in hidden]
+    if others:
+        items.append("- Die anderen Agenten:")
+        for other in others:
+            part = _parts(resolved, other.id)
+            extra = f"; {'; '.join(part)}" if part else ""
+            items.append(f"  - `{other.id}` (Rolle: `{_role_label(other)}`{extra})")
+    if hidden - {agent.id}:
+        items.append(
+            "- In anonymen Kanälen kennst du die anderen nur als „Mitglied A/B/…“, sie dich auch."
+        )
+    return items
+
+
 def _research_block(
     run_id: str,
     resolved: ResolvedRun,
@@ -499,6 +545,7 @@ def _research_block(
     items = [f"- Run: `{run_id}`"]
     if agent is not None:
         items.append(f"- Du bist `{agent.id}` (Rolle: `{_role_label(agent)}`).")
+        items += _team_items(resolved, agent)
     else:
         items.append(
             f"- Du teilst dir diesen Ordner „{shared_name}“ mit anderen Agenten des Runs. "

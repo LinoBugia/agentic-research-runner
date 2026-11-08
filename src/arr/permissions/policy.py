@@ -57,6 +57,7 @@ from arr.permissions.types import (
     RequestCategory,
     Risk,
     RiskLevel,
+    UserQuestion,
 )
 from arr.settings import app_dir
 from arr.venvs import run_venv_dir, venv_base_prefix, venv_root
@@ -1951,6 +1952,7 @@ class ApprovalLogEntry(Record):
     request: PermissionRequest | None = None
     decision: Decision | None = None
     rule: AlwaysRule | None = None
+    question: UserQuestion | None = None
     note: str | None = None
 
 

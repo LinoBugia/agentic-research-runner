@@ -78,6 +78,8 @@ def waiting_row_html(item: ApprovalItem, now: float) -> str:
             sub.append(f"Risiko {RISK[item.risk.level][1]}")
     elif item.type is ApprovalType.ESCALATION:
         sub.append("Run pausiert")
+    elif item.type is ApprovalType.QUESTION:  # W3-09 L16: a question of an agent to you
+        sub.append(f"#{esc(item.channel or '')}")
     else:
         sub = [esc(item.run.project), esc(STARTER_PHRASE.get(item.requested_by or Starter.GUI))]
         n = len(item.deviations)

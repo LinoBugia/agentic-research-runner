@@ -6,7 +6,9 @@ on the column): full (role, model, assignment, meta) → two lines (ID + status,
 one line (ID, short „jetzt“, status). The complete „jetzt“ line and the agent's details are
 always in the tooltip (UX-Abnahme 1). Running tools show their duration, updated in the
 browser (`data-since`). A waiting agent shows why and how long still instead of a bare
-„wartet“ (docs/09 §4.6), counted down in the browser (`data-until`).
+„wartet“ (docs/09 §4.6), counted down in the browser (`data-until`), e.g. „wartet auf Ergebnis
+von diskutant-2 · noch 12 min“ (L14). A finished agent of a running run shows „fertig ·
+ansprechbar“: a message to it wakes it (L13).
 """
 
 import math
@@ -43,6 +45,10 @@ _NOW_ICON = {
 }
 
 
+REACHABLE = "fertig · ansprechbar"
+"""The „jetzt“ line of a finished agent that a message still wakes (L13)."""
+
+
 def remaining(seconds: float) -> str:
     """Time left as „0:32“ or „12 min“ (same as `remaining` in static/run_detail.js)."""
     left = max(0, math.floor(seconds))
@@ -72,6 +78,8 @@ def now_text(agent: AgentState, now: float | None = None) -> str:
     """The „jetzt“ line as plain text, e.g. „Bash · curl -sO … (wartet auf deine Freigabe)“."""
     if agent.waiting is not None:
         return wait_text(agent.waiting, time.time() if now is None else now)
+    if agent.reachable:
+        return REACHABLE
     act = agent.activity
     if act is None:
         return "noch keine Tätigkeit"
@@ -91,6 +99,9 @@ def _now_html(agent: AgentState, now: float) -> str:
             f'<span class="now wait"><span class="k">{sym}</span>{esc(wait.text)}'
             f'<span class="k">{until_html(wait.until, now)}</span></span>'
         )
+    if agent.reachable:
+        sym = icon("check", small=True)
+        return f'<span class="now reachable"><span class="k">{sym}</span>{REACHABLE}</span>'
     act = agent.activity
     if act is None:
         return '<span class="now"><span class="k">noch keine Tätigkeit</span></span>'
@@ -111,6 +122,8 @@ def short_now(agent: AgentState) -> str:
     """Short „jetzt“ for one-line cards: the argument, the label or why it waits."""
     if agent.waiting is not None:
         return agent.waiting.text
+    if agent.reachable:
+        return REACHABLE
     act = agent.activity
     if act is None:
         return ""

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from arr.backends.base import Usage
+from arr.runs.eventlog import RATE_LIMIT_PASSING
 from arr.service.api_models import (
     ToolBundle,
     ToolStatus,
@@ -391,7 +392,9 @@ def to_event(
     run_dir: Path | None,
     agent_id: str,
 ) -> TranscriptEvent | None:
-    """One line of `transcript.jsonl` as `TranscriptEvent`; `tool_result` lines give None."""
+    """One line of `transcript.jsonl` as `TranscriptEvent`; `tool_result` lines give None, and
+    so does a `rate_limit` that held nothing up (`allowed`, `allowed_warning`; Nachtest V5):
+    the GUI shows a `rate_limit` entry as „Nutzungslimit erreicht“."""
     kind = str(record.get("kind") or "")
     if kind == TOOL_RESULT:
         return None
@@ -443,4 +446,7 @@ def to_event(
         api_kind = TranscriptKind(kind)
     except ValueError:
         return None
+    status = str(data.get("status") or "")
+    if api_kind is TranscriptKind.RATE_LIMIT and status in RATE_LIMIT_PASSING:
+        return None  # V5: the window was reported, nothing held the turn up
     return TranscriptEvent(**base, kind=api_kind, data=data)

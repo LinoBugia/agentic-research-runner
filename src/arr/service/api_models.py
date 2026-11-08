@@ -573,6 +573,7 @@ class WaitReason(StrEnum):
     CAPACITY = "capacity"  # its turn waits for a free place of the auth profile
     ROUND = "round"  # idle; the next round of the discussion comes
     END = "end"  # idle; the discussion ends unless something happens
+    RESULT = "result_from"  # turn ended, waits for the result of another agent (L14)
 
 
 class AgentWait(ApiModel):
@@ -582,6 +583,7 @@ class AgentWait(ApiModel):
     text: str = Field(description="e.g. „wartet auf Antwort von diskutant-1“")
     until: float | None = None
     file: str | None = None
+    result_from: str | None = Field(default=None, description="L14: whose result it waits for")
 
 
 class DiscussionState(ApiModel):
@@ -830,6 +832,9 @@ class AgentState(ApiModel):
     results_count: int = Field(default=0, ge=0)
     ratings_count: int = Field(default=0, ge=0)
     work_dir: str
+    reachable: bool = Field(
+        default=False, description="L13: done, a message to it wakes it („fertig · ansprechbar“)"
+    )
 
     @model_validator(mode="after")
     def _blocked_needs_reason(self) -> Self:
@@ -1217,6 +1222,7 @@ _TYPE_ACTIONS = {
     ApprovalType.RUN_START: {DecisionAction.ALLOW, DecisionAction.DENY, DecisionAction.ADJUST},
     ApprovalType.PERMISSION: {DecisionAction.ALLOW, DecisionAction.DENY},
     ApprovalType.ESCALATION: {DecisionAction.OPTION},
+    ApprovalType.QUESTION: {DecisionAction.ANSWER},
 }
 
 
@@ -1224,7 +1230,8 @@ class ApprovalItem(ApiModel):
     """An entry of the approval inbox, complete per type (docs/08 §5.0 `ApprovalItem`, K5).
 
     Fields are grouped by type: permission (`agent` … `consequences`), run start (`skill` …
-    `standard_notes`), escalation (`stage` … `options`). `title` is the German sentence of
+    `standard_notes`), escalation (`stage` … `options`), question of an agent to the user
+    (`agent`, `question_text` … `answer`, L16). `title` is the German sentence of
     the card. The same rules as the core `arr.permissions.types.ApprovalItem` apply: run
     starts have no deadline, run starts and escalations are decided only by the user once.
     """
@@ -1287,6 +1294,11 @@ class ApprovalItem(ApiModel):
     comment_to: ApprovalAgentRef | None = Field(
         default=None, description="Agent who gets the user's comment (escalation: the worker)"
     )
+    # question (L16)
+    question_text: str | None = None
+    channel: str | None = None
+    msg_id: int | None = None
+    answer: str | None = Field(default=None, description="The user's answer, once given")
     # all open items
     count: int = Field(default=1, ge=1, description="Equal requests this one card answers")
     terminal: bool = Field(default=False, description="Decided in the terminal of `arr run`")
@@ -1308,6 +1320,8 @@ class ApprovalItem(ApiModel):
             raise ValueError("Run-Start-Freigaben haben keine Frist (07 §5)")
         if self.type is ApprovalType.ESCALATION and (not self.options or self.topology is None):
             raise ValueError("Eine Eskalation braucht Optionen und die Topologie des Runs")
+        if self.type is ApprovalType.QUESTION and (self.agent is None or not self.question_text):
+            raise ValueError("Eine Frage an den User braucht agent und question_text")
         self._check_vendors()
         if self.status is ApprovalStatus.OPEN and self.decision is not None:
             raise ValueError("Ein offener Eintrag hat keine decision")
@@ -1320,7 +1334,9 @@ class ApprovalItem(ApiModel):
                 self.decision.decided_by is not DecidedBy.USER
                 or self.decision.scope is not DecisionScope.ONCE
             ):
-                raise ValueError("Run-Starts und Eskalationen entscheidet nur der User, einmalig")
+                raise ValueError(
+                    "Run-Starts, Eskalationen und Antworten gibt nur der User, einmalig"
+                )
         if self.revocable and self.status is not ApprovalStatus.DECIDED:
             raise ValueError("revocable nur bei entschiedenen Einträgen")
         return self
@@ -1351,7 +1367,8 @@ class DecisionRequest(ApiModel):
     """Decision sent by the GUI (docs/08 §5.2 „Entscheiden“, „Anpassen“).
 
     `allow`/`deny` for permissions and run starts, `option` + `option_key` for escalations,
-    `adjust` + `config` (changed values by deviation path) for run starts.
+    `adjust` + `config` (changed values by deviation path) for run starts, `answer` with the
+    text in `comment` for a question of an agent (L16).
     """
 
     action: DecisionAction
@@ -1368,6 +1385,8 @@ class DecisionRequest(ApiModel):
             raise ValueError("option_key gehört genau zu action=option")
         if (self.action is DecisionAction.ADJUST) != (self.config is not None):
             raise ValueError("config gehört genau zu action=adjust")
+        if self.action is DecisionAction.ANSWER and not (self.comment or "").strip():
+            raise ValueError("Eine Antwort braucht einen Text in comment")
         return self
 
 
