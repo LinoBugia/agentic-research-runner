@@ -29,7 +29,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -1841,7 +1841,55 @@ _SECRET_FLAG_RE = re.compile(
     r"(?i)(--?(?:password|passwd|token|api[-_]?key|secret|auth)(?:=|\s+))(\"[^\"]*\"|'[^']*'|\S+)"
 )
 _AUTH_HEADER_RE = re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=\-]{8,}")
-_URL_CREDS_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^\s/@:]+:[^\s/@]+@")
+_URL_CREDS_PLAIN = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^\s/@:]+:[^\s/@]+@")
+"""Credentials in a URL, `scheme://user:password@`. Searched as is, it takes quadratic time on
+a long run like `a.a.a.…` without `://` (review W3-07, NB5); `_URL_CREDS_RE` finds the same."""
+_SCHEME_RUN_RE = re.compile(r"(?i)[a-z0-9+.\-]+")
+_SCHEME_START_RE = re.compile(r"(?i)\b[a-z]")
+_URL_TAIL_RE = re.compile(r"[^\s/@:]+:[^\s/@]+@")
+
+
+class _UrlCredentials:
+    """`_URL_CREDS_PLAIN` in linear time, with the same matches (W3-09, NB5).
+
+    A scheme runs to the end of its run of scheme characters, so it can only end right before
+    a `://`. Only the places of `://` are visited (`str.find`); where `user:password@` follows,
+    the run of scheme characters before it is measured once on the reversed text, its first
+    start of a scheme is searched, and the plain pattern then matches from there. The runs
+    before two `://` never overlap, so no character is read more than a few times.
+    """
+
+    pattern = _URL_CREDS_PLAIN.pattern
+
+    def search(self, text: str, pos: int = 0) -> "re.Match[str] | None":
+        """The first match at or after `pos`, as `_URL_CREDS_PLAIN.search` would find it."""
+        return self._search(text, pos, [])
+
+    def _search(self, text: str, pos: int, reverse: list[str]) -> "re.Match[str] | None":
+        at = text.find("://", pos)
+        while at >= 0:
+            if _URL_TAIL_RE.match(text, at + 3) is not None:
+                if not reverse:
+                    reverse.append(text[::-1])
+                run = _SCHEME_RUN_RE.match(reverse[0], len(text) - at)
+                first = max(pos, at - (run.end() - run.start())) if run is not None else at
+                start = _SCHEME_START_RE.search(text, first, at)
+                match = _URL_CREDS_PLAIN.match(text, start.start()) if start is not None else None
+                if match is not None:
+                    return match
+            at = text.find("://", at + 1)
+        return None
+
+    def sub(self, repl: "Callable[[re.Match[str]], str]", text: str) -> str:
+        """`_URL_CREDS_PLAIN.sub` with a function as replacement."""
+        parts, pos, reverse = [], 0, []
+        while (match := self._search(text, pos, reverse)) is not None:
+            parts += [text[pos : match.start()], repl(match)]
+            pos = match.end()
+        return "".join(parts) + text[pos:]
+
+
+_URL_CREDS_RE = _UrlCredentials()
 
 
 def redact(text: str) -> str:
