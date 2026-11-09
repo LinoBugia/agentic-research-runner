@@ -13,10 +13,19 @@ Selecting something changes the view without reloading the page and keeps the UR
 that was just started has no agents and channels yet: they join the page when the preparation
 made them (`_sync_structure`). „gelesen bis“ per channel lives in the browser (`ui_seen`, §5.0);
 static/run_detail.js reports it after loading.
+
+Live without gaps (W3-10 V4): the page subscribes before it reads the run, so nothing the
+watcher publishes while the page loads is lost; a change of the selected agent only changes
+the filter of the subscription. An update that fails is tried again, and the status the page
+shows only counts once it is drawn. While the run is not settled, and after every reconnect
+of the browser, the page compares itself with the run (`_reconcile`): a missed event costs
+at most `RECONCILE_SECONDS`.
 """
 
 import json
+import logging
 import re
+import time
 from typing import Any
 from urllib.parse import urlencode
 
@@ -65,6 +74,7 @@ from arr.service.gui.components.stage_bar import stage_bar_html
 from arr.service.gui.components.transcript_event import event_dom_id
 from arr.service.gui.layout import Frame
 from arr.service.gui.pages.run_detail_channel import ChannelView, unread_count
+from arr.service.gui.pages.run_detail_inputs import REPEAT_LABEL, InputsView, repeat_href
 from arr.service.gui.pages.run_detail_log import LogView
 from arr.service.gui.pages.run_detail_overview import (
     agents_html,
@@ -76,11 +86,19 @@ from arr.service.gui.pages.run_detail_results import ResultsView, result_dom_id
 from arr.service.gui.pages.run_detail_transcript import TranscriptView
 from arr.service.gui.texts import RISK, STARTER_PHRASE, WAITING_FOR_YOU, run_status
 
+log = logging.getLogger("arr.service.gui")
+
 PUMP_SECONDS = 0.1
+"""Live events are applied in batches, at most 10 times a second (§6.6)."""
 START_CHECK_SECONDS = 1.0
+RECONCILE_SECONDS = 5.0
+"""An open run that is not settled compares itself with the run this often (V4)."""
+RETRY_SECONDS = 2.0
+"""A live update that failed is tried again after this pause."""
+SETTLE_SECONDS = 60.0
+"""A finished run without a secret scan entry counts as settled this long after its end."""
 NOT_BEGUN = (RunStatus.QUEUED, RunStatus.PREPARING)
 START_FAILED = "Run konnte nicht vorbereitet werden"
-"""Live events are applied in batches, at most 10 times a second (§6.6)."""
 DECIDED_SECONDS = 1.5
 """A decided compact card shows its confirmation this long (G2, same as the Freigaben page)."""
 SCAN_MESSAGES = 200
@@ -90,7 +108,7 @@ KATEX_URL = f"{STATIC_URL}/katex.mjs"
 """KaTeX as a file of this package (static/katex.mjs, license next to it), for formulas (G7)."""
 _SENTENCE_END = re.compile(r"(?<=[^\d])\. ")
 
-View = ChannelView | TranscriptView | ResultsView | LogView
+View = ChannelView | TranscriptView | ResultsView | LogView | InputsView
 
 
 SCAN_SHOWN = 5
@@ -132,8 +150,16 @@ class RunDetailPage:
         self.compact_elements: dict[str, list[ui.element]] = {}
         self.rendered_items: tuple[tuple[str, int], ...] | None = None
         self.dirty: set[str] = set()
-        self.subscription = None
+        self.subscription: Any = None
         self._actions_key: tuple[Any, ...] | None = None
+        self.shown_status = detail.run.status
+        """The status the page has drawn; a failed redraw keeps the old one (V4)."""
+        self._retry_at = 0.0
+        self._reconciling = False
+        self._connects = 0
+        self._reconcile_failing = False
+        self.gone_html = ""
+        """§8.4 banner once the run folder is gone (W3-10.1)."""
 
     # --- shortcuts -------------------------------------------------------------------------
 
@@ -149,6 +175,12 @@ class RunDetailPage:
 
     async def build(self) -> None:
         api = self.api
+        # subscribe first: what happens while the page reads the run waits in the queue (V4)
+        wanted = {self.params["agent"]} if self.params.get("agent") else set()
+        self.subscription = api.subscribe(self.run_id, agents=wanted)
+        self.frame.client.on_delete(self._close)
+        self.detail = await api.get_run(self.run_id)
+        self.shown_status = self.status
         self.agents = {a.id: a for a in await api.list_agents(self.run_id)}
         self.channels = {c.name: c for c in await api.list_channels(self.run_id)}
         self.results = await api.get_results(self.run_id)
@@ -198,11 +230,15 @@ class RunDetailPage:
         self._render_overview_cards()
         self._render_overview_rest()
         await self._select_initial()
-        self.subscription = api.subscribe(self.run_id, agents=self._wanted_agents())
-        self.frame.client.on_delete(self._close)
-        ui.timer(PUMP_SECONDS, self._pump)
-        if self.status in NOT_BEGUN:
-            self.start_check = ui.timer(START_CHECK_SECONDS, self._check_start)
+        with self.root:
+            ui.timer(PUMP_SECONDS, self._pump)
+            self.reconcile_timer = ui.timer(
+                RECONCILE_SECONDS, self._reconcile_if_open, immediate=False
+            )
+            if self.status in NOT_BEGUN:
+                self.start_check = ui.timer(START_CHECK_SECONDS, self._check_start)
+        # back after sleep or a lost connection: compare with the run (V4, §6.6)
+        self.frame.client.on_connect(self._on_reconnect)
 
     def _close(self) -> None:
         if self.subscription is not None:
@@ -210,11 +246,13 @@ class RunDetailPage:
 
     async def _check_start(self) -> None:
         """A failed preparation leaves no folder and no event, so ask until the run has begun."""
-        if self.status not in NOT_BEGUN:
+        if self.shown_status not in NOT_BEGUN:
             self.start_check.deactivate()
             return
         try:
-            await self.api.get_run(self.run_id)
+            detail = await self.api.get_run(self.run_id)
+            if detail.run.status is not self.shown_status:
+                self.dirty.add("run")  # the start event may have come before the page
         except ApiException as exc:
             if exc.error.code is ErrorCode.START_FAILED:
                 self.start_check.deactivate()
@@ -337,6 +375,11 @@ class RunDetailPage:
                     "Pfad des Run-Ordners kopieren</button>",
                     tag="span",
                 ).mark("menu-copy")
+                # V8: „Neuer Run“ with everything of this run; it starts only there
+                raw(
+                    f'<a role="menuitem" href="{esc(repeat_href(run.id))}">{REPEAT_LABEL} …</a>',
+                    tag="span",
+                ).mark("repeat")
                 if not run.status.is_final:
                     label = "Nicht mehr anheften" if run.pinned else "Anheften"
                     item = ui.element("button").props('type="button" role="menuitem"')
@@ -376,7 +419,7 @@ class RunDetailPage:
 
     def _render_attention(self) -> None:
         """Banner „Wartet auf dich“ (at every width) and the hint „Fragen an dich“ (K13, K15)."""
-        failure = self._run_error_html() + self._scan_html()
+        failure = self.gone_html + self._run_error_html() + self._scan_html()
         top = self.detail.open_approvals_top
         questions = self.detail.questions_to_user
         first_q = next((m for m in self.questions.values() if "user" in m.to), None)
@@ -533,6 +576,9 @@ class RunDetailPage:
                 f"„{p['agent']}“ erscheint hier, sobald die Arbeitskopie bereit ist. Das dauert "
                 "meist nur Sekunden."
             )
+        elif p.get("ansicht") == "eingaben":
+            self._last_verlauf = ("kanal", self._default_channel())
+            await self.select("ansicht", "eingaben", push=False)
         elif p.get("ansicht") == "ablauf" or (
             self.status is RunStatus.FAILED and not p.get("kanal") and not p.get("nachricht")
         ):
@@ -609,6 +655,9 @@ class RunDetailPage:
         if kind == "ansicht" and value == "ablauf":
             self.tab = "ablauf"
             query = {"ansicht": "ablauf"}
+        elif kind == "ansicht" and value == "eingaben":
+            self.tab = "eingaben"
+            query = {"ansicht": "eingaben"}
         elif kind in ("ansicht", "ergebnis"):
             self.tab = "ergebnisse"
             query = {"ansicht": "ergebnisse"}
@@ -643,6 +692,9 @@ class RunDetailPage:
             self._render_channel_item(name)
         for agent_id, card in self.cards.items():
             card.select(self.tab == "verlauf" and self.selected == ("agent", agent_id))
+        if previous != self.selected and self.subscription is not None:
+            # before the view reads: its transcript events from now on wait in the queue
+            self.subscription.agents = self._wanted_agents()
         self._render_tabs()
         self.view_box.clear()
         with self.view_box:
@@ -650,6 +702,8 @@ class RunDetailPage:
                 self.view = ResultsView(self, result_id=result_id)
             elif self.tab == "ablauf":
                 self.view = LogView(self)
+            elif self.tab == "eingaben":
+                self.view = InputsView(self)
             elif self.selected[0] == "kanal":
                 self.view = ChannelView(self, self.channels[self.selected[1]], jump_to=msg_id)
             else:
@@ -660,8 +714,6 @@ class RunDetailPage:
                 self.view_box.clear()
                 self.view = None
                 raw(error_html(exc, retry_href=f"/runs/{self.run_id}"))
-        if previous != self.selected and self.subscription is not None:
-            self._resubscribe()
         if push:
             self.frame.js(f"arr.rd.pushUrl({_js(urlencode(query))})")
 
@@ -680,6 +732,7 @@ class RunDetailPage:
             tab("verlauf", "Verlauf")
             + tab("ergebnisse", f"Ergebnisse{count}")
             + tab("ablauf", "Ablauf")
+            + tab("eingaben", "Eingaben")
         )
 
     async def _on_select(self, event: Any) -> None:
@@ -857,6 +910,8 @@ class RunDetailPage:
         self._render_overview_cards()
         if isinstance(self.view, TranscriptView):
             self.view.refresh_waiting()
+        elif isinstance(self.view, ChannelView):
+            self.view.refresh_answer_hint()  # a question of the inbox came or went (W3-10.1)
 
     # --- actions ------------------------------------------------------------------------------
 
@@ -927,16 +982,23 @@ class RunDetailPage:
             alternative=("Stattdessen pausieren", self._pause) if can_pause else None,
         )
 
-    async def _refresh_run(self) -> None:
-        old = self.status
+    async def _refresh_run(self, *, structure: bool = False) -> None:
+        # the drawn status, not the last fetched one: a redraw that failed half way is redone
+        old = self.shown_status
         self.detail = await self.api.get_run(self.run_id)
         await self._load_approvals()
-        if old is not self.status or self.status in (RunStatus.QUEUED, RunStatus.PREPARING):
+        self._render_head()  # the head first: it tells the status even if the rest fails
+        if structure or old is not self.status or self.status in NOT_BEGUN:
             await self._sync_structure()
-        self._render_head()
+            self._render_head()  # turns and „n laufende Turns“ of the agents just read
         self._render_overview_cards()
         if old is self.status:
             return
+        await self._status_changed(old)
+        self.shown_status = self.status
+
+    async def _status_changed(self, old: RunStatus) -> None:
+        """The run's status changed since the page drew it: results, view, overview."""
         # the finalizer wrote the summary: it arrives without a result event
         self.results = await self.api.get_results(self.run_id)
         self._render_tabs()
@@ -949,7 +1011,7 @@ class RunDetailPage:
                 await self.select("msg", self.view.name, msg_id=self.view.jump_to, push=False)
             else:
                 self.view.refresh_status()
-        elif isinstance(self.view, ResultsView):
+        elif isinstance(self.view, ResultsView | InputsView):
             await self.view.refresh()
         self._render_overview_rest()
 
@@ -958,20 +1020,103 @@ class RunDetailPage:
     def _wanted_agents(self) -> set[str]:
         return {self.selected[1]} if self.selected[0] == "agent" else set()
 
-    def _resubscribe(self) -> None:
-        if self.subscription is not None:
-            self.subscription.close()
-        self.subscription = self.api.subscribe(self.run_id, agents=self._wanted_agents())
-
     async def _pump(self) -> None:
         if self.subscription is None:
             return
-        events = self.subscription.drain()
-        if not events:
+        for event in self.subscription.drain():
+            try:
+                await self._apply(event)
+            except Exception:  # noqa: BLE001 - one bad event must not stop the live view
+                log.warning("Run-Detail: ein Live-Ereignis ließ sich nicht anwenden", exc_info=True)
+                self.dirty.update({"run", "agents"})
+        if self.dirty and time.monotonic() >= self._retry_at:
+            await self._flush()
+
+    def _settled(self) -> bool:
+        """Nothing changes any more: final, and the secret scan has run (or long ago)."""
+        run = self.detail.run
+        if not self.shown_status.is_final:
+            return False
+        if run.secret_scan is not None:
+            return True
+        return run.ended_at is not None and self.api.now() - run.ended_at > SETTLE_SECONDS
+
+    async def _reconcile_if_open(self) -> None:
+        if not self._settled():
+            await self.reconcile()
+
+    async def _on_reconnect(self) -> None:
+        """NiceGUI calls this on every handshake; the first one only opens the page."""
+        self._connects += 1
+        if self._connects > 1:
+            await self.reconcile()
+
+    async def reconcile(self) -> None:
+        """Compare the page with the run and draw what it missed (V4, §6.6 „lädt die Lücke
+        nach“): status and head, agent cards, new messages of the open channel, new entries of
+        the open transcript. Cheap when nothing changed."""
+        if self._reconciling or self.subscription is None:
             return
-        for event in events:
-            await self._apply(event)
-        await self._flush()
+        self._reconciling = True
+        try:
+            detail = await self.api.get_run(self.run_id)
+            if _fingerprint(detail) != _fingerprint(self.detail) or (
+                detail.run.status is not self.shown_status
+            ):
+                self.dirty.add("run")
+            agents = {a.id: a for a in await self.api.list_agents(self.run_id)}
+            if agents.keys() != self.agents.keys():
+                self.dirty.add("agents")
+            else:
+                for agent in agents.values():
+                    self._update_agent(agent)
+            await self._catch_up_view()  # the pump draws what is dirty, never two at once
+            self._reconcile_failing = False
+        except ApiException as exc:
+            if exc.error.code is ErrorCode.NOT_FOUND:
+                self._folder_gone()
+            elif not self._reconcile_failing:  # once, not every 5 s
+                log.info("Run-Detail: Abgleich mit %s fehlgeschlagen", self.run_id, exc_info=True)
+                self._reconcile_failing = True
+        finally:
+            self._reconciling = False
+
+    def _folder_gone(self) -> None:
+        """The run folder vanished while the page was open: say so (§8.4), stop comparing."""
+        if self.gone_html:
+            return
+        log.warning("Run-Detail: Run-Ordner von %s nicht mehr lesbar", self.run_id, exc_info=True)
+        self.reconcile_timer.deactivate()
+        self.gone_html = banner_html(
+            "err",
+            f"Run-Ordner nicht lesbar: {self.run_id}.",
+            " Vermutlich wurde der Ordner außerhalb von arr verschoben oder gelöscht. Die "
+            f"Anzeige ist seit {fmt.clock(self.api.now())} nicht aktuell.",
+            [("Zu den Runs", "/runs"), ("Neu laden", f"/runs/{self.run_id}")],
+            small=True,
+        )
+        self._render_attention()
+
+    async def _catch_up_view(self) -> None:
+        """Messages or transcript entries the open view has not shown yet."""
+        view = self.view
+        if isinstance(view, ChannelView) and view.list is not None:
+            info = next(
+                (c for c in await self.api.list_channels(self.run_id) if c.name == view.name),
+                None,
+            )
+            if info is not None and (info.last_message_id or 0) > view.last_id:
+                page = await self.api.get_messages(
+                    self.run_id, view.name, since_id=view.last_id, limit=200
+                )
+                for msg in page.items:
+                    self._on_message(msg)
+        elif isinstance(view, TranscriptView) and view.list is not None and view.rows:
+            page = await self.api.get_transcript(
+                self.run_id, view.agent_id, from_seq=max(view.rows) + 1, limit=200
+            )
+            for ev in page.items:
+                view.on_event(ev)
 
     async def _apply(self, event: LiveEvent) -> None:
         if isinstance(event, UsageTickEvent):
@@ -1007,9 +1152,12 @@ class RunDetailPage:
 
     def _update_agent(self, agent: AgentState) -> None:
         old = self.agents.get(agent.id)
-        self.agents[agent.id] = agent
         card = self.cards.get(agent.id)
-        if card is not None:
+        if old == agent and card is not None and card.agent == agent:
+            return  # the card shows this state already (a duplicate event, the comparison)
+        self.agents[agent.id] = agent
+        if card is not None and card.agent != agent:
+            # against what the card has drawn, not against `self.agents` (W3-10.1, NB3)
             card.update(agent)
         if old is None or old.state is not agent.state:
             self.dirty.update({"order", "overview", "attention"})  # „n laufende Turns …“
@@ -1034,19 +1182,56 @@ class RunDetailPage:
                 self.detail.questions_to_user += 1
                 self.dirty.add("attention")
         self.channels[msg.channel] = info.model_copy(update=update)
+        asked = self.questions.get((msg.channel, msg.reply_to or 0))
+        if new and asked is not None and msg.sender in asked.to:
+            self.answered(msg.channel, asked.id)  # the addressee answered: the room closed it
         view = self.view
         if isinstance(view, ChannelView) and view.name == msg.channel:
             view.info = self.channels[msg.channel]
             view.add_live(msg)
             view.refresh_head()
+            if new and msg.open and "user" in msg.to:
+                view.refresh_answer_hint()
         self._render_channel_item(msg.channel)
 
+    def answered(self, channel: str, msg_id: int) -> None:
+        """A question is answered: out of the open questions, the hints and the counts."""
+        asked = self.questions.pop((channel, msg_id), None)
+        if asked is None:
+            return
+        info = self.channels.get(channel)
+        if info is not None:
+            open_now = max(0, info.open_questions - 1)
+            self.channels[channel] = info.model_copy(update={"open_questions": open_now})
+        if "user" in asked.to:
+            self.detail.questions_to_user = max(0, self.detail.questions_to_user - 1)
+            self.dirty.add("attention")
+        self.dirty.add("overview")
+        view = self.view
+        if isinstance(view, ChannelView) and view.name == channel:
+            view.info = self.channels.get(channel, view.info)
+            if msg_id in view.rows:  # the question row loses its „offen“
+                view.add_live(asked.model_copy(update={"open": False}))
+            view.refresh_head()
+            view.refresh_answer_hint()
+
     async def _flush(self) -> None:
+        """Draw what changed; a failure keeps all of it for the next try (V4)."""
         dirty, self.dirty = self.dirty, set()
+        try:
+            await self._draw(set(dirty))
+        except Exception:  # noqa: BLE001 - the page stays live and tries again
+            self.dirty |= dirty
+            self._retry_at = time.monotonic() + RETRY_SECONDS
+            log.warning("Run-Detail: Aktualisierung fehlgeschlagen, neuer Versuch", exc_info=True)
+
+    async def _draw(self, dirty: set[str]) -> None:
         new_stage = "stages" in dirty
         if "run" in dirty:
-            await self._refresh_run()
+            await self._refresh_run(structure="agents" in dirty)
             dirty -= {"meters", "stages", "attention"}
+        elif "agents" in dirty:
+            await self._sync_structure()
         if "approvals" in dirty:
             await self._refresh_approvals()
             dirty.add("overview")
@@ -1099,6 +1284,27 @@ def _show_decided(element: ui.element, message: str, *, positive: bool) -> None:
 def _js(value: str) -> str:
     """A Python string as a JavaScript string literal."""
     return json.dumps(value)
+
+
+def _fingerprint(detail: RunDetail) -> tuple[Any, ...]:
+    """What the head shows of a run, without the clock (time and costs come as ticks)."""
+    run = detail.run
+    top = detail.open_approvals_top
+    discussion = detail.discussion
+    return (
+        run.status,
+        run.status_since,
+        run.ended_at,
+        run.slimmed,
+        run.pinned,
+        run.secret_scan.model_dump_json() if run.secret_scan is not None else None,
+        run.error.message if run.error is not None else None,
+        (top.id, top.more) if top is not None else None,
+        detail.questions_to_user,
+        tuple(detail.actions_allowed),
+        discussion.model_dump_json() if discussion is not None else None,
+        tuple((s.key, s.status) for s in detail.stages),
+    )
 
 
 def register() -> None:

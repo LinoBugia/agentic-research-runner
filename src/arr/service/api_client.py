@@ -46,6 +46,7 @@ from arr.service.api_models import (
     RunAction,
     RunDetail,
     RunFilter,
+    RunInputs,
     RunResults,
     RunsPage,
     RunSummary,
@@ -306,6 +307,10 @@ class ApiClient(Protocol):
 
     async def get_changes(self, run_id: str) -> list[AgentChanges]:
         """File changes per agent [S]."""
+        ...
+
+    async def get_run_inputs(self, run_id: str) -> RunInputs:
+        """Inputs of a run and the input that repeats it (`GET /api/runs/{id}/inputs`, W3-10)."""
         ...
 
     async def list_profiles(self) -> list[ProfileInfo]:

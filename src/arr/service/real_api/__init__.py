@@ -5,7 +5,7 @@ It is assembled from areas, one class per module, each the border of a later ord
 
 - `runs` (`runs.py`, W3-01; W3-02 changes it): list_runs, get_run, run_action (pause, resume,
   stop), list_channels, get_messages, post_message, list_agents, get_transcript, get_results,
-  get_log, get_changes, resolve_run, start_run.
+  get_log, get_changes, get_run_inputs, resolve_run, start_run.
 - `live` (`live.py`, W3-01): subscribe, now; starts the watcher (`arr.service.watcher`).
 - `workfolder` (`workfolder.py`, W3-01): get_workfolder, get_counts, list_warnings.
 - `catalog` (`catalog.py`, W3-01, read only): list_projects, get_project, list_skills,
@@ -67,6 +67,7 @@ from arr.service.api_models import (
     RunAction,
     RunDetail,
     RunFilter,
+    RunInputs,
     RunResults,
     RunsPage,
     SetupState,
@@ -271,6 +272,9 @@ class RealApi:
 
     async def get_changes(self, run_id: str) -> list[AgentChanges]:
         return await self.runs.get_changes(run_id)
+
+    async def get_run_inputs(self, run_id: str) -> RunInputs:
+        return await self.runs.get_run_inputs(run_id)
 
     async def resolve_run(self, run_input: dict[str, Any]) -> ResolveResult:
         return await self.runs.resolve_run(run_input)

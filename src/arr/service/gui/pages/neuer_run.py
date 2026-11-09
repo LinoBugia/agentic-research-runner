@@ -10,17 +10,25 @@ locked while one is open; after unchecked typing it stays clickable and checks f
 `/neuer-run?skill=…&projekt=…` preselects; `/neuer-run?von=<approval>` adjusts a run start of
 Claude Code: same run ID, values from the request, your changes marked, „Freigeben und
 starten“ stores the decision as `adjust` with `changes` (docs/08 §5.2).
+
+`/neuer-run?wie=<run>` repeats a run („Wiederholen“, W3-10 V8; „Neu starten“ of §8.4): project,
+skill, parameters, task, the changes of the agents, limits and decider of that run, the name
+with „(Wiederholung)“. A project, skill or profile that is gone stays in the form and shows
+its error at the field (§8.4); nothing starts before „Run starten“.
 """
 
 import re
 from typing import Any
 
 from nicegui import ui
+from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
 from arr.models import Decider
 from arr.permissions.types import ApprovalStatus, ApprovalType, DecisionAction
 from arr.service.api_client import ApiClient
 from arr.service.api_models import (
+    REPEAT_SUFFIX,
     Action,
     ApiException,
     ApprovalItem,
@@ -31,6 +39,8 @@ from arr.service.api_models import (
     ProjectInfo,
     ResolveResult,
     RunFilter,
+    RunInputAgent,
+    RunInputs,
     RunStartAgent,
     SkillInfo,
     SkillKind,
@@ -183,6 +193,7 @@ class NeuerRunPage:
         self.want_skill = skill
         self.want_project = project
         self.item: ApprovalItem | None = None
+        self.repeat_of: RunInputs | None = None
         self.skills: dict[str, SkillInfo] = {}
         self.projects: list[ProjectInfo] = []
         self.profiles: list[ProfileInfo] = []
@@ -232,19 +243,18 @@ class NeuerRunPage:
         if self.von:
             item = await api.get_approval(self.von)
         elif self.wie:
-            detail = await api.get_run(self.wie)
-            self.want_project = detail.run.project
-            self.want_skill = detail.run.skill or NO_SKILL
-            self.template = {
-                "name": f"{detail.run.name} (neu)",
-                "task_md": detail.task_md or TASK_TEMPLATE,
-                "limits": {
-                    "wall_time_s": detail.run.limits.wall_time_s,
-                    "turns_per_agent": detail.run.limits.turns_per_agent,
-                    "budget_usd": detail.run.limits.budget_usd,
-                },
-                "decider": detail.decider.value,
+            inputs = self.repeat_of = await api.get_run_inputs(self.wie)
+            self.want_project = inputs.project
+            self.want_skill = inputs.skill or NO_SKILL
+            self.template = _copy(inputs.repeat) or {
+                # not prepared yet: what the folder already tells
+                "project": inputs.project,
+                "skill": inputs.skill or NO_SKILL,
+                "name": f"{inputs.name.removesuffix(REPEAT_SUFFIX)}{REPEAT_SUFFIX}",
+                "task_md": inputs.task_md or "",
             }
+            if not task_has_content(self.template.get("task_md") or ""):
+                self.template["task_md"] = TASK_TEMPLATE
         return {
             "projects": await api.list_projects(),
             "skills": await api.list_skills(SkillKind.GROUP),
@@ -295,6 +305,8 @@ class NeuerRunPage:
         self._init_input(data["runs"])
         if self.adjust:
             self._adjust_head()
+        elif self.repeat_of is not None:
+            self._repeat_head(self.repeat_of)
         with ui.element("div").classes("nr-grid").props("data-form-scope"):
             with ui.element("div"):
                 self._section_project()
@@ -397,6 +409,8 @@ class NeuerRunPage:
         skill: str | None = self.want_skill if self.want_skill in self.skills else None
         if skill is None and self.wie and self.want_skill == NO_SKILL:
             skill = NO_SKILL  # „wie dieser Run“ of a run without a skill
+        if self.repeat_of is not None:
+            skill = self.want_skill  # a skill that is gone shows its error (§8.4)
         if skill is None:
             used = [r.skill for r in runs if r.skill in self.skills]
             skill = used[0] if used else None
@@ -426,10 +440,11 @@ class NeuerRunPage:
                 },
                 "limits": {"wall_time_s": 20 * 60, "budget_usd": 3},
             }
-        if self.template:
-            limits = {k: v for k, v in self.template.pop("limits").items() if v}
+        if self.template:  # a repeat keeps its project and skill, also gone ones (§8.4)
+            limits = {k: v for k, v in (self.template.pop("limits", None) or {}).items() if v}
             self.input.update(self.template)
             self.input["limits"].update(limits)
+            self.input["agents"] = _copy(self.input.get("agents") or {})
 
     def _default_params(self, skill: str | None) -> dict[str, Any]:
         info = self.skills.get(skill)
@@ -453,6 +468,20 @@ class NeuerRunPage:
                 "</a></div>"
             )
 
+    def _repeat_head(self, inputs: RunInputs) -> None:
+        """„Wiederholung von …“ with what the repeat cannot take over (V8)."""
+        notes = "".join(f"<li>{esc(n)}</li>" for n in inputs.repeat_notes)
+        notes_html = f"<ul>{notes}</ul>" if notes else ""
+        with self.top:
+            raw(
+                f'<div class="banner info nr-repeat-notes" role="status">{icon("replay")}'
+                f'<div class="txt"><b>Wiederholung von „{esc(inputs.name)}“</b>Alles ist wie im '
+                f'Run <span class="mono">{esc(inputs.run_id)}</span> vorbelegt. Prüfe und ändere '
+                f"es hier; gestartet wird erst mit „Run starten“.{notes_html}</div>"
+                f'<a class="btn btn-sm" href="/runs/{esc(inputs.run_id)}?ansicht=eingaben">'
+                "Eingaben des Runs</a></div>"
+            ).mark("repeat-head")
+
     # --- sections --------------------------------------------------------------------------------
 
     def _section_project(self) -> None:
@@ -467,6 +496,11 @@ class NeuerRunPage:
             options = [(p.name, f"{p.name} – {p.title}") for p in self.projects]
             if self.adjust and self.input["project"] not in [p.name for p in self.projects]:
                 options.insert(0, (self.input["project"], self.input["project"]))
+            elif self.repeat_of is not None and self.input["project"] not in [
+                p.name for p in self.projects
+            ]:
+                gone = self.input["project"]
+                options.insert(0, (gone, f"{gone} – gibt es nicht mehr"))
             self.fields["project"] = Field(
                 "Projekt",
                 name="project",
@@ -488,9 +522,14 @@ class NeuerRunPage:
                 .props('role="radiogroup" aria-label="Skill"')
             ):
                 cards = [(s.name, s) for s in self.skills.values()] + [(NO_SKILL, None)]
+                gone = self.input["skill"]
+                if self.repeat_of is not None and gone and gone not in self.skills:
+                    cards.insert(0, (gone, None))  # the skill of the old run, gone since
                 for name, skill in cards:
                     title = name or "Ohne Skill"
-                    if skill is None:
+                    if skill is None and name:
+                        sub = "Diesen Skill gibt es im Workfolder nicht mehr."
+                    elif skill is None:
                         sub = "Ein Agent, Topologie solo. Weitere Agenten kommen später."
                     else:
                         n = skill.agents_count or "?"
@@ -833,6 +872,9 @@ class NeuerRunPage:
                 raw('<p class="small muted">Noch keine Agenten. Wähle oben einen Skill.</p>')
             return
         effort = {p: d.effort.value if d.effort else "–" for p, d in self.settings.defaults.items()}
+        resolved_effort = _efforts(self.result.resolved_run_yaml if self.result else "")
+        if not resolved_effort and self.repeat_of is not None:  # nothing resolves: the old run
+            resolved_effort = {a.id: a.effort.value for a in self.repeat_of.agents if a.effort}
         original = self.original.get("agents", {})
         with box, ui.element("table").classes("tbl compact nr-agents"):
             raw(
@@ -849,13 +891,16 @@ class NeuerRunPage:
                         model_cell = ui.element("td")
                         with model_cell:
                             self._model_select(agent)
+                            shown = resolved_effort.get(agent.id) or effort.get(agent.provider, "–")
                             raw(
-                                f"{esc(agent.profile)} · Effort "
-                                f"{esc(effort.get(agent.provider, '–'))}",
+                                f"{esc(agent.profile)} · Effort {esc(shown)}",
                                 tag="span",
                                 classes="info",
                             ).props(f'id="profile-{esc(agent.id)}"')
-                        self.agent_errors[agent.id] = raw("", tag="span")
+                            # inside the cell: a span between cells moved the columns (W3-10)
+                            self.agent_errors[agent.id] = raw("", tag="span").props(
+                                f'data-mark="agent-error-{esc(agent.id)}"'
+                            )
                         raw(
                             esc(WORKSPACE.get(agent.workspace_mode.value, "Kopie")), tag="td"
                         ).classes("wrap")
@@ -1092,7 +1137,9 @@ class NeuerRunPage:
         if not task_has_content(data["task_md"]):
             data["task_md"] = ""
         data["skill"] = data["skill"] or None
-        if self.adjust or self.settings is None:
+        if self.adjust or self.repeat_of is not None or self.settings is None:
+            # a repeat keeps every limit of the old run, also one equal to your standard: the
+            # skill could set another (V8: the same `run.yaml`)
             return data
         # only what you changed: limits of the skill and of `arr.yaml` keep their order (02 §3.3)
         std = self.settings.limits
@@ -1127,6 +1174,12 @@ class NeuerRunPage:
             else:
                 self._update_agent_marks(result.agents)
             self._render_channels(result)
+        elif self.repeat_of is not None and not self.agent_cells:
+            # nothing resolves (e.g. a profile of the skill is gone): the agents of the old run
+            # carry the errors at their rows (V8, §8.4)
+            old = [_start_agent(a) for a in self.repeat_of.agents]
+            if self._agents_changed(old):
+                self._render_agents(old)
         self.yaml_box.set_content(
             esc(result.resolved_run_yaml or "Die Vorschau erscheint, sobald alle Angaben passen.")
         )
@@ -1177,8 +1230,9 @@ class NeuerRunPage:
 
     def _shows_errors(self, field: Field) -> bool:
         """Errors stand at a field once it was left or after „Run starten“ (K7); a fresh form
-        has no red field. In „Anpassen“ the request is already filled in, so they show at once."""
-        return field.touched or self.tried_start or self.adjust
+        has no red field. In „Anpassen“ the request is already filled in, so they show at once;
+        the same for a repeat (V8): a project, skill or profile that is gone stands at once."""
+        return field.touched or self.tried_start or self.adjust or self.repeat_of is not None
 
     def _show_error(self, field: Field, message: str | None) -> None:
         field.set_error(message if self._shows_errors(field) else None)
@@ -1552,6 +1606,40 @@ def _duration_range(low: float, high: float) -> str:
     if high < 3600:
         return f"{int(low // 60)}–{int(high // 60)} min"
     return f"{fmt.decimal(low / 3600, 1)}–{fmt.decimal(high / 3600, 1)} h"
+
+
+def _start_agent(agent: RunInputAgent) -> RunStartAgent:
+    """An agent of the repeated run as a row of the table."""
+    return RunStartAgent(
+        id=agent.id,
+        role_label=agent.role_label,
+        provider=agent.provider,
+        vendor=agent.vendor,
+        model=agent.model,
+        model_label=agent.model_label,
+        profile=agent.profile,
+        tools={"shell": agent.shell, "web": agent.web},
+        read_dirs=list(agent.read_dirs),
+        workspace_mode=agent.workspace_mode,
+        skills=list(agent.skills),
+    )
+
+
+def _efforts(run_yaml: str) -> dict[str, str]:
+    """Effort per agent as the preview `run.yaml` holds it (also from `group.yaml` or a
+    repeat, W3-10); the table showed only the standard of `arr.yaml`."""
+    if not run_yaml:
+        return {}
+    try:
+        data = YAML(typ="safe").load(run_yaml)
+    except YAMLError:
+        return {}
+    agents = data.get("agents") if isinstance(data, dict) else None
+    return {
+        str(a["id"]): str(a["effort"])
+        for a in agents or []
+        if isinstance(a, dict) and a.get("id") and a.get("effort")
+    }
 
 
 def _copy(value: Any) -> Any:

@@ -360,3 +360,32 @@ section[id] { scroll-margin-top: calc(var(--top-h) + 16px); }
 .risk-line .dots { letter-spacing: 1px; margin-right: 2px; }
 .run-file { border-bottom: 1px dotted var(--border-strong); cursor: help; }
 .composer .cmp-suggest:not(:empty) { display: block; color: var(--text); }
+
+/* ---------- W3-10: inputs of a run (V9), „Wiederholen“ (V8), U9 ---------- */
+.menu-pop a[role="menuitem"] { display: block; padding: 6px 10px; border-radius: 4px; color: var(--text); text-decoration: none; }
+.menu-pop a[role="menuitem"]:hover, .menu-pop a[role="menuitem"]:focus-visible { background: var(--surface-2); }
+.in-view { display: flex; flex-direction: column; gap: 18px; }
+.in-view > * { flex-shrink: 0; } /* the task box must not shrink to nothing */
+.in-top { display: flex; align-items: center; gap: 12px; justify-content: space-between; flex-wrap: wrap; }
+.in-top p { margin: 0; }
+.in-sec { display: flex; flex-direction: column; gap: 8px; }
+.in-h { display: flex; align-items: center; gap: 10px; justify-content: space-between; }
+.in-h h2 { margin: 0; font-size: 15px; }
+.in-task h1 { font-size: 16px; margin: 0 0 6px; }
+.in-task h2 { font-size: 14px; margin: 12px 0 4px; }
+.in-task { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; background: var(--surface); max-height: 420px; overflow: auto; }
+.in-kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
+.in-kv dt { color: var(--text-2); font-size: 13px; }
+.in-kv dd { margin: 0; }
+.in-view .tbl .chip { margin: 0 4px 4px 0; }
+.in-yaml summary { cursor: pointer; padding: 4px 0; }
+.in-yaml pre { max-height: 480px; overflow: auto; white-space: pre; }
+.nr-repeat-notes { margin: 0 0 12px; }
+.nr-repeat-notes ul { margin: 4px 0 0; padding-left: 18px; }
+.nr-agents td .error { display: block; white-space: normal; max-width: 420px; font-size: 12px; color: var(--err); font-weight: 600; margin-top: 4px; }
+
+/* ---------- W3-10.1: „Antwort an X“ above the channel input ---------- */
+.cmp-answer { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 6px 16px; border-top: 1px solid var(--border); background: var(--surface); font-size: 13px; }
+.cmp-answer:empty { display: none; }
+.cmp-answer .txt { flex: 1; min-width: 0; }
+.cmp-answer.on { background: var(--surface-2); }

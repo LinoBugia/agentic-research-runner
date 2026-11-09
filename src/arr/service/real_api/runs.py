@@ -17,6 +17,7 @@ watcher has already seen; `_follow_delivery` publishes them again (W3-02).
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import os
 import re
@@ -27,6 +28,9 @@ from typing import Any
 
 from arr.errors import ArrError, ConfigError, ConfigIssue
 from arr.models import (
+    AgentConfig,
+    GroupChatConfig,
+    ParamSpec,
     ProfilesFile,
     Provider,
     ProviderDefaults,
@@ -36,8 +40,8 @@ from arr.models import (
     Starter,
     WorkfolderSettings,
 )
-from arr.permissions.policy import redact
-from arr.resolve import dump_yaml_model, validate_model
+from arr.permissions.policy import REDACTED, _redact_data, redact
+from arr.resolve import dump_yaml_model, load_group_spec, validate_model
 from arr.room.types import DeliveryStatus, MessageVia
 from arr.room.types import Message as RoomMessage
 from arr.runs.launch import Launch, plan_run_input, request_stop, reserve_run, run_launch
@@ -45,6 +49,7 @@ from arr.runs.manager import RunManager, set_run_status
 from arr.runs.prepare import _check_codex_toolchain, _make_plan
 from arr.service.api_client import count_active, count_runs_waiting
 from arr.service.api_models import (
+    REPEAT_SUFFIX,
     Action,
     ActionResult,
     AgentChanges,
@@ -65,6 +70,10 @@ from arr.service.api_models import (
     RunCounts,
     RunDetail,
     RunFilter,
+    RunInputAgent,
+    RunInputChannel,
+    RunInputParam,
+    RunInputs,
     RunResults,
     RunsPage,
     RunStartAgent,
@@ -150,7 +159,8 @@ def form_input(
     """A run input as `RunInput` data, start parameters and overrides per agent.
 
     The form of „Neuer Run“ sends `project`, `skill`, `name`, `task_md`, `params`, `agents` (per
-    agent `model`, `web`, `read_dirs`), `limits` (`wall_time_s`, `turns_per_agent`,
+    agent `model`, `web`, `read_dirs`; a repeat also `auth` and `effort`), `limits`
+    (`wall_time_s`, `turns_per_agent`,
     `budget_usd`) and `decider` (see `MockApi.resolve_run`); only what differs from the
     standards counts. The content of a run file has no `task_md` and passes as it is.
     """
@@ -249,6 +259,14 @@ def _agent_specs(
                     spec["auth"] = auth
                 if standard is not None and standard.effort:
                     spec["effort"] = standard.effort.value
+        # profile and effort of a run that is repeated (W3-10 V8): they win over the standards
+        if change.get("auth"):
+            spec["auth"] = change["auth"]
+        if "effort" in change:
+            if change["effort"]:
+                spec["effort"] = change["effort"]
+            else:
+                spec.pop("effort", None)
         if "web" in change:
             spec["tools"] = {**spec.get("tools", {}), "web": bool(change["web"])}
         if "read_dirs" in change:
@@ -289,6 +307,114 @@ def _delivery_settled(message: RoomMessage) -> bool:
     status = message.delivery.status if message.delivery is not None else None
     return status is DeliveryStatus.WOKEN or (
         status is DeliveryStatus.HINT_MID_TURN and len(message.to) == 1
+    )
+
+
+SECRET_NOTE = (
+    "Ein Wert der Eingaben (Name, Parameter, Agent oder Kanal) sah wie ein Geheimnis aus und "
+    f"steht hier als „{REDACTED}“; trag ihn bei Bedarf neu ein."
+)
+
+
+def _without_secrets(inputs: RunInputs) -> RunInputs:
+    """Every text of the answer through the secret filter (V9 „ein Secret steht nie darin“,
+    W3-10.1): names, parameter values, agents, channels and the repeat, not only the task.
+    `run.yaml` is filtered value by value (`_redact_yaml`) already."""
+    data = inputs.model_dump(mode="json", exclude={"run_yaml", "repeat_notes", "task_md"})
+    clean = _redact_data(data)
+    for agent in clean["agents"]:  # derived from the role file: „Sk-ant-…“ is no key any more
+        if agent.get("role"):
+            agent["role_label"] = role_label(agent["role"], agent["role_label"])
+    notes = list(inputs.repeat_notes)
+    if clean != data:  # the task in `repeat` is filtered already and does not count again
+        notes.append(SECRET_NOTE)
+    return RunInputs.model_validate(
+        {**clean, "task_md": inputs.task_md, "run_yaml": inputs.run_yaml, "repeat_notes": notes}
+    )
+
+
+def _redact_yaml(text: str) -> str:
+    """`redact` for each value of a YAML file: across lines, `fake-auth` followed by the next
+    key looks like the flag `-auth <value>` and would hide the next line."""
+    if "PRIVATE KEY-----" in text:
+        text = redact(text)  # a key block spans lines
+    out = []
+    for line in text.splitlines(keepends=True):
+        key, sep, value = line.partition(": ")
+        out.append(f"{key}{sep}{redact(value)}" if sep else redact(line))
+    return "".join(out)
+
+
+def _keep_origin(launch: Launch, origin: ResolvedRun) -> Launch:
+    """Agents changed in the form keep `base_id` and `replica` of the skill (W3-10 V8).
+
+    The changes make them explicit agents of the run, which would turn `m-1` of `m: count 2`
+    into its own base: another role name in the prompt and another `run.yaml` than the same
+    run without changes.
+    """
+    before = {a.id: a for a in origin.agents}
+    agents = [
+        a.model_copy(update={"base_id": before[a.id].base_id, "replica": before[a.id].replica})
+        if a.id in before
+        else a
+        for a in launch.resolved.agents
+    ]
+    resolved = launch.resolved.model_copy(update={"agents": agents})
+    return dataclasses.replace(launch, resolved=resolved)
+
+
+def _agent_choice(agent: AgentConfig) -> dict[str, Any]:
+    """What „Neuer Run“ can set per agent, as a change of the form (`_agent_specs`)."""
+    return {
+        "model": agent.model,
+        "auth": agent.auth,
+        "effort": agent.effort.value if agent.effort is not None else None,
+        "web": agent.tools.web,
+        "read_dirs": [str(d) for d in agent.read_dirs],
+    }
+
+
+def _agent_rest(agent: AgentConfig) -> tuple[Any, ...]:
+    """What the form cannot set: it comes from the skill."""
+    return (agent.role, agent.workspace, tuple(agent.skills), agent.tools.shell)
+
+
+def _input_agent(agent: AgentConfig) -> RunInputAgent:
+    return RunInputAgent(
+        id=agent.id,
+        role_label=role_label(agent.role, agent.base_id),
+        role=agent.role,
+        provider=agent.provider,
+        vendor=vendor_of(agent.provider),
+        model=agent.model,
+        model_label=model_label(agent.model),
+        profile=agent.auth,
+        effort=agent.effort,
+        workspace_mode=agent.workspace.mode,
+        workspace_name=agent.workspace.name,
+        web=agent.tools.web,
+        shell=agent.tools.shell,
+        read_dirs=[str(d) for d in agent.read_dirs],
+        skills=list(agent.skills),
+        channels=list(agent.channels),
+    )
+
+
+def _input_channel(channel: GroupChatConfig) -> RunInputChannel:
+    return RunInputChannel(
+        name=channel.name,
+        purpose=channel.purpose,
+        members=list(channel.members),
+        mode=channel.mode,
+        order=channel.order.value,
+        moderator=channel.moderator,
+        open_from=channel.open_from,
+        anonymous=channel.anonymous,
+        wake_on=[w.value for w in channel.wake_on],
+        debounce_s=channel.debounce_s,
+        idle_after_s=channel.idle_after_s,
+        quiet_after_s=channel.quiet_after_s,
+        max_wakeups_per_agent=channel.max_wakeups_per_agent,
     )
 
 
@@ -450,6 +576,155 @@ class RunsArea:
     async def get_log(self, run_id: str) -> list[LogEntry]:
         return log_entries(self._record(run_id))
 
+    async def get_run_inputs(self, run_id: str) -> RunInputs:
+        """What the run was started with (V9) and the input of „Neuer Run“ that repeats it
+        (V8): `run.yaml`, `task.md`, the parameters with the docs of the skill."""
+        record = self._record(run_id)
+        return await asyncio.to_thread(lambda: _without_secrets(self._run_inputs(record)))
+
+    def _run_inputs(self, record: RunRecord) -> RunInputs:
+        meta = record.meta
+        resolved = record.load_resolved()
+        project = resolved.project if resolved is not None else (meta.project if meta else "")
+        skill = resolved.skill if resolved is not None else (meta.skill if meta else None)
+        topology = resolved.topology.kind if resolved is not None else None
+        name = (meta.name if meta else None) or (
+            f"{skill or (topology.value if topology else 'solo')} · {project}"
+        )
+        task = record.task_md
+        task_md = redact(task) if task is not None else None
+        if resolved is None:
+            return RunInputs(
+                run_id=record.run_id,
+                name=name,
+                available=False,
+                project=project,
+                skill=skill,
+                task_md=task_md,
+            )
+        specs = self._param_specs(skill)
+        params = [
+            RunInputParam(
+                name=key,
+                value=value,
+                default=specs[key].default if key in specs else None,
+                doc=specs[key].doc if key in specs else None,
+                changed=key in specs and specs[key].default != value,
+            )
+            for key, value in resolved.params.items()
+        ]
+        limits = resolved.limits
+        wall = int(limits.wall_time.total_seconds()) if limits.wall_time else None
+        try:
+            text = (record.run_dir / "run.yaml").read_text("utf-8")
+        except OSError:
+            text = None
+        repeat, notes = self._repeat_input(resolved, name, task_md or "")
+        if task is not None and task_md != task:
+            notes.append(
+                "Die Aufgabe enthielt etwas, das wie ein Geheimnis aussieht. Es ist hier durch "
+                "einen Platzhalter ersetzt; trag es bei Bedarf neu ein."
+            )
+        return RunInputs(
+            run_id=record.run_id,
+            name=name,
+            available=True,
+            project=project,
+            skill=skill,
+            topology=topology,
+            task_md=task_md,
+            params=params,
+            agents=[_input_agent(a) for a in resolved.agents],
+            channels=[_input_channel(c) for c in resolved.groupchats],
+            limits={
+                "wall_time_s": wall,
+                "turns_per_agent": limits.turns_per_agent,
+                "budget_usd": limits.budget_usd,
+            },
+            decider=resolved.approvals.decider,
+            approval_timeout_s=int(resolved.approvals.timeout.total_seconds()),
+            run_yaml=_redact_yaml(text) if text is not None else None,
+            repeat=repeat,
+            repeat_notes=notes,
+        )
+
+    def _param_specs(self, skill: str | None) -> dict[str, ParamSpec]:
+        """Declared parameters of the skill as it is now; none without the skill."""
+        if not skill:
+            return {}
+        info = discover_skills(self.state.workfolder / "skills").skills.get(skill)
+        if info is None or info.group_file is None:
+            return {}
+        try:
+            return dict(load_group_spec(info.group_file).params)
+        except ArrError:
+            return {}
+
+    def _repeat_input(
+        self, resolved: ResolvedRun, name: str, task_md: str
+    ) -> tuple[dict[str, Any], list[str]]:
+        """The form input that gives the same `run.yaml` (V8), with what it cannot carry.
+
+        Project, skill, parameters, task, limits and decider go as they are. For the agents
+        only what differs from the skill as it resolves now goes as a change, so a run
+        without changes repeats with none. Without that resolution (project, skill or profile
+        gone) every agent keeps its model, profile, effort, web and read folders; the form
+        then shows the missing piece at its field (docs/08 §8.4).
+        """
+        limits = resolved.limits
+        data: dict[str, Any] = {
+            "project": resolved.project,
+            "skill": resolved.skill or "",
+            "name": f"{name.removesuffix(REPEAT_SUFFIX)}{REPEAT_SUFFIX}",  # not twice
+            "task_md": task_md,
+            "params": dict(resolved.params) if resolved.skill else {},
+            "agents": {},
+            "limits": {
+                "wall_time_s": int(limits.wall_time.total_seconds()) if limits.wall_time else None,
+                "turns_per_agent": limits.turns_per_agent,
+                "budget_usd": limits.budget_usd,
+            },
+            "decider": resolved.approvals.decider.value,
+        }
+        notes: list[str] = []
+        try:
+            base = self._plan({**data, "skill": data["skill"] or None}).resolved
+        except (ArrError, OSError):
+            base = None
+        now = {a.id: a for a in base.agents} if base is not None else {}
+        for agent in resolved.agents:
+            current = now.get(agent.id)
+            if base is not None and current is None:
+                notes.append(
+                    f"Den Agenten „{agent.id}“ gibt es im Skill nicht mehr; die Wiederholung "
+                    "läuft ohne ihn."
+                )
+                continue
+            wanted = _agent_choice(agent)
+            have = _agent_choice(current) if current is not None else {}
+            change = {k: v for k, v in wanted.items() if have.get(k) != v}
+            if change:
+                data["agents"][agent.id] = change
+            if current is not None and _agent_rest(current) != _agent_rest(agent):
+                notes.append(
+                    f"Rolle, Arbeitsordner oder Skills von „{agent.id}“ kommen jetzt aus dem "
+                    "Skill und weichen vom alten Run ab."
+                )
+        if base is not None:
+            old_ids = {a.id for a in resolved.agents}
+            for agent_id in now:
+                if agent_id not in old_ids:
+                    notes.append(
+                        f"„{agent_id}“ ist neu im Skill und läuft in der Wiederholung mit."
+                    )
+            if [c.model_dump(mode="json") for c in base.groupchats] != [
+                c.model_dump(mode="json") for c in resolved.groupchats
+            ]:
+                notes.append(
+                    "Die Gruppenchats kommen aus dem Skill und haben sich seitdem geändert."
+                )
+        return data, notes
+
     async def get_changes(self, run_id: str) -> list[AgentChanges]:
         return agent_changes(self._record(run_id))
 
@@ -570,6 +845,7 @@ class RunsArea:
                 sender="user",
                 kind=request.kind,
                 to=list(request.to),
+                reply_to=getattr(request, "reply_to", None),  # `PostReplyRequest` (W3-10.1)
                 via=MessageVia.GUI,
             )
         except ArrError as exc:
@@ -676,7 +952,7 @@ class RunsArea:
                 data["groupchats"] = [c.model_dump(mode="json") for c in resolved.groupchats]
                 data["stages"] = [s.model_dump(mode="json") for s in resolved.stages]
                 data["raters"] = list(resolved.raters)
-                launch = plan()
+                launch = _keep_origin(plan(), resolved)
             _check_prepared(launch)
         except ConfigError as exc:
             raise _named(exc, ids) from None
