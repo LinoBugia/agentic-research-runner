@@ -1,6 +1,6 @@
 # agentic research runner (`arr`)
 
-> 🚧 **Under construction.** The agent core works and the user interface is on its way. Interfaces, commands and file formats may change at any time, so `arr` isn't ready for production use yet.
+> 🚧 **Under construction.** The agent core and the web interface work; the MCP server for Claude Code is being built. Interfaces, commands and file formats may change at any time, so `arr` isn't ready for production use yet.
 
 AI agents are now proving real mathematics. OpenAI has published 721 manuscripts on open research problems in [openai/math](https://github.com/openai/math) (as of October 2026). About 42% of the main results are formalized in Lean, and OpenAI cautions that some of the others may still have issues. For its [Navier–Stokes solution](https://openai.com/index/navier-stokes-solution/), OpenAI reports running a system of coordinated agents: a group of roughly 10,000 concurrently active agents that talked to each other and ran code, all monitored and isolated. Both efforts relied on unreleased internal models.
 
@@ -14,13 +14,14 @@ A single model is quick to agree with itself about a proof. A group with clear r
 
 Setups like [OpenProver](https://github.com/Kripner/openprover), where a planner coordinates the proof search and hands subtasks to workers, map naturally onto the roles of a research group. `arr` doesn't do formal verification in Lean yet.
 
-`arr` will also be available as an MCP server, so you can use it right from an agent like Claude. You keep working with your mathematical companion the way you always have, just with more behind it: your agent can spawn groups of workers to attack a problem, send them off to explore different ideas, check on their progress and read the results. This part is planned for wave 4.
+`arr` will also be available as an MCP server, so you can use it right from an agent like Claude. You keep working with your mathematical companion the way you always have, just with more behind it: your agent can spawn groups of workers to attack a problem, send them off to explore different ideas, check on their progress and read the results. This part is being built in wave 4.
 
 ## What `arr` does
 
 - **Mixed groups:** Claude and Codex agents work together in one run, each with its own role and working folder.
 - **Group chats:** Agents talk in channels, ask each other direct questions and share files. A question reaches an agent even in the middle of its work.
 - **Workflows:** Solo work, round-table discussions, or a waterfall with ratings and rework rounds.
+- **Web interface:** Start runs, follow agents and chats live, step in, decide approvals and answer the agents' questions in your browser.
 - **Full record:** Every run records who did what and when: transcripts, chats, results, file changes and costs.
 - **Safety:** Agents run in a sandbox and can only read and write what they're allowed to. Risky steps such as installing packages need your approval, and every run ends with a scan for leaked secrets.
 - **Local:** Everything runs on your machine. Credentials stay in the macOS keychain or your existing logins.
@@ -38,20 +39,21 @@ Agents in `arr` work on hard, sometimes unsolvable problems for hours, without c
 | 0 | Foundations and technical groundwork | ✅ done |
 | 1 | Core library and clickable prototype | ✅ done |
 | 2 | Real agents: mixed runs from the CLI | ✅ done |
-| 3 | Service and UI with real data | 🚧 in progress |
-| 4 | MCP server for Claude Code, ready-made group skills | planned |
-| 5 | Polish, onboarding, robustness | planned |
+| 3 | Service and UI with real data | ✅ done |
+| 4 | MCP server for Claude Code, ready-made group skills | 🚧 in progress |
+| 5 | Hardening (separate macOS user for agents), onboarding, polish | planned |
 
 The [plan diagram](umsetzung/Codeplan_Ablauf.md) (in German) shows how the work packages fit together. The user interface and CLI messages are also in German for now.
 
 ## Try it
 
-`arr` is developed on macOS with Python 3.12 and [uv](https://docs.astral.sh/uv/). Instructions for real runs will follow once setup through the UI is finished. You'll need your own Claude or ChatGPT access for those.
+`arr` is developed on macOS with Python 3.12 and [uv](https://docs.astral.sh/uv/). Real runs need your own Claude or ChatGPT access; step-by-step instructions follow with the onboarding in wave 5.
 
 ```bash
 uv sync                                         # set up the environment
 uv run arr --help                               # list commands
 uv run arr info                                 # version, Python, platform
+uv run arr serve                                # start the local web interface
 uv run pytest                                   # tests (no real models)
 uv run ruff check && uv run ruff format --check # linter and format
 ```
