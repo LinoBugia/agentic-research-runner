@@ -323,7 +323,10 @@ class RealApi:
         return await self.profiles.remove_login(name, dry_run)
 
     async def get_profile_usage(self, name: str) -> ProfileUsage:
-        return self.profile_usage.get(name)
+        import asyncio  # here, so W4-00 B8 changes this file in one place only
+
+        # many large transcripts take seconds cold: never on the event loop (W4-00 B8)
+        return await asyncio.to_thread(self.profile_usage.get, name)
 
     async def start_login(self, name: str) -> LoginStart:
         return await self.profiles.start_login(name)

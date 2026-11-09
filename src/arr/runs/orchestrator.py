@@ -107,6 +107,8 @@ class StopReason(StrEnum):
 
     USER = "user"
     LIMIT = "limit"
+    PROFILE_BLOCKED = "profile_blocked"
+    """The Not-Aus: a profile of the run was blocked (W4-00 B11); a stop like the user's."""
 
 
 class LimitKind(StrEnum):
@@ -118,6 +120,23 @@ class LimitKind(StrEnum):
 
 
 _AGENT_LIMIT_TEXT = "Dieser Agent hat seine Turns aufgebraucht (turns_per_agent)."
+
+
+def blocked_text(profile: str) -> str:
+    """The reason of a run the Not-Aus stopped (W4-00 B11): run detail, summary.md, inbox."""
+    return f"Gestoppt: Profil „{profile}“ wurde gesperrt (Not-Aus)."
+
+
+def stopped_text(entries: Sequence[Mapping[str, Any]], *, ran: bool) -> str:
+    """Why a `stopped` run stopped, from its `stop` entries in `orchestrator.jsonl`."""
+    for entry in entries:
+        data = entry.get("data") or {}
+        blocked = data.get("reason") == StopReason.PROFILE_BLOCKED
+        profile = data.get("profile")
+        if entry.get("kind") == "stop" and blocked and isinstance(profile, str) and profile:
+            return blocked_text(profile)
+    return "Der User hat den Run gestoppt." if ran else "Der Run wurde vor dem Start gestoppt."
+
 
 _LIMIT_TEXT = {
     LimitKind.WALL_TIME: "Die Gesamtlaufzeit des Runs ist erreicht.",
@@ -402,6 +421,8 @@ class Orchestrator(RunContext):
         """`wait_until` in a row that ended by their deadline (`wait_guard.until_streak`, L10)."""
         self._turn_marks: dict[str, int] = {}
         """Newest message ID when the agent's latest turn began: its inbox showed all up to it."""
+        self._turn_starts: dict[str, float] = {}
+        """Unix time at which the agent's latest turn began (W4-00 B14)."""
         self._questions: dict[int, str] = {}
         """Open questions to the user (L16): message ID → item of the approval inbox."""
         self._last_seen = 0
@@ -596,6 +617,7 @@ class Orchestrator(RunContext):
         self._yielding.pop(agent_id, None)
         self.room.reset_wait_guard(agent_id)
         since, mark = time.time(), self.last_message_id()
+        self._turn_starts[agent_id] = since
         self._set_status(handle, AgentStatus.WORKING)
         loop = asyncio.get_running_loop()
         active = _ActiveTurn(
@@ -821,7 +843,8 @@ class Orchestrator(RunContext):
         if self.wall_end is not None:
             until = min(until, self.wall_end)
         mark = self._turn_marks.get(handle.id, 0)
-        self._long_waits[handle.id] = LongWait(until, wait.file, wait.result_from, wait.since, mark)
+        since = self._result_since(handle.id, wait)
+        self._long_waits[handle.id] = LongWait(until, wait.file, wait.result_from, since, mark)
         self._set_status(handle, AgentStatus.WAITING)
         if wait.result_from is not None:
             self.log.write(
@@ -837,6 +860,14 @@ class Orchestrator(RunContext):
                 "waiting", agent=handle.id, reason=WaitKind.UNTIL.value, until=until, file=wait.file
             )
         self.log.write("wake_scheduled", agent=handle.id, reason="timeout", due=until)
+
+    def _result_since(self, agent_id: str, wait: WaitState) -> float:
+        """From when a result of the awaited agent counts (W4-00 B14): from the beginning of
+        the waiting agent's turn, not from its `wait_until`. A result that came in this turn
+        before the call is the one it waits for, so it wakes the agent at once with it;
+        `result_missing` („ohne ein neues Ergebnis“) never hides a result of this turn. A
+        result from before the turn stays old (S22)."""
+        return min(wait.since, self._turn_starts.get(agent_id, wait.since))
 
     def _end_long_wait(self, agent_id: str) -> None:
         self._long_waits.pop(agent_id, None)
@@ -1190,12 +1221,21 @@ class Orchestrator(RunContext):
 
     def close_user_questions(self, note: str) -> None:
         """The run ends: questions to the user nobody answered are closed (L16), in the inbox
-        and in the room (nobody answers them any more)."""
+        and in the room (nobody answers them any more).
+
+        The log says `closed` for every question it closes in the room (W4-00 B15), also when
+        a stop or a limit made the inbox item `obsolete` already (`cancel_all`); then with the
+        `reason` `stopped` or `limit`.
+        """
+        reason = None
+        if self._stop_reason is not None:
+            reason = "limit" if self._limit is not None else "stopped"
         for msg_id, item_id in list(self._questions.items()):
             del self._questions[msg_id]
             self.room.close_question(msg_id)
-            if self.inbox.close_question(item_id, note):
-                self.log.write("user_question", msg=msg_id, item=item_id, state="closed")
+            if self.inbox.close_question(item_id, note) or reason is not None:
+                extra = {"reason": reason} if reason is not None else {}
+                self.log.write("user_question", msg=msg_id, item=item_id, state="closed", **extra)
 
     def _close_user_questions_of(self, agent_id: str, note: str, reason: str) -> None:
         """The agent worked on without the user's answer: its open questions to the user close
@@ -1405,8 +1445,11 @@ class Orchestrator(RunContext):
             self.log.write("limit", limit=self._limit.value, **info)
             note = _LIMIT_TEXT[self._limit]
         else:
-            self.log.write("stop", reason=StopReason.USER.value, **info)
-            note = "Der Run wurde gestoppt."
+            reason = self._stop_reason or StopReason.USER
+            self.log.write("stop", reason=reason.value, **info)
+            profile = info.get("profile")
+            blocked = reason is StopReason.PROFILE_BLOCKED and isinstance(profile, str)
+            note = blocked_text(profile) if blocked else "Der Run wurde gestoppt."
         self.inbox.cancel_all(note)  # before interrupt(): Codex ignores it while a handler waits
         self._runnable.set()
         self.halted.set()

@@ -24,11 +24,12 @@ from service_kit import make_run_folder, make_workfolder, start_run_process, tra
 from arr.errors import ArrError
 from arr.models import AuthProfile, ProfilesFile, RunStatus
 from arr.resolve import load_yaml_model
+from arr.runs.inspect import run_status
 from arr.runs.launch import LiveFactory, plan_launch, refuse_disabled, run_launch
 from arr.runs.orchestrator import OrchestratorLog
 from arr.runs.prepare import load_run_meta
 from arr.runs.secret_scan import SCAN_KIND
-from arr.service.api_models import ApiException, CreateProfileRequest, ErrorCode
+from arr.service.api_models import ApiException, CreateProfileRequest, ErrorCode, RunAction
 from arr.service.real_api import RealApi
 from arr.service.real_api.profile_usage import NOTE
 from arr.usage import AgentUsage, RunUsage, UsageTotal
@@ -209,6 +210,27 @@ def test_a_missing_file_leaves_the_known_block(arr_home: Path) -> None:
         refuse_disabled(["fake-auth"], ProfilesFile(profiles=[blocked]))
 
 
+def test_w4_00_b14_the_text_names_a_way_that_exists_in_the_gui(arr_home: Path) -> None:
+    """The way named in the text is in the navigation and on the settings page, with a field
+    to pick another profile (review W3-06, B14: „nimm ein anderes Profil“ had no place)."""
+    from arr.service.gui.layout import NAV
+    from arr.service.gui.pages.einstellungen import SECTIONS
+
+    arr_home.mkdir(parents=True, exist_ok=True)
+    blocked = AuthProfile(name="fake-auth", kind="claude_oauth", disabled=True)
+    with pytest.raises(ArrError) as caught:
+        refuse_disabled(["fake-auth"], ProfilesFile(profiles=[blocked]))
+    text = str(caught.value)
+    assert "nimm ein anderes Profil" not in text
+    pages = {entry[3] for entry in NAV if entry}
+    sections = {title for _anchor, title in SECTIONS if title}
+    assert "„Auth-Profile“" in text and "Auth-Profile" in pages
+    assert "„Einstellungen → Standards und Limits“" in text
+    assert "Einstellungen" in pages and "Standards und Limits" in sections
+    source = (Path(__file__).parents[1] / "src/arr/service/gui/pages/einstellungen.py").read_text()
+    assert 'name=f"defaults.{provider.value}.auth"' in source, "the field to pick a profile"
+
+
 async def test_no_test_and_no_login_on_a_blocked_profile(api: RealApi) -> None:
     await api.disable_profile("fake-auth")
     with pytest.raises(ApiException, match="ist gesperrt") as error:
@@ -246,7 +268,7 @@ async def test_a_run_of_the_service_stops_with_finalizer_and_scan(api: RealApi, 
     assert preview.runs == [run_id]
     result = await api.disable_profile("fake-auth")
     assert result.ok and result.runs == [run_id] and result.failed_runs == []
-    assert "1 Runs werden gestoppt" in result.message
+    assert "1 laufender Run wird gestoppt" in result.message
     await eventually(lambda: status_of(wf, run_id) is RunStatus.STOPPED, within=15)
     run_dir = wf / "runs" / run_id
     await eventually(lambda: scanned(run_dir), within=15)
@@ -375,6 +397,9 @@ async def test_one_blocked_profile_of_several_is_enough(wf: Path, arr_home: Path
     result = await asyncio.wait_for(running, 15)
     assert result.status is RunStatus.STOPPED
     assert "Das Profil „fake-b“ wurde gesperrt: Der Run wird gestoppt …" in lines
+    # W4-00 B11: the run names the profile, also when only the file told it
+    summary = (result.run_dir / "output" / "summary.md").read_text("utf-8")
+    assert "Gestoppt: Profil „fake-b“ wurde gesperrt (Not-Aus)." in summary
 
 
 async def test_a_run_goes_on_while_the_file_cannot_be_read(
@@ -395,6 +420,116 @@ async def test_a_run_goes_on_while_the_file_cannot_be_read(
     path.write_text(good.replace("claude_oauth}", "claude_oauth, disabled: true}", 1))
     result = await asyncio.wait_for(running, 15)
     assert result.status is RunStatus.STOPPED, "the block works again after the outage"
+
+
+BLOCKED = "Gestoppt: Profil „fake-auth“ wurde gesperrt (Not-Aus)."
+
+
+async def test_w4_00_b11_the_run_names_the_blocked_profile(api: RealApi, wf: Path) -> None:
+    """Run detail (summary and log), `summary.md`, `arr runs status` and the log entry."""
+    run_id = (await api.start_run(RUN_INPUT)).run_id
+    await eventually(lambda: status_of(wf, run_id) is RunStatus.RUNNING, within=15)
+    await api.disable_profile("fake-auth")
+    await eventually(lambda: status_of(wf, run_id) is RunStatus.STOPPED, within=15)
+    run_dir = wf / "runs" / run_id
+    await eventually(lambda: scanned(run_dir), within=15)
+    entries = OrchestratorLog(run_dir).entries()
+    [stop] = [e for e in entries if e["kind"] == "stop"]
+    assert stop["data"]["reason"] == "profile_blocked" and stop["data"]["profile"] == "fake-auth"
+    summary = (run_dir / "output" / "summary.md").read_text("utf-8")
+    assert f"- **Grund:** {BLOCKED}" in summary and "Der User" not in summary
+    assert run_status(run_dir).reason == BLOCKED
+    assert BLOCKED in (await api.get_results(run_id)).summary_md
+    texts = [entry.text for entry in await api.get_log(run_id)]
+    assert any(t.startswith("Profil „fake-auth“ wurde gesperrt (Not-Aus).") for t in texts)
+
+
+async def test_w4_00_b11_a_stop_by_the_user_stays_the_users(api: RealApi, wf: Path) -> None:
+    run_id = (await api.start_run(RUN_INPUT)).run_id
+    await eventually(lambda: status_of(wf, run_id) is RunStatus.RUNNING, within=15)
+    await api.run_action(run_id, RunAction.STOP)
+    run_dir = wf / "runs" / run_id
+    await eventually(lambda: scanned(run_dir), within=15)
+    assert run_status(run_dir).reason == "Der User hat den Run gestoppt."
+    [stop] = [e for e in OrchestratorLog(run_dir).entries() if e["kind"] == "stop"]
+    assert stop["data"]["reason"] == "user" and "profile" not in stop["data"]
+
+
+async def test_w4_00_b11_a_stop_before_the_agents_names_the_profile(
+    wf: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocked while the run is still being prepared: no agent ran, the reason says why."""
+    from arr.runs import manager as manager_module
+
+    lines: list[str] = []
+    managers: list[Any] = []
+    real_setup = manager_module.RunManager._setup
+
+    async def slow_setup(self: Any) -> None:
+        write_block(arr_home, "fake-auth")
+        self.stop()  # what the watcher does a moment later
+        await real_setup(self)
+
+    monkeypatch.setattr(manager_module.RunManager, "_setup", slow_setup)
+    running = await launch_with(wf, LONG, lines, on_manager=managers.append)
+    result = await asyncio.wait_for(running, 15)
+    assert result.status is RunStatus.STOPPED
+    summary = (result.run_dir / "output" / "summary.md").read_text("utf-8")
+    assert BLOCKED in summary
+
+
+@pytest.mark.parametrize(
+    ("ids", "preview", "stopping", "failing", "unsaved"),
+    [
+        (
+            ["r1"],
+            "1 laufender Run würde gestoppt.",
+            "1 laufender Run wird gestoppt, danach",
+            "1 Run ließ sich nicht stoppen: r1. Beende den Prozess im Terminal.",
+            "Nicht stoppen ließ sich: r1. Beende ihn im Terminal.",
+        ),
+        (
+            ["r1", "r2"],
+            "2 laufende Runs würden gestoppt.",
+            "2 laufende Runs werden gestoppt, danach",
+            "2 Runs ließen sich nicht stoppen: r1, r2. Beende die Prozesse im Terminal.",
+            "Nicht stoppen ließen sich: r1, r2. Beende sie im Terminal.",
+        ),
+    ],
+)
+async def test_w4_00_b12_one_run_and_more_runs(
+    api: RealApi,
+    monkeypatch: pytest.MonkeyPatch,
+    ids: list[str],
+    preview: str,
+    stopping: str,
+    failing: str,
+    unsaved: str,
+) -> None:
+    profiles = api.profiles
+    failed: list[str] = []
+
+    async def stop_runs(_ids: list[str]) -> list[str]:
+        return list(failed)
+
+    monkeypatch.setattr(profiles, "_run_ids", lambda _name: list(ids))
+    monkeypatch.setattr(profiles, "_stop_runs", stop_runs)
+    assert (await api.disable_profile("fake-auth", dry_run=True)).message == preview
+    assert stopping in (await api.disable_profile("fake-auth")).message
+    failed[:] = ids
+    assert failing in (await api.disable_profile("fake-auth")).message
+    cause = ApiException.of(ErrorCode.UNAVAILABLE, "Die Datei ist gesperrt.")
+    text = profiles._unsaved_block("fake-auth", cause, ids, ids, None).message
+    assert unsaved in text and "Runs ließen" not in text.replace(failing, "")
+    text = profiles._unsaved_block("fake-auth", cause, ids, [], None).message
+    word = "1 laufender Run hier wird" if len(ids) == 1 else "2 laufende Runs hier werden"
+    assert f"{word} trotzdem gestoppt." in text
+
+
+def test_w4_00_b12_the_dialog_counts_right() -> None:
+    from arr.service.gui.pages.profile import running_runs
+
+    assert (running_runs(1), running_runs(2)) == ("1 laufender Run", "2 laufende Runs")
 
 
 async def test_a_second_stop_through_the_block_changes_nothing(api: RealApi, wf: Path) -> None:
@@ -460,7 +595,8 @@ async def test_a_block_that_cannot_be_written_still_stops_the_runs_here(
     result = await api.disable_profile("fake-auth")
     assert not result.ok and result.runs == [run_id]
     assert "nicht gesperrt" in result.message and "ließ sich nicht speichern" in result.message
-    assert "trotzdem gestoppt (1)" in result.message and "anderen Workfoldern" in result.message
+    assert "1 laufender Run hier wird trotzdem gestoppt." in result.message
+    assert "anderen Workfoldern" in result.message
     assert result.profile is not None and not result.profile.disabled
     assert not disabled_in_file(arr_home, "fake-auth")
     await eventually(lambda: status_of(wf, run_id) is RunStatus.STOPPED, within=15)

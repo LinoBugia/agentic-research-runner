@@ -640,7 +640,7 @@ def test_bridge_never_raises() -> None:
         params = command_request()["params"]
         assert bridge("item/commandExecution/requestApproval", params) == {"decision": "decline"}
         assert bridge("item/fileChange/requestApproval", None) == {"decision": "decline"}
-        assert bridge("something/new", {}) == {}
+        assert bridge("something/new", {})["code"] == -32601  # an error, never {} (W4-00 H1)
     finally:
         loop.call_soon_threadsafe(loop.stop)
         runner.join(2)
@@ -876,3 +876,174 @@ def test_w3_00_1_g1_warning_names_variant_2_causes(caplog) -> None:
     codex_config._check_size(codex_config.ENTRIES_WARN, 100, "R")
     assert "kürzere Projekt- und Skill-Namen" in caplog.text
     assert "archiv" not in caplog.text.casefold()
+
+
+# -- W4-00: H1 (JSON-RPC error for unknown methods), H2 (unknown fields in commands) ---------
+
+
+def sent(kit: Kit, request_id: int) -> dict[str, Any]:
+    """What went out to the app-server as the answer to one server request."""
+    payloads = [
+        p for c in kit.codexes for p in c._client._sync.written if p.get("id") == request_id
+    ]
+    assert len(payloads) == 1, payloads
+    return payloads[0]
+
+
+def is_rpc_error(payload: dict[str, Any], code: int) -> bool:
+    """A JSON-RPC error and nothing the app-server could read as a result."""
+    error = payload.get("error")
+    return (
+        "result" not in payload
+        and isinstance(error, dict)
+        and error.get("code") == code
+        and isinstance(error.get("message"), str)
+        and bool(error["message"])
+    )
+
+
+@pytest.mark.parametrize("method", ["currentTime/read", "item/somethingNew/requestApproval"])
+async def test_w4_00_h1_unknown_method_gets_a_json_rpc_error(setup, method) -> None:
+    """`currentTime/read` exists in 0.163.0 (experimental API) but is not one arr answers."""
+    script = simple_turn()
+    script.insert(1, {"id": 61, "method": method, "params": {"threadId": THREAD}})
+    backend, kit, inbox = setup([script])
+    await backend.start()
+    events = await play(backend)
+    answer = sent(kit, 61)
+    assert is_rpc_error(answer, -32601), answer
+    assert answer == {"id": 61, "error": answer["error"]}  # id and error, nothing else
+    # the user and the log still learn of it
+    refused = [e for e in events if e.kind is EventKind.ERROR]
+    assert len(refused) == 1 and f"„{method}“ abgelehnt" in refused[0].data["message"]
+    assert refused[0].raw["answer"] == {"error": answer["error"]}
+    assert not inbox.items() and events[-1].data["status"] == "ok"
+
+
+_OLD_REFUSALS = {"item/tool/call": {"contentItems": [], "success": False}}
+
+
+async def test_w4_00_h1_countertest_the_old_empty_result_is_caught(setup, monkeypatch) -> None:
+    """With the answer before W4-00 (`{}`), `is_rpc_error` above fails."""
+    from arr.backends import codex_approvals
+
+    monkeypatch.setattr(codex_approvals, "refusal", lambda m: dict(_OLD_REFUSALS.get(m, {})))
+    script = simple_turn()
+    script.insert(1, {"id": 62, "method": "currentTime/read", "params": {}})
+    backend, kit, _ = setup([script])
+    await backend.start()
+    await play(backend)
+    assert sent(kit, 62) == {"id": 62, "result": {}}
+    assert not is_rpc_error(sent(kit, 62), -32601)
+
+
+@pytest.mark.parametrize("method", ["account/chatgptAuthTokens/refresh", "attestation/generate"])
+async def test_w4_00_h1_token_requests_get_an_error_not_an_empty_token(setup, method) -> None:
+    """Their answers require a token; `{}` was no refusal in the protocol either."""
+    script = simple_turn()
+    script.insert(1, {"id": 63, "method": method, "params": {"reason": "unauthorized"}})
+    backend, kit, _ = setup([script])
+    await backend.start()
+    await play(backend)
+    assert is_rpc_error(sent(kit, 63), -32000)
+
+
+async def test_w4_00_h1_known_refusals_and_decisions_stay_results(setup) -> None:
+    script = simple_turn()
+    script.insert(1, {"id": 64, "method": "item/tool/call", "params": {}})
+    script.insert(1, command_request())
+    backend, kit, _ = setup([script], decider=Decider(DecisionAction.ALLOW))
+    await backend.start()
+    await play(backend)
+    assert sent(kit, 64) == {"id": 64, "result": {"contentItems": [], "success": False}}
+    assert sent(kit, 7) == {"id": 7, "result": {"decision": "accept"}}
+
+
+def real_command_params(**changes: Any) -> dict[str, Any]:
+    """A command request as Codex 0.163.0 sends it (S2 §10, with the experimental fields)."""
+    params: dict[str, Any] = {
+        "kind": "command",
+        "threadId": THREAD,
+        "turnId": TURN,
+        "itemId": "exec-1",
+        "startedAtMs": 1762700000000,
+        "environmentId": "local",
+        "approvalId": None,
+        "reason": "Ich brauche sympy.",
+        "command": "/bin/zsh -lc 'pip install sympy'",
+        "cwd": "work",
+        "commandActions": [{"type": "unknown", "command": "pip install sympy"}],
+        "proposedExecpolicyAmendment": ["/bin/zsh", "-lc", "pip install sympy"],
+        "proposedNetworkPolicyAmendments": None,
+        "networkApprovalContext": None,
+        "additionalPermissions": None,
+        "availableDecisions": ["accept", "cancel"],
+    }
+    params.update(changes)
+    return params
+
+
+async def _command(setup, params: dict[str, Any]) -> tuple[Kit, ApprovalInbox]:
+    script = simple_turn()
+    script.insert(1, {"id": 7, "method": "item/commandExecution/requestApproval", "params": params})
+    backend, kit, inbox = setup([script], decider=Decider(DecisionAction.ALLOW))
+    await backend.start()
+    await play(backend)
+    await asyncio.sleep(0.05)
+    return kit, inbox
+
+
+def steered(kit: Kit) -> list[str]:
+    return [line for line in kit.log if line.startswith("steer")]
+
+
+async def test_w4_00_h2_a_real_command_request_reaches_the_inbox(setup) -> None:
+    kit, inbox = await _command(setup, real_command_params())
+    assert sent(kit, 7)["result"] == {"decision": "accept"}
+    assert len(inbox.items()) == 1 and not steered(kit)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"sandboxPermissions": "require_escalated"},  # a new top-level field
+        {"writableRoots": ["/Users/someone"]},
+        {"networkApprovalContext": {"host": "pypi.org", "protocol": "https", "port": 22}},
+        {"networkApprovalContext": "pypi.org"},  # not readable
+    ],
+)
+async def test_w4_00_h2_unknown_fields_are_refused_without_asking(setup, changes) -> None:
+    kit, inbox = await _command(setup, real_command_params(**changes))
+    assert sent(kit, 7)["result"] == {"decision": "decline"}
+    assert not inbox.items()  # nobody was asked
+    assert any("Feld, das arr nicht kennt" in line for line in steered(kit))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"fileSystem": {"write": ["/Users/someone/.ssh"]}},
+        {"network": {"enabled": True}},
+        {},
+    ],
+)
+async def test_w4_00_h2_extra_permissions_are_refused_without_asking(setup, extra) -> None:
+    kit, inbox = await _command(setup, real_command_params(additionalPermissions=extra))
+    assert sent(kit, 7)["result"] == {"decision": "decline"}
+    assert not inbox.items()
+    assert any("additionalPermissions" in line for line in steered(kit))
+
+
+async def test_w4_00_h2_countertest_without_the_check_the_field_reaches_the_inbox(
+    setup, monkeypatch
+) -> None:
+    """The check is what refuses: without it the same request is asked and accepted."""
+    from arr.backends import codex_approvals
+
+    monkeypatch.setattr(
+        codex_approvals,
+        "COMMAND_PARAM_FIELDS",
+        frozenset(real_command_params()) | {"writableRoots"},
+    )
+    kit, inbox = await _command(setup, real_command_params(writableRoots=["/x"]))
+    assert sent(kit, 7)["result"] == {"decision": "accept"} and inbox.items()

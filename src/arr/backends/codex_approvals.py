@@ -14,8 +14,12 @@ It runs in the client's reader thread and blocks it while it waits, so:
   into a running process) or carries neither a command nor a network host cannot be checked
   and is declined (W2-02.1 M4).
 - **All other requests** are answered explicitly with a refusal, never with the SDK default
-  (which accepts): extra permissions, MCP elicitations, user input, legacy approvals. Each of
-  them is reported to `on_refused` (method, params, answer) for an event with `raw`.
+  (which accepts): extra permissions, MCP elicitations, user input, legacy approvals. A method
+  without a well-formed negative answer, above all one arr does not know, gets a JSON-RPC
+  error, never `{}` (W4-00, H1). Each of them is reported to `on_refused` (method, params,
+  answer) for an event with `raw`.
+- **Unknown fields** in a shell or file request are refused without asking (W4-00, H2): the
+  field lists are held against the schema of the pinned Codex version.
 - **A stop while it waits** (`cancel_waiting`) ends the wait first with a `decline`; only then
   can the client deliver the answer to `turn/interrupt`.
 """
@@ -27,6 +31,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from arr.backends.codex_sdk import RpcError
 from arr.models import Provider
 from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.types import (
@@ -44,6 +49,11 @@ logger = logging.getLogger(__name__)
 COMMAND = "item/commandExecution/requestApproval"
 FILE_CHANGE = "item/fileChange/requestApproval"
 
+SCHEMA_VERSION = "0.163.0"
+"""Codex version whose app-server schema the method and field lists below are held against
+(`codex app-server generate-json-schema --experimental`; arr starts the client with the SDK's
+default `experimentalApi: true`). `tests/test_codex_schema.py` turns red on another version."""
+
 _REFUSALS: dict[str, dict[str, Any]] = {
     "item/permissions/requestApproval": {"permissions": {}, "scope": "turn"},
     "mcpServer/elicitation/request": {"action": "decline", "content": None},
@@ -54,9 +64,22 @@ _REFUSALS: dict[str, dict[str, Any]] = {
 }
 """Well-formed negative answers to the server requests arr does not act on (W3-06.5, Punkt 5):
 extra permissions, MCP elicitations, user input, a dynamic tool call (arr runs no tool for
-the app-server), and the legacy approval methods. `account/chatgptAuthTokens/refresh` and
-`attestation/generate` are answered with `{}` (no token): arr never hands out a credential, and
-the app-server uses its own `CODEX_HOME`. Every one is also surfaced to the user as an error."""
+the app-server), and the legacy approval methods. Every one is also surfaced to the user as an
+error."""
+
+CREDENTIAL_METHODS = frozenset({"account/chatgptAuthTokens/refresh", "attestation/generate"})
+"""Requests for a token. Their answers require one, so there is no well-formed refusal: arr
+answers with a JSON-RPC error (it never hands out a credential, and the app-server uses its own
+`CODEX_HOME`)."""
+
+KNOWN_METHODS = frozenset({COMMAND, FILE_CHANGE, *_REFUSALS, *CREDENTIAL_METHODS})
+"""Server requests arr answers on purpose; every other method gets `METHOD_NOT_FOUND`."""
+
+METHOD_NOT_FOUND = -32601
+"""JSON-RPC 2.0 „Method not found“: the method is not one arr answers (H1)."""
+
+REFUSED = -32000
+"""JSON-RPC 2.0 implementation-defined error: a known request arr refuses on purpose."""
 
 _UNCHECKED = "Die Anfrage konnte nicht geprüft werden und gilt als abgelehnt."
 _UNCHECKABLE = (
@@ -82,6 +105,34 @@ CHANGE_KIND_FIELDS = frozenset({"type", "move_path"})
 CHANGE_KINDS = frozenset({"add", "delete", "update"})
 """Kinds of change arr understands; `update` may carry `move_path`."""
 
+COMMAND_PARAM_FIELDS = frozenset(
+    {
+        "additionalPermissions",
+        "approvalId",
+        "availableDecisions",
+        "command",
+        "commandActions",
+        "cwd",
+        "environmentId",
+        "itemId",
+        "kind",
+        "networkApprovalContext",
+        "proposedExecpolicyAmendment",
+        "proposedNetworkPolicyAmendments",
+        "reason",
+        "startedAtMs",
+        "threadId",
+        "turnId",
+    }
+)
+"""Fields of `CommandExecutionRequestApprovalParams` in the pinned Codex version (schema with
+the experimental fields, W4-00 H2). A field beyond these could change what an approved command
+may do, so arr refuses the request. arr answers only `accept` or `decline`, so the proposed
+amendments and `availableDecisions` never take effect."""
+
+NETWORK_CONTEXT_FIELDS = frozenset({"host", "protocol"})
+"""Fields of `NetworkApprovalContext` (schema): the host arr checks and its protocol."""
+
 _FILE_UNREADABLE = (
     "Diese Datei-Änderung lässt sich nicht vollständig lesen und ist deshalb abgelehnt. Lege "
     "deine Dateien einzeln mit einem Add-Patch im Arbeitsordner an."
@@ -104,13 +155,27 @@ _FILE_GRANT_ROOT = (
     "„grantRoot“ (dauerhaftes Schreibrecht für einen ganzen Ordner) ist nicht erlaubt, auch "
     "nicht mit Freigabe. Schreibe einzelne Dateien in deinem Arbeitsordner."
 )
+_COMMAND_UNKNOWN_FIELD = (
+    "Diese Befehlsanfrage enthält ein Feld, das arr nicht kennt und das die Rechte des Befehls "
+    "ändern könnte. Sie ist abgelehnt. Führe den Befehl ohne Sonderrechte in deinem "
+    "Arbeitsordner aus."
+)
+_COMMAND_EXTRA_PERMISSIONS = (
+    "Zusätzliche Rechte für einen Befehl („additionalPermissions“) sind nicht erlaubt, auch "
+    "nicht mit Freigabe. Führe den Befehl ohne Sonderrechte in deinem Arbeitsordner aus."
+)
 
 
 def refusal(method: str) -> dict[str, Any]:
-    """The refusing answer to a server request (`decline` for shell and file requests)."""
+    """The refusing answer to a server request: `decline` for shell and file requests, a
+    well-formed negative result where the protocol has one, otherwise a JSON-RPC error."""
     if method in (COMMAND, FILE_CHANGE):
         return {"decision": "decline"}
-    return dict(_REFUSALS.get(method, {}))
+    if method in _REFUSALS:
+        return dict(_REFUSALS[method])
+    if method in CREDENTIAL_METHODS:
+        return RpcError(REFUSED, f"arr refuses {method}: it hands out no credentials")
+    return RpcError(METHOD_NOT_FOUND, f"Method not found: arr does not answer {method}")
 
 
 def _deny(reason: str) -> Decision:
@@ -164,9 +229,10 @@ class ApprovalBridge:
 
     def _answer(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == COMMAND:
-            if not self._checkable(params):
-                logger.info("Nicht prüfbare Befehlsanfrage von %s abgelehnt", self.agent_id)
-                self.on_denied(_UNCHECKABLE)
+            reason = self._command_refusal(params)
+            if reason is not None:
+                logger.info("Befehlsanfrage von %s abgelehnt: %s", self.agent_id, reason)
+                self.on_denied(reason)
                 return refusal(method)
             request = self._command_request(params)
         elif method == FILE_CHANGE:
@@ -190,11 +256,27 @@ class ApprovalBridge:
         return {"decision": "decline"}
 
     @staticmethod
-    def _checkable(params: dict[str, Any]) -> bool:
+    def _command_refusal(params: dict[str, Any]) -> str | None:
+        """Why a shell request is refused without asking, or None (W2-02.1 M4, W4-00 H2).
+
+        Like a file request: an unknown field, also inside `networkApprovalContext`, and any
+        extra permissions are refused before the request reaches the inbox.
+        """
+        network = params.get("networkApprovalContext")
+        if set(params) - COMMAND_PARAM_FIELDS:
+            return _COMMAND_UNKNOWN_FIELD
+        if network is not None and (
+            not isinstance(network, dict) or set(network) - NETWORK_CONTEXT_FIELDS
+        ):
+            return _COMMAND_UNKNOWN_FIELD
+        if params.get("additionalPermissions") is not None:
+            return _COMMAND_EXTRA_PERMISSIONS
         if params.get("kind") not in (None, "command"):
-            return False
-        host = (params.get("networkApprovalContext") or {}).get("host")
-        return bool(str(params.get("command") or "").strip() or host)
+            return _UNCHECKABLE
+        host = (network or {}).get("host")
+        if not (str(params.get("command") or "").strip() or host):
+            return _UNCHECKABLE
+        return None
 
     def _request(self, **fields: Any) -> PermissionRequest:
         return PermissionRequest(

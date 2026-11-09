@@ -228,8 +228,9 @@ def refuse_disabled(names: Iterable[str], known: ProfilesFile) -> None:
         ) from None
     if blocked:
         raise ArrError(
-            f"Das Profil „{blocked[0]}“ ist gesperrt, der Agent läuft nicht an. Entsperre es auf "
-            "der Seite „Auth-Profile“ oder nimm ein anderes Profil."
+            f"Das Profil „{blocked[0]}“ ist gesperrt, der Agent läuft nicht an. Entsperre es "
+            "unter „Auth-Profile“ oder wähle unter „Einstellungen → Standards und Limits“ ein "
+            "anderes Profil als Standard."
         )
 
 
@@ -898,7 +899,10 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
             limit = str(data.get("limit"))
             return "Limit erreicht: " + LIMIT_TEXT.get(limit, limit)
         case "stop":
-            return "Stopp: laufende Turns werden unterbrochen, danach läuft der Finalizer."
+            text = "Stopp: laufende Turns werden unterbrochen, danach läuft der Finalizer."
+            if data.get("reason") == "profile_blocked" and data.get("profile"):
+                text = f"Profil „{data['profile']}“ wurde gesperrt (Not-Aus). {text}"
+            return text
         case "pause":
             return f"Pause ({data.get('reason')}): neue Turns warten."
         case "resume":

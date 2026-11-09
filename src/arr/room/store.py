@@ -140,7 +140,9 @@ CONVERSATION_RULES = (
     "Behauptungen mit Begründung oder Beleg: Datei, Rechnung, Anhang.",
     "Beantworte Fragen an dich zuerst.",
     "Wer jemanden fragt, schreibt `@name` (oder `to`); `@alle` fragt alle, `@user` den User "
-    "(nur er antwortet darauf). Auf eine Antwort wartest du mit `wait_for_messages`.",
+    "(nur er antwortet darauf). Auf eine Antwort wartest du mit `wait_for_messages`, auf den "
+    "User nie mit `wait_until`: Antwortet er nicht, arbeite mit einer begründeten Annahme weiter "
+    "und nenne sie in deinem Ergebnis.",
     "Widerspruch als `objection` mit `reply_to`, sachlich und konkret.",
     "Nicht wiederholen. Zustimmung nur, wenn sie etwas hinzufügt.",
     "Lange Inhalte (Beweise, Code, Tabellen) als Anhang, im Text nur die Kernaussage.",
@@ -1888,6 +1890,11 @@ class AgentRoom:
                 f"@{wanted} nach: Eine Nachricht weckt auch einen fertigen Agenten."
             )
         return agent
+
+    def asked_the_user(self) -> bool:
+        """True while a question of mine to the user is open (V10, W4-00): then waiting is
+        not advised, a reasoned assumption is."""
+        return any(q.sender == self.agent_id for q in self.store.open_user_questions())
 
     def wait_guard(self) -> WaitGuard:
         """My row of `wait_guard` (defaults without one)."""

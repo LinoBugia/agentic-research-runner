@@ -51,6 +51,13 @@ def tokens(count: int | None) -> str:
     return str(count)
 
 
+def exact(count: int | None) -> str:
+    """Exact number with a thousands dot, for the record per profile (W4-00 B13): `1.081`."""
+    if count is None:
+        return "–"
+    return f"{count:,}".replace(",", ".")
+
+
 def size(num_bytes: int | None) -> str:
     """Decimal units: `0 B`, `38 MB`, `2,3 GB`, `1,2 TB`."""
     if num_bytes is None:
