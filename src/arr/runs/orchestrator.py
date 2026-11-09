@@ -122,6 +122,18 @@ class LimitKind(StrEnum):
 _AGENT_LIMIT_TEXT = "Dieser Agent hat seine Turns aufgebraucht (turns_per_agent)."
 
 
+PROFILE_SHOWN_MAX = 64
+"""A profile name from `orchestrator.jsonl` is shown at most this long (W4-00.1, B5)."""
+
+
+def profile_shown(value: Any) -> str | None:
+    """The profile of a `stop` entry as text for people: only a non-empty string, cut to
+    `PROFILE_SHOWN_MAX` characters; None for anything else."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value if len(value) <= PROFILE_SHOWN_MAX else value[: PROFILE_SHOWN_MAX - 1] + "…"
+
+
 def blocked_text(profile: str) -> str:
     """The reason of a run the Not-Aus stopped (W4-00 B11): run detail, summary.md, inbox."""
     return f"Gestoppt: Profil „{profile}“ wurde gesperrt (Not-Aus)."
@@ -132,8 +144,8 @@ def stopped_text(entries: Sequence[Mapping[str, Any]], *, ran: bool) -> str:
     for entry in entries:
         data = entry.get("data") or {}
         blocked = data.get("reason") == StopReason.PROFILE_BLOCKED
-        profile = data.get("profile")
-        if entry.get("kind") == "stop" and blocked and isinstance(profile, str) and profile:
+        profile = profile_shown(data.get("profile"))
+        if entry.get("kind") == "stop" and blocked and profile is not None:
             return blocked_text(profile)
     return "Der User hat den Run gestoppt." if ran else "Der Run wurde vor dem Start gestoppt."
 

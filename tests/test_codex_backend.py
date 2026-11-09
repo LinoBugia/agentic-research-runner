@@ -1045,5 +1045,65 @@ async def test_w4_00_h2_countertest_without_the_check_the_field_reaches_the_inbo
         "COMMAND_PARAM_FIELDS",
         frozenset(real_command_params()) | {"writableRoots"},
     )
+    kinds = codex_approvals.COMMAND_PARAM_KINDS | {"writableRoots": frozenset({"array"})}
+    monkeypatch.setattr(codex_approvals, "COMMAND_PARAM_KINDS", kinds)
     kit, inbox = await _command(setup, real_command_params(writableRoots=["/x"]))
     assert sent(kit, 7)["result"] == {"decision": "accept"} and inbox.items()
+
+
+# -- W4-00.1 Punkt 2 (B1): the kind of each value, as in the schema -------------------------
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"networkApprovalContext": {"host": ["pypi.org", "evil.example"], "protocol": "https"}},
+        {"networkApprovalContext": {"host": {"a": 1}, "protocol": "https"}},
+        {"networkApprovalContext": {"host": "pypi.org", "protocol": 443}},
+        {"command": ["rm", "-rf", "/"]},
+        {"command": {"x": 1}},
+        {"command": 5},
+        {"cwd": 123},
+        {"cwd": ["/"]},
+        {"itemId": {"a": 1}},
+        {"reason": {"a": 1}},
+        {"kind": {"type": "command"}},
+        {"startedAtMs": "1762700000000"},
+        {"startedAtMs": True},
+        {"availableDecisions": "accept"},
+        {"approvalId": 7},
+    ],
+)
+async def test_w4_00_1_b1_a_value_of_the_wrong_kind_is_refused(
+    setup, changes, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Refused without asking, with a reason for the agent, no stack trace, nothing turned
+    into text for the inbox (`attack_h2_bridge.py`)."""
+    kit, inbox = await _command(setup, real_command_params(**changes))
+    assert sent(kit, 7)["result"] == {"decision": "decline"}
+    assert not inbox.items(), "nobody was asked"
+    assert any("Wert, den arr nicht lesen kann" in line for line in steered(kit))
+    assert not [r for r in caplog.records if r.exc_info], "no stack trace in the log"
+
+
+async def test_w4_00_1_b1_countertest_without_the_check_a_list_host_is_asked(
+    setup, monkeypatch
+) -> None:
+    """Without the kind check the list is no longer refused for its kind (before: it reached
+    the inbox as the text "['pypi.org', 'evil.example']")."""
+    from arr.backends import codex_approvals
+
+    monkeypatch.setattr(codex_approvals, "_kinds_ok", lambda values, kinds: True)
+    host = {"host": ["pypi.org", "evil.example"], "protocol": "https"}
+    kit, _ = await _command(setup, real_command_params(networkApprovalContext=host))
+    assert not any("Wert, den arr nicht lesen kann" in line for line in steered(kit))
+
+
+async def test_w4_00_1_b1_right_kinds_and_nulls_still_reach_the_inbox(setup) -> None:
+    network = {"host": "pypi.org", "protocol": "https"}
+    kit, inbox = await _command(
+        setup, real_command_params(networkApprovalContext=network, command=None, cwd=None)
+    )
+    assert sent(kit, 7)["result"] == {"decision": "accept"}
+    [item] = inbox.items()
+    assert item.request.hosts == ["pypi.org"] and item.request.command == ""

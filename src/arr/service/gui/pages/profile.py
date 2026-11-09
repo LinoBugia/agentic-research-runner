@@ -159,7 +159,8 @@ def _workfolders_html(usage: ProfileUsage) -> str:
         for f in usage.workfolders
         if f.problem is not None
     )
-    return f'<p class="small muted" style="margin-top:8px">{text}</p>{problems}'
+    head = f'<p class="small muted" style="margin-top:8px">{text}</p>' if text else ""
+    return f"{head}{problems}"
 
 
 def usage_html(usage: ProfileUsage, now: float) -> str:

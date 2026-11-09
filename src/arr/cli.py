@@ -173,6 +173,9 @@ def run(
     except ArrError as exc:
         _fail(str(exc))
     typer.echo(f"Workfolder: {launch.workfolder}")
+    from arr.service.state import record_workfolder
+
+    record_workfolder(launch.workfolder)  # for „Nachweis je Profil“ (W4-00.1); never raises
     try:
         result = asyncio.run(run_launch(launch, decider=TerminalDecider(), report=typer.echo))
     except ArrError as exc:

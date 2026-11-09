@@ -324,3 +324,18 @@ async def test_runs_stop_from_a_second_process_ends_a_running_run(m1: Path) -> N
     assert "Stopp angefordert" not in status.output
     assert not (run_dir / STOP_REQUEST).exists(), "no request stays behind (W2-05.3)"
     assert json.loads((run_dir / "meta.json").read_text())["status"] == "stopped"
+
+
+def test_w4_00_1_arr_run_records_its_workfolder(m1: Path, arr_home: Path) -> None:
+    """Punkt 1: a run of `arr run` puts its workfolder into the list of known workfolders,
+    before the first agent starts; the recent list of the GUI stays as it was."""
+    from arr.service.state import known_workfolders_file, recent_workfolders
+
+    result = runner.invoke(app, ["run", "run.yaml"])
+    assert result.exit_code == 0, result.output
+    known = json.loads(known_workfolders_file().read_text("utf-8"))["workfolders"]
+    assert known == [str(m1)]
+    assert recent_workfolders() == [], "„zuletzt geöffnet“ is the service's"
+    [run_dir] = run_dirs(m1)
+    started = min(e["ts"] for e in log_entries(run_dir, "turn"))
+    assert known_workfolders_file().stat().st_mtime <= started

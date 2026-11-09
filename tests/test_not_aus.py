@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 from pydantic import SecretStr
-from run_kit import FAST, eventually, fake_builders, say, turns, wait, write_profiles
+from run_kit import FAST, eventually, fake_builders, post, say, turns, wait, write_profiles
 from service_kit import make_run_folder, make_workfolder, start_run_process, transcript_line
 
 from arr.errors import ArrError
@@ -908,3 +908,87 @@ async def test_200_runs_stay_under_a_second(api: RealApi, wf: Path, tmp_path: Pa
     t20, t200 = min(times[20]), min(times[200])
     assert t200 <= RATIO_MAX * t20, f"200 Runs {t200:.3f} s, 20 Runs {t20:.3f} s: nicht linear"
     assert t200 <= CEILING_S, f"200 Runs {t200:.3f} s"
+
+
+# --------------------------------------------------------------------------------------------
+# W4-00.1: B4, B5, B7
+# --------------------------------------------------------------------------------------------
+
+
+async def test_w4_00_1_b4_an_open_item_closes_with_the_not_aus_note(
+    wf: Path, arr_home: Path
+) -> None:
+    """The open question to the user becomes `obsolete` with the reason of the Not-Aus, not
+    „Der Run wurde gestoppt.“ (R13)."""
+    lines: list[str] = []
+    ask = post("main", "@user Welches Band?", kind="question")
+    running = await launch_with(wf, {"a": turns([ask, wait(60)])}, lines)
+
+    def asked() -> bool:
+        files = list((wf / "runs").glob("*/approvals.jsonl"))
+        return bool(files) and '"open"' in files[0].read_text("utf-8")
+
+    await eventually(asked, within=15)
+    write_block(arr_home, "fake-auth")
+    result = await asyncio.wait_for(running, 15)
+    assert result.status is RunStatus.STOPPED
+    text = (result.run_dir / "approvals.jsonl").read_text("utf-8")
+    entries = [json.loads(line) for line in text.splitlines()]
+    [closed] = [e for e in entries if e["event"] == "obsolete"]
+    assert closed["note"] == BLOCKED
+
+
+@pytest.mark.parametrize(
+    ("profile", "shown"),
+    [
+        (["max", "x"], None),
+        ({"name": "max"}, None),
+        ("", None),
+        ("p" * 100_000, "p" * 63 + "…"),
+        ("max", "max"),
+    ],
+)
+def test_w4_00_1_b5_the_log_line_takes_only_a_short_text(profile: Any, shown: str | None) -> None:
+    from arr.runs.launch import describe_entry
+    from arr.runs.orchestrator import stopped_text
+
+    entry = {"kind": "stop", "data": {"reason": "profile_blocked", "profile": profile}}
+    text = describe_entry(entry)
+    assert text is not None and len(text) < 200
+    if shown is None:
+        assert text.startswith("Stopp:") and "gesperrt" not in text
+        assert stopped_text([entry], ran=True) == "Der User hat den Run gestoppt."
+    else:
+        assert text.startswith(f"Profil „{shown}“ wurde gesperrt (Not-Aus).")
+        assert (
+            stopped_text([entry], ran=True)
+            == f"Gestoppt: Profil „{shown}“ wurde gesperrt (Not-Aus)."
+        )
+
+
+def test_w4_00_1_b7_stopped_text_before_and_after_the_start() -> None:
+    from arr.runs.orchestrator import stopped_text
+
+    assert stopped_text([], ran=False) == "Der Run wurde vor dem Start gestoppt."
+    assert stopped_text([], ran=True) == "Der User hat den Run gestoppt."
+
+
+async def test_w4_00_1_b7_a_stop_before_the_start_says_so(
+    wf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stopped while the run is being prepared, without a block: `summary.md` and
+    `arr runs status` say so (R18)."""
+    from arr.runs import manager as manager_module
+
+    real_setup = manager_module.RunManager._setup
+
+    async def stopping_setup(self: Any) -> None:
+        self.stop()
+        await real_setup(self)
+
+    monkeypatch.setattr(manager_module.RunManager, "_setup", stopping_setup)
+    result = await asyncio.wait_for(await launch_with(wf, LONG, []), 15)
+    assert result.status is RunStatus.STOPPED
+    summary = (result.run_dir / "output" / "summary.md").read_text("utf-8")
+    assert "- **Grund:** Der Run wurde vor dem Start gestoppt." in summary
+    assert run_status(result.run_dir).reason == "Der Run wurde vor dem Start gestoppt."

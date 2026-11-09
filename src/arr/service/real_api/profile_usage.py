@@ -1,10 +1,14 @@
 """„Nachweis je Profil“: what ran through arr on one auth profile (W3-06, docs/08 §5.8).
 
-**All known workfolders (W4-00 B15).** The Not-Aus works in every workfolder through the
-saved block, so the record counts in every workfolder arr knows: this service's own and those
-in `~/.arr/workfolders.json` (the ones the service was opened with, at most `MAX_RECENT`). Each
-row names its workfolder. A workfolder that is missing or cannot be read is listed with the
-reason, never skipped in silence; so is a list that cannot be read.
+**All known workfolders (W4-00 B15, W4-00.1).** The Not-Aus works in every workfolder through
+the saved block, so the record counts in every workfolder arr knows: this service's own, those
+of `known_workfolders.json` (every workfolder in which a run started or that the service opened,
+never shortened), of `known_workfolders.missed` (could not be added there) and of
+`workfolders.json` (the recent ones of the GUI). Each row names its workfolder. A workfolder
+that is missing or cannot be read is listed with the reason, never skipped in silence; so is a
+list that cannot be read, and the record says „unvollständig“ when an entry was missed. One
+`runs` folder counts once, also when two workfolders reach it through a link (B2). The lists
+in `~/.arr` are the user's: they may be links (B3); the hardness below applies from `runs` on.
 
 **Source.** `usage.json` of a finished run. A run without one (`interrupted`, or one that is
 still active) is summed from its transcripts (only their `turn_end` lines, as `arr.usage`), so
@@ -49,7 +53,11 @@ from arr.service.api_models import (
     ProfileUsageSum,
 )
 from arr.service.real_api.base import ServiceState
-from arr.service.state import workfolders_file
+from arr.service.state import (
+    known_workfolders_file,
+    missed_workfolders_file,
+    workfolders_file,
+)
 from arr.usage import (
     USAGE_FILE,
     AgentUsage,
@@ -60,9 +68,9 @@ from arr.usage import (
 )
 
 NOTE = (
-    "Erfasst sind die Läufe über arr in allen Workfoldern, die arr kennt (die zuletzt im Dienst "
-    "geöffneten), auch aus „arr run“. Workfolder, die nie im Dienst geöffnet wurden, und die "
-    "direkte Nutzung von Claude Code oder Codex fehlen hier."
+    "Erfasst sind die Läufe über arr in allen Workfoldern, in denen ein Run gestartet oder die "
+    "der Dienst geöffnet hat, auch aus „arr run“. Die direkte Nutzung von Claude Code oder Codex "
+    "fehlt hier."
 )
 ABORTED = (RunStatus.STOPPED, RunStatus.FAILED, RunStatus.INTERRUPTED)
 WEEK_S = 7 * 24 * 3600
@@ -80,7 +88,12 @@ _TURN_END = b'"turn_end"'
 MISSING = "fehlt"
 NOT_A_FOLDER = "ist kein Ordner"
 UNREADABLE = "lässt sich nicht lesen"
-LIST_UNREADABLE = "Die Liste der Workfolder lässt sich nicht lesen. Gezählt ist nur dieser."
+LIST_UNREADABLE = "Die Liste der Workfolder lässt sich nicht lesen. Der Nachweis ist unvollständig."
+INCOMPLETE = (
+    "arr konnte nicht jeden Workfolder vermerken, in dem ein Run startete (siehe Log). Der "
+    "Nachweis ist unvollständig."
+)
+SAME_RUNS = "gleicher runs-Ordner wie {name}, schon gezählt"
 
 
 # --------------------------------------------------------------------------------------------
@@ -103,10 +116,13 @@ def _open_dir(name: str, dir_fd: int) -> int | None:
         return None
 
 
-def _open_regular(name: str, dir_fd: int | None) -> tuple[int, os.stat_result] | None:
-    """An open regular file and its `fstat`; None for a link, FIFO, folder or error."""
+def _open_regular(
+    name: str, dir_fd: int | None, *, follow: bool = False
+) -> tuple[int, os.stat_result] | None:
+    """An open regular file and its `fstat`; None for a link (unless `follow`), FIFO, folder
+    or error. `follow` is for the user's own lists in `~/.arr` (B3)."""
     try:
-        fd = os.open(name, _FILE, dir_fd=dir_fd)
+        fd = os.open(name, _FILE & ~os.O_NOFOLLOW if follow else _FILE, dir_fd=dir_fd)
     except OSError:
         return None
     try:
@@ -203,11 +219,17 @@ class _Reader:
         """Usage summed from the transcripts of an ended run (keyed by its `meta.json`)."""
 
     def small(
-        self, folder: str, name: str, dir_fd: int | None, parse: Callable[[bytes], Any]
+        self,
+        folder: str,
+        name: str,
+        dir_fd: int | None,
+        parse: Callable[[bytes], Any],
+        *,
+        follow: bool = False,
     ) -> tuple[bool, Any]:
         """(found, value): `found` is False if there is no such regular file; `value` is
         None if it could not be read or parsed."""
-        opened = _open_regular(name, dir_fd)
+        opened = _open_regular(name, dir_fd, follow=follow)
         if opened is None:
             self._files.pop((folder, name), None)
             return False, None
@@ -228,9 +250,14 @@ class _Reader:
         finally:
             os.close(fd)
 
-    def runs(self, workfolder: Path, *, current: bool) -> tuple[list[_Run], int, str | None]:
+    def runs(
+        self, workfolder: Path, *, current: bool, seen: dict[tuple[int, int], str]
+    ) -> tuple[list[_Run], int, str | None]:
         """The readable runs of a workfolder, the number of unreadable run folders, and why
-        the workfolder itself could not be read (None if it could)."""
+        the workfolder itself could not be read or was not counted (None if it was).
+
+        `seen` maps `(st_dev, st_ino)` of the `runs` folders counted so far to the name of
+        their workfolder; a `runs` folder reached a second time counts no more (B2)."""
         try:
             info = os.stat(workfolder)  # the workfolder itself is the user's choice
         except FileNotFoundError:
@@ -251,7 +278,14 @@ class _Reader:
             except OSError:
                 return [], 0, UNREADABLE
             try:
+                info = os.fstat(runs_fd)
+                key = (info.st_dev, info.st_ino)
+                if key in seen:
+                    return [], 0, SAME_RUNS.format(name=seen[key])
+                seen[key] = workfolder.name or str(workfolder)
                 return self._runs_in(workfolder, runs_fd, current)
+            except OSError:
+                return [], 0, UNREADABLE
             finally:
                 os.close(runs_fd)
         finally:
@@ -348,17 +382,44 @@ class _Reader:
         finally:
             os.close(agent_fd)
 
-    def workfolder_list(self) -> tuple[list[Path], bool]:
-        """The workfolders of `workfolders.json` and whether the list could be read (a
-        missing list is no problem: then only the current workfolder is known)."""
-        path = workfolders_file()
-        found, value = self.small(str(path.parent), str(path), None, json.loads)
+    def _list(self, path: Path) -> tuple[list[Path], bool]:
+        """The workfolders of one JSON list in `~/.arr` and whether it could be read (a
+        missing list is no problem). The user's links are followed (B3)."""
+        found, value = self.small(str(path.parent), str(path), None, json.loads, follow=True)
         if not found:
             return [], not os.path.lexists(path)
         items = value.get("workfolders") if isinstance(value, dict) else None
         if not isinstance(items, list):
             return [], False
         return [Path(item) for item in items if isinstance(item, str) and item], True
+
+    def _missed(self) -> tuple[list[Path], bool]:
+        """Paths of `known_workfolders.missed` and whether there is such a file at all."""
+        path = missed_workfolders_file()
+        found, value = self.small(str(path.parent), str(path), None, bytes, follow=True)
+        if not found:
+            return [], os.path.lexists(path)
+        text = value.decode("utf-8", "replace") if isinstance(value, bytes) else ""
+        return [Path(line) for line in text.splitlines() if line.strip()], True
+
+    def workfolder_lists(self) -> tuple[list[Path], list[ProfileUsageFolder]]:
+        """All workfolders of the lists in `~/.arr` (known, missed, recent; may repeat), and
+        what makes the record unreadable or incomplete."""
+        problems: list[ProfileUsageFolder] = []
+        paths: list[Path] = []
+        for path in (known_workfolders_file(), workfolders_file()):
+            found, readable = self._list(path)
+            paths += found
+            if not readable:
+                problems.append(
+                    ProfileUsageFolder(path=str(path), name=path.name, problem=LIST_UNREADABLE)
+                )
+        missed, incomplete = self._missed()
+        if incomplete:
+            paths += missed
+            path = missed_workfolders_file()
+            problems.append(ProfileUsageFolder(path=str(path), name=path.name, problem=INCOMPLETE))
+        return paths, problems
 
 
 # --------------------------------------------------------------------------------------------
@@ -447,16 +508,17 @@ class ProfileUsageArea:
         self._reader = _Reader()
         self._lock = threading.Lock()
 
-    def _workfolders(self) -> tuple[list[Path], bool]:
-        """This service's workfolder first, then the known others, each once."""
+    def _workfolders(self) -> tuple[list[Path], list[ProfileUsageFolder]]:
+        """This service's workfolder first, then the known others, each once; relative paths
+        are skipped (they would resolve against the service's own folder)."""
         current = self.state.workfolder
-        others, readable = self._reader.workfolder_list()
+        others, problems = self._reader.workfolder_lists()
         folders = [current]
         for folder in others:
             folder = folder.expanduser()
             if folder.is_absolute() and not any(_same(folder, known) for known in folders):
                 folders.append(folder)
-        return folders, readable
+        return folders, problems
 
     def get(self, name: str, *, now: datetime | None = None) -> ProfileUsage:
         """The record of `name`; blocking file reads, so the service calls it in a thread."""
@@ -467,9 +529,12 @@ class ProfileUsageArea:
         rows: list[tuple[ProfileRunUsage, UsageTotal]] = []
         folders: list[ProfileUsageFolder] = []
         with self._lock:
-            workfolders, list_readable = self._workfolders()
+            workfolders, problems = self._workfolders()
+            seen: dict[tuple[int, int], str] = {}
             for index, workfolder in enumerate(workfolders):
-                runs, unreadable, problem = self._reader.runs(workfolder, current=index == 0)
+                runs, unreadable, problem = self._reader.runs(
+                    workfolder, current=index == 0, seen=seen
+                )
                 found = [row for run in runs if (row := _row(run, name)) is not None]
                 rows += found
                 folders.append(
@@ -482,11 +547,7 @@ class ProfileUsageArea:
                         problem=problem,
                     )
                 )
-        if not list_readable:
-            path = workfolders_file()
-            folders.append(
-                ProfileUsageFolder(path=str(path), name=path.name, problem=LIST_UNREADABLE)
-            )
+        folders += problems
         rows.sort(key=lambda item: -(item[0].started or 0))
         return ProfileUsage(
             profile=name,

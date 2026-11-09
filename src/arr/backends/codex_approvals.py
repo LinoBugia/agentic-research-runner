@@ -133,6 +133,55 @@ amendments and `availableDecisions` never take effect."""
 NETWORK_CONTEXT_FIELDS = frozenset({"host", "protocol"})
 """Fields of `NetworkApprovalContext` (schema): the host arr checks and its protocol."""
 
+JSON_KINDS: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "integer": (int,),
+    "array": (list,),
+    "object": (dict,),
+    "null": (type(None),),
+}
+"""JSON-Schema types → Python types of a parsed JSON value (`bool` is never an `integer`)."""
+
+COMMAND_PARAM_KINDS: dict[str, frozenset[str]] = {
+    "additionalPermissions": frozenset({"object", "null"}),
+    "approvalId": frozenset({"string", "null"}),
+    "availableDecisions": frozenset({"array", "null"}),
+    "command": frozenset({"string", "null"}),
+    "commandActions": frozenset({"array", "null"}),
+    "cwd": frozenset({"string", "null"}),
+    "environmentId": frozenset({"string", "null"}),
+    "itemId": frozenset({"string"}),
+    "kind": frozenset({"string"}),
+    "networkApprovalContext": frozenset({"object", "null"}),
+    "proposedExecpolicyAmendment": frozenset({"array", "null"}),
+    "proposedNetworkPolicyAmendments": frozenset({"array", "null"}),
+    "reason": frozenset({"string", "null"}),
+    "startedAtMs": frozenset({"integer"}),
+    "threadId": frozenset({"string"}),
+    "turnId": frozenset({"string"}),
+}
+"""JSON types of each field of `CommandExecutionRequestApprovalParams` in 0.163.0 (W4-00.1,
+B1), held against the schema by `tests/test_codex_schema.py`. A value of another kind is
+refused without asking, never turned into text for the inbox."""
+
+NETWORK_CONTEXT_KINDS: dict[str, frozenset[str]] = {
+    "host": frozenset({"string"}),
+    "protocol": frozenset({"string"}),
+}
+"""JSON types of the fields of `NetworkApprovalContext` (schema)."""
+
+
+def _of_kind(value: Any, kinds: frozenset[str]) -> bool:
+    if isinstance(value, bool):
+        return False  # no field of these requests is a boolean
+    return any(isinstance(value, JSON_KINDS[kind]) for kind in kinds)
+
+
+def _kinds_ok(values: dict[str, Any], kinds: dict[str, frozenset[str]]) -> bool:
+    """True if every present field has a value of its kind in the schema."""
+    return all(_of_kind(value, kinds[name]) for name, value in values.items())
+
+
 _FILE_UNREADABLE = (
     "Diese Datei-Änderung lässt sich nicht vollständig lesen und ist deshalb abgelehnt. Lege "
     "deine Dateien einzeln mit einem Add-Patch im Arbeitsordner an."
@@ -158,6 +207,11 @@ _FILE_GRANT_ROOT = (
 _COMMAND_UNKNOWN_FIELD = (
     "Diese Befehlsanfrage enthält ein Feld, das arr nicht kennt und das die Rechte des Befehls "
     "ändern könnte. Sie ist abgelehnt. Führe den Befehl ohne Sonderrechte in deinem "
+    "Arbeitsordner aus."
+)
+_COMMAND_UNREADABLE = (
+    "Diese Befehlsanfrage enthält einen Wert, den arr nicht lesen kann (falsche Art, z. B. eine "
+    "Liste statt eines Texts). Sie ist abgelehnt. Führe den Befehl ohne Sonderrechte in deinem "
     "Arbeitsordner aus."
 )
 _COMMAND_EXTRA_PERMISSIONS = (
@@ -269,6 +323,10 @@ class ApprovalBridge:
             not isinstance(network, dict) or set(network) - NETWORK_CONTEXT_FIELDS
         ):
             return _COMMAND_UNKNOWN_FIELD
+        if not _kinds_ok(params, COMMAND_PARAM_KINDS) or (
+            network is not None and not _kinds_ok(network, NETWORK_CONTEXT_KINDS)
+        ):
+            return _COMMAND_UNREADABLE
         if params.get("additionalPermissions") is not None:
             return _COMMAND_EXTRA_PERMISSIONS
         if params.get("kind") not in (None, "command"):
@@ -295,7 +353,7 @@ class ApprovalBridge:
             tool="commandExecution",
             tool_call_id=params.get("itemId"),
             command=params.get("command") or "",
-            hosts=[str(host)] if host else [],
+            hosts=[host] if host else [],
             work_dir=params.get("cwd") or self.work_dir,
             reason=params.get("reason"),
             categories=categories,

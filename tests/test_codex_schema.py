@@ -85,6 +85,28 @@ def test_command_fields_are_the_ones_of_the_schema(schema: dict[str, Any]) -> No
     assert _fields(network) == ca.NETWORK_CONTEXT_FIELDS
 
 
+def _kinds(prop: dict[str, Any], definitions: dict[str, Any]) -> frozenset[str]:
+    """The JSON types a property allows, through `$ref`, `anyOf`, `allOf` and `oneOf`."""
+    if "$ref" in prop:
+        return _kinds(definitions[prop["$ref"].rsplit("/", 1)[-1]], definitions)
+    for key in ("anyOf", "allOf", "oneOf"):
+        if key in prop:
+            return frozenset().union(*(_kinds(p, definitions) for p in prop[key]))
+    kind = prop["type"]
+    return frozenset([kind] if isinstance(kind, str) else kind)
+
+
+def test_command_kinds_are_the_ones_of_the_schema(schema: dict[str, Any]) -> None:
+    """W4-00.1 Punkt 2: the kind of every value, e.g. `host` is a string."""
+    command = schema["command"]
+    definitions = command["definitions"]
+    found = {name: _kinds(p, definitions) for name, p in command["properties"].items()}
+    assert found == ca.COMMAND_PARAM_KINDS
+    network = definitions["NetworkApprovalContext"]["properties"]
+    assert {n: _kinds(p, definitions) for n, p in network.items()} == ca.NETWORK_CONTEXT_KINDS
+    assert set(ca.JSON_KINDS) >= set().union(*found.values())
+
+
 def test_file_fields_are_the_ones_of_the_schema(schema: dict[str, Any]) -> None:
     assert _fields(schema["file"]) == ca.FILE_PARAM_FIELDS
     definitions = schema["v2"]["definitions"]
