@@ -11,14 +11,18 @@ How agents learn about new messages (docs/06-gruppenchats.md §4):
 
 Who is when on turn (docs/06 §5.1, §5.2, docs/09 §4) is a *discussion phase*:
 `Orchestrator.discuss` (implemented by `run_discussion`). `rounds` gives all members a turn
-per round. `event` gives everyone the kick-off; then a message that concerns an idle,
-waiting or (for a question) finished member wakes it at once (`arr.room.address`: `to`,
-`@name`, `reply_to`, a question to all), `any` after `debounce_s`; a `wait_until` ends with
-its file or deadline; with nobody working and an idle member, a *round* starts after
-`idle_after_s`, at most `rounds` of them, also while others wait long (L11). Wake-up limit
-(also for the wake-ups of `wait_until`, L10), ping-pong guard and `quiet_after_s` stay as
-safety nets. Every wait is logged (`waiting`, `round`, `wake_scheduled`). Outside a discussion phase
-nobody is woken automatically; hints and the inbox work always.
+per round. `event` gives everyone the kick-off; then a message that concerns an idle or
+waiting member wakes it at once (`arr.room.address`: `to`, `@name`, `reply_to`, a question to
+all), `any` after `debounce_s`. A finished member is reachable (L13): every direct message to
+it (`@name`, a reply to its message, a question to it) wakes it, and after that turn it is
+finished again unless it reports otherwise. A `wait_until` ends with its file, with the next
+result of the agent it waits for (L14) or with its deadline; with nobody working and an idle
+member, a *round* starts after `idle_after_s`, at most `rounds` of them, also while others
+wait long (L11). The discussion ends with `all_done` only when no direct message to a member
+is left unread (L15). Wake-up limit (also for the wake-ups of `wait_until`, L10), ping-pong
+guard and `quiet_after_s` stay as safety nets. Every wait is logged (`waiting`, `round`,
+`wake_scheduled`). Outside a discussion phase nobody is woken automatically; hints and the
+inbox work always.
 """
 
 import asyncio
@@ -32,12 +36,13 @@ from typing import TYPE_CHECKING, Any
 from arr.backends.base import TurnOutcome
 from arr.errors import ArrError
 from arr.models import AgentStatus, ChannelMode, GroupChatConfig, RoundOrder, WakeOn
-from arr.room.address import Address, address
+from arr.room.address import Address, address, is_user_question
 from arr.room.store import ORCHESTRATOR, USER, WAIT_UNTIL_REPEAT
-from arr.room.types import DeliveryStatus, Inbox, Message, MessageKind
+from arr.room.types import DeliveryStatus, Inbox, Message, MessageKind, Result
 from arr.runs.context import DiscussionEnd, DiscussionOutcome, TurnJob
 
 if TYPE_CHECKING:
+    from arr.room.store import AgentRoom
     from arr.runs.orchestrator import Orchestrator
 
 logger = logging.getLogger(__name__)
@@ -55,6 +60,13 @@ __all__ = [
 
 DEFAULT_ROUNDS = 3
 """Rounds of a `rounds` discussion when the topology gives none."""
+
+DIRECT = frozenset({Address.QUESTION, Address.MENTION, Address.REPLY})
+"""A direct message to a member (L13, L15): `to`/`@name`, a reply to its message, a question."""
+MAX_DIRECT_IN_PROMPT = 10
+"""Direct messages shown in full at the start of a turn; older ones are only counted."""
+RESULT_EXCERPT_CHARS = 1500
+"""How much of a result body the wake-up of `until_result_from` shows (L14)."""
 
 PROGRESS_KINDS = frozenset({MessageKind.CLAIM, MessageKind.PROOF, MessageKind.DECISION})
 """Kinds that count as progress for the ping-pong guard (docs/06 §5.2)."""
@@ -99,20 +111,28 @@ def _render(msg: Message, *, me: str) -> str:
 
 
 def render_turn_prompt(
-    agent_id: str, prompt: str, inbox: Inbox | None, user_messages: Sequence[Message] = ()
+    agent_id: str,
+    prompt: str,
+    inbox: Inbox | None,
+    user_messages: Sequence[Message] = (),
+    direct: Sequence[Message] = (),
 ) -> str:
     """The prompt of a turn: inbox first, then the assignment (docs/06 §4, §10).
 
     The inbox lists open questions to the agent in full (questions of `user` first), then
-    unread messages of `user` in full with a priority mark, then the number of new messages
-    per channel. Without an inbox (agent in no channel) the prompt is returned unchanged.
-    The agent reads other messages itself, so the prompt stays short.
+    unread messages of `user` in full with a priority mark, then the other unread messages to
+    the agent (`direct`: `@name`, replies to its messages; at most `MAX_DIRECT_IN_PROMPT`, the
+    newest), so a finished agent woken by a request sees it (L13); then the number of new
+    messages per channel. Without an inbox (agent in no channel) the prompt is returned
+    unchanged. The agent reads other messages itself, so the prompt stays short.
     """
     if inbox is None:
         return prompt
     questions = sorted(inbox.open_questions, key=lambda m: (m.sender != USER, m.id))
     asked = {m.id for m in questions}
     from_user = [m for m in user_messages if m.id not in asked]
+    shown = asked | {m.id for m in from_user}
+    to_me = [m for m in direct if m.id not in shown][-MAX_DIRECT_IN_PROMPT:]
     parts = ["## Posteingang"]
     if questions:
         rendered = "\n\n".join(
@@ -125,6 +145,9 @@ def render_turn_prompt(
     if from_user:
         rendered = "\n\n".join(_render(m, me=agent_id) for m in from_user)
         parts.append("★ Nachrichten vom User (haben Vorrang):\n\n" + rendered)
+    if to_me:
+        rendered = "\n\n".join(_render(m, me=agent_id) for m in to_me)
+        parts.append("Nachrichten an dich (ungelesen):\n\n" + rendered)
     user_counts: dict[str, int] = {}
     for msg in user_messages:
         user_counts[msg.channel] = user_counts.get(msg.channel, 0) + 1
@@ -144,8 +167,8 @@ def render_turn_prompt(
 
 
 def is_question_to(msg: Message, agent_id: str) -> bool:
-    """True for a question that names `agent_id` in `to`."""
-    return msg.kind is MessageKind.QUESTION and agent_id in msg.to
+    """True for a question that names `agent_id` in `to`; a question to the user is none (L16)."""
+    return msg.kind is MessageKind.QUESTION and agent_id in msg.to and not is_user_question(msg)
 
 
 def compose_hint(agent_id: str, messages: Iterable[Message]) -> str:
@@ -211,11 +234,14 @@ class HintGate:
 
 
 class PingPongTracker:
-    """Counts messages between two agents without progress and flags the pair once.
+    """Counts the exchange between two agents without progress and flags the pair once.
 
     A message goes from its sender to one other agent if `to` names exactly that agent or
-    it replies to a message of that agent. A claim, proof or decision between the two resets
-    their count; more than `limit` messages without one flag the pair (only once).
+    it replies to a message of that agent; a message to the user (L16) goes to no agent. Only
+    an exchange counts, a message in the other direction than the last one of the pair: many
+    messages of one agent to another in a row count once (W3-09.1, B3), so a burst of requests
+    to a finished agent does not lock it out. A claim, proof or decision between the two resets
+    their count; more than `limit` changes of direction without one flag the pair (only once).
     `sender_of` looks up the sender of older messages that the tracker has not seen.
     """
 
@@ -224,11 +250,13 @@ class PingPongTracker:
         self._sender_of = sender_of
         self._senders: dict[int, str] = {}
         self._counts: dict[frozenset[str], int] = {}
+        self._last: dict[frozenset[str], str] = {}
+        """Sender of the last counted message of a pair."""
         self.flagged: set[frozenset[str]] = set()
 
     def _other(self, msg: Message) -> str | None:
         if len(msg.to) == 1:
-            return msg.to[0]
+            return msg.to[0] if msg.to[0] not in (ORCHESTRATOR, USER) else None
         if msg.reply_to is not None:
             sender = self._senders.get(msg.reply_to) or self._sender_of(msg.reply_to)
             if sender not in (None, ORCHESTRATOR, USER):
@@ -246,7 +274,11 @@ class PingPongTracker:
         pair = frozenset({msg.sender, other})
         if msg.kind in PROGRESS_KINDS:
             self._counts[pair] = 0
+            self._last.pop(pair, None)
             return None
+        if self._last.get(pair) == msg.sender:
+            return None  # the same direction again: no exchange (B3)
+        self._last[pair] = msg.sender
         self._counts[pair] = self._counts.get(pair, 0) + 1
         if self._counts[pair] > self.limit and pair not in self.flagged:
             self.flagged.add(pair)
@@ -261,12 +293,12 @@ class PingPongTracker:
 
 _ROUND_PROMPT = (
     "Lies die neuen Nachrichten in #{channel}, arbeite weiter und poste deinen Beitrag. "
-    "Hast du in dieser Runde nichts beizutragen, poste `pass`. Bist du fertig, gib dein "
-    "Ergebnis ab oder melde `done` mit set_status und einem kurzen Fazit."
+    "Hast du in dieser Runde nichts beizutragen, poste `pass`. Ist dein Teil erledigt, gib "
+    "dein Ergebnis ab oder melde `done` mit set_status und einem kurzen Fazit."
 )
 _KICKOFF_PROMPT = (
     "Diskussion in #{channel}: Lies den Steckbrief und die Nachrichten und beteilige dich. "
-    "Bist du fertig, gib dein Ergebnis ab oder melde `done` mit set_status."
+    "Ist dein Teil erledigt, gib dein Ergebnis ab oder melde `done` mit set_status."
 )
 _IDLE_ROUND_PROMPT = (
     "Runde {number} von {of} in #{channel}: Lies die neuen Nachrichten, antworte, gib dein "
@@ -280,14 +312,19 @@ _WAKE_REASONS = {
     "any": "neue Nachrichten",
     "file": "die Datei, auf die du wartest, ist da",
     "timeout": "deine Wartezeit ist um",
+    "result_from": "{agent} hat ein Ergebnis abgegeben",
+    "result_missing": "{agent} ist fertig, ohne ein neues Ergebnis abzugeben",
 }
 _WAKE_PROMPT = (
     "Du wurdest in #{channel} geweckt: {reason}. Lies deinen Posteingang und antworte, wenn "
-    "du etwas beitragen kannst. Bist du fertig, gib dein Ergebnis ab oder melde `done`."
+    "du etwas beitragen kannst. Ist dein Teil erledigt, gib dein Ergebnis ab oder melde "
+    "`done`; du bleibst ansprechbar."
 )
-_SELF_WAKES = frozenset({"file", "timeout"})
+_SELF_WAKES = frozenset({"file", "timeout", "result_from", "result_missing"})
 """Wake-ups the agent asked for with `wait_until`; they count against `max_wakeups_per_agent`
 like all others (L10), but the ping-pong guard does not stop them."""
+_AWAITED = frozenset({"file", "result_from", "result_missing"})
+"""Self wake-ups by what the agent waited for: they reset the count of deadlines (L10)."""
 _CHANNEL_WAIT_ORDER = ("agents", "approval", "capacity")
 
 
@@ -375,6 +412,13 @@ class _Wake:
     due: float
     reasons: list[str] = field(default_factory=list)
     messages: list[int] = field(default_factory=list)
+    awaited: str | None = None
+    """`result_from`/`result_missing`: the agent it waited for, as the waiting agent sees it
+    (its alias behind an anonymous channel, L14, W3-09.1 B2)."""
+    result: str | None = None
+    """`result_from`: the result, shown in the wake-up prompt (only what it may read, B1)."""
+    final: bool = False
+    """L15: woken once for an unread message before the end, also behind the ping-pong guard."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,11 +435,13 @@ class _EventDiscussion:
     """`event` (docs/06 §5.2, docs/09 §4.3, §4.4): kick-off, wake-ups, idle rounds.
 
     A member is in one state: working (turn running, maybe blocked by an approval or inside
-    `wait_for_messages`), waiting for a free place, waiting long (`wait_until`), idle, or done.
-    The discussion ends with `all_done` when all members are done, with `rounds` after the
-    last idle round, with `quiet` when `quiet_after_s` passed without a message although a
-    round ran, or with `stopped`/`limit`. Every state that waits has a deadline: the turn's
-    own limits, `approvals.timeout`, the `wait_until` deadline, `idle_after_s`.
+    `wait_for_messages`), waiting for a free place, waiting long (`wait_until`), idle, or done
+    and reachable (L13). The discussion ends with `all_done` when all members are done and no
+    direct message to one of them is unread (L15; such a message wakes its addressee once),
+    with `rounds` after the last idle round, with `quiet` when `quiet_after_s` passed without
+    a message although a round ran, or with `stopped`/`limit`. Every state that waits has a
+    deadline: the turn's own limits, `approvals.timeout`, the `wait_until` deadline,
+    `idle_after_s`.
 
     A member waiting long holds nobody up (L11): rounds and `quiet` go on for the idle ones,
     and the end of the discussion ends its wait (`wait_end`). Its wake-ups count against
@@ -433,6 +479,8 @@ class _EventDiscussion:
         self.ping_pong = PingPongTracker(orch.pacing.ping_pong_limit, orch.sender_of)
         self.outcome = DiscussionOutcome(config.name, config.mode, DiscussionEnd.QUIET)
         self.reported: _ChannelWait | None = None
+        self.final_wakes: set[tuple[str, int]] = set()
+        """L15: (member, message) woken once because the message was unread at the end."""
 
     # -- notifications from the orchestrator -------------------------------------------
 
@@ -473,14 +521,16 @@ class _EventDiscussion:
 
     # -- rules ---------------------------------------------------------------------------
 
-    def _trigger(self, msg: Message, member: str) -> str | None:
+    def _trigger(self, msg: Message, member: str, *, guarded: bool = True) -> str | None:
         """Wake reason of `msg` for `member`, or None (docs/09 §4.1, §4.2).
 
         Own messages and messages of the orchestrator never wake. A finished member wakes
-        only for a question to it, an exhausted one (`turns_per_agent`) never; a member that
-        waits with `wait_until` only for messages that concern it.
+        for every direct message to it (L13: a question, `@name`, a reply to its message), not
+        for a question to all or `any`; an exhausted one (`turns_per_agent`) never; a member
+        that waits with `wait_until` only for messages that concern it. With `guarded` the
+        ping-pong guard (`no_autowake`) holds; L15 asks without it.
         """
-        if msg.sender in (member, ORCHESTRATOR) or member in self.no_autowake:
+        if msg.sender in (member, ORCHESTRATOR) or (guarded and member in self.no_autowake):
             return None
         if self.orch.exhausted(member):
             return None
@@ -488,10 +538,10 @@ class _EventDiscussion:
         how = address(msg, member, self.orch.sender_of)
         if how is Address.QUESTION and {WakeOn.QUESTION, WakeOn.MENTION} & set(wake_on):
             return "question"
-        if self.orch.agent_status(member) is AgentStatus.DONE:
-            return None
         if how in (Address.MENTION, Address.REPLY) and WakeOn.MENTION in wake_on:
             return how.value
+        if self.orch.agent_status(member) is AgentStatus.DONE:
+            return None
         if how is Address.QUESTION_ALL and WakeOn.QUESTION in wake_on:
             return how.value
         if WakeOn.ANY in wake_on and self.orch.long_wait(member) is None:
@@ -504,8 +554,11 @@ class _EventDiscussion:
         task = self.busy.get(member)
         return (task is not None and not task.done()) or self.orch.is_busy(member)
 
-    def _schedule(self, member: str, reason: str, msg: Message | None = None) -> None:
-        """Wake `member`: at once (L8), only `any` after `debounce_s` (docs/06 §5.2)."""
+    def _schedule(self, member: str, reason: str, msg: Message | None = None, **info: Any) -> _Wake:
+        """Wake `member`: at once (L8), only `any` after `debounce_s` (docs/06 §5.2).
+
+        `info` goes into the log entry `wake_scheduled` (e.g. `unread` for L15, `result_from`).
+        """
         now = self.loop.time()
         delay = self.config.debounce_s if reason == "any" else 0.0
         wake = self.wakes.get(member)
@@ -513,7 +566,12 @@ class _EventDiscussion:
             wake = self.wakes[member] = _Wake(due=now + delay)
             due = time.time() + delay
             self.orch.log.write(
-                "wake_scheduled", channel=self.config.name, agent=member, reason=reason, due=due
+                "wake_scheduled",
+                channel=self.config.name,
+                agent=member,
+                reason=reason,
+                due=due,
+                **info,
             )
         elif delay == 0.0:
             wake.due = min(wake.due, now)  # a message to it does not wait for a debounce
@@ -522,6 +580,7 @@ class _EventDiscussion:
         if msg is not None and msg.id not in wake.messages:
             wake.messages.append(msg.id)
         self.changed.set()
+        return wake
 
     def _stop_ping_pong(self, pair: frozenset[str]) -> None:
         agents = sorted(pair)
@@ -532,14 +591,28 @@ class _EventDiscussion:
         self.orch.room.post(self.config.name, PING_PONG_NOTE, to=agents)
 
     def _check_long_waits(self) -> None:
-        """`wait_until`: wake when the file is there or the deadline has passed."""
+        """`wait_until`: wake when the file is there, when the awaited agent submitted a result
+        or finished without one (L14), or when the deadline has passed."""
         now = time.time()
         for member in self.members:
             wait = self.orch.long_wait(member)
             if wait is None or self._busy(member) or member in self.wakes:
                 continue
+            awaited = wait.result_from
+            result = self.orch.new_result(awaited, wait.since, wait.mark) if awaited else None
             if wait.file is not None and self.orch.until_file_exists(member, wait.file):
                 self._schedule(member, "file")
+            elif awaited is not None and result is not None:
+                wake = self._schedule(member, "result_from", result_from=awaited)
+                wake.awaited = self.orch.view(member).shown_name(awaited)
+                wake.result = _result_text(result, wake.awaited, self.orch.view(member))
+            elif (
+                awaited is not None
+                and self.orch.agent_status(awaited) is AgentStatus.DONE
+                and not self._busy(awaited)
+            ):
+                wake = self._schedule(member, "result_missing", result_from=awaited)
+                wake.awaited = self.orch.view(member).shown_name(awaited)
             elif wait.until <= now:
                 self._schedule(member, "timeout")
 
@@ -562,9 +635,9 @@ class _EventDiscussion:
 
     def _fire(self, tg: asyncio.TaskGroup, member: str, wake: _Wake) -> None:
         own = set(wake.reasons) <= _SELF_WAKES
-        if not own and member in self.no_autowake:
+        if not (own or wake.final) and member in self.no_autowake:
             return
-        if "file" in wake.reasons:
+        if _AWAITED & set(wake.reasons):
             self.orch.reset_until_streak(member)
         elif wake.reasons == ["timeout"]:
             streak = self.orch.count_until_timeout(member)
@@ -581,7 +654,7 @@ class _EventDiscussion:
             return
         count = self.orch.count_wakeup(self.config.name, member)
         self.outcome.wakeups[member] = count
-        reason = ", ".join(_WAKE_REASONS[r] for r in wake.reasons)
+        reason = ", ".join(_WAKE_REASONS[r].format(agent=wake.awaited) for r in wake.reasons)
         self.orch.log.write(
             "wake",
             channel=self.config.name,
@@ -591,7 +664,10 @@ class _EventDiscussion:
             count=count,
         )
         self.orch.mark_delivered(wake.messages, DeliveryStatus.WOKEN, member)
-        self._start(tg, member, _WAKE_PROMPT.format(channel=self.config.name, reason=reason))
+        prompt = _WAKE_PROMPT.format(channel=self.config.name, reason=reason)
+        if wake.result is not None:
+            prompt += "\n\n" + wake.result
+        self._start(tg, member, prompt)
 
     def _skip(self, member: str, reason: str, limit: int) -> None:
         self.orch.log.write(
@@ -623,6 +699,33 @@ class _EventDiscussion:
 
     def _all_done(self) -> bool:
         return all(self.orch.agent_status(m) is AgentStatus.DONE for m in self.members)
+
+    def _wake_for_unread(self) -> bool:
+        """L15: before `all_done`, wake every member a direct message to is unread for.
+
+        Unread is a message after the member's cursor in this channel and after the start of
+        its last turn (what was in a turn's inbox counts as seen); it must wake the member at
+        all (`_trigger` without the ping-pong guard: exhausted, `wake_on`). The guard does not
+        hold here (W3-09.1, B3): each message wakes its addressee at most once this way, and
+        `max_wakeups_per_agent` holds, so the end comes. True if a wake-up was scheduled.
+        """
+        found = False
+        for member in self.members:
+            if self._busy(member):
+                continue
+            seen = max(self.orch.room.cursor(member, self.config.name), self.orch.turn_mark(member))
+            for msg in self.orch.room.messages(self.config.name, after_id=seen):
+                if (member, msg.id) in self.final_wakes:
+                    continue
+                if address(msg, member, self.orch.sender_of) not in DIRECT:
+                    continue
+                reason = self._trigger(msg, member, guarded=False)
+                if reason is None:
+                    continue
+                self.final_wakes.add((member, msg.id))
+                self._schedule(member, reason, msg, unread=msg.id).final = True
+                found = True
+        return found
 
     def _working_wait(self) -> _ChannelWait:
         """What the discussion waits for while turns run (only the running ones count).
@@ -676,13 +779,15 @@ class _EventDiscussion:
             self._report(_ChannelWait("wake", time.time() + max(0.0, due - now)))
             return due
         if self._all_done():
+            if self._wake_for_unread():  # L15
+                return now
             return DiscussionEnd.ALL_DONE
         long_waits = [w for m in self.members if (w := self.orch.long_wait(m)) is not None]
         wake_at: float | None = None  # loop time at which a `wait_until` may wake
         if long_waits:
             until = min(w.until for w in long_waits)
             wake_at = now + max(0.0, until - time.time())
-            if any(w.file for w in long_waits):
+            if any(w.file or w.result_from for w in long_waits):
                 wake_at = min(wake_at, now + 1.0)
             if not self._idle_members():  # only members waiting long are left
                 self._report(_ChannelWait("agents", until))
@@ -760,3 +865,26 @@ class _EventDiscussion:
             if self.reported is not None:
                 self._report(_ChannelWait("none"))
         return self.outcome
+
+
+def _result_text(result: Result | Message, shown: str, view: "AgentRoom") -> str | None:
+    """A result for the wake-up of `until_result_from` (L14): title, file, start of the body.
+
+    Only what the waiting agent may read itself (W3-09.1, B1, B2): a result of `submit_result`
+    (run-wide) or a message `result` in a channel of its own, else None (the wake-up then only
+    says that a result came). Names as it sees them (`shown`); a result file is named only if
+    its path does not carry the ID of an agent hidden behind an alias.
+    """
+    if isinstance(result, Message):
+        if not view.can_read(result.channel):
+            return None
+        head = f"Ergebnis von {shown} (Nachricht #{result.id} in #{result.channel}):"
+        body = result.body
+    else:
+        head = f"Ergebnis #{result.id} von {shown}: „{result.title}“"
+        if result.path:
+            head += f" (Datei: {result.path})" if shown == result.agent else " (als Datei)"
+        body = result.body or ""
+    if len(body) > RESULT_EXCERPT_CHARS:
+        body = body[:RESULT_EXCERPT_CHARS] + " …"
+    return head + ("\n\n" + body if body else "")

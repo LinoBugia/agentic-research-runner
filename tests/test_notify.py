@@ -266,3 +266,24 @@ def test_only_finished_runs_have_a_switch_of_their_own(arr_home: Path) -> None:
     write_app_settings({"notifications": {e.value: False for e in NotificationEvent}})
     assert not switched_on(FINISHED)
     assert switched_on(created(permission()))
+
+
+def test_w3_09_a3_a_question_to_the_user_is_a_notification() -> None:
+    """L16: agent, run and the question; a secret in it is removed, the text is cut."""
+    item = permission(
+        id="apr_2",
+        type=ApprovalType.QUESTION,
+        title="explorer-1 fragt dich",
+        command=None,
+        risk=None,
+        categories=[],
+        deadline=None,
+        question_text=f"Welches Band hat Vorrang? Token {SECRET}",
+        channel="main",
+        msg_id=4,
+    )
+    text = message_for(created(item), 0.0)
+    assert text is not None and text.startswith("explorer-1 fragt dich (Collatz): Welches Band")
+    assert SECRET not in text and switched_on(created(item))
+    long = item.model_copy(update={"question_text": "x" * 1000})
+    assert len(message_for(created(long), 0.0) or "") == MAX_TEXT

@@ -40,6 +40,7 @@ from arr.permissions.types import RequestCategory
 from arr.resolve import load_yaml_model
 from arr.room.store import RoomStore
 from arr.room.types import Message as RoomMessage
+from arr.runs.eventlog import RATE_LIMIT_PASSING
 from arr.runs.inspect import describe_checkpoint, open_approvals, run_lock_held, run_reason
 from arr.runs.launch import CHANNEL_WAIT_TEXT, ORPHAN_MIN_AGE_S, describe_entry
 from arr.runs.prepare import AgentFile, RunMeta, load_agent_file, load_run_meta
@@ -826,7 +827,13 @@ def open_items(record: RunRecord) -> list[dict[str, Any]]:
 
 
 def _item_is_escalation(entry: Mapping[str, Any]) -> bool:
-    return entry.get("request") is None
+    return entry.get("request") is None and entry.get("question") is None
+
+
+def item_question(entry: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The question of an item „Frage“ (L16), None for other items."""
+    question = entry.get("question")
+    return question if isinstance(question, Mapping) else None
 
 
 def open_escalation_id(record: RunRecord) -> str | None:
@@ -839,6 +846,9 @@ def open_escalation_id(record: RunRecord) -> str | None:
 
 def item_title(entry: Mapping[str, Any], *, stage: str | None = None, attempts: int = 0) -> str:
     """The sentence of an item (title of the card), without the full command (docs/08 R5)."""
+    question = item_question(entry)
+    if question is not None:
+        return f"{question.get('agent_id') or 'Ein Agent'} fragt dich"
     request = entry.get("request") or {}
     if not isinstance(request, Mapping) or not request:
         if not stage:
@@ -868,6 +878,9 @@ def describe_item(entry: Mapping[str, Any]) -> str:
     """One German line for an open item (banner „Wartet auf dich“)."""
     request = entry.get("request") or {}
     title = item_title(entry)
+    question = item_question(entry)
+    if question is not None:
+        return f"{title}: {_excerpt(str(question.get('text') or ''), 120)}"
     if not isinstance(request, Mapping) or not request:
         return title
     what = request.get("command") or ", ".join(request.get("paths") or [])
@@ -1131,13 +1144,17 @@ class _FlowView:
 
     waits: dict[str, Mapping[str, Any]] = field(default_factory=dict)
     """The agent's current `waiting` entry: a new turn ends every wait, a turn end every wait
-    but `wait_until` (it starts with the turn end)."""
+    but `wait_until` and `result_from` (they start with the turn end)."""
     silent: dict[str, Mapping[str, Any]] = field(default_factory=dict)
     """`turn_silent` of a turn that is still running."""
     channel: str | None = None
     channel_wait: Mapping[str, Any] | None = None
     round: int = 0
     of: int | None = None
+
+
+_LONG_WAITS = ("wait_until", "result_from")
+"""Reasons of `waiting` for a wait after the turn (`wait_until`, with `until_result_from` L14)."""
 
 
 def flow_view(entries: Sequence[Mapping[str, Any]]) -> _FlowView:
@@ -1171,7 +1188,7 @@ def flow_view(entries: Sequence[Mapping[str, Any]]) -> _FlowView:
             view.silent.pop(agent, None)
         elif kind == "turn_end":
             view.silent.pop(agent, None)
-            if _data(view.waits.get(agent, {})).get("reason") != "wait_until":
+            if _data(view.waits.get(agent, {})).get("reason") not in _LONG_WAITS:
                 view.waits.pop(agent, None)
     return view
 
@@ -1207,7 +1224,7 @@ def agent_wait(
     row = waits.get(agent_id)
     if row is not None and row.get("kind") == "wait_for_messages":
         file = row.get("file")
-        asked = _asked(record, agent_id)
+        asked = ["dir" if name == "user" else name for name in _asked(record, agent_id)]
         text = f"wartet auf Antwort von {', '.join(asked)}" if asked else "wartet auf Nachrichten"
         if file:
             text += f" oder auf „{file}“"
@@ -1217,6 +1234,17 @@ def agent_wait(
     last = view.waits.get(agent_id)
     data = _data(last) if last is not None else {}
     waiting = last is not None
+    if status is AgentStatus.WAITING and waiting and data.get("reason") == "result_from":
+        awaited = str(data.get("result_from") or "?")
+        file = data.get("file") if isinstance(data.get("file"), str) else None
+        text = f"wartet auf Ergebnis von {awaited}" + (f" oder auf „{file}“" if file else "")
+        return AgentWait(
+            reason=WaitReason.RESULT,
+            text=text,
+            until=_number_of(data.get("until")),
+            file=file,
+            result_from=awaited,
+        )
     if status is AgentStatus.WAITING and waiting and data.get("reason") == "wait_until":
         file = data.get("file") if isinstance(data.get("file"), str) else None
         text = f"wartet auf „{file}“" if file else "wartet auf Nachrichten (Turn beendet)"
@@ -1453,14 +1481,25 @@ def run_detail(
 # --------------------------------------------------------------------------------------------
 
 
+def _rate_limit_stops(record: Mapping[str, Any] | None) -> bool:
+    """A `rate_limit` event that holds the profile up (not `allowed`/`allowed_warning`, V5)."""
+    data = record.get("data") if record is not None else None
+    status = str(data.get("status") or "") if isinstance(data, Mapping) else ""
+    return status not in RATE_LIMIT_PASSING
+
+
 def _activity(agent: AgentRecord, *, final: bool) -> Activity | None:
     index = agent.transcript
     lines = index.lines
     if not lines:
         return None
-    # the last line that says something about the agent (usage lines are bookkeeping)
+    # the last line that says something about the agent (usage lines are bookkeeping, and so
+    # is a `rate_limit` line that held nothing up, V5)
     pos = len(lines) - 1
-    while pos > 0 and lines[pos].kind == "usage":
+    while pos > 0 and (
+        lines[pos].kind == "usage"
+        or (lines[pos].kind == "rate_limit" and not _rate_limit_stops(index.read([pos]).get(pos)))
+    ):
         pos -= 1
     line = lines[pos]
     wanted = [pos]
@@ -1516,10 +1555,16 @@ def _activity(agent: AgentRecord, *, final: bool) -> Activity | None:
             since=line.ts or None,
         )
     if kind == "rate_limit":
+        resets = data.get("resets_at")
+        until = (
+            f"weiter um {time.strftime('%H:%M', time.localtime(resets))}"
+            if isinstance(resets, int | float)
+            else None
+        )
         return Activity(
             kind=ActivityKind.BLOCKED,
-            label="Rate-Limit",
-            arg=str(data.get("status") or ""),
+            label="Nutzungslimit erreicht",
+            arg=until or str(data.get("status") or "") or None,
             since=line.ts or None,
         )
     if kind == "turn_end":
@@ -1676,6 +1721,9 @@ def agent_states(record: RunRecord, resolved: ResolvedRun | None = None) -> list
                 results_count=results_count.get(config.id, 0),
                 ratings_count=ratings_count.get(config.id, 0),
                 work_dir=work_dir,
+                reachable=not final
+                and state is AgentDisplayState.DONE
+                and view.channel in config.channels,
             )
         )
     return out

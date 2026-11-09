@@ -12,6 +12,10 @@ a click grants what the user sees, nothing more. An allowed installation also co
 package hosts it needs for a short time, so `pip install` asks once (W2-01 §7, review W2-01.1
 N1).
 
+A question of an agent to the user (`@user`, docs/09 L16) is an item too: `open_question`
+opens it, nobody waits on it. It is closed by the user's answer, in the inbox (`resolve` with
+`answer`) or in the channel (`answered`), or when the run ends (`close_question`, `cancel`).
+
 Items live in memory; every step is appended to `approvals.jsonl` (docs/02 §4).
 See docs/07-berechtigungen-und-freigaben.md §3-§6.
 """
@@ -55,6 +59,7 @@ from arr.permissions.types import (
     RequestCategory,
     Risk,
     RiskLevel,
+    UserQuestion,
 )
 
 __all__ = [
@@ -269,6 +274,55 @@ class ApprovalInbox:
         finally:
             await self._leave(item.id)
 
+    def open_question(
+        self, run_id: str, agent_id: str, channel: str, msg_id: int, text: str
+    ) -> ApprovalItem:
+        """Open an item „Frage“ for a question of an agent to the user (L16).
+
+        Nobody waits on it and no decider is asked: the agent waits in the channel with
+        `wait_for_messages`. The item has no deadline; it closes with the answer or the run.
+        """
+        question = UserQuestion(agent_id=agent_id, channel=channel, msg_id=msg_id, text=text)
+        with self._lock:
+            item = ApprovalItem(
+                id=self._next_id(run_id),
+                type=ApprovalType.QUESTION,
+                run_id=run_id,
+                agent_id=agent_id,
+                question=question,
+            )
+            self._items[item.id] = item
+            self._write(LogEvent.OPEN, item, note=f"Frage von {agent_id} in #{channel}")
+        return item
+
+    def answered(self, item_id: str, text: str, *, via: str = "channel") -> bool:
+        """The user answered a question outside the inbox, e.g. in the channel; False if it
+        was not open any more (answered in the inbox meanwhile)."""
+        decision = Decision(
+            action=DecisionAction.ANSWER,
+            decided_by=DecidedBy.USER,
+            reason="Im Kanal beantwortet." if via == "channel" else "Beantwortet.",
+            comment=text.strip() or "(ohne Text)",
+        )
+        with self._lock:
+            item = self.get(item_id)
+            if item.status is not ApprovalStatus.OPEN or item.type is not ApprovalType.QUESTION:
+                return False
+            item = self._update(item, ApprovalStatus.DECIDED, decision)
+            self._write(LogEvent.DECIDED, item)
+        return True
+
+    def close_question(self, item_id: str, note: str) -> bool:
+        """A question nobody answered becomes obsolete, e.g. at the end of the run; False if
+        it was not open."""
+        with self._lock:
+            item = self.get(item_id)
+            if item.status is not ApprovalStatus.OPEN or item.type is not ApprovalType.QUESTION:
+                return False
+            item = self._update(item, ApprovalStatus.OBSOLETE, None)
+            self._write(LogEvent.OBSOLETE, item, note=note)
+        return True
+
     def resolve(self, item_id: str, decision: Decision) -> ApprovalItem:
         """Record the decision for an open item and wake the waiting agent (thread-safe).
 
@@ -276,7 +330,9 @@ class ApprovalInbox:
         enforced by the types). Raises `ArrError` if the item is not open any more. If the
         request contains a secret, an „Immer“ decision is kept with scope `run` (no rule in
         `arr.yaml`) and the user gets a hint. An escalation takes only one of its options,
-        chosen by `user` with scope `once` (E15); anything else raises `ArrError`.
+        chosen by `user` with scope `once` (E15); anything else raises `ArrError`. A question
+        to the user takes only an `answer` of `user` with a text; the caller posts it into the
+        channel.
         """
         with self._lock:
             item = self.get(item_id)
@@ -285,6 +341,12 @@ class ApprovalInbox:
                     f"Die Freigabe „{item_id}“ ist nicht mehr offen ({item.status}). "
                     "Eine Entscheidung ist nicht mehr nötig."
                 )
+            if item.type is ApprovalType.QUESTION:
+                if decision.action is not DecisionAction.ANSWER:
+                    raise ArrError("Auf eine Frage antwortest du mit einem Text.")
+                item = self._decide_user_only(item, decision)
+                self._write(LogEvent.DECIDED, item)
+                return item
             if item.type is ApprovalType.ESCALATION:
                 item = self._decide_escalation(item, decision)
                 self._write(LogEvent.DECIDED, item)
@@ -307,6 +369,15 @@ class ApprovalInbox:
         if remembered.note is not None:
             self._notify(remembered.note)
         return item
+
+    def _decide_user_only(self, item: ApprovalItem, decision: Decision) -> ApprovalItem:
+        """Store a decision only the user makes, once (E15): escalations and answers."""
+        if decision.decided_by is not DecidedBy.USER or decision.scope is not DecisionScope.ONCE:
+            raise ArrError(
+                "Eskalationen und Antworten an Agenten gibst in v1 nur du selbst, und zwar "
+                "einmalig (E15). Die Entscheidung wurde nicht übernommen."
+            )
+        return self._update(item, ApprovalStatus.DECIDED, decision)
 
     def _decide_escalation(self, item: ApprovalItem, decision: Decision) -> ApprovalItem:
         """Check a choice for an escalation (E15: user, once, an offered option) and store it."""
@@ -333,13 +404,14 @@ class ApprovalInbox:
     def cancel(self, item_id: str, note: str = "Der Run wurde gestoppt.") -> ApprovalItem:
         """Mark an open item obsolete and release the agent with a `deny` (stop, docs/07 §7).
 
-        An escalation becomes obsolete without a decision; its waiter gets None.
+        An escalation and a question to the user become obsolete without a decision; the
+        waiter of an escalation gets None.
         """
         with self._lock:
             item = self.get(item_id)
             if item.status is not ApprovalStatus.OPEN:
                 return item
-            if item.type is ApprovalType.ESCALATION:
+            if item.type in (ApprovalType.ESCALATION, ApprovalType.QUESTION):
                 item = self._update(item, ApprovalStatus.OBSOLETE, None)
                 self._write(LogEvent.OBSOLETE, item, note=note)
                 self._wake(item.id, None)
@@ -589,6 +661,7 @@ class ApprovalInbox:
                 item_id=item.id,
                 request=request or item.request,
                 decision=decision or item.decision,
+                question=item.question if event is LogEvent.OPEN else None,
                 note=note,
             )
         )

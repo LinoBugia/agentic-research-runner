@@ -353,9 +353,9 @@ async def test_b4_wait_until_with_a_file_only_for_claude(
         params = set(tool.input_schema["properties"])
         background = "Hintergrund" in (tool.description or "")
         if provider == "codex":
-            assert params == {"minutes"} and not background
+            assert params == {"minutes", "until_result_from"} and not background
         else:
-            assert params == {"minutes", "until_file"} and background
+            assert params == {"minutes", "until_file", "until_result_from"} and background
 
 
 async def test_b6_a_nul_byte_in_a_path_is_a_german_error(store: RoomStore) -> None:
@@ -500,16 +500,20 @@ async def test_a2_run_b_at_name_in_the_text_wakes_at_once(workfolder: Path) -> N
 
 
 async def test_a2_run_c_reply_to_wakes_the_author(workfolder: Path) -> None:
+    """A reply wakes the author; also a finished one (L13): D1 is done when D2 replies."""
     scripts = {
         D1: turns([wait(0.3), post("main", "Das stimmt nicht für n = 9.", kind="objection",
-                                   reply_to=2), done()]),
+                                   reply_to=2), done()], [say("gesehen")]),
         D2: turns([post("main", "Lemma A gilt für alle n ≡ 1 mod 4.", kind="claim")],
                   [post("main", "Stimmt, ich korrigiere.", reply_to=3), done()]),
     }  # fmt: skip
     manager, outcome, _ = await discuss(workfolder, scripts)
     assert outcome.ended_by is DiscussionEnd.ALL_DONE
-    [wake] = log_entries(manager.run_dir, "wake")
-    assert wake["data"]["agent"] == D2 and wake["data"]["reasons"] == ["reply"]
+    wakes = [
+        (e["data"]["agent"], e["data"]["reasons"]) for e in log_entries(manager.run_dir, "wake")
+    ]
+    assert wakes == [(D2, ["reply"]), (D1, ["reply"])]
+    assert manager.orchestrator.agent_status(D1) is AgentStatus.DONE, "done again afterwards"
 
 
 async def test_a2_at_all_wakes_every_other_member(workfolder: Path) -> None:
@@ -588,18 +592,23 @@ async def test_submit_result_finishes_but_an_open_own_question_keeps_working(
     assert len(turn_starts(manager.run_dir, D2)) == 2, "its open question kept it in"
 
 
-async def test_done_stays_and_only_a_question_wakes_it_again(workfolder: Path) -> None:
+async def test_done_stays_and_every_direct_message_wakes_it_again(workfolder: Path) -> None:
+    """L13: „fertig“ is reachable. A note with `@name` wakes the finished agent as well as a
+    question; the woken turn shows the note in full; afterwards it is done again."""
     scripts = {
         D1: turns([post("main", "Fertig.", kind="result")],
-                  [post("main", "Antwort: ja.", kind="answer", reply_to=3)]),
-        D2: turns([wait(0.3), post("main", "Notiz für @diskutant-1"),
+                  [post("main", "Antwort: ja.", kind="answer", reply_to=4)], repeat_last=True),
+        D2: turns([wait(0.3), post("main", "Notiz für @diskutant-1"), wait(0.3),
                    post("main", "@diskutant-1 gilt das?", kind="question"), done()]),
     }  # fmt: skip
     manager, outcome, _ = await discuss(workfolder, scripts)
     assert outcome.ended_by is DiscussionEnd.ALL_DONE
-    [wake] = log_entries(manager.run_dir, "wake")
-    assert wake["data"]["agent"] == D1 and wake["data"]["reasons"] == ["question"]
+    wakes = [e["data"] for e in log_entries(manager.run_dir, "wake")]
+    assert wakes and wakes[0]["agent"] == D1 and wakes[0]["reasons"][0] == "mention"
+    woken = turn_starts(manager.run_dir, D1)[1]["data"]["prompt"]
+    assert "Nachrichten an dich (ungelesen)" in woken and "Notiz für @diskutant-1" in woken
     assert manager.orchestrator.agent_status(D1) is AgentStatus.DONE, "done again afterwards"
+    assert not [m for m in manager.room.messages("main") if m.open], "the question is answered"
 
 
 # --- A4: Run A – idle rounds, `rounds` limits them, `discussion_end` reports them -----------

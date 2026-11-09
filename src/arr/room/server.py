@@ -26,6 +26,7 @@ from pydantic import ValidationError
 from arr.errors import ArrError
 from arr.log import setup_logging
 from arr.models import Provider
+from arr.room.address import is_user_question
 from arr.room.store import USER, AgentRoom, RoomStore
 from arr.room.types import ChannelInfo, Inbox, Message, RoomError
 from arr.room.waiting import PROVIDER_ENV, STREAK_MAX_S, WaitEnd, WaitOutcome, wait_max_s
@@ -42,9 +43,9 @@ FOOTER_SEPARATOR = "\n\n---\n"
 INSTRUCTIONS = (
     "Gruppenchat dieses Runs. Lies zuerst `inbox()`. Neue Nachrichten holst du mit "
     "`read_messages()`, schreiben mit `post_message(channel, body, kind, to, reply_to, refs)`. "
-    "Wen du ansprichst, nennst du mit `@name` im Text. Auf eine Antwort wartest du mit "
-    "`wait_for_messages`. Dateien aus deinem Arbeitsordner hängst du über `refs` an. Jedes "
-    "Ergebnis endet mit „ungelesen: …“."
+    "Wen du ansprichst, nennst du mit `@name` im Text, den User mit `@user`. Auf eine Antwort "
+    "wartest du mit `wait_for_messages`. Dateien aus deinem Arbeitsordner hängst du über `refs` "
+    "an. Jedes Ergebnis endet mit „ungelesen: …“."
 )
 INTERNAL_ERROR = "Interner Fehler im Gruppenchat. Die Details stehen im Run-Log."
 _EXPECTED = {
@@ -73,7 +74,8 @@ def _size(size: int) -> str:
 def render_message(msg: Message) -> str:
     """One message as text; the header starts with `[#<id> ` (parsed by tests and tools).
 
-    Messages of `user` are marked „★ vom User, hat Vorrang“ (docs/06 §10).
+    Messages of `user` are marked „★ vom User, hat Vorrang“ (docs/06 §10), questions to the
+    user „Frage an den User“ (only the user answers them, L16).
     """
     head = f"[#{msg.id} {msg.sender} · {msg.kind.value}"
     if msg.reply_to is not None:
@@ -84,6 +86,7 @@ def render_message(msg: Message) -> str:
     marks = (
         ("★ vom User, hat Vorrang", msg.sender == USER),
         ("angeheftet", msg.pinned),
+        ("Frage an den User", is_user_question(msg)),
         ("offene Frage", msg.open),
     )
     flags = [flag for flag, on in marks if on]
@@ -213,12 +216,14 @@ def render_wait(outcome: WaitOutcome) -> str:
     return text
 
 
-def render_wait_until(until: float, file: str | None) -> str:
+def render_wait_until(until: float, file: str | None, result_from: str | None = None) -> str:
     """Answer of `wait_until`: end the turn now, arr wakes the agent."""
     minutes = max(1, round((until - time.time()) / 60))
     reasons = ["eine Nachricht an dich kommt"]
     if file:
         reasons.append(f"die Datei „{file}“ da ist")
+    if result_from:
+        reasons.append(f"{result_from} ein Ergebnis abgibt")
     return (
         "Gut. Beende jetzt deinen Turn mit einer kurzen Zusammenfassung. arr weckt dich, "
         f"sobald {' oder '.join(reasons)}, spätestens um {_clock(until)} (in {minutes} min)."
@@ -317,9 +322,11 @@ def build_server(room: AgentRoom) -> MCPServer:
     @server.tool(
         description="Nachricht in einen deiner Kanäle schreiben. `kind`: note, idea, claim, "
         "proof, objection, question, answer, proposal, decision (nur Moderator), result, pass. "
-        "`to`: Adressaten (leer = alle); eine `question` mit `to` bleibt offen, bis der "
-        "Adressat mit `answer` und `reply_to` antwortet. `refs`: Dateien relativ zu deinem "
-        "Arbeitsordner, die als Anhang für alle Mitglieder kopiert werden."
+        "`to`: Adressaten (leer = alle), `user` für den User; `@name` und `@user` im Text "
+        "adressieren genauso. Eine `question` mit `to` bleibt offen, bis der Adressat mit "
+        "`answer` und `reply_to` antwortet; eine Frage an den User beantwortet nur der User. "
+        "`refs`: Dateien relativ zu deinem Arbeitsordner, die als Anhang für alle Mitglieder "
+        "kopiert werden."
     )
     def post_message(
         channel: str,
@@ -418,34 +425,39 @@ def build_server(room: AgentRoom) -> MCPServer:
             raise ToolError(await asyncio.to_thread(_with_footer, room, INTERNAL_ERROR)) from None
         return await asyncio.to_thread(_with_footer, room, render_wait(outcome))
 
+    def _wait_until(minutes: float, until_file: str | None, result_from: str | None) -> str:
+        def call() -> str:
+            state = room.wait_until(minutes, until_file, result_from)
+            shown = result_from.strip().removeprefix("@") if state.result_from else None
+            return render_wait_until(state.until, state.file, shown)
+
+        return _respond(room, "wait_until", call)
+
     if os.environ.get(PROVIDER_ENV) == Provider.CODEX:
         # Codex computes long scripts in the foreground; no `until_file` (L9, F1)
         @server.tool(
-            description="Lange warten, wenn gerade niemand antwortet: `minutes` (höchstens "
-            "30). Danach beendest du deinen Turn; arr weckt dich bei einer Nachricht an dich "
-            "oder nach Ablauf."
+            description="Lange warten, wenn gerade niemand antwortet oder du auf das Ergebnis "
+            "eines anderen Agenten wartest: `minutes` (höchstens 30), optional "
+            "`until_result_from` (Name des Agenten). Danach beendest du deinen Turn; arr weckt "
+            "dich bei einer Nachricht an dich, sobald der Agent ein Ergebnis abgibt, oder nach "
+            "Ablauf."
         )
-        def wait_until(minutes: float) -> str:
-            def call() -> str:
-                state = room.wait_until(minutes)
-                return render_wait_until(state.until, state.file)
-
-            return _respond(room, "wait_until", call)
+        def wait_until(minutes: float, until_result_from: str | None = None) -> str:
+            return _wait_until(minutes, None, until_result_from)
 
     else:
 
         @server.tool(
-            description="Lange warten, z. B. auf eine Rechnung, die im Hintergrund läuft: "
-            "`minutes` (höchstens 30), optional `until_file` (relativ zu deinem "
-            "Arbeitsordner). Danach beendest du deinen Turn; arr weckt dich bei einer "
-            "Nachricht an dich, wenn die Datei da ist, oder nach Ablauf."
+            description="Lange warten, z. B. auf eine Rechnung, die im Hintergrund läuft, oder "
+            "auf das Ergebnis eines anderen Agenten: `minutes` (höchstens 30), optional "
+            "`until_file` (relativ zu deinem Arbeitsordner) und `until_result_from` (Name des "
+            "Agenten). Danach beendest du deinen Turn; arr weckt dich bei einer Nachricht an "
+            "dich, wenn die Datei da ist, sobald der Agent ein Ergebnis abgibt, oder nach Ablauf."
         )
-        def wait_until(minutes: float, until_file: str | None = None) -> str:
-            def call() -> str:
-                state = room.wait_until(minutes, until_file)
-                return render_wait_until(state.until, state.file)
-
-            return _respond(room, "wait_until", call)
+        def wait_until(
+            minutes: float, until_file: str | None = None, until_result_from: str | None = None
+        ) -> str:
+            return _wait_until(minutes, until_file, until_result_from)
 
     @server.tool(description="Aktuellen Auftrag mit Stufe und Kontextpaket noch einmal abrufen.")
     def get_assignment() -> str:

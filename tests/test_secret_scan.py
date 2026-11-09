@@ -445,3 +445,70 @@ def test_w3_07_2_nb1_the_linear_search_finds_the_same() -> None:
     for _ in range(20_000):
         ident = "".join(rnd.choice(("a", "A", "1", "_", ".", "é", "Z9")) for _ in range(40))
         assert _random_segment(ident) is bool(_RANDOM_SEGMENT_RE.search(ident)), ident
+
+
+URL_LINES = {
+    "dotted": lambda n: "a." * (n // 2),  # NB5: `a.a.a…` without `://`
+    "dashed": lambda n: "a-" * (n // 2),
+    "sk": lambda n: "sk-" * (n // 3),
+    "xoxb": lambda n: "xoxb-" * (n // 5),
+    "dotted_scheme": lambda n: "a." * (n // 2) + "://x:y",  # `://` at the end, no `@`
+}
+"""W3-09 NB5: lines on which `url_credentials` took quadratic time on `2b7760f` (no secret)."""
+
+
+@pytest.mark.parametrize("shape", list(URL_LINES))
+@pytest.mark.parametrize(("size", "limit_s"), [(1 << 20, 1.0), (4 << 20, 4.0)], ids=["1MB", "4MB"])
+def test_w3_09_nb5_url_credentials_in_linear_time(shape: str, size: int, limit_s: float) -> None:
+    """1 MB in under 1 s, 4 MB in under 4 s; on `2b7760f` 80 000 characters took 13–73 s."""
+    from arr.runs.secret_scan import _NAMED_PATTERNS
+
+    rule = dict(_NAMED_PATTERNS)["url_credentials"]
+    line = URL_LINES[shape](size)
+    started = time.perf_counter()
+    assert not rule.search(line)
+    assert time.perf_counter() - started < limit_s
+
+
+def test_w3_09_nb5_a_run_with_a_4_mb_line_is_scanned_at_once(tmp_path: Path) -> None:
+    """`scan_url_run.py` of the review as a test: 200 KB took 57 s, 4 MB now in under 4 s."""
+    run = _run_dir(tmp_path)
+    _write(run / "agents/a/work/perm.txt", URL_LINES["dotted"](4 << 20) + "\n")
+    _write(run / "agents/a/work/url.txt", "a." * 1000 + "https://bot:fake-pass-123@host/x\n")
+    started = time.perf_counter()
+    found = [(f.file, f.line, f.kind) for f in scan_run_dir(run).findings]
+    assert time.perf_counter() - started < 4.0
+    assert found == [("agents/a/work/url.txt", 1, "url_credentials")]
+
+
+URL_PIECES = (
+    "http", "https", "git+ssh", "a", "A", "Z", "ſ", "K", "é", "_", "9", "x", "ab.cd",
+    "abcdefghijklmnopq", "A1b2C3d4E5f6G7h8I9", ".", "+", "-", ":", "://", "//", "/", "@", " ",
+    "\t", "user", "pa.ss", "p@ss", "host", ":p", "::", "a-", "sk-", "«entfernt»",
+)  # fmt: skip
+"""Pieces of random lines for the URL rule: schemes, long names, delimiters (all fake)."""
+
+
+def test_w3_09_nb5_the_linear_url_rule_finds_the_same() -> None:
+    """Same matches as the plain pattern of `2b7760f`, also for schemes longer than 32
+    characters, which a bounded scheme `{0,31}` would miss; `redact` gives the same text."""
+    import random
+
+    from arr.permissions.policy import _URL_CREDS_PLAIN, _URL_CREDS_RE, redact
+
+    rnd = random.Random(7)
+    hits = 0
+    for _ in range(30_000):
+        line = "".join(rnd.choice(URL_PIECES) for _ in range(rnd.randint(1, 18)))
+        plain, linear = _URL_CREDS_PLAIN.search(line), _URL_CREDS_RE.search(line)
+        assert (plain and plain.span(), plain and plain.groups()) == (
+            linear and linear.span(),
+            linear and linear.groups(),
+        ), f"line {line!r}"
+        expected = _URL_CREDS_PLAIN.sub(lambda m: f"{m.group(1)}X@", line)
+        assert _URL_CREDS_RE.sub(lambda m: f"{m.group(1)}X@", line) == expected
+        hits += plain is not None
+    assert hits > 50, "both outcomes are covered"
+    long_scheme = "abcdefghijklmnopqA1b2C3d4E5f6G7h8I9://bot:fake-pass@host"
+    assert _URL_CREDS_RE.search(long_scheme) is not None
+    assert redact(long_scheme) == "abcdefghijklmnopqA1b2C3d4E5f6G7h8I9://«entfernt»@host"

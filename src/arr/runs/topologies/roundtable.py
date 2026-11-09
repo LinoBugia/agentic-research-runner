@@ -102,9 +102,12 @@ async def run(ctx: RunContext) -> None:
         f"## Aufgabe\n\n{task}\n\nBearbeitet die Aufgabe gemeinsam in #{channel}. Lies die neuen "
         "Nachrichten, arbeite weiter und poste deinen Beitrag. "
         + _PACING_TEXT[ctx.config.channel(channel).mode].format(rounds=rounds)
-        + " Wen du fragst, nennst du mit `@name`; auf eine Antwort wartest du mit "
-        "`wait_for_messages`. Bist du fertig, gib dein Ergebnis ab oder melde `done` mit "
-        "set_status und einem kurzen Fazit."
+        + " Wen du fragst, nennst du mit `@name`, den User mit `@user`; auf eine Antwort wartest "
+        "du mit `wait_for_messages`. Teilt ihr die Arbeit auf, sagt im Kanal, wer welchen Teil "
+        "übernimmt. Ist dein Teil erledigt, gib dein Ergebnis ab oder melde `done` mit "
+        "set_status und einem kurzen Fazit; du bleibst ansprechbar, eine Nachricht an dich "
+        "weckt dich. Brauchst du dafür das Ergebnis eines anderen, warte mit "
+        '`wait_until(minutes, until_result_from="<name>")`.'
     )
     await ctx.discuss(channel, prompt, stage=STAGE, rounds=rounds, context=context)
     if ctx.stop_requested or not summarizer:

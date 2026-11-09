@@ -42,7 +42,7 @@ from arr.models import (
     Rubric,
 )
 from arr.resolve import load_yaml_model
-from arr.room.address import address, mentions
+from arr.room.address import USER_ADDRESS, address, is_user_question, mentions
 from arr.room.types import (
     AgentStatusRecord,
     Assignment,
@@ -120,7 +120,7 @@ CREATE TABLE IF NOT EXISTS floor(id INTEGER PRIMARY KEY, ts REAL, channel TEXT,
     moderator TEXT, agent TEXT, prompt TEXT, msg_id INTEGER, handled INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS agent_report(agent TEXT PRIMARY KEY, status TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS agent_wait(agent TEXT, kind TEXT, since REAL, until REAL,
-    file TEXT, PRIMARY KEY (agent, kind));
+    file TEXT, result_from TEXT, PRIMARY KEY (agent, kind));
 CREATE TABLE IF NOT EXISTS wait_guard(agent TEXT PRIMARY KEY, waited REAL NOT NULL DEFAULT 0,
     seen INTEGER, last_end TEXT, yield_to TEXT, end_turn TEXT,
     until_streak INTEGER NOT NULL DEFAULT 0);
@@ -128,7 +128,8 @@ CREATE TABLE IF NOT EXISTS wait_guard(agent TEXT PRIMARY KEY, waited REAL NOT NU
 """Tables of docs/02 §5 plus `channel.state`, `msg.via`/`msg.delivery`, `poll`, `floor`,
 `agent_report` (the status an agent reported itself), `agent_wait` (one row per agent and
 kind of wait, docs/09 §4.3) and `wait_guard` (the limits of waiting, L7, L10, L12). Rooms of
-runs before W3-07 lack the last three; readers treat that as „no rows“."""
+runs before W3-07 lack the last three, rooms before W3-09 the column `agent_wait.result_from`
+(L14); readers treat that as „no rows“ or „none“."""
 
 WAIT_GUARD_FIELDS = frozenset(
     {"waited", "seen", "last_end", "yield_to", "end_turn", "until_streak"}
@@ -138,13 +139,15 @@ CONVERSATION_RULES = (
     "Eine Nachricht, ein Gedanke. Setze `kind` korrekt.",
     "Behauptungen mit Begründung oder Beleg: Datei, Rechnung, Anhang.",
     "Beantworte Fragen an dich zuerst.",
-    "Wer jemanden fragt, schreibt `@name` (oder `to`); `@alle` fragt alle. Auf eine Antwort "
-    "wartest du mit `wait_for_messages`.",
+    "Wer jemanden fragt, schreibt `@name` (oder `to`); `@alle` fragt alle, `@user` den User "
+    "(nur er antwortet darauf). Auf eine Antwort wartest du mit `wait_for_messages`.",
     "Widerspruch als `objection` mit `reply_to`, sachlich und konkret.",
     "Nicht wiederholen. Zustimmung nur, wenn sie etwas hinzufügt.",
     "Lange Inhalte (Beweise, Code, Tabellen) als Anhang, im Text nur die Kernaussage.",
-    "Wer fertig ist, gibt sein Ergebnis ab (`submit_result` oder Nachricht `result`) oder "
-    "meldet `done`. Danach weckt dich nur noch eine Frage an dich.",
+    "Wer seinen Teil erledigt hat, gibt sein Ergebnis ab (`submit_result` oder Nachricht "
+    "`result`) oder meldet `done`. Fertig heißt: Du wartest nicht mehr, bleibst aber "
+    "ansprechbar; jede Nachricht an dich weckt dich. Wartest du auf das Ergebnis eines anderen, "
+    'warte mit `wait_until(minutes, until_result_from="<name>")`.',
 )
 """Conversation rules of docs/06-gruppenchats.md §6 and docs/09 §4.7, in every channel brief."""
 
@@ -157,8 +160,9 @@ _MODE_TEXT = {
 }
 _END_TEXT = {
     ChannelMode.ROUNDS: "nach der letzten Runde oder wenn alle `pass`/`done` melden.",
-    ChannelMode.EVENT: "wenn alle fertig sind (Ergebnis abgegeben oder `done`), nach den "
-    "Leerlauf-Runden oder wenn es lange ruhig ist.",
+    ChannelMode.EVENT: "wenn alle fertig sind (Ergebnis abgegeben oder `done`) und keine "
+    "Nachricht an einen von ihnen ungelesen ist, nach den Leerlauf-Runden oder wenn es lange "
+    "ruhig ist.",
     ChannelMode.MODERATED: "wenn der Moderator die Diskussion mit einer Entscheidung beendet.",
 }
 
@@ -497,13 +501,25 @@ class RoomStore:
             con.execute("UPDATE msg SET open=0 WHERE channel=? AND open=1", (channel,))
         return cur.rowcount > 0
 
+    def _resolved(self) -> ResolvedRun | None:
+        if not hasattr(self, "_run"):
+            run_yaml = self.run_dir / "run.yaml"
+            self._run = load_yaml_model(run_yaml, ResolvedRun) if run_yaml.is_file() else None
+        return self._run
+
     def rubric(self) -> Rubric:
         """Rubric of the run from `run.yaml` (docs/03 §3); the default scale without one."""
-        if not hasattr(self, "_rubric"):
-            run_yaml = self.run_dir / "run.yaml"
-            run = load_yaml_model(run_yaml, ResolvedRun) if run_yaml.is_file() else None
-            self._rubric = run.rubric if run and run.rubric else Rubric()
-        return self._rubric
+        run = self._resolved()
+        return run.rubric if run and run.rubric else Rubric()
+
+    def agent_ids(self) -> list[str]:
+        """Agents of the run from `run.yaml`, in order; without it the channel members."""
+        run = self._resolved()
+        if run is not None:
+            return [a.id for a in run.agents]
+        with self._read() as con:
+            rows = con.execute("SELECT DISTINCT agent FROM member ORDER BY rowid").fetchall()
+        return [r[0] for r in rows]
 
     def open_channel(self, channel: str) -> None:
         """Open a channel whose `open_from` stage has been reached (W2-03)."""
@@ -612,12 +628,14 @@ class RoomStore:
         )
         assert cur.lastrowid is not None
         if kind is MessageKind.ANSWER and reply_to is not None:
-            # An answer by an addressee closes the open question (docs/06 §3).
+            # An answer by an addressee closes the open question (docs/06 §3); a question to
+            # the user only the user (L16).
             row = con.execute(
                 "SELECT to_agents FROM msg WHERE id=? AND kind='question' AND open=1",
                 (reply_to,),
             ).fetchone()
-            if row and sender in json.loads(row["to_agents"]):
+            addressees = json.loads(row["to_agents"]) if row else []
+            if sender in addressees and (USER not in addressees or sender == USER):
                 con.execute("UPDATE msg SET open=0 WHERE id=?", (reply_to,))
         return cur.lastrowid
 
@@ -643,6 +661,11 @@ class RoomStore:
 
         Messages from `user` need `via` and start with delivery `pending`; the orchestrator
         updates it with `set_delivery`. `to` holds real agent IDs of channel members.
+
+        The user answers open questions to the user in the channel (L16): a message with
+        `reply_to` on such a question, or one to its asker (`to`, `@name`), closes it. A message
+        without addressee and without `reply_to` answers nothing: a note to all stays a note to
+        all (User 08.11., W3-09.1).
         """
         if sender not in RESERVED_SENDERS:
             raise ValueError(f"post() writes as orchestrator or user, not as {sender!r}")
@@ -663,11 +686,16 @@ class RoomStore:
                     f"Kein Mitglied von #{channel}: {', '.join(unknown)}. "
                     f"Mitglieder: {', '.join(ch.members)}."
                 )
+            asked: list[Message] = []
             if sender == USER:  # `@name` of the user addresses like `to` (docs/09 §4.1)
                 named = mentions(body, ch.members, USER, lambda n: n if n in ch.members else None)
                 to = [*to, *named]
+                asked = self._open_user_questions(con, channel)
             if reply_to is not None:
                 self._check_reply_to(con, ch.name, reply_to, ArrError)
+            for question in asked:
+                if reply_to == question.id or question.sender in to:
+                    con.execute("UPDATE msg SET open=0 WHERE id=?", (question.id,))
             msg_id = self._insert_msg(
                 con,
                 channel,
@@ -681,6 +709,24 @@ class RoomStore:
                 delivery=delivery,
             )
             return self._load_msg(con, msg_id)
+
+    @staticmethod
+    def _open_user_questions(con: sqlite3.Connection, channel: str | None) -> list[Message]:
+        sql, args = "SELECT * FROM msg WHERE open=1 AND kind='question'", ()
+        if channel is not None:
+            sql, args = sql + " AND channel=?", (channel,)
+        found = [_row_to_message(r) for r in con.execute(sql + " ORDER BY id", args)]
+        return [m for m in found if is_user_question(m)]
+
+    def close_question(self, msg_id: int) -> None:
+        """Close a question nobody will answer any more (its asker worked on, the run ended)."""
+        with self._write() as con:
+            con.execute("UPDATE msg SET open=0 WHERE id=? AND kind='question'", (msg_id,))
+
+    def open_user_questions(self, channel: str | None = None) -> list[Message]:
+        """Open questions to the user (L16), oldest first; real sender IDs."""
+        with self._read() as con:
+            return self._open_user_questions(con, channel)
 
     @staticmethod
     def _check_reply_to(
@@ -861,6 +907,7 @@ class RoomStore:
                 since=r["since"],
                 until=r["until"],
                 file=r["file"],
+                result_from=dict(r).get("result_from"),
             )
             for r in rows
         }
@@ -1191,6 +1238,20 @@ class AgentRoom:
             )
         return ch
 
+    def shown_name(self, agent: str) -> str:
+        """How this agent sees `agent`: its alias when an anonymous channel of mine hides it,
+        else its ID (W3-09.1, B2; the same rule as `_check_result_from`)."""
+        with self.store._read() as con:
+            for ch in self._readable(con):
+                if ch.anonymous and agent in ch.members:
+                    return ch.display(agent)
+        return agent
+
+    def can_read(self, channel: str) -> bool:
+        """True if this agent may read `channel` (a member, not waiting for `open_from`)."""
+        with self.store._read() as con:
+            return any(ch.name == channel for ch in self._readable(con))
+
     def moderated_channels(self) -> list[str]:
         """Channels this agent moderates (the server offers moderator tools only then)."""
         with self.store._read() as con:
@@ -1366,7 +1427,7 @@ class AgentRoom:
                 "SELECT * FROM msg WHERE channel=? AND open=1 ORDER BY id", (ch.name,)
             ):
                 msg = _row_to_message(row)
-                if self.agent_id in msg.to:
+                if self.agent_id in msg.to and not is_user_question(msg):
                     result.append(self._view(msg, ch))
         return sorted(result, key=lambda m: m.id)
 
@@ -1543,11 +1604,12 @@ class AgentRoom:
                     )
                 targets = self._targets(ch, to or [])
                 # `@name` in the text addresses like `to` (docs/09 §4.1)
-                targets = list(
-                    dict.fromkeys(
-                        [*targets, *mentions(body, ch.members, self.agent_id, ch.resolve)]
-                    )
-                )
+                named = mentions(body, ch.members, self.agent_id, ch.resolve)
+                if kind is MessageKind.QUESTION and USER in (*targets, *named):
+                    # a question to the user goes to the user, other `@name` in its text are
+                    # only named, never asked instead of the user (L16, Nachtest V7)
+                    named = [USER]
+                targets = list(dict.fromkeys([*targets, *named]))
                 if reply_to is not None:
                     self.store._check_reply_to(con, ch.name, reply_to, RoomError)
                 # Inside BEGIN IMMEDIATE nobody else inserts: max+1 is the next ID.
@@ -1590,6 +1652,9 @@ class AgentRoom:
     def _targets(self, ch: _Channel, to: list[str]) -> list[str]:
         targets = []
         for name in to:
+            if name.strip().removeprefix("@").casefold() == USER_ADDRESS:
+                targets.append(USER)  # the user is a fixed address (L16)
+                continue
             agent = ch.resolve(name)
             if agent is None:
                 shown = ", ".join(ch.display(a) for a in ch.members if a != self.agent_id)
@@ -1723,20 +1788,31 @@ class AgentRoom:
         return until_file
 
     def begin_wait(
-        self, kind: WaitKind, seconds: float, until_file: str | None = None
+        self,
+        kind: WaitKind,
+        seconds: float,
+        until_file: str | None = None,
+        result_from: str | None = None,
     ) -> WaitState:
-        """Record that this agent waits from now for `seconds` (and maybe `until_file`)."""
+        """Record that this agent waits from now for `seconds` (and maybe `until_file` or the
+        next result of the agent `result_from`, a real ID)."""
         until_file = self._check_until_file(until_file)
         now = _now()
         state = WaitState(
-            agent=self.agent_id, kind=kind, since=now, until=now + seconds, file=until_file
+            agent=self.agent_id,
+            kind=kind,
+            since=now,
+            until=now + seconds,
+            file=until_file,
+            result_from=result_from,
         )
         with self.store._write() as con:
             con.execute(
-                "INSERT INTO agent_wait(agent, kind, since, until, file) VALUES(?,?,?,?,?) "
-                "ON CONFLICT(agent, kind) DO UPDATE SET since=excluded.since, "
-                "until=excluded.until, file=excluded.file",
-                (self.agent_id, kind.value, state.since, state.until, state.file),
+                "INSERT INTO agent_wait(agent, kind, since, until, file, result_from) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(agent, kind) DO UPDATE SET "
+                "since=excluded.since, until=excluded.until, file=excluded.file, "
+                "result_from=excluded.result_from",
+                (self.agent_id, kind.value, state.since, state.until, state.file, result_from),
             )
         return state
 
@@ -1744,14 +1820,22 @@ class AgentRoom:
         """End this agent's wait of `kind`."""
         self.store.clear_wait(self.agent_id, kind)
 
-    def wait_until(self, minutes: float, until_file: str | None = None) -> WaitState:
-        """Ask to be woken after `minutes` (at most 30), on a message or when `until_file` is
-        there; the agent ends its turn afterwards (docs/09 §4.3).
+    def wait_until(
+        self,
+        minutes: float,
+        until_file: str | None = None,
+        until_result_from: str | None = None,
+    ) -> WaitState:
+        """Ask to be woken after `minutes` (at most 30), on a message, when `until_file` is
+        there or when the agent `until_result_from` submits a result (L14); the agent ends its
+        turn afterwards (docs/09 §4.3).
 
-        Refused after `WAIT_UNTIL_REPEAT` of them in a row ended by their deadline (L10).
+        Refused after `WAIT_UNTIL_REPEAT` of them in a row ended by their deadline (L10), for
+        an unknown agent, for oneself and for an agent that is done already.
         """
         if not isinstance(minutes, int | float) or not math.isfinite(minutes) or minutes <= 0:
             raise RoomError("„minutes“ muss eine Zahl größer als 0 sein, z. B. 10.")
+        result_from = self._check_result_from(until_result_from)
         if self.wait_guard().until_streak >= WAIT_UNTIL_REPEAT:
             raise RoomError(
                 f"Du hast {WAIT_UNTIL_REPEAT}-mal hintereinander mit `wait_until` gewartet, ohne "
@@ -1760,7 +1844,50 @@ class AgentRoom:
                 "weckt dich bei einer Nachricht an dich."
             )
         minutes = min(float(minutes), WAIT_UNTIL_MAX_MIN)
-        return self.begin_wait(WaitKind.UNTIL, minutes * 60, until_file)
+        return self.begin_wait(WaitKind.UNTIL, minutes * 60, until_file, result_from)
+
+    def _check_result_from(self, name: str | None) -> str | None:
+        """The real ID of the agent named in `until_result_from`, None without a name (L14).
+
+        A name is resolved as in `to` (aliases in anonymous channels); an agent of the run that
+        shares no channel with me counts by its ID, unless an anonymous channel of mine hides
+        it. Unknown names, myself and agents that are done already raise `RoomError`.
+        """
+        if name is None or not str(name).strip():
+            return None
+        wanted = str(name).strip().removeprefix("@")
+        if not wanted.strip("@ "):  # only `@`: no name (B4)
+            raise RoomError(
+                "„until_result_from“ nennt keinen Agenten. Nenne einen Agenten, z. B. so, wie "
+                "du ihn mit `@name` ansprichst, oder lass das Feld weg."
+            )
+        with self.store._read() as con:
+            channels = self._readable(con)
+            hidden = {a for ch in channels if ch.anonymous for a in ch.members}
+            agent = next((a for ch in channels if (a := ch.resolve(wanted)) is not None), None)
+            if agent is None and wanted in self.store.agent_ids() and wanted not in hidden:
+                agent = wanted
+            if agent is None:
+                shown = [ch.display(a) for ch in channels for a in ch.members]
+                shown += [a for a in self.store.agent_ids() if a not in hidden]
+                me = {self.agent_id} | {ch.display(self.agent_id) for ch in channels}  # B5
+                names = [n for n in dict.fromkeys(shown) if n not in me]
+                raise RoomError(
+                    f"Den Agenten „{wanted}“ gibt es in diesem Run nicht. Du kannst auf das "
+                    f"Ergebnis von {', '.join(names) or 'niemandem'} warten."
+                )
+            if agent == self.agent_id:
+                raise RoomError(
+                    "Auf dein eigenes Ergebnis kannst du nicht warten. Gib es ab oder arbeite "
+                    "weiter."
+                )
+            row = con.execute("SELECT status FROM agent_state WHERE agent=?", (agent,)).fetchone()
+        if row is not None and row["status"] == AgentStatus.DONE.value:
+            raise RoomError(
+                f"„{wanted}“ ist schon fertig, sein Ergebnis liegt vor. Lies es oder frag mit "
+                f"@{wanted} nach: Eine Nachricht weckt auch einen fertigen Agenten."
+            )
+        return agent
 
     def wait_guard(self) -> WaitGuard:
         """My row of `wait_guard` (defaults without one)."""
@@ -1784,11 +1911,12 @@ class AgentRoom:
         return max((m.id for m in self._for_me(unread=False)), default=0)
 
     def _for_me(self, *, unread: bool) -> list[Message]:
+        """Messages that concern me, as I see them (aliases in anonymous channels)."""
         with self.store._read() as con:
-            found = []
+            found: list[tuple[Message, _Channel]] = []
             for ch in self._readable(con):
                 found += [
-                    _row_to_message(r)
+                    (_row_to_message(r), ch)
                     for r in con.execute(
                         "SELECT * FROM msg WHERE channel=? AND id>? AND sender!=? ORDER BY id",
                         (ch.name, self._cursor(con, ch.name) if unread else 0, self.agent_id),
@@ -1802,7 +1930,11 @@ class AgentRoom:
                     senders[msg_id] = row["sender"] if row else ""
                 return senders[msg_id] or None
 
-            return [m for m in found if address(m, self.agent_id, sender_of) is not None]
+            return [
+                self._view(m, ch)
+                for m, ch in found
+                if address(m, self.agent_id, sender_of) is not None
+            ]
 
     def submit_result(
         self,

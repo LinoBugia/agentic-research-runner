@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from arr.backends.base import Usage
+from arr.runs.eventlog import RATE_LIMIT_ALLOWED
 from arr.service.api_models import (
     ToolBundle,
     ToolStatus,
@@ -391,7 +392,9 @@ def to_event(
     run_dir: Path | None,
     agent_id: str,
 ) -> TranscriptEvent | None:
-    """One line of `transcript.jsonl` as `TranscriptEvent`; `tool_result` lines give None."""
+    """One line of `transcript.jsonl` as `TranscriptEvent`; `tool_result` lines give None, and
+    so does a `rate_limit` with `allowed`, which changes nothing (Nachtest V5). `allowed_warning`
+    is served: it throttles the profile, the GUI shows it as a hint (W3-09.1)."""
     kind = str(record.get("kind") or "")
     if kind == TOOL_RESULT:
         return None
@@ -443,4 +446,7 @@ def to_event(
         api_kind = TranscriptKind(kind)
     except ValueError:
         return None
+    status = str(data.get("status") or "")
+    if api_kind is TranscriptKind.RATE_LIMIT and status in RATE_LIMIT_ALLOWED:
+        return None  # V5: the window was reported, nothing changed
     return TranscriptEvent(**base, kind=api_kind, data=data)

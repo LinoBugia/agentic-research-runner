@@ -210,7 +210,7 @@ def test_permission_types() -> None:
     assert {s.value for s in DecisionScope} == {"once", "agent", "run", "always"}
     assert {d.value for d in DecidedBy} == {"user", "gatekeeper", "mandate_rule", "fixed_rule"}
     assert {"action", "scope", "decided_by", "reason", "changes"} <= fields(Decision)
-    assert {t.value for t in ApprovalType} == {"run_start", "permission", "escalation"}
+    assert {t.value for t in ApprovalType} == {"run_start", "permission", "escalation", "question"}
     assert {s.value for s in ApprovalStatus} == {
         "open",
         "decided",

@@ -100,7 +100,7 @@ Ausgabe ausgelagert: `blobs/000009-toolu_03.txt`
 
 > **Hinweis aus #main** (post_tool_use): 1 Frage an dich in #main
 
-*Rate-Limit: allowed_warning, Auslastung 82 %*
+*Warnung zum Nutzungslimit: weiter erlaubt, Auslastung 82 %, Fenster bis 16:40:00*
 
 **Fehler** (tool_error, behebbar): Werkzeug kurz nicht erreichbar
 

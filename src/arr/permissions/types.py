@@ -38,7 +38,8 @@ class DecisionAction(StrEnum):
     """Outcome of a decision (docs/07 §3, §5; docs/08 §5.0).
 
     `ask` is only a PolicyEngine result (goes to the inbox), never a final decision.
-    `adjust` is for run starts changed by the user, `option` for escalations.
+    `adjust` is for run starts changed by the user, `option` for escalations, `answer` for a
+    question of an agent to the user (the text in `comment`, L16).
     """
 
     ALLOW = "allow"
@@ -46,6 +47,7 @@ class DecisionAction(StrEnum):
     ASK = "ask"
     ADJUST = "adjust"
     OPTION = "option"
+    ANSWER = "answer"
 
 
 class DecisionScope(StrEnum):
@@ -67,11 +69,16 @@ class DecidedBy(StrEnum):
 
 
 class ApprovalType(StrEnum):
-    """Kind of an inbox item (docs/07-berechtigungen-und-freigaben.md §6)."""
+    """Kind of an inbox item (docs/07-berechtigungen-und-freigaben.md §6).
+
+    `question`: an agent asks the user with `@user` (docs/09 §4.2, L16); it waits for nothing
+    in the inbox, the answer goes into the channel.
+    """
 
     RUN_START = "run_start"
     PERMISSION = "permission"
     ESCALATION = "escalation"
+    QUESTION = "question"
 
 
 class ApprovalStatus(StrEnum):
@@ -163,9 +170,13 @@ class Decision(Record):
             raise ValueError("„changes“ gehört genau zu „adjust“ und darf dort nicht leer sein.")
         if (self.action is DecisionAction.OPTION) != (self.option is not None):
             raise ValueError("„option“ gehört genau zu „action: option“.")
-        user_only = (DecisionAction.ADJUST, DecisionAction.OPTION)
+        user_only = (DecisionAction.ADJUST, DecisionAction.OPTION, DecisionAction.ANSWER)
         if self.action in user_only and self.decided_by is not DecidedBy.USER:
-            raise ValueError("Anpassen und Eskalationen entscheidet in v1 nur der User (07 §6).")
+            raise ValueError(
+                "Anpassen, Eskalationen und Antworten an Agenten gibt in v1 nur der User (07 §6)."
+            )
+        if self.action is DecisionAction.ANSWER and not (self.comment or "").strip():
+            raise ValueError("Eine Antwort braucht einen Text in „comment“.")
         return self
 
     @property
@@ -194,20 +205,32 @@ class EscalatedBy(Record):
         return self
 
 
+class UserQuestion(Record):
+    """A question of an agent to the user in a channel (`@user`, docs/09 §4.2, L16)."""
+
+    agent_id: str
+    channel: str
+    msg_id: int
+    text: str
+
+
 _ALLOWED_ACTIONS = {
     ApprovalType.RUN_START: {DecisionAction.ALLOW, DecisionAction.DENY, DecisionAction.ADJUST},
     ApprovalType.PERMISSION: {DecisionAction.ALLOW, DecisionAction.DENY},
     ApprovalType.ESCALATION: {DecisionAction.OPTION},
+    ApprovalType.QUESTION: {DecisionAction.ANSWER},
 }
-_USER_ONLY_TYPES = {ApprovalType.RUN_START, ApprovalType.ESCALATION}
+_USER_ONLY_TYPES = {ApprovalType.RUN_START, ApprovalType.ESCALATION, ApprovalType.QUESTION}
 
 
 class ApprovalItem(Record):
-    """An entry of the approval inbox: run start, permission request or escalation (docs/07 §6).
+    """An entry of the approval inbox: run start, permission request, escalation or a question
+    of an agent to the user (docs/07 §6, docs/09 L16).
 
-    Run starts have no deadline (docs/07 §5). Run starts and escalations are decided only by
-    the user, with scope `once` (E15, docs/07 §6). The GUI builds its own view model with the same
-    enums (docs/08 §5.0); the details of a run start come from the resolved run.
+    Run starts have no deadline (docs/07 §5). Run starts, escalations and questions are decided
+    only by the user, with scope `once` (E15, docs/07 §6); a question has no deadline either,
+    it closes with the end of the run. The GUI builds its own view model with the same enums
+    (docs/08 §5.0); the details of a run start come from the resolved run.
     """
 
     id: str = Field(description="e.g. apr_0042, used in deep links")
@@ -223,6 +246,7 @@ class ApprovalItem(Record):
     stage: str | None = Field(default=None, description="Escalation: stage that failed")
     summary: str | None = None
     options: list[EscalationOption] = Field(default_factory=list)
+    question: UserQuestion | None = None
     decision: Decision | None = None
     count: int = Field(default=1, ge=1, description="Equal requests answered by this item")
 
@@ -234,6 +258,8 @@ class ApprovalItem(Record):
             raise ValueError("Run-Start-Freigaben haben keine Frist (07 §5).")
         if self.type is ApprovalType.ESCALATION and not self.options:
             raise ValueError("Eine Eskalation braucht mindestens eine Option.")
+        if (self.type is ApprovalType.QUESTION) != (self.question is not None):
+            raise ValueError("„question“ gehört genau zu einer Frage an den User.")
         if (self.status is ApprovalStatus.DECIDED) and self.decision is None:
             raise ValueError("Ein entschiedener Eintrag braucht „decision“.")
         if self.status is ApprovalStatus.OPEN and self.decision is not None:
@@ -244,9 +270,9 @@ class ApprovalItem(Record):
                 or self.decision.scope is not DecisionScope.ONCE
             ):
                 raise ValueError(
-                    "Run-Starts und Eskalationen entscheidet in v1 nur der User in der GUI, "
-                    "jeweils einmalig (E15, 07 §6). Erlaubt ist nur „decided_by: user“ mit "
-                    "„scope: once“."
+                    "Run-Starts, Eskalationen und Fragen an den User entscheidet in v1 nur der "
+                    "User in der GUI, jeweils einmalig (E15, 07 §6). Erlaubt ist nur "
+                    "„decided_by: user“ mit „scope: once“."
                 )
             if self.decision.action not in _ALLOWED_ACTIONS[self.type]:
                 raise ValueError(
