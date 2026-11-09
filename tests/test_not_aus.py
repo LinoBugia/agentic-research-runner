@@ -734,19 +734,41 @@ async def test_a_profile_without_a_run_has_an_empty_record(api: RealApi) -> None
     assert record.runs == [] and record.total.runs == 0
 
 
-async def test_200_runs_stay_under_a_second(api: RealApi, wf: Path) -> None:
+RATIO_MAX = 20
+"""200 runs may take at most this many times as long as 20: linear is ≈ 10, quadratic ≈ 100."""
+CEILING_S = 3.0
+"""Backstop only: the CI runner (Ubuntu 26) took 1.1–1.4 s for 200 runs where a Mac takes 0.5 s;
+the criterion that does not depend on the machine is `RATIO_MAX` (W3-10.2)."""
+
+
+def _usage_runs(workfolder: Path, count: int) -> None:
     import shutil
 
-    template = make_run_folder(wf, status=RunStatus.DONE)
+    template = make_run_folder(workfolder, status=RunStatus.DONE)
     write_usage(template, {"a": ("fake-auth", total(1, 1, 1))})
     meta = json.loads((template / "meta.json").read_text())
-    for number in range(199):
+    for number in range(count - 1):
         run_id = f"20261001-{number // 60:02d}{number % 60:02d}_demo_custom_{number:04x}"
-        target = wf / "runs" / run_id
+        target = workfolder / "runs" / run_id
         shutil.copytree(template, target)
         (target / "meta.json").write_text(json.dumps({**meta, "run_id": run_id}))
-    fresh = RealApi(wf, base_url=BASE, scan=False)
-    started = time.perf_counter()
-    record = await fresh.get_profile_usage("fake-auth")
-    assert time.perf_counter() - started <= 1.0
-    assert record.total.runs == 200 and record.total.input == 200
+
+
+async def test_200_runs_stay_under_a_second(api: RealApi, wf: Path, tmp_path: Path) -> None:
+    """The usage of a profile over 200 runs grows linearly. Measured against 20 runs on the same
+    machine, cold (a fresh `RealApi` each time), alternately and the best of three, so neither a
+    slow runner nor load fails it; a quadratic step still does (W3-10.2)."""
+    small = make_workfolder(tmp_path / "klein")
+    _usage_runs(small, 20)
+    _usage_runs(wf, 200)
+    times: dict[int, list[float]] = {20: [], 200: []}
+    for _ in range(3):
+        for workfolder, count in ((small, 20), (wf, 200)):
+            fresh = RealApi(workfolder, base_url=BASE, scan=False)
+            started = time.perf_counter()
+            record = await fresh.get_profile_usage("fake-auth")
+            times[count].append(time.perf_counter() - started)
+            assert record.total.runs == count and record.total.input == count
+    t20, t200 = min(times[20]), min(times[200])
+    assert t200 <= RATIO_MAX * t20, f"200 Runs {t200:.3f} s, 20 Runs {t20:.3f} s: nicht linear"
+    assert t200 <= CEILING_S, f"200 Runs {t200:.3f} s"

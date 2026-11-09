@@ -1,5 +1,6 @@
-"""Tempo of `RealApi` (W3-01 A7): a list of 200 runs and a run detail with 50 000 transcript
-lines each in under a second, cold (first read) and warm (cached by mtime)."""
+"""Tempo of `RealApi` (W3-01 A7): a list of 200 runs that grows linearly (against 20 runs on
+the same machine, W3-10.2) and a run detail with 50 000 transcript lines in under a second,
+cold (first read) and warm (cached by mtime)."""
 
 import asyncio
 import json
@@ -41,34 +42,54 @@ def clone_runs(template: Path, count: int) -> list[Path]:
     return out
 
 
-def test_list_of_200_runs_under_a_second(wf: Path) -> None:
-    template = make_run_folder(wf, status=RunStatus.DONE, name="Vorlage")
+RATIO_MAX = 20
+"""200 runs may take at most this many times as long as 20: linear is ≈ 10, quadratic ≈ 100."""
+CEILING_S = 3.0
+"""Backstop only: the CI runner (Ubuntu 26) is about 2.5 times slower than a Mac; the criterion
+that does not depend on the machine is `RATIO_MAX` (W3-10.2)."""
+
+
+def _listed_runs(workfolder: Path, count: int) -> None:
+    template = make_run_folder(workfolder, status=RunStatus.DONE, name="Vorlage")
     transcript = template / "agents" / "a" / "transcript.jsonl"
     with transcript.open("w", encoding="utf-8") as handle:
         for seq in range(1, 101):
             handle.write(transcript_line(seq, "a", template.name, "text", {"text": "x"}) + "\n")
     (template / "output" / "summary.md").write_text("# Zusammenfassung\n", "utf-8")
-    clone_runs(template, 199)
+    clone_runs(template, count - 1)
 
-    async def measure() -> tuple[list[float], float, int]:
-        # cold = a fresh RealApi (no caches); the best of three keeps a loaded machine from
-        # failing the test without weakening the criterion (W3-01.2 N2)
-        colds = []
+
+def test_list_of_200_runs_under_a_second(wf: Path, tmp_path: Path) -> None:
+    """The list grows linearly: 200 runs against 20 on the same machine, cold (a fresh
+    `RealApi`) and warm (cached by mtime), alternately and the best of three, so neither a slow
+    runner nor load fails it; a quadratic step still does (W3-10.2, before: under 1 s)."""
+    small = make_workfolder(tmp_path / "klein")
+    _listed_runs(small, 20)
+    _listed_runs(wf, 200)
+
+    async def measure() -> dict[int, tuple[float, float]]:
+        times: dict[int, tuple[list[float], list[float]]] = {20: ([], []), 200: ([], [])}
         for _ in range(3):
-            api = RealApi(wf, base_url=BASE)
-            start = time.perf_counter()
-            page = await api.list_runs(limit=200)
-            colds.append(time.perf_counter() - start)
-        start = time.perf_counter()
-        await api.list_runs(limit=200)
-        warm = time.perf_counter() - start
-        return colds, warm, page.total
+            for workfolder, count in ((small, 20), (wf, 200)):
+                api = RealApi(workfolder, base_url=BASE)
+                start = time.perf_counter()
+                page = await api.list_runs(limit=200)
+                cold = time.perf_counter() - start
+                start = time.perf_counter()
+                await api.list_runs(limit=200)
+                times[count][0].append(cold)
+                times[count][1].append(time.perf_counter() - start)
+                assert page.total == count
+        return {n: (min(colds), min(warms)) for n, (colds, warms) in times.items()}
 
-    colds, warm, total = asyncio.run(measure())
-    assert total == 200
-    shown = ", ".join(f"{c:.3f}" for c in colds)
-    print(f"\nlist_runs(200): cold {shown} s (best {min(colds):.3f} s), warm {warm:.3f} s")
-    assert min(colds) < LIMIT_S and warm < LIMIT_S
+    best = asyncio.run(measure())
+    (cold20, warm20), (cold200, warm200) = best[20], best[200]
+    print(
+        f"\nlist_runs: 20 Runs kalt {cold20:.3f} s, warm {warm20:.3f} s; "
+        f"200 Runs kalt {cold200:.3f} s, warm {warm200:.3f} s"
+    )
+    assert cold200 <= RATIO_MAX * cold20 and warm200 <= RATIO_MAX * warm20, "nicht linear"
+    assert cold200 < CEILING_S and warm200 < CEILING_S
 
 
 def test_run_detail_with_50000_transcript_lines_under_a_second(wf: Path) -> None:
