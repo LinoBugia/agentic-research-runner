@@ -13,7 +13,7 @@ import yaml
 from run_kit import turns, wait, write_profiles
 from service_kit import append, hold_lock, make_run_folder, transcript_line
 from test_gui_live_v4 import pages
-from test_gui_real import page_html, see
+from test_gui_real import _walk, page_html, see
 from test_gui_runs_real import FORM, make_api, real_user, until, until_final, until_status, wf
 
 from arr.models import ChannelMode, Decider, RunStatus
@@ -292,28 +292,51 @@ def test_rate_limit_text_says_reached_only_for_rejected() -> None:
     assert "erreicht" not in rate_limit_text({"status": "seltsam"})
 
 
+def transcript_rows(user: Any) -> str:
+    """The lines of the open transcript (`ev-row`, ids `seq-…`), not the cards around it."""
+    with user.client:
+        return "\n".join(
+            str(node.content) for node in _walk(user.client.layout) if "ev-row" in node._classes
+        )
+
+
 async def test_rate_limit_lines_in_the_transcript(wf: Path) -> None:
-    """Until W3-09.1 delivers `allowed_warning` again, the line comes from a fake transcript."""
+    """Since W3-09.1 the transcript API serves `allowed_warning` (it throttles the profile) and
+    drops `allowed`; the fake `transcript.jsonl` goes through that real path. In the transcript
+    „erreicht“ stands once, for `rejected`; the agent card shows the same real limit in its
+    line „jetzt“ (W3-09 V5), so the two belong together and are counted apart (W3-10.2)."""
     folder = make_run_folder(wf, status=RunStatus.DONE, agents=["a"], name="Limits")
     path = folder / "agents" / "a" / "transcript.jsonl"
     resets = time.time() + 3600
     lines = [
         transcript_line(1, "a", folder.name, "turn_start", {"turn": 1, "prompt": "Los."}),
         transcript_line(
-            2, "a", folder.name, "rate_limit", {"status": "allowed_warning", "resets_at": resets}
+            2, "a", folder.name, "rate_limit", {"status": "allowed", "resets_at": resets}
         ),
         transcript_line(
-            3, "a", folder.name, "rate_limit", {"status": "rejected", "resets_at": resets}
+            3, "a", folder.name, "rate_limit", {"status": "allowed_warning", "resets_at": resets}
+        ),
+        transcript_line(
+            4, "a", folder.name, "rate_limit", {"status": "rejected", "resets_at": resets}
         ),
     ]
     append(path, "".join(f"{line}\n" for line in lines))
     async with real_user(make_api(wf)) as user:
         await user.open(f"/runs/{folder.name}?agent=a")
-        html = await see(user, "Profil auf einen Turn gedrosselt", retries=200)
+        await see(user, "Profil auf einen Turn gedrosselt", retries=200)
         clock = fmt.clock(resets)
-        assert f"Hinweis zum Nutzungslimit: Fenster bis {clock}" in html
-        assert f"Nutzungslimit erreicht · weiter um {clock}" in html
-        assert html.count("Nutzungslimit erreicht") == 1, "only the rejected one"
+        rows = transcript_rows(user)
+        assert 'id="seq-3"' in rows and 'id="seq-4"' in rows
+        assert 'id="seq-2"' not in rows, "`allowed` changes nothing and is not served"
+        assert rows.count("Hinweis zum Nutzungslimit") == 1, "the hint is `allowed_warning`"
+        assert f"Hinweis zum Nutzungslimit: Fenster bis {clock}" in rows
+        assert f"Nutzungslimit erreicht · weiter um {clock}" in rows
+        assert rows.count("Nutzungslimit erreicht") == 1, "only the rejected one"
+        with user.client:
+            card = str(next(iter(user.find(marker="agent-a").elements)).content)
+        assert '<span class="now">' in card, card
+        now = card[card.index('<span class="now">') :]
+        assert f"Nutzungslimit erreicht ·</span> weiter um {clock}" in now, "W3-09 V5"
 
 
 # --- W3-10.1 point 6: „Antwort an X“ ------------------------------------------------------------
