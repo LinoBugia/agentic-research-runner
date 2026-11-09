@@ -26,12 +26,13 @@ Welle 3   W3-00 Codex-E19 Variante 2 ──► (vor W3-04 und W3-05)
                          ├─► W3-04 Workfolder, Projekte (+W3-00) ─┼──► UX-Abnahme 3
                          └─► W3-05 Auth-Profile (+W3-00) ─────────┘
                                 │
-Welle 4   W4-01 MCP-Bridge + Projektvorlage ─┐
-          W4-02 SkillRegistry + Skills-Seite ┼─► W4-05 Start-Skills ─► W4-06 E2E ─► M2
-          W4-03 exploration, review, moderiert┤
-          W4-04 Aufsichts-Agent ─────────────┘
+Welle 4   W4-00 Pflicht-Überträge ─┬─► W4-01 MCP-Bridge + Run-Start-Freigabe ─► W4-04 Aufsichts-Agent ─┐
+          W4-02 Skills-Seite ──────┤                                                                ├─► W4-06 E2E ─► M2
+                                   └─► W4-03 exploration, review, moderiert ─► W4-05 Start-Skills ──┘
                                 │
-Welle 5   W5-01 Usage & Speicher ─┐
-          W5-02 Onboarding        ├─► W5-04 Usability-Test + Feinschliff ─► M3 = v1
-          W5-03 Robustheit        ┘
+Welle 5   W5-00 Spike eigener macOS-Benutzer ─► W5-03 Robustheit + Härtung ─┐
+          W5-01 Usage & Speicher ───────────────────────────────────────────┼─► W5-04 Usability-Test + Feinschliff ─► M3 = v1
+          W5-02 Onboarding ─────────────────────────────────────────────────┘
 ```
+
+Welle 4: W4-01 und W4-03 starten, wenn W4-00 und W4-02 gemerged sind; W4-05 braucht W4-02 und W4-03.
