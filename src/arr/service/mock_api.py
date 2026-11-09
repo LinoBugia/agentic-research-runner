@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, StrEnum
 from typing import Any
+from urllib.parse import quote
 
 from pydantic import BaseModel
 
@@ -6874,7 +6875,7 @@ class MockApi:
     ) -> SaveSkillFileResult:
         """Save a skill file in memory (W4-02); same path rules and conflicts as the service."""
         index = self._skill_index(name)
-        check_path(path)
+        check_path(path, new=request.version is None)
         skill = self.state.skills[index]
         data = request.content.encode("utf-8")
         if len(data) > MAX_SKILL_FILE_BYTES or "\x00" in request.content:
@@ -6899,7 +6900,9 @@ class MockApi:
                     ErrorCode.CONFLICT,
                     f"{path} wurde außerhalb geändert. arr hat nichts überschrieben. Lade die "
                     "Datei neu, bevor du speicherst.",
-                    action=Action(label="Neu laden", url=f"/skills/{name}?datei={path}"),
+                    action=Action(
+                        label="Neu laden", url=f"/skills/{name}?datei={quote(path, safe='/')}"
+                    ),
                 )
         self.state.skill_texts[(name, path)] = request.content
         return SaveSkillFileResult(

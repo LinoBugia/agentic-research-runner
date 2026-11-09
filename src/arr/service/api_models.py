@@ -1170,6 +1170,11 @@ class Estimate(ApiModel):
     notes: list[str] = Field(
         default_factory=list, description="German: how the ranges came about, what is unknown"
     )
+    turns_open: bool = Field(
+        default=False,
+        description="No upper bound for the turns is known: `turns.max` equals `turns.min` "
+        "(W4-02.1)",
+    )
 
 
 class CapacityInfo(ApiModel):

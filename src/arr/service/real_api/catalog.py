@@ -16,6 +16,7 @@ known, and what to do; a skill with problems cannot be started. Writing goes thr
 
 import asyncio
 import json
+import logging
 import os
 import time
 from collections.abc import Iterable, Mapping
@@ -87,7 +88,11 @@ from arr.workfolder import (
 )
 
 MAX_FILES = 200
+MAX_FILE_DEPTH = 12
+"""Deepest folder below a skill that the file list shows (W4-02.1)."""
 _LANGUAGES = {".md": "markdown", ".yaml": "yaml", ".yml": "yaml", ".py": "python"}
+log = logging.getLogger("arr.service.catalog")
+
 CHECK_PROFILE = "pruefung"
 """Stand-in profile while a skill is checked: profiles belong to the run, not to the skill."""
 CHECK_MODELS = {Provider.CLAUDE: "claude-sonnet-5-5", Provider.CODEX: "gpt-5.5"}
@@ -306,6 +311,23 @@ def _check_resolved(
 def check_group(
     folder: Path, catalog: SkillCatalog, settings: WorkfolderSettings
 ) -> tuple[GroupSpec | None, list[SkillIssue]]:
+    """`_check_group`; an unexpected failure becomes an issue of this skill (W4-02.1)."""
+    try:
+        return _check_group(folder, catalog, settings)
+    except Exception as exc:  # noqa: BLE001 - a hostile group.yaml never breaks the caller
+        log.warning("Prüfung der group.yaml von %s fehlgeschlagen", folder.name, exc_info=True)
+        return None, [
+            SkillIssue(
+                file=GROUP_FILE,
+                message=f"Die Prüfung ist fehlgeschlagen ({type(exc).__name__}). Vereinfache "
+                "die group.yaml.",
+            )
+        ]
+
+
+def _check_group(
+    folder: Path, catalog: SkillCatalog, settings: WorkfolderSettings
+) -> tuple[GroupSpec | None, list[SkillIssue]]:
     """Check the `group.yaml` of a skill folder; the spec (if it loads) and its issues.
 
     Order: read (regular file, at most 256 KB, UTF-8) → YAML → fields → placeholders and
@@ -493,16 +515,32 @@ class CatalogArea:
         return discover_skills(self.state.workfolder / "skills")
 
     def _skill_files(self, root: Path) -> list[str]:
-        files = []
-        for base, dirs, names in os.walk(root):
-            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
-            for name in sorted(names):
-                if name.startswith("."):
+        """Files of a skill (at most `MAX_FILES`, `MAX_FILE_DEPTH` folders deep, hidden ones
+        left out); a folder that cannot be read (e.g. a path too long) is skipped."""
+        files: list[str] = []
+        stack: list[tuple[str, str, int]] = [(str(root), "", 0)]
+        while stack:
+            folder, prefix, depth = stack.pop()
+            try:
+                with os.scandir(folder) as it:
+                    entries = sorted(it, key=lambda e: e.name, reverse=True)
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.name.startswith("."):
                     continue
-                files.append(str(Path(base, name).relative_to(root)))
-                if len(files) >= MAX_FILES:
-                    return files
-        return files
+                rel = f"{prefix}{entry.name}"
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_dir:
+                    if depth + 1 < MAX_FILE_DEPTH:
+                        stack.append((entry.path, f"{rel}/", depth + 1))
+                    continue
+                files.append(rel)
+        files.sort()
+        return files[:MAX_FILES]
 
     def _usage(self, name: str) -> SkillUsage:
         projects: set[str] = set()
@@ -586,8 +624,30 @@ class CatalogArea:
         catalog = self._catalog()
         settings = self._settings()
         names = sorted({*catalog.skills, *catalog.problems})
-        skills = [self._skill(name, catalog, settings) for name in names]
+        skills = [self._checked(name, catalog, settings) for name in names]
         return [s for s in skills if kind is None or s.kind is kind]
+
+    def _checked(
+        self, name: str, catalog: SkillCatalog, settings: WorkfolderSettings | None = None
+    ) -> SkillInfo:
+        """`_skill`, but an unexpected failure only marks this one skill as invalid."""
+        try:
+            return self._skill(name, catalog, settings)
+        except Exception as exc:  # noqa: BLE001 - one broken skill never blocks the others
+            log.warning("Prüfung von Skill %s fehlgeschlagen", name, exc_info=True)
+            return SkillInfo(
+                name=name,
+                description="",
+                kind=SkillKind.TOOL,
+                valid=False,
+                issues=[
+                    SkillIssue(
+                        file=SKILL_FILE,
+                        message=f"Die Prüfung ist fehlgeschlagen ({type(exc).__name__}). "
+                        "Vereinfache die Dateien des Skills oder lege ihn neu an.",
+                    )
+                ],
+            )
 
     async def list_skills(self, kind: SkillKind | None = None) -> list[SkillInfo]:
         return await asyncio.to_thread(self._list, kind)
@@ -596,14 +656,23 @@ class CatalogArea:
         catalog = self._catalog()
         if name not in catalog.skills and name not in catalog.problems:
             raise not_found("Skill", name)
-        return self._skill(name, catalog)
+        return self._checked(name, catalog)
 
     async def get_skill(self, name: str) -> SkillInfo:
         return await asyncio.to_thread(self._one, name)
 
-    def _file(self, name: str, path: str) -> SkillFile:
-        if "/" in name or name in (".", "..") or not name:
+    def _exact(self, name: str) -> SkillCatalog:
+        """The catalog, if `name` is exactly the folder name of a skill in it, else `not_found`.
+
+        On APFS `RUNDE` opens the folder `runde`; only the name as listed counts (W4-02.1).
+        """
+        catalog = self._catalog()
+        if name not in catalog.skills and name not in catalog.problems:
             raise not_found("Skill", name)
+        return catalog
+
+    def _file(self, name: str, path: str) -> SkillFile:
+        self._exact(name)
         content = skill_files.read_file(self.state.workfolder, name, path)
         return SkillFile(
             skill=name,
@@ -622,8 +691,7 @@ class CatalogArea:
     # -- skill editor (W4-02) ---------------------------------------------------------------
 
     def _save(self, name: str, path: str, request: SaveSkillFileRequest) -> SaveSkillFileResult:
-        if "/" in name or name in (".", "..") or not name:
-            raise not_found("Skill", name)
+        self._exact(name)
         written = skill_files.write_file(
             self.state.workfolder, name, path, request.content, version=request.version
         )
@@ -638,7 +706,7 @@ class CatalogArea:
         catalog = self._catalog()
         if name not in catalog.skills and name not in catalog.problems:
             raise not_found("Skill", name)
-        return SaveSkillFileResult(file=file, skill=self._skill(name, catalog))
+        return SaveSkillFileResult(file=file, skill=self._checked(name, catalog))
 
     async def save_skill_file(
         self, name: str, path: str, request: SaveSkillFileRequest

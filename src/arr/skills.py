@@ -9,6 +9,7 @@ See docs/03-skills-und-research-groups.md §1-3 and docs/spikes/S1_claude.md §3
 
 import difflib
 import json
+import logging
 import os
 import re
 import shutil
@@ -26,7 +27,7 @@ from ruamel.yaml.error import YAMLError
 from arr import __version__
 from arr.errors import ArrError, ConfigError, ConfigIssue
 from arr.models import ProjectSettings
-from arr.resolve import validate_model
+from arr.resolve import too_nested, validate_model
 
 __all__ = [
     "ARR_SKILL",
@@ -49,12 +50,19 @@ __all__ = [
     "write_claude_plugin",
 ]
 
+log = logging.getLogger("arr.skills")
+
 SKILL_FILE = "SKILL.md"
 GROUP_FILE = "group.yaml"
 SKILLS_DIR = "skills"
 """Folder of the skills in the workfolder; messages name it instead of an absolute path."""
 MAX_SKILL_FILE_BYTES = 256 * 1024
 """Largest skill file arr reads or writes (SKILL.md, group.yaml, roles; W4-02)."""
+FRONTMATTER_TOO_NESTED = (
+    "Der Kopfbereich der SKILL.md ist zu verschachtelt (zu viele Ebenen oder Verweise mit & und "
+    "*). Schreibe ihn flach: „name“, „description“ und höchstens einfache Einträge unter "
+    "„metadata“."
+)
 ARR_SKILL = "arr"
 """Name of the skill that explains arr to the user agent; never given to research agents."""
 PLUGIN_NAME = "arr"
@@ -234,6 +242,8 @@ def _parse_frontmatter(text: str, source: str) -> dict[str, Any]:
         )
     try:
         data = YAML(typ="safe").load(match.group(1))
+    except RecursionError:
+        raise ConfigError.single("", FRONTMATTER_TOO_NESTED, source=source) from None
     except YAMLError as exc:
         mark = getattr(exc, "problem_mark", None)
         line = mark.line + 2 if mark else None  # +1 for 1-based, +1 for the `---` line
@@ -244,6 +254,8 @@ def _parse_frontmatter(text: str, source: str) -> dict[str, Any]:
             source=source,
             line=line,
         ) from None
+    if too_nested(data):
+        raise ConfigError.single("", FRONTMATTER_TOO_NESTED, source=source)
     if not isinstance(data, dict):
         raise ConfigError.single(
             "",
@@ -343,6 +355,14 @@ def discover_skills(skills_dir: str | Path) -> SkillCatalog:
             catalog.skills[entry.name] = load_skill(entry)
         except ConfigError as exc:
             catalog.problems[entry.name] = exc
+        except Exception as exc:  # noqa: BLE001 - one broken skill never blocks the others
+            log.warning("Skill %s ließ sich nicht laden", entry.name, exc_info=True)
+            catalog.problems[entry.name] = ConfigError.single(
+                "",
+                f"Die SKILL.md ließ sich nicht prüfen ({type(exc).__name__}). Vereinfache die "
+                "Datei oder lege sie neu an.",
+                source=str(entry / SKILL_FILE),
+            )
     return catalog
 
 

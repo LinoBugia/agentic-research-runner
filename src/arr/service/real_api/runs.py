@@ -88,6 +88,7 @@ from arr.service.api_models import (
     TranscriptKind,
     TranscriptPage,
 )
+from arr.service.gui import format as fmt
 from arr.service.real_api.approvals import ApprovalsArea
 from arr.service.real_api.base import RunHandle, ServiceState, not_allowed, not_found
 from arr.service.real_api.catalog import check_group
@@ -516,6 +517,7 @@ def estimate_run(resolved: ResolvedRun) -> Estimate:
     cap = len(agents) * limits.turns_per_agent if limits.turns_per_agent else None
     if most is None or (cap is not None and cap < most):
         most = cap
+    turns_open = most is None
     if most is None:
         most = least
         notes.append("Ohne Limit für Turns pro Agent ist die Obergrenze offen.")
@@ -526,7 +528,7 @@ def estimate_run(resolved: ResolvedRun) -> Estimate:
         cost = Range(min=0, max=budget)
         cost_basis = "budget"
         notes.append(
-            f"Kosten: höchstens das Budget von {budget:g} $. Preise schätzt arr nicht, "
+            f"Kosten: höchstens das Budget von {fmt.budget(budget)}. Preise schätzt arr nicht, "
             "bei Abo-Profilen zählt der rechnerische Preis."
         )
     else:
@@ -549,6 +551,7 @@ def estimate_run(resolved: ResolvedRun) -> Estimate:
         turns=Range(min=least, max=most),
         cost_usd=cost,
         duration_s=duration,
+        turns_open=turns_open,
         cost_basis=cost_basis,  # type: ignore[arg-type]
         duration_basis=duration_basis,  # type: ignore[arg-type]
         notes=notes,

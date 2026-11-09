@@ -12,6 +12,7 @@ before unsaved changes get lost.
 
 import json
 import re
+from urllib.parse import quote
 
 from nicegui import ui
 
@@ -217,7 +218,7 @@ def file_href(skill: str, path: str) -> str:
     for tab, file in TAB_FILES.items():
         if file == path:
             return f"/skills/{skill}?tab={tab}"
-    return f"/skills/{skill}?tab=dateien&datei={path}"
+    return f"/skills/{skill}?tab=dateien&datei={quote(path, safe='/')}"
 
 
 def issue_html(skill: str, issue: SkillIssue) -> str:
@@ -275,7 +276,7 @@ class SkillsPage:
         self.name, self.tab, self.datei = name, tab, datei
         url = f"/skills/{name}" + (f"?tab={tab}" if tab != "uebersicht" else "")
         if datei:
-            url = f"/skills/{name}?tab=dateien&datei={datei}"
+            url = f"/skills/{name}?tab=dateien&datei={quote(datei, safe='/')}"
         ui.navigate.history.push(url)
         self.frame.title = name
         ui.page_title(tab_title(name, self.frame.counts.waiting))

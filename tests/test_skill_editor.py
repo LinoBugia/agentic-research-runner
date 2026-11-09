@@ -8,6 +8,7 @@ import asyncio
 import os
 import re
 import stat
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from service_kit import make_workfolder
 from test_gui import gui_user
 from test_gui_screens import _walk, editor_text, see
 
+from arr.errors import ConfigError
 from arr.models import (
     AgentConfig,
     ApprovalSettings,
@@ -30,6 +32,7 @@ from arr.models import (
     TopologyConfig,
     TopologyKind,
 )
+from arr.resolve import load_group_spec
 from arr.service.api_models import (
     ApiException,
     CreateSkillRequest,
@@ -38,8 +41,11 @@ from arr.service.api_models import (
     SaveSkillFileRequest,
     SkillKind,
 )
+from arr.service.gui.pages.neuer_run import _estimate_text
+from arr.service.gui.pages.skills import file_href
 from arr.service.mock_api import MockApi
 from arr.service.real_api import RealApi
+from arr.service.real_api import catalog as catalog_module
 from arr.service.real_api import skill_files as sf
 from arr.service.real_api.runs import estimate_run
 from arr.skills import discover_skills
@@ -642,3 +648,338 @@ async def test_gui_mock_edits_saves_and_asks_before_discarding() -> None:
         await see(user, "＋ Neuer Skill")
         html = await see(user, "Duplizieren …")
         assert "kommen in einer späteren Version" not in html
+
+
+# ================================================================================================
+# W4-02.1: rework after the review
+# ================================================================================================
+
+
+def bomb(levels: int, fan: int = 9) -> str:
+    """The alias bomb of the review (`yaml_bombe_messung.py`): 9^(levels+1) items expanded."""
+    out = [f"a0: &a0 [{', '.join(['x'] * fan)}]"]
+    for i in range(1, levels + 1):
+        out.append(f"a{i}: &a{i} [{', '.join([f'*a{i - 1}'] * fan)}]")
+    out.append("kind: research-group\nversion: 1\ntopology: roundtable\nagents: []\n")
+    return "\n".join(out)
+
+
+async def timed(coro: Any, limit: float = 20.0) -> tuple[Any, float]:
+    start = time.monotonic()
+    result = await asyncio.wait_for(coro, timeout=limit)
+    return result, time.monotonic() - start
+
+
+@pytest.mark.parametrize("levels", [6, 7])
+async def test_alias_bomb_is_refused_quickly_and_only_marks_its_skill(
+    wf: Path, levels: int
+) -> None:
+    group_skill(wf)  # a healthy neighbour
+    api = make_api(wf)
+    _ok, healthy = await timed(api.list_skills())
+    bad = wf / "skills" / "bombe"
+    bad.mkdir()
+    (bad / "SKILL.md").write_text(SKILL_MD.format(name="bombe"), "utf-8")
+    (bad / "group.yaml").write_text(bomb(levels), "utf-8")
+    skills, elapsed = await timed(api.list_skills())
+    # relative: the bomb costs at most a few times a normal listing (before: 21 s / minutes)
+    assert elapsed < max(2.0, 10 * healthy), (elapsed, healthy)
+    by_name = {s.name: s for s in skills}
+    assert by_name["runde"].valid
+    [issue] = by_name["bombe"].issues
+    assert issue.file == "group.yaml" and "zu verschachtelt" in issue.message
+    with pytest.raises(ConfigError) as error:
+        load_group_spec(bad / "group.yaml")  # the run start reads it the same way
+    assert "zu verschachtelt" in error.value.issue_message
+
+
+async def test_deep_nesting_in_group_yaml_is_an_issue_not_a_crash(wf: Path) -> None:
+    group_skill(wf)
+    bad = wf / "skills" / "tief"
+    bad.mkdir()
+    (bad / "SKILL.md").write_text(SKILL_MD.format(name="tief"), "utf-8")
+    (bad / "group.yaml").write_text(
+        "kind: research-group\ntopology: roundtable\nagents: " + "[" * 500 + "]" * 500 + "\n"
+    )
+    api = make_api(wf)
+    skill = await api.get_skill("tief")
+    assert not skill.valid and "zu verschachtelt" in skill.issues[0].message
+    assert {s.name for s in await api.list_skills()} == {"runde", "tief"}
+    (bad / "group.yaml").write_text("a: " + "[" * 5000 + "]" * 5000 + "\n")
+    assert "zu verschachtelt" in (await api.get_skill("tief")).issues[0].message
+
+
+async def test_deep_skill_md_in_another_skill_blocks_nothing_else(wf: Path) -> None:
+    """Review `test_deep_skill_md_in_another_skill_blocks_every_run_start`."""
+    group_skill(wf)
+    bad = wf / "skills" / "tief"
+    bad.mkdir()
+    (bad / "SKILL.md").write_text(
+        "---\nname: tief\ndescription: ok\nmetadata: " + "[" * 500 + "]" * 500 + "\n---\n", "utf-8"
+    )
+    catalog = discover_skills(wf / "skills")
+    assert "runde" in catalog.skills and "tief" in catalog.problems
+    assert "zu verschachtelt" in catalog.problems["tief"].issue_message
+    api = make_api(wf)
+    skills = {s.name: s for s in await api.list_skills()}
+    assert skills["runde"].valid and not skills["tief"].valid
+    run_input = {"project": "demo", "skill": "runde", "task": "x", "defaults": DEFAULTS}
+    assert (await api.resolve_run(run_input)).errors == []
+    started = await api.start_run(run_input)
+    assert started.run_id
+    await api.stop_runs()
+
+
+async def test_frontmatter_alias_bomb_is_refused(wf: Path) -> None:
+    folder = wf / "skills" / "bombe"
+    folder.mkdir(parents=True)
+    head = bomb(7).replace(
+        "kind: research-group\nversion: 1\ntopology: roundtable\nagents: []\n", ""
+    )
+    (folder / "SKILL.md").write_text(
+        "---\nname: bombe\ndescription: x\nmetadata:\n  " + head.replace("\n", "\n  ") + "\n---\n",
+        "utf-8",
+    )
+    catalog, elapsed = await timed(asyncio.to_thread(discover_skills, wf / "skills"))
+    assert elapsed < 5 and "zu verschachtelt" in catalog.problems["bombe"].issue_message
+
+
+async def test_one_failing_check_never_breaks_the_list(
+    wf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    group_skill(wf)
+    group_skill(wf, "zweite")
+    original = catalog_module.CatalogArea._skill
+
+    def boom(self: Any, name: str, catalog: Any, settings: Any = None) -> Any:
+        if name == "zweite":
+            raise RuntimeError("kaputt")
+        return original(self, name, catalog, settings)
+
+    monkeypatch.setattr(catalog_module.CatalogArea, "_skill", boom)
+    skills = {s.name: s for s in await make_api(wf).list_skills()}
+    assert skills["runde"].valid
+    assert not skills["zweite"].valid and "RuntimeError" in skills["zweite"].issues[0].message
+
+
+# -- point 2: no raw errors when writing -------------------------------------------------------
+
+
+async def test_lone_surrogate_is_a_clear_message(wf: Path) -> None:
+    folder = group_skill(wf)
+    api = make_api(wf)
+    file = await api.get_skill_file("runde", "SKILL.md")
+    with pytest.raises(ApiException) as error:
+        await api.save_skill_file(
+            "runde", "SKILL.md", SaveSkillFileRequest(content="a\ud800b", version=file.version)
+        )
+    assert error.value.error.code is ErrorCode.INVALID
+    assert "Zeichen, die in keiner Textdatei stehen" in error.value.error.message
+    assert (folder / "SKILL.md").read_text() == file.content
+
+
+async def test_names_are_at_most_200_characters(wf: Path) -> None:
+    folder = group_skill(wf)
+    api = make_api(wf)
+    before = snapshot(folder)
+    for path in ("a" * 300 + ".md", "roles/" + "b" * 250 + ".md", "c" * 201):
+        with pytest.raises(ApiException) as error:
+            await api.save_skill_file("runde", path, SaveSkillFileRequest(content="x"))
+        assert (
+            error.value.error.code is ErrorCode.INVALID and "zu lang" in error.value.error.message
+        )
+    assert snapshot(folder) == before
+    longest = "d" * 197 + ".md"  # 200 characters: the temporary file name still fits
+    await api.save_skill_file("runde", longest, SaveSkillFileRequest(content="x"))
+    assert (folder / longest).read_text() == "x"
+    assert not [p for p in folder.iterdir() if p.name.startswith(".")]
+
+
+async def test_a_folder_in_place_of_the_file_is_a_clear_message(
+    wf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = group_skill(wf)
+    target = folder / "roles" / "m.md"
+    api = make_api(wf)
+    file = await api.get_skill_file("runde", "roles/m.md")
+    original = sf._current
+    calls = {"n": 0}
+
+    def swap(folder_fd: int, name: str, label: str) -> Any:
+        result = original(folder_fd, name, label)
+        if calls["n"] == 1:  # the second check, right before `rename`
+            target.unlink()
+            target.mkdir()
+        calls["n"] += 1
+        return result
+
+    monkeypatch.setattr(sf, "_current", swap)
+    with pytest.raises(ApiException) as error:
+        await api.save_skill_file(
+            "runde", "roles/m.md", SaveSkillFileRequest(content="# neu\n", version=file.version)
+        )
+    assert error.value.error.code is ErrorCode.NOT_ALLOWED
+    assert "Ordner" in error.value.error.message and "nichts geändert" in error.value.error.message
+    assert target.is_dir() and not list(target.iterdir())
+    assert not [p for p in (folder / "roles").iterdir() if p.name.startswith(".")]
+
+
+async def test_only_the_exact_skill_name_reads_and_writes(wf: Path) -> None:
+    folder = group_skill(wf)
+    api = make_api(wf)
+    file = await api.get_skill_file("runde", "SKILL.md")
+    for call in (
+        api.get_skill_file("RUNDE", "SKILL.md"),
+        api.save_skill_file(
+            "RUNDE", "SKILL.md", SaveSkillFileRequest(content="# alias\n", version=file.version)
+        ),
+    ):
+        with pytest.raises(ApiException) as error:
+            await call
+        assert error.value.error.code is ErrorCode.NOT_FOUND
+    assert (folder / "SKILL.md").read_text() == file.content
+
+
+def _deep_tree(folder: Path, levels: int) -> None:
+    """A folder tree deeper than any path may be, built relative to open folders."""
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for i in range(levels):
+            os.mkdir(f"d{i}", dir_fd=fd)
+            child = os.open(f"d{i}", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        os.close(os.open("tief.md", os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=fd))
+    finally:
+        os.close(fd)
+
+
+async def test_a_very_deep_folder_tree_neither_breaks_the_list_nor_the_duplicate(
+    wf: Path,
+) -> None:
+    folder = group_skill(wf)
+    _deep_tree(folder, 400)
+    api = make_api(wf)
+    skill = await asyncio.wait_for(api.get_skill("runde"), timeout=20)
+    assert skill.valid and not any("tief.md" in f for f in skill.files)
+    result = await asyncio.wait_for(
+        api.duplicate_skill("runde", DuplicateSkillRequest(name="runde-tief")), timeout=60
+    )
+    assert result.skill.valid and any(p.endswith("/") for p in result.left_out)
+
+
+# -- point 3: the gaps the mutations M09, M14, M15, M24 showed --------------------------------
+
+
+async def test_a_role_linked_out_of_the_skill_is_an_issue(wf: Path, tmp_path: Path) -> None:
+    folder = group_skill(wf, critic_role="roles/aussen.md")
+    outside = tmp_path / "aussen.md"
+    outside.write_text("# draußen\n", "utf-8")
+    os.symlink(outside, folder / "roles" / "aussen.md")
+    [issue] = (await make_api(wf).get_skill("runde")).issues
+    assert issue.field == "agents[1].role" and "ist ein Link aus dem Skill hinaus" in issue.message
+
+
+@pytest.mark.parametrize("role", ["../geheim.md", "roles/../../geheim.md", "/etc/hosts"])
+async def test_a_role_outside_the_skill_is_an_issue(wf: Path, role: str) -> None:
+    group_skill(wf, critic_role=role)
+    (wf / "skills" / "geheim.md").write_text("# geheim\n", "utf-8")
+    [issue] = (await make_api(wf).get_skill("runde")).issues
+    assert issue.field == "agents[1].role" and "liegt außerhalb des Skills" in issue.message
+
+
+async def test_paths_deeper_than_the_limit_are_refused(wf: Path) -> None:
+    folder = group_skill(wf)
+    path = "/".join(["e"] * sf.MAX_DEPTH) + ".md"  # MAX_DEPTH + 1 parts would be needed: here
+    deeper = "/".join(["e"] * (sf.MAX_DEPTH + 1))
+    api = make_api(wf)
+    with pytest.raises(ApiException) as error:
+        await api.save_skill_file("runde", deeper, SaveSkillFileRequest(content="x"))
+    assert error.value.error.code is ErrorCode.INVALID and "zu tief" in error.value.error.message
+    assert not (folder / "e").exists()
+    await api.save_skill_file("runde", path, SaveSkillFileRequest(content="x"))
+    assert (folder / path).read_text() == "x"
+
+
+def test_folders_with_underscore_are_no_skills_for_the_editor(wf: Path) -> None:
+    hidden = wf / "skills" / "_roles"
+    hidden.mkdir(parents=True)
+    (hidden / "kritiker.md").write_text("# Kritiker\n", "utf-8")
+    for call in (
+        lambda: sf.read_file(wf, "_roles", "kritiker.md"),
+        lambda: sf.write_file(wf, "_roles", "neu.md", "x", version=None),
+    ):
+        with pytest.raises(ApiException) as error:
+            call()
+        assert error.value.error.code is ErrorCode.NOT_FOUND
+    assert sorted(p.name for p in hidden.iterdir()) == ["kritiker.md"]
+
+
+# -- point 4: texts ----------------------------------------------------------------------------
+
+
+def test_texts_follow_08_section_8_7() -> None:
+    est = estimate_run(
+        resolved_run(
+            TopologyKind.ROUNDTABLE,
+            limits=Limits(wall_time=timedelta(minutes=20), turns_per_agent=6, budget_usd=2.5),
+        )
+    )
+    assert any("Budget von 2,50 $" in n for n in est.notes), est.notes
+    assert "höchstens 2,50 $ (Budget)" in _estimate_text(est)
+    stages = [StageSpec(name="s1", agent="a-1")]
+    open_end = estimate_run(
+        resolved_run(
+            TopologyKind.WATERFALL,
+            params={"on_fail": "escalate"},
+            stages=stages,
+            raters=["a-2"],
+            limits=Limits(wall_time=timedelta(hours=1), turns_per_agent=None, budget_usd=2),
+        )
+    )
+    assert open_end.turns_open and _estimate_text(open_end).startswith("mindestens 2 Turns")
+
+
+async def test_new_file_names_say_which_letters_go(wf: Path) -> None:
+    group_skill(wf)
+    with pytest.raises(ApiException) as error:
+        await make_api(wf).save_skill_file("runde", "prüfer.md", SaveSkillFileRequest(content=""))
+    assert "a–z" in error.value.error.message and "Umlaute" in error.value.error.message
+
+
+# -- point 5: file links are encoded ----------------------------------------------------------
+
+
+async def test_file_links_are_encoded_and_such_files_open(wf: Path) -> None:
+    folder = group_skill(wf)
+    odd = "notiz & frage #1?.md"
+    (folder / odd).write_text("# Notiz\n", "utf-8")
+    href = file_href("runde", f"roles/{odd}")
+    assert href == "/skills/runde?tab=dateien&datei=roles/notiz%20%26%20frage%20%231%3F.md"
+    api = make_api(wf)
+    file = await api.get_skill_file("runde", odd)
+    assert file.content == "# Notiz\n"
+    await api.save_skill_file(
+        "runde", odd, SaveSkillFileRequest(content="# neu\n", version=file.version)
+    )
+    assert (folder / odd).read_text() == "# neu\n"
+    with pytest.raises(ApiException):  # new files keep the strict names
+        await api.save_skill_file("runde", "neu & alt.md", SaveSkillFileRequest(content="x"))
+
+
+# -- point 6: a duplicate has a total limit -----------------------------------------------------
+
+
+async def test_a_too_large_skill_is_not_duplicated(
+    wf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = group_skill(wf)
+    (folder / "daten.bin").write_bytes(b"x" * 4000)
+    monkeypatch.setattr(sf, "MAX_COPY_TOTAL", 3000)
+    before = sorted(p.name for p in (wf / "skills").iterdir())
+    with pytest.raises(ApiException) as error:
+        await make_api(wf).duplicate_skill("runde", DuplicateSkillRequest(name="runde-gross"))
+    assert error.value.error.code is ErrorCode.NOT_ALLOWED
+    assert "zu groß zum Duplizieren" in error.value.error.message
+    assert "nichts angelegt" in error.value.error.message
+    assert sorted(p.name for p in (wf / "skills").iterdir()) == before

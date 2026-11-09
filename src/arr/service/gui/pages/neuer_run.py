@@ -1622,15 +1622,16 @@ def _number(text: str, kind: str) -> int | float | None:
 
 def _estimate_text(est: Estimate) -> str:
     """„4–12 Turns · höchstens 2 $ (Budget) · höchstens 20 min“; unknown parts say so (W4-02)."""
-    turns = (
-        f"{int(est.turns.min)} Turns"
-        if est.turns.min == est.turns.max
-        else f"{int(est.turns.min)}–{int(est.turns.max)} Turns"
-    )
+    if est.turns_open:
+        turns = f"mindestens {int(est.turns.min)} Turns"
+    elif est.turns.min == est.turns.max:
+        turns = f"{int(est.turns.min)} Turns"
+    else:
+        turns = f"{int(est.turns.min)}–{int(est.turns.max)} Turns"
     if est.cost_basis == "unknown":
         money = "Kosten unbekannt"
     elif est.cost_basis == "budget":
-        money = f"höchstens {fmt.threshold(est.cost_usd.max)} $ (Budget)"
+        money = f"höchstens {fmt.budget(est.cost_usd.max)} (Budget)"
     else:
         approx = "≈ " if est.cost_kind is not None else ""
         money = f"{approx}{fmt.threshold(est.cost_usd.min)}–{fmt.threshold(est.cost_usd.max)} $"

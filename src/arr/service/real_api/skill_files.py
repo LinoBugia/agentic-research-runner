@@ -23,6 +23,7 @@ import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 from arr.service.api_models import Action, ApiException, ErrorCode
 from arr.skills import (
@@ -33,6 +34,7 @@ from arr.skills import (
     SKILL_FILE,
     SKILLS_DIR,
 )
+from arr.workfolder import os_reason
 
 MAX_BYTES = MAX_SKILL_FILE_BYTES
 """Largest file the editor reads or writes (256 KB)."""
@@ -41,6 +43,12 @@ MAX_DEPTH = 6
 MAX_COPY_BYTES = 20 * 1024 * 1024
 """Largest file a duplicate copies; larger ones are left out and named."""
 MAX_COPY_FILES = 500
+MAX_COPY_TOTAL = 200 * 1024 * 1024
+"""Most bytes a duplicate copies in all; a larger skill is not duplicated (W4-02.1)."""
+MAX_COPY_DEPTH = 12
+"""Deepest folder a duplicate copies; deeper ones are left out and named (W4-02.1)."""
+MAX_PART = 200
+"""Longest file or folder name in a skill; the temporary file adds 22 characters (W4-02.1)."""
 MAX_NAME = 64
 
 _PART_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
@@ -64,11 +72,13 @@ def version_of(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
-def check_path(path: str) -> list[str]:
+def check_path(path: str, *, new: bool = True) -> list[str]:
     """The parts of a relative path inside a skill; `ApiException` (`invalid`) otherwise.
 
-    Refused: empty, absolute, `\\`, NUL, `.`/`..`, hidden parts (`.x`), characters other than
-    letters, digits, `.`, `_`, `-`, and more than `MAX_DEPTH` parts.
+    Refused always: empty, absolute, `\\`, NUL, control characters, `.`/`..`, hidden parts
+    (`.x`), parts over `MAX_PART` characters and more than `MAX_DEPTH` parts. With `new` (a
+    file the editor creates) also characters other than a–z, A–Z, digits, `.`, `_`, `-`; an
+    existing file with e.g. `&` or `#` in its name can still be opened and saved (W4-02.1).
     """
     if not isinstance(path, str) or not path or len(path) > 512:
         raise _invalid("Gib einen Dateinamen im Skill an, z. B. roles/kritiker.md.")
@@ -81,15 +91,26 @@ def check_path(path: str) -> list[str]:
     if len(parts) > MAX_DEPTH:
         raise _invalid(f"Der Pfad ist zu tief verschachtelt (höchstens {MAX_DEPTH} Ebenen).")
     for part in parts:
+        if len(part) > MAX_PART:
+            raise _invalid(
+                f"Der Name „{part[:40]}…“ ist zu lang (höchstens {MAX_PART} Zeichen). Wähle "
+                "einen kürzeren."
+            )
         if part in ("", ".", ".."):
             raise _invalid(
                 f"„{path[:80]}“ enthält „{part or '//'}“. Gib den Pfad ohne „..“ und ohne "
                 "leere Teile an, z. B. roles/kritiker.md."
             )
-        if not _PART_RE.fullmatch(part):
+        if part.startswith(".") or any(ord(ch) < 32 for ch in part):
             raise _invalid(
-                f"„{part[:80]}“ ist als Datei- oder Ordnername nicht erlaubt. Nimm Buchstaben, "
-                "Ziffern, „.“, „_“ und „-“, ohne Punkt am Anfang."
+                f"„{part[:80]}“ ist als Datei- oder Ordnername nicht erlaubt (Punkt am Anfang "
+                "oder Steuerzeichen)."
+            )
+        if new and not _PART_RE.fullmatch(part):
+            raise _invalid(
+                f"„{part[:80]}“ ist als Datei- oder Ordnername nicht erlaubt. Nimm die "
+                "Buchstaben a–z und A–Z, Ziffern, „.“, „_“ und „-“, ohne Punkt am Anfang. "
+                "Umlaute und Leerzeichen gehen nicht."
             )
     return parts
 
@@ -256,19 +277,22 @@ def read_file(workfolder: Path, skill: str, path: str) -> FileContent:
     `not_found` if it does not exist, `not_allowed` for links, FIFOs, devices, files over
     `MAX_BYTES` and non-UTF-8 content, `invalid` for a bad path.
     """
-    parts = check_path(path)
+    parts = check_path(path, new=False)
     label = f"„{path}“"
-    with _folder(workfolder, skill, parts, create=False) as folder:
-        try:
-            fd = _open_file(folder, parts[-1], label)
-        except FileNotFoundError:
-            raise ApiException.of(
-                ErrorCode.NOT_FOUND, f"Datei „{skill}/{path}“ nicht gefunden."
-            ) from None
-        try:
-            data = _read_fd(fd, label)
-        finally:
-            os.close(fd)
+    try:
+        with _folder(workfolder, skill, parts, create=False) as folder:
+            try:
+                fd = _open_file(folder, parts[-1], label)
+            except FileNotFoundError:
+                raise ApiException.of(
+                    ErrorCode.NOT_FOUND, f"Datei „{skill}/{path}“ nicht gefunden."
+                ) from None
+            try:
+                data = _read_fd(fd, label)
+            finally:
+                os.close(fd)
+    except OSError as exc:
+        raise _os_failed(label, exc, "lesen") from None
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -298,14 +322,34 @@ def _changed_outside(skill: str, path: str) -> ApiException:
     return _conflict(
         f"{path} wurde außerhalb geändert. arr hat nichts überschrieben. Lade die Datei neu, "
         "bevor du speicherst.",
-        action=Action(label="Neu laden", url=f"/skills/{skill}?datei={path}"),
+        action=Action(label="Neu laden", url=f"/skills/{skill}?datei={quote(path, safe='/')}"),
+    )
+
+
+def _os_failed(label: str, exc: OSError, what: str = "speichern") -> ApiException:
+    """An `OSError` of the file system as a German message; nothing was changed."""
+    if isinstance(exc, IsADirectoryError):
+        reason = "an ihrer Stelle steht jetzt ein Ordner"
+    elif exc.errno == errno.ENAMETOOLONG:
+        reason = "der Pfad ist zu lang"
+    else:
+        reason = os_reason(exc)
+    done = " arr hat nichts geändert." if what == "speichern" else ""
+    return ApiException.of(
+        ErrorCode.NOT_ALLOWED,
+        f"{label} ließ sich nicht {what} ({reason}).{done} Prüfe den Skill-Ordner und versuche "
+        "es erneut.",
     )
 
 
 def _encode(text: str, label: str) -> bytes:
+    no_text = f"{label}: Der Text enthält Zeichen, die in keiner Textdatei stehen."
     if not isinstance(text, str) or "\x00" in text:
-        raise _invalid(f"{label}: Der Text enthält Zeichen, die in keiner Textdatei stehen.")
-    data = text.encode("utf-8", errors="strict")
+        raise _invalid(no_text)
+    try:
+        data = text.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:  # e.g. a lone surrogate from JSON `\ud800`
+        raise _invalid(no_text) from None
     if len(data) > MAX_BYTES:
         raise _invalid(
             f"{label} wäre zu groß ({len(data) // 1024} KB, höchstens {MAX_BYTES // 1024} KB). "
@@ -345,41 +389,44 @@ def write_file(
     folders), which must not exist yet. A file that changed since `version` or that appeared
     meanwhile is not touched (`conflict`). The permission bits of an existing file are kept.
     """
-    parts = check_path(path)
+    parts = check_path(path, new=version is None)
     label = f"„{path}“"
     data = _encode(text, label)
     create = version is None
-    with _folder(workfolder, skill, parts, create=create) as folder:
-        name = parts[-1]
-        current = _current(folder, name, label)
-        if create and current is not None:
-            raise _conflict(f"Die Datei {label} gibt es schon. Wähle einen anderen Namen.")
-        if not create:
-            if current is None:
-                raise _conflict(
-                    f"{label} wurde außerhalb gelöscht. Speichere sie als neue Datei oder lade "
-                    "den Skill neu."
-                )
-            if version_of(current[0]) != version:
-                raise _changed_outside(skill, path)
-        mode = current[1] if current is not None else 0o644
-        temp = _write_temp(folder, name, data, mode)
-        try:
-            if create:
-                os.link(temp, name, src_dir_fd=folder, dst_dir_fd=folder, follow_symlinks=False)
-                os.unlink(temp, dir_fd=folder)
-            else:
-                again = _current(folder, name, label)
-                if again is None or version_of(again[0]) != version:
+    try:
+        with _folder(workfolder, skill, parts, create=create) as folder:
+            name = parts[-1]
+            current = _current(folder, name, label)
+            if create and current is not None:
+                raise _conflict(f"Die Datei {label} gibt es schon. Wähle einen anderen Namen.")
+            if not create:
+                if current is None:
+                    raise _conflict(
+                        f"{label} wurde außerhalb gelöscht. Speichere sie als neue Datei oder lade "
+                        "den Skill neu."
+                    )
+                if version_of(current[0]) != version:
                     raise _changed_outside(skill, path)
-                os.rename(temp, name, src_dir_fd=folder, dst_dir_fd=folder)
-        except FileExistsError:
-            raise _conflict(
-                f"Die Datei {label} gibt es schon. Wähle einen anderen Namen."
-            ) from None
-        finally:
-            with contextlib.suppress(OSError):
-                os.unlink(temp, dir_fd=folder)
+            mode = current[1] if current is not None else 0o644
+            temp = _write_temp(folder, name, data, mode)
+            try:
+                if create:
+                    os.link(temp, name, src_dir_fd=folder, dst_dir_fd=folder, follow_symlinks=False)
+                    os.unlink(temp, dir_fd=folder)
+                else:
+                    again = _current(folder, name, label)
+                    if again is None or version_of(again[0]) != version:
+                        raise _changed_outside(skill, path)
+                    os.rename(temp, name, src_dir_fd=folder, dst_dir_fd=folder)
+            except FileExistsError:
+                raise _conflict(
+                    f"Die Datei {label} gibt es schon. Wähle einen anderen Namen."
+                ) from None
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp, dir_fd=folder)
+    except OSError as exc:
+        raise _os_failed(label, exc) from None
     return FileContent(text=text, version=version_of(data), size=len(data))
 
 
@@ -553,20 +600,47 @@ def create_skill(workfolder: Path, name: str, kind: str, description: str) -> li
     return sorted(files)
 
 
-def _collect(folder: int, prefix: str, out: dict[str, tuple[bytes, int]], left: list[str]) -> None:
-    """Regular files below an open folder, without following links; the rest goes to `left`."""
+class _CopyTooLarge(Exception):
+    """The files of a duplicate exceed `MAX_COPY_TOTAL`."""
+
+
+def _collect(
+    folder: int,
+    prefix: str,
+    out: dict[str, tuple[bytes, int]],
+    left: list[str],
+    depth: int = 0,
+) -> None:
+    """Regular files below an open folder, without following links; the rest goes to `left`.
+
+    Folders deeper than `MAX_COPY_DEPTH` are left out; more than `MAX_COPY_TOTAL` bytes in all
+    raise `_CopyTooLarge`.
+    """
     for entry in sorted(os.listdir(folder)):
         rel = f"{prefix}{entry}"
-        info = os.stat(entry, dir_fd=folder, follow_symlinks=False)
+        try:
+            info = os.stat(entry, dir_fd=folder, follow_symlinks=False)
+        except OSError:
+            left.append(rel)
+            continue
         if stat.S_ISDIR(info.st_mode):
             if entry.startswith("."):
                 continue
-            sub = os.open(entry, _DIR_FLAGS, dir_fd=folder)
+            if depth + 1 >= MAX_COPY_DEPTH:
+                left.append(f"{rel}/")
+                continue
             try:
-                _collect(sub, f"{rel}/", out, left)
+                sub = os.open(entry, _DIR_FLAGS, dir_fd=folder)
+            except OSError:
+                left.append(f"{rel}/")
+                continue
+            try:
+                _collect(sub, f"{rel}/", out, left, depth + 1)
             finally:
                 os.close(sub)
         elif stat.S_ISREG(info.st_mode) and not entry.startswith("."):
+            if sum(len(d) for d, _m in out.values()) + info.st_size > MAX_COPY_TOTAL:
+                raise _CopyTooLarge
             if info.st_size > MAX_COPY_BYTES or len(out) >= MAX_COPY_FILES:
                 left.append(rel)
                 continue
@@ -622,10 +696,22 @@ def duplicate_skill(workfolder: Path, source: str, name: str) -> list[str]:
             ) from None
         try:
             _collect(folder, "", files, left)
+        except _CopyTooLarge:
+            raise ApiException.of(
+                ErrorCode.NOT_ALLOWED,
+                f"„{source}“ ist zu groß zum Duplizieren (mehr als {MAX_COPY_TOTAL // 1024**2} "
+                "MB in allen Dateien). arr hat nichts angelegt. Lege große Dateien außerhalb "
+                "des Skills ab oder kopiere ihn im Finder.",
+            ) from None
+        except OSError as exc:
+            raise _os_failed(f"„{source}“", exc, "lesen") from None
         finally:
             os.close(folder)
     if SKILL_FILE in files:
         data, mode = files[SKILL_FILE]
         files[SKILL_FILE] = (renamed_skill_md(data, name), mode)
-    _install(workfolder, name, files)
+    try:
+        _install(workfolder, name, files)
+    except OSError as exc:
+        raise _os_failed(f"„{name}“", exc, "anlegen") from None
     return left
