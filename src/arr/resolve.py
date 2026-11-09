@@ -57,7 +57,9 @@ __all__ = [
     "dump_yaml_model",
     "load_group_spec",
     "load_run_input",
+    "line_of_path",
     "load_yaml_model",
+    "parse_yaml_text",
     "resolve_run",
     "validate_model",
     "validation_issues",
@@ -118,6 +120,15 @@ def _read_yaml(path: Path, source: str) -> tuple[Any, dict[Loc, int]]:
         raise ConfigError.single(
             "", f"Datei nicht lesbar: {path} ({exc.strerror}).", source=source
         ) from None
+    return parse_yaml_text(text, source)
+
+
+def parse_yaml_text(text: str, source: str) -> tuple[Any, dict[Loc, int]]:
+    """Parse YAML text into plain values and the 1-based line of every key and list item.
+
+    Raises `ConfigError` (with the line) for invalid YAML, an empty text or a text that is no
+    section of `key: value` entries. Used for files and for the skill check (W4-02).
+    """
     try:
         raw = YAML(typ="rt").load(text)
     except DuplicateKeyError as exc:
@@ -337,6 +348,20 @@ def validation_issues(
         seen.add(path)
         issues.append(ConfigIssue(path, _message(error), _line_for(loc, lines)))
     return issues
+
+
+_PATH_PART_RE = re.compile(r"([^.\[\]]+)|\[(\d+)\]")
+
+
+def line_of_path(path: str, lines: Mapping[Loc, int] | None) -> int | None:
+    """The line of a path like `agents[1].role` (or of its nearest parent) in a YAML file.
+
+    `lines` comes from `parse_yaml_text`. Used to give every issue of a check a line (W4-02).
+    """
+    loc: list[str | int] = []
+    for match in _PATH_PART_RE.finditer(path):
+        loc.append(int(match[2]) if match[2] is not None else match[1])
+    return _line_for(tuple(loc), lines)
 
 
 def _line_for(loc: Loc, lines: Mapping[Loc, int] | None) -> int | None:

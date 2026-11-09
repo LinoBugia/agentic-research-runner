@@ -1,22 +1,38 @@
-"""Skills: look at and check skills, start runs from them; read only in v1 (docs/08 §5.7).
+"""Skills: look at, check, edit, duplicate and create skills, start runs from them
+(docs/08 §5.7, W4-02).
 
 Left the skills grouped by kind („Group · startbar“, „Werkzeug“, „User-Agent“) with use and
-check state, right the selected skill: tabs „Übersicht“ (flow of the topology, parameters,
-agents with count/mix/when in plain words, channels, rating, „Benutzt von“), „SKILL.md“,
-„group.yaml“, „Rollen“ and „Prüfung“ (errors with file and line). An invalid skill cannot be
-started. Editing, duplicating and new skills come with W4-02.
+check state („⚠ n“) and „＋ Neuer Skill“, right the selected skill: tabs „Übersicht“ (flow of the
+topology, parameters, agents with count/mix/when in plain words, channels, rating, „Benutzt
+von“), „SKILL.md“ and „group.yaml“ (editor), „Rollen“, „Dateien“ (all files, editor, new file)
+and „Prüfung“ (errors with file, line and what to do). An invalid skill cannot be started.
+The editor (`SkillEditor`) saves also invalid files, shows the check right after and asks
+before unsaved changes get lost.
 """
+
+import json
+import re
 
 from nicegui import ui
 
 from arr.models import TopologyKind
 from arr.service.api_client import ApiClient
-from arr.service.api_models import ApiException, SkillInfo, SkillKind
+from arr.service.api_models import (
+    ApiException,
+    CreateSkillRequest,
+    DuplicateSkillRequest,
+    SaveSkillFileRequest,
+    SkillInfo,
+    SkillIssue,
+    SkillKind,
+)
 from arr.service.gui import format as fmt
 from arr.service.gui.app import get_api
 from arr.service.gui.components.badge import badge_html
 from arr.service.gui.components.banner import empty_state_html
 from arr.service.gui.components.base import button, esc, icon, markdown_html, raw
+from arr.service.gui.components.form import Field, radio
+from arr.service.gui.components.form_dialog import FormDialog
 from arr.service.gui.components.page_state import (
     clean_href,
     load_into,
@@ -25,7 +41,8 @@ from arr.service.gui.components.page_state import (
     use_screen_assets,
 )
 from arr.service.gui.components.params import CHOICE_LABELS, param_text
-from arr.service.gui.layout import Frame
+from arr.service.gui.components.skill_editor import SkillEditor, install_editor_js, issue_where
+from arr.service.gui.layout import Frame, tab_title
 from arr.service.gui.texts import TOPOLOGY_LABEL, Status
 
 KIND_GROUPS = [
@@ -43,8 +60,20 @@ TABS = [
     ("skill", "SKILL.md"),
     ("yaml", "group.yaml"),
     ("rollen", "Rollen"),
+    ("dateien", "Dateien"),
     ("pruefung", "Prüfung"),
 ]
+TAB_FILES = {"skill": "SKILL.md", "yaml": "group.yaml"}
+"""Tabs that are the editor of one file."""
+ROLE_MISSING = re.compile(r"^Rolle (\S+) nicht gefunden\.")
+ROLE_TEMPLATE = (
+    "# Rolle: {name}\n\nBeschreibe hier, was dieser Agent tut, worauf er achtet und wie er sein "
+    "Ergebnis abgibt (`submit_result`).\n"
+)
+UNSAVED = (
+    "Du hast ungespeicherte Änderungen an {path}. Speichere oder verwirf sie zuerst, dann geht "
+    "es hier weiter."
+)
 
 # Flow of each topology in plain words (docs/03 §4, docs/08 §6.5 table of the progress bar)
 FLOW = {
@@ -183,24 +212,86 @@ def channels_html(skill: SkillInfo) -> str:
     return f'<div class="small stack">{"".join(lines)}</div>'
 
 
+def file_href(skill: str, path: str) -> str:
+    """Where the editor of `path` lives: its own tab for SKILL.md and group.yaml."""
+    for tab, file in TAB_FILES.items():
+        if file == path:
+            return f"/skills/{skill}?tab={tab}"
+    return f"/skills/{skill}?tab=dateien&datei={path}"
+
+
+def issue_html(skill: str, issue: SkillIssue) -> str:
+    """One problem of the check: where (link to the file's editor) and what to do."""
+    return (
+        '<div class="check"><span class="st bad" aria-hidden="true">✕</span><span class="txt">'
+        f'<a class="b" href="{esc(file_href(skill, issue.file))}">{esc(issue_where(issue))}</a>'
+        f"<small>{esc(issue.message)}</small></span></div>"
+    )
+
+
 class SkillsPage:
     """State of one Skills page (one browser tab)."""
 
-    def __init__(self, frame: Frame, api: ApiClient, *, name: str, tab: str) -> None:
+    def __init__(
+        self, frame: Frame, api: ApiClient, *, name: str, tab: str, datei: str = ""
+    ) -> None:
         self.frame = frame
         self.api = api
         self.name = name
+        self.datei = datei
+        if datei and not tab:
+            tab = "dateien"
         self.tab = tab if tab in dict(TABS) else "uebersicht"
+        self.editor: SkillEditor | None = None
+        self.skill: SkillInfo | None = None
+        self.renders = 0
 
     async def build(self) -> None:
         with self.frame.content:
+            self.dialog = FormDialog()
             self.box = ui.element("div")
+        await self._load()
+
+    async def _load(self) -> None:
+        self.renders += 1  # the title of this render gets the focus after `_open`
+        self.box.clear()
+        self.editor = None
         await load_into(
             self.box,
             self.api.list_skills,
             self._render,
             retry_href=clean_href(f"/skills/{self.name}" if self.name else "/skills"),
             skeleton=skeleton_html(6, shape="rows", reason="Die Skills werden geprüft …"),
+        )
+
+    def _unsaved(self) -> str | None:
+        """The message for actions that would replace the editor while it has changes."""
+        if self.editor is not None and self.editor.dirty:
+            return UNSAVED.format(path=self.editor.path)
+        return None
+
+    async def _open(self, name: str, tab: str = "uebersicht", datei: str = "") -> None:
+        """Show another skill in place (after creating or duplicating), with its URL."""
+        self.name, self.tab, self.datei = name, tab, datei
+        url = f"/skills/{name}" + (f"?tab={tab}" if tab != "uebersicht" else "")
+        if datei:
+            url = f"/skills/{name}?tab=dateien&datei={datei}"
+        ui.navigate.history.push(url)
+        self.frame.title = name
+        ui.page_title(tab_title(name, self.frame.counts.waiting))
+        await self._load()
+        # breadcrumb „Skills › <name>“ of the new skill, and the focus on its title (§7.7)
+        ui.run_javascript(
+            "(() => { const c = document.querySelector('.topbar .crumbs'); if (!c) return; "
+            "c.replaceChildren(); const a = document.createElement('a'); a.href = '/skills'; "
+            "a.textContent = 'Skills'; const sep = document.createElement('span'); "
+            "sep.className = 'sep'; sep.setAttribute('aria-hidden', 'true'); "
+            "sep.textContent = '›'; const n = document.createElement('span'); "
+            f"n.textContent = {json.dumps(name)}; c.append(a, sep, n); }})();"
+            # after the dialog has closed and given the focus back (arr.js), Vue may still
+            # replace the new title once: focus it a moment later
+            f"setTimeout(() => arr.whenEl('#skill-title[data-render=\"{self.renders}\"]', "
+            "(h) => h.focus()), 300);"
         )
 
     async def _render(self, skills: list[SkillInfo]) -> None:
@@ -212,34 +303,27 @@ class SkillsPage:
                     "Noch keine Skills",
                     "Die Start-Skills lassen sich mit einem Klick anlegen."
                     if self._prototype
-                    else "Die Start-Skills kommen mit Auftrag W4-05.",
+                    else "Lege einen Skill aus einer Vorlage an. Die Start-Skills kommen mit "
+                    "Auftrag W4-05.",
                     [],
                 )
             )
             with (
                 ui.element("div").classes("btn-row").style("justify-content:center;margin-top:12px")
             ):
-                button(
-                    "Start-Skills anlegen", self._create_start_skills, classes="btn primary"
-                ).mark("start-skills")
+                button("Neuer Skill", self._new_dialog, classes="btn primary").mark("new-skill")
+                button("Start-Skills anlegen", self._create_start_skills, classes="btn").mark(
+                    "start-skills"
+                )
             return
         names = [s.name for s in skills]
         selected = self.name if self.name in names else names[0]
         with ui.element("div").classes("split"):
             with ui.element("nav").classes("subnav").props('aria-label="Skills"'):
-                parts = []
-                for kind, title in KIND_GROUPS:
-                    group = [s for s in skills if s.kind is kind]
-                    if not group:
-                        continue
-                    parts.append(f'<div class="grp">{esc(title)}</div>')
-                    parts += [skill_item_html(s, s.name == selected) for s in group]
-                raw("".join(parts), tag="div", classes="list")
-                raw(
-                    '<p class="small muted" style="margin-top:12px">Bearbeiten, Duplizieren und '
-                    "neue Skills kommen in einer späteren Version.</p>"
-                )
+                button("＋ Neuer Skill", self._new_dialog, classes="btn sk-new").mark("new-skill")
+                self.list_box = raw("", tag="div", classes="list")
             self.detail = ui.element("div")
+        self._render_list(skills, selected)
         if self.name and self.name not in names:
             with self.detail:
                 raw(
@@ -252,47 +336,97 @@ class SkillsPage:
         with self.detail:
             await self._render_detail(skill)
 
+    def _render_list(self, skills: list[SkillInfo], selected: str) -> None:
+        parts = []
+        for kind, title in KIND_GROUPS:
+            group = [s for s in skills if s.kind is kind]
+            if not group:
+                continue
+            parts.append(f'<div class="grp">{esc(title)}</div>')
+            parts += [skill_item_html(s, s.name == selected) for s in group]
+        self.list_box.set_content("".join(parts))
+
+    async def _refresh(self, skill: SkillInfo) -> None:
+        """After saving: list badge, head and tabs show the new check; the editor stays."""
+        self.skill = skill
+        try:
+            skills = await self.api.list_skills()
+        except ApiException:
+            skills = []
+        if skills:
+            self._render_list(skills, skill.name)
+        self._render_head(skill)
+        self._render_tabs(skill)
+
     async def _render_detail(self, skill: SkillInfo) -> None:
+        self.skill = skill
+        self.head = ui.element("div")
+        self._render_head(skill)
+        self.tabs = raw("", tag="div")
+        self._render_tabs(skill)
+        if self.tab == "uebersicht":
+            self._overview(skill)
+        elif self.tab == "pruefung":
+            self._checks(skill)
+        elif self.tab == "rollen":
+            await self._roles(skill)
+        elif self.tab == "dateien":
+            await self._files(skill)
+        else:
+            await self._edit(skill, TAB_FILES[self.tab])
+
+    def _render_head(self, skill: SkillInfo) -> None:
         status = (
             badge_html(CHECKED)
             if skill.valid
             else badge_html(Status("st-warn", "warning", f"{len(skill.issues)} Fehler"))
         )
-        with ui.element("div").classes("page-head").style("margin-bottom:8px"):
-            raw(
-                f'<h1 id="skill-title" tabindex="-1">{esc(skill.name)}</h1>'
-                f'<span class="tag">{esc(KIND_TAG[skill.kind])}</span>{status}',
-                tag="div",
-                classes="row",
-            )
-            if skill.kind is SkillKind.GROUP:
+        self.head.clear()
+        with self.head:
+            with ui.element("div").classes("page-head").style("margin-bottom:8px"):
+                raw(
+                    f'<h1 id="skill-title" tabindex="-1" data-render="{self.renders}">'
+                    f"{esc(skill.name)}</h1>"
+                    f'<span class="tag">{esc(KIND_TAG[skill.kind])}</span>{status}',
+                    tag="div",
+                    classes="row",
+                )
                 with ui.element("div").classes("actions"):
-                    if skill.valid:
-                        raw(
-                            f'<a class="btn primary" href="/neuer-run?skill={esc(skill.name)}">'
-                            f"{icon('add')}Run mit diesem Skill</a>",
-                            tag="span",
-                        )
-                    else:
-                        raw(
-                            '<button type="button" class="btn primary" disabled '
-                            'aria-disabled="true" title="Behebe zuerst die Fehler unter '
-                            f'„Prüfung“.">{icon("add")}Run mit diesem Skill</button>',
-                            tag="span",
-                        )
-        raw(f'<p class="muted">{esc(skill.description)}</p>')
-        if not skill.valid:
-            first = skill.issues[0] if skill.issues else None
-            where = f"{first.file}, Zeile {first.line}: " if first and first.line else ""
-            raw(
-                f'<div class="banner err banner-sm" role="alert" style="margin-bottom:12px">'
-                f'{icon("error")}<div class="txt"><b>{esc(where)}'
-                f"{esc(first.message if first else 'Prüfung fehlgeschlagen.')}</b>"
-                "Runs mit diesem Skill lassen sich erst nach der Korrektur starten.</div></div>"
-            )
+                    button("Duplizieren …", self._duplicate_dialog).mark("duplicate")
+                    if skill.kind is SkillKind.GROUP:
+                        if skill.valid:
+                            raw(
+                                f'<a class="btn primary" href="/neuer-run?skill={esc(skill.name)}"'
+                                f' data-mark="run-with-skill">{icon("add")}Run mit diesem Skill'
+                                "</a>",
+                                tag="span",
+                            )
+                        else:
+                            raw(
+                                '<button type="button" class="btn primary" disabled '
+                                'aria-disabled="true" aria-describedby="skill-blocked" '
+                                'data-mark="run-with-skill" title="Behebe zuerst die Fehler '
+                                f'unter „Prüfung“.">{icon("add")}Run mit diesem Skill</button>',
+                                tag="span",
+                            )
+            raw(f'<p class="muted">{esc(skill.description)}</p>')
+            if not skill.valid:
+                first = skill.issues[0] if skill.issues else None
+                where = f"{issue_where(first)}: " if first else ""
+                more = f" (und {len(skill.issues) - 1} weitere)" if len(skill.issues) > 1 else ""
+                raw(
+                    '<div class="banner err banner-sm" role="alert" id="skill-blocked" '
+                    f'style="margin-bottom:12px">{icon("error")}<div class="txt"><b>{esc(where)}'
+                    f"{esc(first.message if first else 'Prüfung fehlgeschlagen.')}{esc(more)}</b>"
+                    "Runs mit diesem Skill lassen sich erst nach der Korrektur starten. "
+                    f'<a href="/skills/{esc(skill.name)}?tab=pruefung">Alle Fehler ansehen</a>'
+                    "</div></div>"
+                )
+
+    def _render_tabs(self, skill: SkillInfo) -> None:
         tabs = []
         for key, label in TABS:
-            if key == "yaml" and skill.kind is not SkillKind.GROUP:
+            if key == "yaml" and "group.yaml" not in skill.files:
                 continue
             count = ""
             if key == "rollen":
@@ -300,31 +434,25 @@ class SkillsPage:
                 if not roles:
                     continue
                 count = f' <span class="n">{len(roles)}</span>'
+            if key == "dateien":
+                count = f' <span class="n">{len(skill.files)}</span>'
             if key == "pruefung" and skill.issues:
                 count = f' <span class="n">{len(skill.issues)}</span>'
             current = ' class="active" aria-current="page"' if key == self.tab else ""
             tabs.append(
                 f'<a{current} href="/skills/{esc(skill.name)}?tab={key}">{esc(label)}{count}</a>'
             )
-        raw(
+        self.tabs.set_content(
             '<nav class="tabs" aria-label="Ansicht" style="margin-bottom:12px">'
             f"{''.join(tabs)}</nav>"
         )
-        if self.tab == "uebersicht":
-            self._overview(skill)
-        elif self.tab == "pruefung":
-            self._checks(skill)
-        elif self.tab == "rollen":
-            await self._roles(skill)
-        else:
-            await self._file(skill, "SKILL.md" if self.tab == "skill" else "group.yaml")
 
     def _overview(self, skill: SkillInfo) -> None:
         if skill.kind is not SkillKind.GROUP:
             raw(
                 '<p class="small muted">Werkzeug- und User-Agent-Skills haben keinen Ablauf. '
-                "Agenten bzw. Claude Code laden sie bei Bedarf. Den Inhalt zeigt der Tab "
-                "„SKILL.md“.</p>"
+                "Agenten bzw. Claude Code laden sie bei Bedarf. Den Inhalt zeigt und bearbeitet "
+                "der Tab „SKILL.md“.</p>"
             )
             return
         used = skill.used_by
@@ -342,7 +470,13 @@ class SkillsPage:
             if rubric
             else "keine Bewertung"
         )
-        topology = skill.topology or TopologyKind.SOLO
+        if skill.topology is None:
+            raw(
+                '<p class="small muted">Die group.yaml lässt sich nicht laden, deshalb fehlt die '
+                "Übersicht. Die Fehler stehen unter „Prüfung“.</p>"
+            )
+            return
+        topology = skill.topology
         raw(
             '<div class="grid-2e"><div>'
             f"<h3>Ablauf (Topologie {esc(TOPOLOGY_LABEL[topology])})</h3>{flow_html(topology)}"
@@ -355,57 +489,239 @@ class SkillsPage:
         )
 
     def _checks(self, skill: SkillInfo) -> None:
+        with ui.element("div").classes("btn-row").style("margin-bottom:8px"):
+            button("Erneut prüfen", self._recheck).mark("recheck")
         if not skill.issues:
             raw(
                 '<div class="check"><span class="st ok" aria-hidden="true">✓</span><span '
                 'class="txt">Keine Fehler. Alle Dateien und Rollen sind da.</span></div>'
             )
             return
-        rows = "".join(
-            f'<div class="check"><span class="st bad" aria-hidden="true">✕</span><span class="txt">'
-            f"<b>{esc(i.file)}{', Zeile ' + str(i.line) if i.line else ''}</b>"
-            f"<small>{esc(i.message)}</small></span></div>"
-            for i in skill.issues
-        )
-        raw(rows)
+        for issue in skill.issues:
+            raw(issue_html(skill.name, issue))
+            match = ROLE_MISSING.match(issue.message)
+            if match and issue.file == "group.yaml":
+                role = match[1]
+                with ui.element("div").classes("ed-fix"):
+                    button(
+                        f"{role} anlegen",
+                        lambda role=role: self._create_role(skill, role),
+                        classes="btn small",
+                    ).mark(f"create-role-{role}")
 
-    async def _file(self, skill: SkillInfo, path: str) -> None:
-        if path not in skill.files:
-            raw('<p class="small muted">Diese Datei gibt es in diesem Skill nicht.</p>')
-            return
+    async def _recheck(self) -> None:
+        await self._load()
+        self.frame.toast("Skill erneut geprüft.")
+
+    async def _create_role(self, skill: SkillInfo, role: str) -> None:
+        name = role.rsplit("/", 1)[-1].removesuffix(".md")
         try:
-            file = await self.api.get_skill_file(skill.name, path)
+            await self.api.save_skill_file(
+                skill.name, role, SaveSkillFileRequest(content=ROLE_TEMPLATE.format(name=name))
+            )
         except ApiException as exc:
-            raw(f'<p class="small">{esc(exc.error.message)}</p>')
+            self.frame.toast(exc.error.message, error=True)
             return
-        raw(
-            f'<div class="card-head"><span class="mono small">{esc(skill.name)}/{esc(path)}</span>'
-            f'<span class="faint small">{esc(fmt.size(file.size))} · nur lesen</span></div>'
-        )
-        if file.language == "markdown":
-            body = file.content
-            if body.startswith("---\n"):
-                body = body.split("\n---\n", 1)[-1]
-            raw(f'<div class="card prose">{markdown_html(body)}</div>')
+        self.frame.toast(f"{role} angelegt. Beschreibe jetzt die Rolle.")
+        await self._open(skill.name, "dateien", role)
+
+    async def _edit(self, skill: SkillInfo, path: str) -> None:
+        if path not in skill.files:
             raw(
-                '<details style="margin-top:8px"><summary class="small">Quelltext</summary>'
-                f'<pre class="cmd file-view">{esc(file.content)}</pre></details>'
+                '<p class="small muted">Diese Datei gibt es in diesem Skill nicht. Lege sie unter '
+                "„Dateien“ an.</p>"
             )
             return
-        raw(f'<pre class="cmd file-view">{esc(file.content)}</pre>')
+        editor = SkillEditor(
+            self.api, skill=skill.name, path=path, on_saved=self._refresh, toast=self.frame.toast
+        )
+        if await editor.build():
+            self.editor = editor
+            editor.render_checks(skill)
+
+    async def _files(self, skill: SkillInfo) -> None:
+        with ui.element("div").classes("sk-files"):
+            with ui.element("div").classes("sk-file-list"):
+                links = []
+                for path in skill.files:
+                    current = ' aria-current="page" class="sel"' if path == self.datei else ""
+                    links.append(
+                        f'<li><a{current} href="{esc(file_href(skill.name, path))}">'
+                        f'<span class="mono small">{esc(path)}</span></a></li>'
+                    )
+                raw(
+                    f'<ul class="plain" aria-label="Dateien des Skills">{"".join(links)}</ul>'
+                    if links
+                    else '<p class="small muted">Keine Dateien.</p>'
+                )
+                button("＋ Neue Datei", lambda: self._new_file_dialog(skill)).mark("new-file")
+            with ui.element("div"):
+                if not self.datei:
+                    raw(
+                        '<p class="small muted">Wähle links eine Datei. Bearbeiten lassen sich '
+                        "Textdateien bis 256 KB; Links, Pipes und andere Sonderdateien öffnet "
+                        "der Editor nicht.</p>"
+                    )
+                elif self.datei not in skill.files:
+                    raw(
+                        f'<p class="small">Die Datei „{esc(self.datei)}“ gibt es in diesem Skill '
+                        "nicht.</p>"
+                    )
+                else:
+                    await self._edit(skill, self.datei)
 
     async def _roles(self, skill: SkillInfo) -> None:
         for path in [f for f in skill.files if f.startswith("roles/")]:
             try:
                 file = await self.api.get_skill_file(skill.name, path)
             except ApiException as exc:
-                raw(f'<p class="small">{esc(exc.error.message)}</p>')
+                raw(
+                    f'<section class="card" style="margin-bottom:12px"><h3 class="mono">'
+                    f'{esc(path)}</h3><p class="small">{esc(exc.error.message)}</p></section>'
+                )
                 continue
             raw(
                 f'<section class="card" id="{esc(path)}" style="margin-bottom:12px">'
-                f'<h3 class="mono">{esc(path)}</h3><div class="prose small">'
-                f"{markdown_html(file.content)}</div></section>"
+                f'<div class="card-head"><h3 class="mono">{esc(path)}</h3>'
+                f'<a class="btn small" href="{esc(file_href(skill.name, path))}">Bearbeiten</a>'
+                f'</div><div class="prose small">{markdown_html(file.content)}</div></section>'
             )
+
+    # -- dialogs -------------------------------------------------------------------------------
+
+    def _new_file_dialog(self, skill: SkillInfo) -> None:
+        if (blocked := self._unsaved()) is not None:
+            self.frame.toast(blocked, error=True)
+            return
+        fields: dict[str, Field] = {}
+
+        def build() -> None:
+            fields["path"] = Field(
+                "Pfad im Skill",
+                name="new-file",
+                value="roles/",
+                help_text="Relativ zum Skill, z. B. roles/kritiker.md. Fehlende Ordner legt arr "
+                "an.",
+                attrs='autocomplete="off"',
+            )
+
+        async def submit() -> str | None:
+            path = fields["path"].value.strip()
+            name = path.rsplit("/", 1)[-1].removesuffix(".md")
+            content = ROLE_TEMPLATE.format(name=name) if path.startswith("roles/") else ""
+            try:
+                await self.api.save_skill_file(
+                    skill.name, path, SaveSkillFileRequest(content=content)
+                )
+            except ApiException as exc:
+                fields["path"].set_error(exc.error.message)
+                return "Die Datei wurde nicht angelegt."
+            self.frame.toast(f"{path} angelegt.")
+            await self._open(skill.name, "dateien", path)
+            return None
+
+        self.dialog.open(f"Neue Datei in {skill.name}", "Datei anlegen", build, submit)
+
+    def _duplicate_dialog(self) -> None:
+        skill = self.skill
+        if skill is None:
+            return
+        if (blocked := self._unsaved()) is not None:
+            self.frame.toast(blocked, error=True)
+            return
+        fields: dict[str, Field] = {}
+
+        def build() -> None:
+            raw(
+                f"<p>arr kopiert alle Dateien von „{esc(skill.name)}“ in einen neuen Skill und "
+                "setzt dort den Namen in der SKILL.md. Links und Sonderdateien kopiert arr nicht."
+                "</p>"
+            )
+            fields["name"] = Field(
+                "Name des neuen Skills",
+                name="duplicate-name",
+                value=f"{skill.name}-kopie",
+                help_text="Kleinbuchstaben, Ziffern und „-“, z. B. proof-review-streng.",
+                attrs='autocomplete="off"',
+            )
+
+        async def submit() -> str | None:
+            name = fields["name"].value.strip()
+            try:
+                result = await self.api.duplicate_skill(
+                    skill.name, DuplicateSkillRequest(name=name)
+                )
+            except ApiException as exc:
+                fields["name"].set_error(exc.error.message)
+                return "Der Skill wurde nicht dupliziert."
+            self.frame.toast(result.message)
+            await self._open(result.skill.name)
+            return None
+
+        self.dialog.open(f"Skill „{skill.name}“ duplizieren", "Duplizieren", build, submit)
+
+    def _new_dialog(self) -> None:
+        if (blocked := self._unsaved()) is not None:
+            self.frame.toast(blocked, error=True)
+            return
+        fields: dict[str, Field] = {}
+        kind = {"value": "group"}
+
+        def build() -> None:
+            fields["name"] = Field(
+                "Name",
+                name="skill-name",
+                help_text="Kleinbuchstaben, Ziffern und „-“, z. B. beweis-check. Er ist auch der "
+                "Ordnername.",
+                attrs='autocomplete="off"',
+            )
+            raw('<div class="small" style="font-weight:600;margin:8px 0 4px">Art</div>')
+            with ui.element("div").classes("stack").props('role="radiogroup" aria-label="Art"'):
+                for value, title, sub in (
+                    (
+                        "group",
+                        "Group-Skill",
+                        "Startbare Research-Group: SKILL.md, group.yaml (Topologie roundtable, "
+                        "zwei Agenten) und eine Rolle",
+                    ),
+                    ("tool", "Werkzeug-Skill", "Nur eine SKILL.md, für Agenten und Claude Code"),
+                ):
+                    with ui.element("label").classes("radio-card"):
+                        radio(
+                            "new-skill-kind",
+                            value,
+                            checked=value == kind["value"],
+                            on_change=lambda v: kind.update(value=v),
+                        )
+                        raw(
+                            f"<span><b>{esc(title)}</b><span class='small muted'>{esc(sub)}"
+                            "</span></span>",
+                            tag="span",
+                        )
+            fields["description"] = Field(
+                "Beschreibung",
+                name="skill-description",
+                help_text="Ein Satz: wofür der Skill da ist und wann man ihn nutzt.",
+                attrs='autocomplete="off"',
+            )
+
+        async def submit() -> str | None:
+            name = fields["name"].value.strip()
+            request = CreateSkillRequest(
+                name=name,
+                kind="group" if kind["value"] == "group" else "tool",
+                description=fields["description"].value.strip(),
+            )
+            try:
+                result = await self.api.create_skill(request)
+            except ApiException as exc:
+                fields["name"].set_error(exc.error.message)
+                return "Der Skill wurde nicht angelegt."
+            self.frame.toast(result.message)
+            await self._open(result.skill.name, "skill")
+            return None
+
+        self.dialog.open("Neuer Skill", "Skill anlegen", build, submit)
 
     @property
     def _prototype(self) -> bool:
@@ -425,9 +741,10 @@ class SkillsPage:
 def register() -> None:
     """Register `/skills` and `/skills/<name>` (docs/08 §5.7, §4.3)."""
 
-    async def show(name: str, tab: str, zustand: str) -> None:
+    async def show(name: str, tab: str, zustand: str, datei: str = "") -> None:
         api = state_api(get_api(), zustand)
         use_screen_assets()
+        install_editor_js()
         frame = Frame(
             api,
             active="skills",
@@ -436,12 +753,12 @@ def register() -> None:
             focus="#skill-title" if name else None,
         )
         await frame.start()
-        await SkillsPage(frame, api, name=name, tab=tab).build()
+        await SkillsPage(frame, api, name=name, tab=tab, datei=datei).build()
 
     @ui.page("/skills")
     async def skills(tab: str = "", zustand: str = "") -> None:
         await show("", tab, zustand)
 
     @ui.page("/skills/{name}")
-    async def skill(name: str, tab: str = "", zustand: str = "") -> None:
-        await show(name, tab, zustand)
+    async def skill(name: str, tab: str = "", zustand: str = "", datei: str = "") -> None:
+        await show(name, tab, zustand, datei)

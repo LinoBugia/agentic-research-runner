@@ -94,12 +94,14 @@ from arr.service.api_models import (
     CountsChangedEvent,
     CreateProfileRequest,
     CreateProjectRequest,
+    CreateSkillRequest,
     DecisionInfo,
     DecisionRequest,
     DecisionResponse,
     DeliveryInfo,
     Deviation,
     DiscussionState,
+    DuplicateSkillRequest,
     ErrorCode,
     EscalatedByInfo,
     EscalationOptionInfo,
@@ -166,10 +168,13 @@ from arr.service.api_models import (
     RunStartChannel,
     RunStatusEvent,
     RunSummary,
+    SaveSkillFileRequest,
+    SaveSkillFileResult,
     SecretScanInfo,
     SetupState,
     Severity,
     SizeInfo,
+    SkillChangeResult,
     SkillFile,
     SkillInfo,
     SkillIssue,
@@ -207,6 +212,15 @@ from arr.service.api_models import (
     WorkfolderRequest,
     WorkfolderSettingsInfo,
 )
+from arr.service.real_api.skill_files import (
+    check_name,
+    check_path,
+    renamed_skill_md,
+    template_files,
+    version_of,
+)
+from arr.skills import MAX_SKILL_FILE_BYTES
+from arr.skills import SKILL_FILE as SKILL_FILE_NAME
 
 __all__ = [
     "ApiClient",
@@ -415,6 +429,7 @@ class _State:
     profiles: list[ProfileInfo]
     projects: list[ProjectInfo]
     skills: list[SkillInfo]
+    skill_texts: dict[tuple[str, str], str] = field(default_factory=dict)
     user_rules: list[FixedRule] = field(default_factory=list)
     app_settings: AppSettings | None = None
     workfolder_settings: WorkfolderSettingsInfo | None = None
@@ -4238,6 +4253,21 @@ def _same(value: Any) -> Any:
     return value
 
 
+def _skill_file(name: str, path: str, content: str) -> SkillFile:
+    data = content.encode("utf-8")
+    language = "yaml" if path.endswith((".yaml", ".yml")) else "markdown"
+    if path.endswith(".py"):
+        language = "python"
+    return SkillFile(
+        skill=name,
+        path=path,
+        content=content,
+        language=language,
+        size=len(data),
+        version=version_of(data),
+    )
+
+
 def _not_found(what: str, ident: str) -> ApiException:
     return ApiException.of(ErrorCode.NOT_FOUND, f"{what} „{ident}“ nicht gefunden.")
 
@@ -6824,14 +6854,117 @@ class MockApi:
         return ProjectSetupResult(project=fixed, created=missing, message=message)
 
     async def get_skill_file(self, name: str, path: str) -> SkillFile:
-        """A file of a skill (sample content)."""
+        """A file of a skill (sample content, or what the editor saved)."""
         skill = await self.get_skill(name)
         if path not in skill.files:
             raise _not_found("Datei", f"{name}/{path}")
-        content = self._tr(_skill_file_text(skill, path))
-        language = "yaml" if path.endswith(".yaml") else "markdown"
-        return SkillFile(
-            skill=name, path=path, content=content, language=language, size=len(content.encode())
+        content = self.state.skill_texts.get((name, path))
+        if content is None:
+            content = self._tr(_skill_file_text(skill, path))
+        return _skill_file(name, path, content)
+
+    def _skill_index(self, name: str) -> int:
+        for index, skill in enumerate(self.state.skills):
+            if skill.name == name:
+                return index
+        raise _not_found("Skill", name)
+
+    async def save_skill_file(
+        self, name: str, path: str, request: SaveSkillFileRequest
+    ) -> SaveSkillFileResult:
+        """Save a skill file in memory (W4-02); same path rules and conflicts as the service."""
+        index = self._skill_index(name)
+        check_path(path)
+        skill = self.state.skills[index]
+        data = request.content.encode("utf-8")
+        if len(data) > MAX_SKILL_FILE_BYTES or "\x00" in request.content:
+            raise ApiException.of(
+                ErrorCode.INVALID,
+                f"„{path}“ wäre zu groß oder ist kein Text (höchstens "
+                f"{MAX_SKILL_FILE_BYTES // 1024} KB).",
+                field="content",
+            )
+        if request.version is None:
+            if path in skill.files:
+                raise ApiException.of(
+                    ErrorCode.CONFLICT,
+                    f"Die Datei „{path}“ gibt es schon. Wähle einen anderen Namen.",
+                )
+            skill = skill.model_copy(update={"files": sorted([*skill.files, path])})
+            self.state.skills[index] = skill
+        else:
+            current = await self.get_skill_file(name, path)
+            if current.version != request.version:
+                raise ApiException.of(
+                    ErrorCode.CONFLICT,
+                    f"{path} wurde außerhalb geändert. arr hat nichts überschrieben. Lade die "
+                    "Datei neu, bevor du speicherst.",
+                    action=Action(label="Neu laden", url=f"/skills/{name}?datei={path}"),
+                )
+        self.state.skill_texts[(name, path)] = request.content
+        return SaveSkillFileResult(
+            file=_skill_file(name, path, request.content), skill=self._with_usage(skill)
+        )
+
+    def _take_name(self, name: str) -> None:
+        check_name(name)
+        if any(s.name == name for s in self.state.skills):
+            raise ApiException.of(
+                ErrorCode.CONFLICT,
+                f"Den Namen „{name}“ gibt es im Workfolder schon. Wähle einen anderen.",
+                field="name",
+            )
+
+    async def create_skill(self, request: CreateSkillRequest) -> SkillChangeResult:
+        """A new skill from the built-in template (in memory, W4-02)."""
+        self._take_name(request.name)
+        files = template_files(request.name, request.kind, request.description)
+        description = " ".join(request.description.split()) or "Neuer Skill"
+        if request.kind == "group":
+            skill = SkillInfo(
+                name=request.name,
+                description=description,
+                kind=SkillKind.GROUP,
+                audience="user",
+                files=sorted(files),
+                topology=TopologyKind.ROUNDTABLE,
+                params=[
+                    ParamInfo(
+                        name="rounds", type="int", default=2, min=1, max=5, doc="Anzahl der Runden"
+                    )
+                ],
+                agents_spec=[{"id": "teilnehmer", "count": 2, "role": "roles/teilnehmer.md"}],
+                channels_spec=[{"name": "main", "members": ["teilnehmer-*"], "mode": "rounds"}],
+                agents_count=2,
+            )
+            what = "Group-Skill"
+        else:
+            skill = SkillInfo(
+                name=request.name, description=description, kind=SkillKind.TOOL, files=sorted(files)
+            )
+            what = "Werkzeug-Skill"
+        self.state.skills.append(skill)
+        for path, text in files.items():
+            self.state.skill_texts[(request.name, path)] = text
+        return SkillChangeResult(
+            skill=self._with_usage(skill), message=f"{what} „{request.name}“ angelegt."
+        )
+
+    async def duplicate_skill(self, name: str, request: DuplicateSkillRequest) -> SkillChangeResult:
+        """Copy a skill under a new name (in memory, W4-02)."""
+        source = self.state.skills[self._skill_index(name)]
+        self._take_name(request.name)
+        texts = {path: (await self.get_skill_file(name, path)).content for path in source.files}
+        if SKILL_FILE_NAME in texts:
+            texts[SKILL_FILE_NAME] = renamed_skill_md(
+                texts[SKILL_FILE_NAME].encode("utf-8"), request.name
+            ).decode("utf-8")
+        copy = source.model_copy(update={"name": request.name, "used_by": SkillUsage()})
+        self.state.skills.append(copy)
+        for path, text in texts.items():
+            self.state.skill_texts[(request.name, path)] = text
+        return SkillChangeResult(
+            skill=self._with_usage(copy), message=f"„{name}“ als „{request.name}“ dupliziert."
         )
 
     async def select_workfolder(self, request: WorkfolderRequest) -> WorkfolderInfo:

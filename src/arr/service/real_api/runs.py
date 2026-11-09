@@ -29,6 +29,7 @@ from typing import Any
 from arr.errors import ArrError, ConfigError, ConfigIssue
 from arr.models import (
     AgentConfig,
+    ChannelMode,
     GroupChatConfig,
     ParamSpec,
     ProfilesFile,
@@ -38,6 +39,7 @@ from arr.models import (
     RunInput,
     RunStatus,
     Starter,
+    TopologyKind,
     WorkfolderSettings,
 )
 from arr.permissions.policy import REDACTED, _redact_data, redact
@@ -60,11 +62,13 @@ from arr.service.api_models import (
     ChannelMessageEvent,
     CountsChangedEvent,
     ErrorCode,
+    Estimate,
     FieldIssue,
     LogEntry,
     Message,
     MessagesPage,
     PostMessageRequest,
+    Range,
     ResolveResult,
     RunAction,
     RunCounts,
@@ -86,6 +90,7 @@ from arr.service.api_models import (
 )
 from arr.service.real_api.approvals import ApprovalsArea
 from arr.service.real_api.base import RunHandle, ServiceState, not_allowed, not_found
+from arr.service.real_api.catalog import check_group
 from arr.service.real_api.profiles import provider_of as _profile_provider
 from arr.service.real_api.rundir import (
     RunRecord,
@@ -434,6 +439,120 @@ def _check_prepared(launch: Launch) -> None:
     catalog = discover_skills(root / "skills")
     _make_plan(root, project, resolved, catalog, None, launch.profiles, False)
     _check_codex_toolchain(root, resolved, launch.settings)
+
+
+# --------------------------------------------------------------------------------------------
+# Estimate (W4-02, docs/08 §5.4 „Schätzung“, docs/04 §2 `estimate_run`)
+# --------------------------------------------------------------------------------------------
+
+
+def _int(value: Any, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return default
+    return int(value)
+
+
+def _topology_turns(resolved: ResolvedRun) -> tuple[int, int | None, list[str]]:
+    """Fewest and most turns the topology itself gives (None: open), with German notes.
+
+    Follows the topologies (docs/03 §4): `solo` asks again up to `max_turns`; `roundtable`
+    has one turn per member and round (`event`: kick-off, at most `max_wakeups_per_agent`
+    wake-ups and `rounds` idle rounds) plus the summarizer; `waterfall` one attempt per stage
+    (author + raters, each asked once more at most), up to `1 + max_rework` attempts.
+    """
+    params = resolved.params
+    agents = len(resolved.agents)
+    kind = resolved.topology.kind
+    if kind is TopologyKind.SOLO:
+        most = max(1, _int(params.get("max_turns"), 3))
+        if params.get("require_result") is False:
+            most = 1
+        return 1, most, []
+    if kind is TopologyKind.ROUNDTABLE:
+        rounds = max(1, _int(params.get("rounds"), 3))
+        name = params.get("channel")
+        if name is None and len(resolved.groupchats) == 1:
+            name = resolved.groupchats[0].name
+        try:
+            channel = resolved.channel(str(name))
+        except KeyError:
+            return agents, None, []
+        members = len(channel.members)
+        extra = 1 if params.get("summarizer") else 0
+        if channel.mode is ChannelMode.ROUNDS:
+            return members + extra, members * rounds + extra, []
+        wakeups = channel.max_wakeups_per_agent
+        return (
+            members + extra,
+            members * (1 + wakeups + rounds) + extra,
+            ["Ereignisgesteuert: Wie oft Agenten geweckt werden, hängt von der Diskussion ab."],
+        )
+    if kind is TopologyKind.WATERFALL:
+        rework = max(0, _int(params.get("max_rework"), 2))
+        least = most = 0
+        for stage in resolved.stages:
+            raters = sum(1 for r in resolved.raters if r != stage.agent)
+            least += 1 + raters
+            most += (1 + rework) * (2 + 2 * raters)
+        notes = []
+        if str(params.get("on_fail") or "continue") == "escalate":
+            notes.append("Nach einer Eskalation kann es weitere Versuche geben.")
+            return least, None, notes
+        return least, most, notes
+    return agents, None, []
+
+
+def estimate_run(resolved: ResolvedRun) -> Estimate:
+    """Rough ranges for turns, cost and duration of a resolved run, without invented prices.
+
+    Turns come from the topology and are capped by `turns_per_agent` × agents. Costs: arr
+    knows no prices, so the only honest number is the budget as an upper bound, and only when
+    every agent reports costs (Claude); with Codex agents or without budget the cost is
+    unknown. The duration is at most `wall_time`.
+    """
+    limits = resolved.limits
+    agents = resolved.agents
+    least, most, notes = _topology_turns(resolved)
+    cap = len(agents) * limits.turns_per_agent if limits.turns_per_agent else None
+    if most is None or (cap is not None and cap < most):
+        most = cap
+    if most is None:
+        most = least
+        notes.append("Ohne Limit für Turns pro Agent ist die Obergrenze offen.")
+    least = min(least, most)
+    budget = limits.budget_usd
+    codex = any(a.provider is Provider.CODEX for a in agents)
+    if budget is not None and not codex:
+        cost = Range(min=0, max=budget)
+        cost_basis = "budget"
+        notes.append(
+            f"Kosten: höchstens das Budget von {budget:g} $. Preise schätzt arr nicht, "
+            "bei Abo-Profilen zählt der rechnerische Preis."
+        )
+    else:
+        cost = Range(min=0, max=0)
+        cost_basis = "unknown"
+        notes.append(
+            "Kosten unbekannt: Codex-Agenten melden keine Kosten, sie begrenzen Turns und Laufzeit."
+            if codex
+            else "Kosten unbekannt: Der Run hat kein Budget."
+        )
+    wall = limits.wall_time
+    if wall is not None:
+        duration = Range(min=0, max=wall.total_seconds())
+        duration_basis = "wall_time"
+    else:
+        duration = Range(min=0, max=0)
+        duration_basis = "unknown"
+        notes.append("Dauer unbekannt: Der Run hat keine Laufzeitgrenze.")
+    return Estimate(
+        turns=Range(min=least, max=most),
+        cost_usd=cost,
+        duration_s=duration,
+        cost_basis=cost_basis,  # type: ignore[arg-type]
+        duration_basis=duration_basis,  # type: ignore[arg-type]
+        notes=notes,
+    )
 
 
 class _NoProfile(ArrError):
@@ -915,6 +1034,29 @@ class RunsArea:
                 return {"provider": provider.value, **{k: values[k] for k in sorted(missing)}}
         return None
 
+    def _refuse_invalid_skill(self, name: str) -> None:
+        """A group skill whose check finds problems cannot start (W4-02, docs/08 §5.7)."""
+        catalog = discover_skills(self.state.workfolder / "skills")
+        info = catalog.skills.get(name)
+        if info is None or not info.is_group:
+            return  # unknown or broken skills are reported by the resolution itself
+        try:
+            settings = load_workfolder_settings(self.state.workfolder)
+        except ArrError:
+            return  # the resolution reports a broken `arr.yaml` itself
+        _spec, issues = check_group(info.path, catalog, settings)
+        if not issues:
+            return
+        first = issues[0]
+        where = f"{first.file}, Zeile {first.line}: " if first.line else f"{first.file}: "
+        more = f" (und {len(issues) - 1} weitere)" if len(issues) > 1 else ""
+        raise ConfigError.single(
+            "skill",
+            f"Der Skill „{name}“ hat Fehler und lässt sich nicht starten: {where}"
+            f"{first.message}{more} Behebe sie unter Skills, Reiter „Prüfung“.",
+            source="Neuer Run",
+        )
+
     def _plan(self, run_input: dict[str, Any]) -> Launch:
         """A `Launch` from a run input; `ConfigError`/`ArrError` for problems."""
         data, params, overrides = form_input(run_input)
@@ -956,6 +1098,9 @@ class RunsArea:
             _check_prepared(launch)
         except ConfigError as exc:
             raise _named(exc, ids) from None
+        if data.get("skill"):
+            # last: what the resolution finds itself stands at its field (e.g. an agent's role)
+            self._refuse_invalid_skill(str(data["skill"]))
         return launch
 
     async def resolve_run(self, run_input: dict[str, Any]) -> ResolveResult:
@@ -1039,6 +1184,7 @@ class RunsArea:
                 for c in resolved.groupchats
             ],
             capacity=capacity,
+            estimate=estimate_run(resolved),
         )
 
     async def start_run(self, run_input: dict[str, Any]) -> StartRunResponse:

@@ -34,6 +34,8 @@ from arr.service.api_models import (
     ApprovalItem,
     DecisionRequest,
     Deviation,
+    Estimate,
+    FieldIssue,
     ParamInfo,
     ProfileInfo,
     ProjectInfo,
@@ -1166,6 +1168,7 @@ class NeuerRunPage:
             return
         if self._timer is not None:  # a newer change is pending
             return
+        result = self._with_skill_lock(result)
         self.result = result
         self._checking = False
         if result.agents or not result.errors:  # an error in the form keeps the last table
@@ -1228,6 +1231,27 @@ class NeuerRunPage:
             else:
                 cells["web"].classes(remove="mark-changed")
 
+    def _with_skill_lock(self, result: ResolveResult) -> ResolveResult:
+        """A skill whose check found problems cannot start (W4-02, docs/08 §5.7): its first
+        problem stands at the skill, also where the service does not report it itself."""
+        skill = self._skill()
+        if skill is None or skill.valid or any(i.path == "skill" for i in result.errors):
+            return result
+        first = skill.issues[0] if skill.issues else None
+        where = ""
+        if first is not None:
+            where = f"{first.file}, Zeile {first.line}: " if first.line else f"{first.file}: "
+        text = (
+            f"Der Skill „{skill.name}“ hat Fehler und lässt sich nicht starten: {where}"
+            f"{first.message if first else ''} Behebe sie unter Skills, Reiter „Prüfung“."
+        )
+        issue = FieldIssue(
+            path="skill",
+            message=text,
+            action=Action(label="Skill öffnen", url=f"/skills/{skill.name}?tab=pruefung"),
+        )
+        return result.model_copy(update={"errors": [issue, *result.errors]})
+
     def _shows_errors(self, field: Field) -> bool:
         """Errors stand at a field once it was left or after „Run starten“ (K7); a fresh form
         has no red field. In „Anpassen“ the request is already filled in, so they show at once;
@@ -1283,15 +1307,7 @@ class NeuerRunPage:
         est = result.estimate
         estimate = "–"
         if est is not None:
-            money = (
-                f"≈ {fmt.threshold(est.cost_usd.min)}–{fmt.threshold(est.cost_usd.max)} $"
-                if est.cost_kind is not None
-                else f"{fmt.threshold(est.cost_usd.min)}–{fmt.threshold(est.cost_usd.max)} $"
-            )
-            estimate = (
-                f"{int(est.turns.min)}–{int(est.turns.max)} Turns · {money} · "
-                f"{_duration_range(est.duration_s.min, est.duration_s.max)}"
-            )
+            estimate = _estimate_text(est)
         capacity = " · ".join(
             f"{c.profile}: {c.free} von {c.limit} frei, braucht {c.needed}" for c in result.capacity
         )
@@ -1307,7 +1323,9 @@ class NeuerRunPage:
         ]
         body = "".join(f"<dt>{esc(k)}</dt><dd>{esc(v)}</dd>" for k, v in rows)
         title = ""
-        if est is not None and est.cost_kind is not None:
+        if est is not None and est.notes:
+            title = f' title="{esc(" ".join(est.notes))}"'
+        elif est is not None and est.cost_kind is not None:
             title = ' title="≈ = rechnerischer API-Preis bei Abo-Profilen"'
         self.summary_box.set_content(f'<dl class="kv"{title}>{body}</dl>')
 
@@ -1600,6 +1618,35 @@ def _number(text: str, kind: str) -> int | float | None:
     except ValueError:
         return None
     return int(value) if kind == "int" else value
+
+
+def _estimate_text(est: Estimate) -> str:
+    """„4–12 Turns · höchstens 2 $ (Budget) · höchstens 20 min“; unknown parts say so (W4-02)."""
+    turns = (
+        f"{int(est.turns.min)} Turns"
+        if est.turns.min == est.turns.max
+        else f"{int(est.turns.min)}–{int(est.turns.max)} Turns"
+    )
+    if est.cost_basis == "unknown":
+        money = "Kosten unbekannt"
+    elif est.cost_basis == "budget":
+        money = f"höchstens {fmt.threshold(est.cost_usd.max)} $ (Budget)"
+    else:
+        approx = "≈ " if est.cost_kind is not None else ""
+        money = f"{approx}{fmt.threshold(est.cost_usd.min)}–{fmt.threshold(est.cost_usd.max)} $"
+    if est.duration_basis == "unknown":
+        duration = "Dauer offen"
+    elif est.duration_basis == "wall_time":
+        duration = f"höchstens {_duration_max(est.duration_s.max)}"
+    else:
+        duration = _duration_range(est.duration_s.min, est.duration_s.max)
+    return f"{turns} · {money} · {duration}"
+
+
+def _duration_max(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min"
+    return f"{fmt.decimal(seconds / 3600, 1)} h"
 
 
 def _duration_range(low: float, high: float) -> str:

@@ -394,3 +394,28 @@ section[id] { scroll-margin-top: calc(var(--top-h) + 16px); }
 .appr .question-text { white-space: pre-wrap; }
 .appr .af.answer { align-items: flex-end; }
 .appr .af.answer textarea { flex: 1 1 320px; min-height: 64px; max-width: 100%; font: inherit; padding: var(--s2); border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--surface); color: var(--text); }
+
+/* ---- W4-02 skill editor (docs/08 §5.7) ------------------------------------------------------ */
+.sk-new { width: 100%; justify-content: center; margin-bottom: var(--s2); }
+.skill-editor { display: flex; flex-direction: column; gap: var(--s2); }
+.skill-editor .card-head { display: flex; justify-content: space-between; align-items: center; gap: var(--s2); }
+.skill-editor .ed-hint { margin: 0; }
+.ed-area { width: 100%; min-height: 360px; resize: vertical; font-family: var(--mono); font-size: 13px; line-height: 1.5; tab-size: 2; padding: var(--s2) var(--s3); border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--surface); color: var(--text); white-space: pre; overflow-wrap: normal; overflow: auto; }
+.ed-area:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+[data-skill-editor][data-dirty="1"] .ed-area { border-color: var(--wait-strong); }
+.ed-bar { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.ed-bar [data-cursor] { margin-left: auto; }
+.ed-status:empty { display: none; }
+.ed-status .ok-text { color: var(--ok); }
+.ed-status .warn-text { color: var(--wait); }
+.ed-checks h3 { margin: var(--s2) 0 var(--s1); }
+.ed-checks .check .link-btn.b, .check a.b { font-weight: 600; display: block; }
+.ed-fix { margin: 0 0 var(--s2) 28px; }
+.ed-outside .txt span { display: block; }
+.sk-files { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: var(--s4); align-items: start; }
+.sk-file-list ul.plain { list-style: none; margin: 0 0 var(--s2); padding: 0; }
+.sk-file-list ul.plain a { display: block; padding: 4px 8px; border-radius: var(--radius); text-decoration: none; color: var(--text-2); overflow-wrap: anywhere; }
+.sk-file-list ul.plain a:hover { background: var(--surface-3); color: var(--text); }
+.sk-file-list ul.plain a.sel { background: var(--surface); color: var(--text); box-shadow: inset 3px 0 0 var(--text); }
+@media (max-width: 1279px) { .sk-files { grid-template-columns: 1fr; } }
+[data-skill-editor] [data-dirty-flag][hidden] { display: none; }

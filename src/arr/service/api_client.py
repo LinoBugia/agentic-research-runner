@@ -24,8 +24,10 @@ from arr.service.api_models import (
     ChannelInfo,
     CreateProfileRequest,
     CreateProjectRequest,
+    CreateSkillRequest,
     DecisionRequest,
     DecisionResponse,
+    DuplicateSkillRequest,
     FixedRule,
     GlobalCounts,
     LiveEvent,
@@ -50,7 +52,10 @@ from arr.service.api_models import (
     RunResults,
     RunsPage,
     RunSummary,
+    SaveSkillFileRequest,
+    SaveSkillFileResult,
     SetupState,
+    SkillChangeResult,
     SkillFile,
     SkillInfo,
     SkillKind,
@@ -456,6 +461,20 @@ class ApiClient(Protocol):
 
     async def get_skill_file(self, name: str, path: str) -> SkillFile:
         """Read a file of a skill (`GET /api/skills/{name}/files/{path}`)."""
+        ...
+
+    async def save_skill_file(
+        self, name: str, path: str, request: SaveSkillFileRequest
+    ) -> SaveSkillFileResult:
+        """Save a text file of a skill and check the skill (`PUT …/files/{path}`, W4-02)."""
+        ...
+
+    async def create_skill(self, request: CreateSkillRequest) -> SkillChangeResult:
+        """A new skill from the built-in template (`POST /api/skills`, W4-02)."""
+        ...
+
+    async def duplicate_skill(self, name: str, request: DuplicateSkillRequest) -> SkillChangeResult:
+        """Copy a skill under a new name (`POST /api/skills/{name}/duplicate`, W4-02)."""
         ...
 
     async def select_workfolder(self, request: WorkfolderRequest) -> WorkfolderInfo:
