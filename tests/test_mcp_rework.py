@@ -300,7 +300,13 @@ async def test_read_results_is_bounded_and_paged(wf: Path) -> None:
             offset = int(page["next"].rsplit("offset=", 1)[1].rstrip(")"))
     assert seen == list(range(1, 1501)) and pages >= 30
     async with Service(make_api(wf)) as service:
+        async with service.client(project(wf)) as client:
+            big = await client.call_tool("read_results", {"run_id": folder.name, "limit": 100})
         small = await call(service, "read_results", run_id=folder.name, limit=3)
+    size = sum(len(getattr(c, "text", "")) for c in big.content)
+    wide = result_data(big)
+    assert size <= MAX_ANSWER + 5_000, "the budget ends a page before `limit`"
+    assert 40 < len(wide["results"]) < 100 and "next" in wide
     assert len(small["results"]) == 3 and "offset=3" in small["next"]
     assert len(small["results"][0]["ratings"][0]["comment"]) < 1100
 

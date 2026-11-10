@@ -475,7 +475,7 @@ class UserApi:
             }
             if len(result.ratings) > MAX_RATINGS:
                 entry["ratings_more"] = len(result.ratings) - MAX_RATINGS
-            cost = len(json.dumps(entry, ensure_ascii=False))
+            cost = len(json.dumps(entry, ensure_ascii=False, indent=2))  # as the answer is sent
             if cost > left and out:
                 next_offset = index
                 break
