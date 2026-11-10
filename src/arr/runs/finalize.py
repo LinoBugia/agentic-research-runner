@@ -18,7 +18,9 @@ does not stop the others):
    name), `output/results.json`, `output/ratings.json`.
 5. `usage.json`, and an empty `approvals.jsonl` if there were no requests.
 6. `output/summary.md` (German): status and reason, duration, agents, stages with attempts and
-   scores, results with links, a summarizer's summary, usage sums, hints.
+   scores, the overview a topology built itself (`review`: verdict and rounds, `exploration`:
+   ranking; the latest checkpoint with `overview`, W4-03 F8/F9), results with links, a
+   summarizer's summary, usage sums, hints.
 
 Running it again overwrites every file with the same content (idempotent).
 See docs/02-workfolder-und-runs.md §4, §7.
@@ -507,6 +509,7 @@ class _Finalizer:
             role = f", Rolle {Path(agent.role).stem}" if agent.role else ""
             lines.append(f"- `{agent.id}`: {agent.provider.value}, {agent.model}{role}")
         lines += self._stages(entries)
+        lines += self._overview(entries)
         lines += self._results_section(entries)
         lines += self._summarizer()
         lines += self._usage_section()
@@ -577,6 +580,16 @@ class _Finalizer:
         if ends:
             lines += ["", *ends] if rows else ends
         return lines
+
+    @staticmethod
+    def _overview(entries: Sequence[Mapping[str, Any]]) -> list[str]:
+        """The overview of the latest checkpoint that has one (review, exploration)."""
+        found = [
+            e["data"]["overview"]
+            for e in entries
+            if e["kind"] == "checkpoint" and isinstance(e["data"].get("overview"), str)
+        ]
+        return ["", "## Übersicht", "", found[-1]] if found else []
 
     def _results_section(self, entries: Sequence[Mapping[str, Any]]) -> list[str]:
         lines = ["", "## Ergebnisse", ""]
