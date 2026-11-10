@@ -183,6 +183,8 @@ class _Backend:
     def session_ref(self) -> dict[str, str]:
         return {}
 
+    async def reset(self) -> None: ...
+
     async def close(self) -> None: ...
 
 

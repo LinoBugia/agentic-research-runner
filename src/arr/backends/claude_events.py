@@ -138,6 +138,13 @@ class ClaudeEvents:
         self._open: dict[str, str] = {}
         self._result: ResultMessage | None = None
 
+    def new_session(self) -> None:
+        """Forget the session: a new CLI counts usage and cost from zero again (W4-03 F5)."""
+        self.session_id = None
+        self.compacted = False
+        self._totals = Usage()
+        self._cost_total = None
+
     def event(self, kind: EventKind, data: Mapping[str, Any], raw: Any = None) -> AgentEvent:
         return AgentEvent(self.run_id, self.agent_id, self.turn, kind, dict(data), raw=raw)
 

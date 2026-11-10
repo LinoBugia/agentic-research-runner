@@ -1107,3 +1107,32 @@ async def test_w4_00_1_b1_right_kinds_and_nulls_still_reach_the_inbox(setup) -> 
     assert sent(kit, 7)["result"] == {"decision": "accept"}
     [item] = inbox.items()
     assert item.request.hosts == ["pypi.org"] and item.request.command == ""
+
+
+# -- W4-03 F5: a fresh thread per review round ----------------------------------------------
+
+
+async def test_w4_03_reset_starts_a_new_thread(setup) -> None:
+    """After `reset` the next turn starts a new thread instead of resuming; without it, it
+    resumes (counter-check)."""
+    backend, kit, _ = setup([simple_turn(), simple_turn(), simple_turn()])
+    await backend.start()
+    await play(backend)
+    await backend.reset()
+    assert backend.session_ref() == {}
+    await play(backend, "Runde 2.")
+    await play(backend, "Runde 2b.")
+    assert [s[0] for s in kit.starts] == ["start", "start", f"resume {THREAD}"]
+
+
+async def test_w4_03_reset_sends_the_context_again_in_shared_mode(setup) -> None:
+    backend, kit, _ = setup(
+        [simple_turn(), simple_turn(), simple_turn()],
+        workspace={"mode": "shared", "name": "beweis"},
+    )
+    await backend.start()
+    await play(backend)
+    await play(backend, "Weiter.")
+    await backend.reset()
+    await play(backend, "Frisch.")
+    assert kit.prompts == ["PROJEKTKONTEXT\n\nLos.", "Weiter.", "PROJEKTKONTEXT\n\nFrisch."]

@@ -271,6 +271,29 @@ class ClaudeBackend:
             self._client = None
             self._release_link()
 
+    async def reset(self) -> None:
+        """A fresh session with the next turn (W4-03 F5): disconnect the CLI; the next
+        `run_turn` connects a new one (`start`), which starts a new session, and sends
+        `context.md` again. Usage and cost count from zero in the new session. A no-op after
+        `close()`; never during a turn."""
+        if self._closed:
+            return
+        if self._running:
+            raise RuntimeError("Reset während eines Turns")
+        owner, self._owner = self._owner, None
+        if owner is not None:
+            self._closing.set()
+            try:
+                await owner
+            except Exception:
+                log.debug("Owner-Task von %s endete mit Fehler", self.agent.id, exc_info=True)
+        self._client = None
+        self._closing = asyncio.Event()
+        self._release_link()
+        self._send_context = True
+        self._events.new_session()
+        log.info("Claude-Agent %s: neue Sitzung ab dem nächsten Turn", self.agent.id)
+
     def _release_link(self) -> None:
         if self._tmp_link is not None:
             remove_tmp_link(*self._tmp_link)
