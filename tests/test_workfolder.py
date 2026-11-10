@@ -11,6 +11,7 @@ from arr.cli import app
 from arr.errors import ArrError, ConfigError
 from arr.models import BUILTIN_LIMITS, ProjectSettings, WorkfolderSettings
 from arr.workfolder import (
+    arr_command,
     block_span,
     create_project,
     init_workfolder,
@@ -178,7 +179,7 @@ def test_create_project_from_template(workfolder: Path) -> None:
     assert "<!-- /arr:user-agent -->" in claude
 
     assert json.loads((project / ".mcp.json").read_text(encoding="utf-8")) == {
-        "mcpServers": {"arr": {"command": "arr", "args": ["mcp"]}}
+        "mcpServers": {"arr": {"command": arr_command(), "args": ["mcp"]}}  # absolute (W4-01)
     }
     assert load_project_settings(project) == ProjectSettings()
     assert (project / "project.yaml").is_file()

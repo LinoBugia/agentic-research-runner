@@ -11,6 +11,12 @@ stops every run of the service with finalizer and secret scan, then the process 
 second signal aborts hard like `arr run` (status `interrupted`). At start, runs left active
 by a crash become `interrupted` (`RealApi.start`).
 
+The MCP server for Claude Code (`arr.service.user_api`, W4-01) is mounted at `/mcp/` in the
+same process, with its own startup task for the session manager (spike S6: mounted apps get no
+lifespan) and the DNS-rebinding protection of the `mcp` package on the own name; the `Guard`
+lets only the bearer token from `service.json` through there. What the service tells the
+terminal also goes to the service log (`~/.arr/logs/service.log`, without the token).
+
 This module knows no Typer: `arr.cli` calls `serve()`.
 """
 
@@ -29,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from arr.errors import ArrError
+from arr.log import TERMINAL_COPY, add_secret
 from arr.models import RunStatus
 from arr.runs.launch import EXIT_STOPPED, REPEAT_WINDOW_S, find_workfolder
 from arr.runs.manager import set_run_status
@@ -45,6 +52,7 @@ from arr.service.state import (
     remove_service_info,
     write_service_info,
 )
+from arr.service.user_api import mount_mcp
 from arr.workfolder import is_workfolder
 
 DEFAULT_PORT = 8765
@@ -67,9 +75,14 @@ def _print(line: str) -> None:
 
 
 def _say(report: Report, line: str) -> None:
-    """Report without ever raising (a broken reporter must not stop anything, N3)."""
+    """Report without ever raising (a broken reporter must not stop anything, N3).
+
+    The line also goes to the service log; its filter removes the token (W4-01).
+    """
     with contextlib.suppress(Exception):
         report(line)
+    with contextlib.suppress(Exception):
+        log.info("%s", line, extra={TERMINAL_COPY: True})
 
 
 # --------------------------------------------------------------------------------------------
@@ -333,6 +346,7 @@ def serve(
     if not relay.bind():
         _say(report, f"Kein IPv6 auf diesem Rechner: arr reserviert [::1]:{port} nicht.")
     token = new_token()
+    add_secret(token)  # never in the service log (W4-01)
     hostname = new_hostname()
     info = ServiceInfo(host=hostname, port=port, token=token, pid=os.getpid(), workfolder=str(root))
     api = RealApi(root, base_url=info.url)
@@ -343,8 +357,11 @@ def serve(
     from arr.service.gui.app import setup
 
     setup(api)
+    mcp = mount_mcp(app, api, hostname=hostname, port=port)
     app.add_middleware(Guard, token=token, port=port, hostname=hostname)
     app.on_startup(runtime.startup)
+    app.on_startup(mcp.start)
+    app.on_shutdown(mcp.stop)
     app.on_shutdown(runtime.shutdown)
     _say(report, f"arr startet auf {info.url} mit Workfolder {root}. Beenden mit Strg+C.")
     if not open_browser:

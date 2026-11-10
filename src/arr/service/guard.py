@@ -22,6 +22,13 @@ files, the `/_nicegui/…` endpoints and the Socket.IO websocket under `/_nicegu
   Engine.IO ever reaches another site). Requests without `Origin` may only read (`GET`,
   `HEAD`, `OPTIONS`); everything else needs the own origin.
 
+**`/mcp/` (W4-01):** the MCP server for Claude Code (`arr.service.user_api`) sits below
+`/mcp`. There the cookie counts for nothing: only `Authorization: Bearer <token>` opens it,
+which `arr mcp` reads from `service.json` (a browser never sends it by itself). Host and origin
+are checked as strictly as for the GUI (DNS rebinding: only the own name; any `Origin` but the
+own one is refused). Everything else, a websocket included, gets 403 without data. The GUI
+checks above stay exactly as they are.
+
 Tokens are compared in constant time (`hmac.compare_digest`) and never logged.
 """
 
@@ -46,6 +53,9 @@ LOOPBACK_NAMES = ("127.0.0.1", "localhost")
 """Names a token link may use by mistake; the guard only redirects them to the own name."""
 
 READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+MCP_PATH = "/mcp"
+"""Mount point of the MCP server for Claude Code (W4-01)."""
+BEARER = "bearer "
 
 Scope = MutableMapping[str, Any]
 Receive = Callable[[], Awaitable[MutableMapping[str, Any]]]
@@ -148,16 +158,47 @@ class Guard:
     def cookie_ok(self, scope: Scope) -> bool:
         return self.token_ok(_cookie_value(scope, COOKIE))
 
+    def bearer_ok(self, scope: Scope) -> bool:
+        """`Authorization: Bearer <token>` (only for `/mcp/`, W4-01)."""
+        header = _header(scope, b"authorization") or ""
+        if not header.lower().startswith(BEARER):
+            return False
+        return self.token_ok(header[len(BEARER) :].strip())
+
+    @staticmethod
+    def is_mcp(scope: Scope) -> bool:
+        path = str(scope.get("path") or "")
+        return path == MCP_PATH or path.startswith(MCP_PATH + "/")
+
     # -- ASGI --------------------------------------------------------------------------------
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         kind = scope.get("type")
-        if kind == "websocket":
+        if kind in ("http", "websocket") and self.is_mcp(scope):
+            await self._mcp(scope, receive, send)
+        elif kind == "websocket":
             await self._websocket(scope, receive, send)
         elif kind == "http":
             await self._http(scope, receive, send)
         else:
             await self.app(scope, receive, send)
+
+    async def _mcp(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """`/mcp/`: own host, no foreign origin, the bearer token; never a cookie (W4-01)."""
+        allowed = (
+            scope.get("type") == "http"
+            and self.host_ok(scope)
+            and not self.origin_foreign(scope)
+            and self.bearer_ok(scope)
+        )
+        if allowed:
+            await self.app(scope, receive, send)
+            return
+        if scope.get("type") == "websocket":
+            await receive()
+            await send({"type": "websocket.close", "code": 1008, "reason": "arr: nicht erlaubt"})
+            return
+        await self._refuse(send, 403, b"text/plain; charset=utf-8", b"arr: nicht erlaubt")
 
     async def _websocket(self, scope: Scope, receive: Receive, send: Send) -> None:
         if not (self.host_ok(scope) and self.cookie_ok(scope) and self.origin_ok(scope)):

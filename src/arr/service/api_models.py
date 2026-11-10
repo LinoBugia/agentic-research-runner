@@ -2424,3 +2424,31 @@ class SkillChangeResult(ApiModel):
     skill: SkillInfo
     left_out: list[str] = Field(default_factory=list)
     message: str
+
+
+# --------------------------------------------------------------------------------------------
+# Validation errors without the input (W4-01, Pflicht-Übertrag W3-05.1 N2)
+# --------------------------------------------------------------------------------------------
+
+from pydantic import ValidationError  # noqa: E402 - new parts of this file stay at its end
+
+
+def validation_issues(exc: ValidationError) -> list[FieldIssue]:
+    """The problems of a pydantic error as `FieldIssue`s, never with the input.
+
+    `errors()` and `.json()` carry the whole input by default, a pasted API key included, also
+    with `hide_input_in_errors` (that only covers `str()`). API errors, also those of the MCP
+    tools, are built from `errors(include_input=False)` only.
+    """
+    out = []
+    for error in exc.errors(include_input=False, include_url=False, include_context=False):
+        path = ".".join(str(part) for part in error.get("loc", ()))
+        out.append(FieldIssue(path=path, message=str(error.get("msg") or "ungültig")))
+    return out
+
+
+def validation_error(exc: ValidationError) -> ApiException:
+    """A pydantic error of a request as `ApiException` (`invalid`), without the input."""
+    issues = validation_issues(exc)
+    first = issues[0].message if issues else "Die Angaben sind ungültig."
+    return ApiException.of(ErrorCode.INVALID, first, issues=issues)

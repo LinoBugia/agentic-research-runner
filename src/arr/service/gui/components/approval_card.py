@@ -576,17 +576,7 @@ class ApprovalCard:
         if item.decider:
             kv.append(("Berechtigungs­anfragen", esc(DECIDER[item.decider])))
         if item.estimate:
-            est = item.estimate
-            approx = "≈ " if est.cost_kind and est.cost_kind.value == "estimated" else ""
-            note = " (rechnerisch)" if approx else ""
-            kv.append(
-                (
-                    "Schätzung",
-                    f"{est.turns.min:.0f}–{est.turns.max:.0f} Turns · {approx}"
-                    f"{est.cost_usd.min:.0f}–{est.cost_usd.max:.0f} ${note} · "
-                    f"{est.duration_s.min / 60:.0f}–{est.duration_s.max / 60:.0f} min",
-                )
-            )
+            kv.append(("Schätzung", esc(estimate_text(item.estimate))))
         kv_html = "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in kv)
         web_dev = any(d.path.endswith("tools.web") for d in item.deviations)
         agent_rows = "".join(
@@ -885,3 +875,41 @@ def compact_card(
                 classes="af",
             )
     return element
+
+
+def estimate_text(est: Any) -> str:
+    """„4–12 Turns · höchstens 2 $ (Budget) · höchstens 20 min“ (W4-02 fields, W4-01).
+
+    Unknown parts say so: „Kosten unbekannt“ never shows as „0 $“, an open upper bound of the
+    turns as „mindestens …“, a run without time limit as „Dauer offen“.
+    """
+    if est.turns_open:
+        turns = f"mindestens {int(est.turns.min)} Turns"
+    elif est.turns.min == est.turns.max:
+        turns = f"{int(est.turns.min)} Turns"
+    else:
+        turns = f"{int(est.turns.min)}–{int(est.turns.max)} Turns"
+    if est.cost_basis == "unknown":
+        money = "Kosten unbekannt"
+    elif est.cost_basis == "budget":
+        money = f"höchstens {fmt.budget(est.cost_usd.max)} (Budget)"
+    else:
+        approx = "≈ " if est.cost_kind is not None else ""
+        money = f"{approx}{fmt.threshold(est.cost_usd.min)}–{fmt.threshold(est.cost_usd.max)} $"
+    if est.duration_basis == "unknown":
+        duration = "Dauer offen"
+    elif est.duration_basis == "wall_time":
+        seconds = est.duration_s.max
+        duration = (
+            f"höchstens {int(seconds // 60)} min"
+            if seconds < 3600
+            else f"höchstens {fmt.decimal(seconds / 3600, 1)} h"
+        )
+    else:
+        low, high = est.duration_s.min, est.duration_s.max
+        duration = (
+            f"{int(low // 60)}–{int(high // 60)} min"
+            if high < 3600
+            else f"{fmt.decimal(low / 3600, 1)}–{fmt.decimal(high / 3600, 1)} h"
+        )
+    return f"{turns} · {money} · {duration}"

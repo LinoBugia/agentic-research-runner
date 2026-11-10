@@ -153,6 +153,10 @@ def _mcp_state(file: Path) -> tuple[bool, str]:
     except (OSError, ValueError, AttributeError):
         return False, ".mcp.json ist kein gültiges JSON"
     if isinstance(servers, dict) and "arr" in servers:
+        from arr.workfolder import _arr_server_stale
+
+        if _arr_server_stale(servers["arr"]):
+            return False, ".mcp.json: „arr“ zeigt nicht auf das arr dieser Installation"
         return True, ".mcp.json vorhanden"
     return False, ".mcp.json ohne Server „arr“"
 
