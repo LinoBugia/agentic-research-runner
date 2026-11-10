@@ -78,6 +78,12 @@ Endpoints (REST under `/api`, docs/04 §3 and docs/08 §5; `ApiClient` method in
                                                  [create_project]
     POST /api/projects/{name}/setup              ProjectSetupResult      [setup_project]
     GET  /api/skills/{name}/files/{path}         SkillFile               [get_skill_file]
+    PUT  /api/skills/{name}/files/{path}         SaveSkillFileRequest → SaveSkillFileResult
+                                                 [save_skill_file] (W4-02)
+    POST /api/skills                             CreateSkillRequest → SkillChangeResult
+                                                 [create_skill] (W4-02)
+    POST /api/skills/{name}/duplicate            DuplicateSkillRequest → SkillChangeResult
+                                                 [duplicate_skill] (W4-02)
     GET  (SSE) /api/events                       LiveEvent stream, global: counts.changed,
                                                  warnings.changed, run.status, approval.*,
                                                  usage.tick
@@ -1151,6 +1157,24 @@ class Estimate(ApiModel):
     cost_usd: Range
     cost_kind: CostKind | None = None
     duration_s: Range
+    cost_basis: Literal["estimate", "budget", "unknown"] = Field(
+        default="estimate",
+        description="`estimate`: priced guess (mock) · `budget`: `cost_usd.max` is the run's "
+        "budget, arr knows no prices · `unknown`: `cost_usd` says nothing (W4-02)",
+    )
+    duration_basis: Literal["estimate", "wall_time", "unknown"] = Field(
+        default="estimate",
+        description="`wall_time`: `duration_s.max` is the run's time limit · `unknown`: "
+        "`duration_s` says nothing (W4-02)",
+    )
+    notes: list[str] = Field(
+        default_factory=list, description="German: how the ranges came about, what is unknown"
+    )
+    turns_open: bool = Field(
+        default=False,
+        description="No upper bound for the turns is known: `turns.max` equals `turns.min` "
+        "(W4-02.1)",
+    )
 
 
 class CapacityInfo(ApiModel):
@@ -1561,6 +1585,7 @@ class SkillIssue(ApiModel):
     line: int | None = None
     message: str
     severity: Severity = Severity.ERROR
+    field: str | None = Field(default=None, description="Path in the file, e.g. agents[1].role")
 
 
 class SkillUsage(ApiModel):
@@ -2055,6 +2080,9 @@ class SkillFile(ApiModel):
     content: str
     language: Literal["markdown", "yaml", "python", "text"]
     size: int = Field(ge=0)
+    version: str | None = Field(
+        default=None, description="Content hash when read; `save_skill_file` needs it (W4-02)"
+    )
 
 
 class WorkfolderRequest(ApiModel):
@@ -2349,3 +2377,50 @@ class ProfileUsageFolder(ApiModel):
 
 
 ProfileUsage.model_rebuild()
+
+
+# --------------------------------------------------------------------------------------------
+# Skill editor (W4-02, docs/08 §5.7)
+# --------------------------------------------------------------------------------------------
+
+
+class SaveSkillFileRequest(ApiModel):
+    """Save a text file of a skill (`PUT /api/skills/{name}/files/{path}`).
+
+    `version` is `SkillFile.version` of the opened file; a file changed outside since is not
+    overwritten (`conflict`). `version: None` creates a new file that must not exist yet.
+    """
+
+    content: str
+    version: str | None = None
+
+
+class SaveSkillFileResult(ApiModel):
+    """The saved file and the skill checked right after saving (invalid ones are saved too)."""
+
+    file: SkillFile
+    skill: SkillInfo
+
+
+class CreateSkillRequest(ApiModel):
+    """A new skill from the built-in template (`POST /api/skills`): `tool` has only SKILL.md,
+    `group` SKILL.md, a `group.yaml` with topology `roundtable` and one role."""
+
+    name: str
+    kind: Literal["tool", "group"]
+    description: str = ""
+
+
+class DuplicateSkillRequest(ApiModel):
+    """Copy a skill under a new name (`POST /api/skills/{name}/duplicate`)."""
+
+    name: str
+
+
+class SkillChangeResult(ApiModel):
+    """A skill created or duplicated, checked; `left_out`: files not copied (links, pipes,
+    files over 20 MB), `message`: German sentence for the toast."""
+
+    skill: SkillInfo
+    left_out: list[str] = Field(default_factory=list)
+    message: str

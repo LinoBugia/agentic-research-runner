@@ -8,8 +8,9 @@ It is assembled from areas, one class per module, each the border of a later ord
   get_log, get_changes, get_run_inputs, resolve_run, start_run.
 - `live` (`live.py`, W3-01): subscribe, now; starts the watcher (`arr.service.watcher`).
 - `workfolder` (`workfolder.py`, W3-01): get_workfolder, get_counts, list_warnings.
-- `catalog` (`catalog.py`, W3-01, read only): list_projects, get_project, list_skills,
-  get_skill, get_skill_file, list_profiles.
+- `catalog` (`catalog.py`, W3-01): list_projects, get_project, list_skills, get_skill,
+  get_skill_file, list_profiles; W4-02 (skill editor, `skill_files.py`): save_skill_file,
+  create_skill, duplicate_skill.
 - `approvals` (`approvals.py`, W3-03): list_approvals, get_approval, decide_approval,
   revoke_approval; plus the `decider` of the runs of the service.
 - `setup` (`setup.py`, W3-04): get_setup_state, select_workfolder, create_project,
@@ -46,8 +47,10 @@ from arr.service.api_models import (
     ChannelInfo,
     CreateProfileRequest,
     CreateProjectRequest,
+    CreateSkillRequest,
     DecisionRequest,
     DecisionResponse,
+    DuplicateSkillRequest,
     FixedRule,
     GlobalCounts,
     LogEntry,
@@ -70,7 +73,10 @@ from arr.service.api_models import (
     RunInputs,
     RunResults,
     RunsPage,
+    SaveSkillFileRequest,
+    SaveSkillFileResult,
     SetupState,
+    SkillChangeResult,
     SkillFile,
     SkillInfo,
     SkillKind,
@@ -301,6 +307,17 @@ class RealApi:
 
     async def get_skill_file(self, name: str, path: str) -> SkillFile:
         return await self.catalog.get_skill_file(name, path)
+
+    async def save_skill_file(
+        self, name: str, path: str, request: SaveSkillFileRequest
+    ) -> SaveSkillFileResult:
+        return await self.catalog.save_skill_file(name, path, request)
+
+    async def create_skill(self, request: CreateSkillRequest) -> SkillChangeResult:
+        return await self.catalog.create_skill(request)
+
+    async def duplicate_skill(self, name: str, request: DuplicateSkillRequest) -> SkillChangeResult:
+        return await self.catalog.duplicate_skill(name, request)
 
     # -- ApiClient: profiles (W3-05) ---------------------------------------------------------
 

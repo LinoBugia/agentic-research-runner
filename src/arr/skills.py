@@ -9,9 +9,11 @@ See docs/03-skills-und-research-groups.md §1-3 and docs/spikes/S1_claude.md §3
 
 import difflib
 import json
+import logging
 import os
 import re
 import shutil
+import stat
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -23,15 +25,16 @@ from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
 from arr import __version__
-from arr.errors import ConfigError, ConfigIssue
+from arr.errors import ArrError, ConfigError, ConfigIssue
 from arr.models import ProjectSettings
-from arr.resolve import validate_model
+from arr.resolve import too_nested, validate_model
 
 __all__ = [
     "ARR_SKILL",
     "PLUGIN_NAME",
     "SkillAudience",
     "SkillCatalog",
+    "SkillFileError",
     "SkillInfo",
     "check_research_skills",
     "copy_skill_tree",
@@ -40,14 +43,26 @@ __all__ = [
     "internal_link_target",
     "link_user_skills",
     "load_skill",
+    "read_text_file",
     "skills_for_research_agent",
     "skills_for_user_agent",
     "snapshot_skills",
     "write_claude_plugin",
 ]
 
+log = logging.getLogger("arr.skills")
+
 SKILL_FILE = "SKILL.md"
 GROUP_FILE = "group.yaml"
+SKILLS_DIR = "skills"
+"""Folder of the skills in the workfolder; messages name it instead of an absolute path."""
+MAX_SKILL_FILE_BYTES = 256 * 1024
+"""Largest skill file arr reads or writes (SKILL.md, group.yaml, roles; W4-02)."""
+FRONTMATTER_TOO_NESTED = (
+    "Der Kopfbereich der SKILL.md ist zu verschachtelt (zu viele Ebenen oder Verweise mit & und "
+    "*). Schreibe ihn flach: „name“, „description“ und höchstens einfache Einträge unter "
+    "„metadata“."
+)
 ARR_SKILL = "arr"
 """Name of the skill that explains arr to the user agent; never given to research agents."""
 PLUGIN_NAME = "arr"
@@ -130,7 +145,7 @@ class SkillCatalog:
             problem = self.problems.get(name)
             if problem is not None:
                 raise problem
-            raise ConfigError([issue], source=str(self.root))
+            raise ConfigError([issue], source=SKILLS_DIR)
         return self.skills[name]
 
     def lookup_issue(self, name: str, path: str = "") -> ConfigIssue | None:
@@ -142,16 +157,73 @@ class SkillCatalog:
             return ConfigIssue(
                 path,
                 f"Der Skill „{name}“ ist ungültig: {problem.issue_message}"
-                f" (siehe {self.root / name / SKILL_FILE}).",
+                f" (siehe {SKILLS_DIR}/{name}/{SKILL_FILE}).",
             )
         known = sorted({*self.skills, *self.problems})
         hint = difflib.get_close_matches(name, known, n=1)
         suggestion = f" Meintest du „{hint[0]}“?" if hint else ""
+        # no absolute path in the message (docs/08 §8.4, W3-10 review finding 12)
         return ConfigIssue(
             path,
-            f"Den Skill „{name}“ gibt es nicht in {self.root}.{suggestion} "
-            "Lege ihn dort als Ordner mit einer SKILL.md an.",
+            f"Den Skill „{name}“ gibt es im Workfolder nicht.{suggestion} Lege ihn unter "
+            "Skills an oder als Ordner mit einer SKILL.md im Ordner skills des Workfolders.",
         )
+
+
+# --------------------------------------------------------------------------------------------
+# Reading skill files without hanging (W4-02)
+# --------------------------------------------------------------------------------------------
+
+
+class SkillFileError(ArrError):
+    """A skill file that arr does not read: no regular file, too large or no UTF-8 text."""
+
+
+def read_text_file(path: str | Path, *, limit: int = MAX_SKILL_FILE_BYTES) -> str:
+    """Read a skill file as UTF-8 text without blocking on FIFOs or devices.
+
+    The file is opened non-blocking and checked with `fstat` on the open descriptor: only a
+    regular file of at most `limit` bytes is read. Links are followed (the run's snapshot
+    leaves links out of the skill anyway); the editor reads with `arr.service.real_api.
+    skill_files`, which follows none. Raises `FileNotFoundError` or `SkillFileError`.
+    """
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise SkillFileError(f"Die Datei ist nicht lesbar ({exc.strerror or exc}).") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SkillFileError(
+                "Das ist keine normale Datei (z. B. ein Gerät oder eine Pipe). Ersetze sie "
+                "durch eine Textdatei."
+            )
+        if info.st_size > limit:
+            raise SkillFileError(
+                f"Die Datei ist zu groß ({info.st_size // 1024} KB, höchstens {limit // 1024} "
+                "KB). Kürze sie."
+            )
+        data = b""
+        while len(data) <= limit:
+            chunk = os.read(fd, limit + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError as exc:
+        raise SkillFileError(f"Die Datei ist nicht lesbar ({exc.strerror or exc}).") from None
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise SkillFileError(f"Die Datei ist zu groß (höchstens {limit // 1024} KB). Kürze sie.")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SkillFileError(
+            "Die Datei ist keine UTF-8-Textdatei. Speichere sie im Editor als UTF-8."
+        ) from None
 
 
 # --------------------------------------------------------------------------------------------
@@ -170,6 +242,8 @@ def _parse_frontmatter(text: str, source: str) -> dict[str, Any]:
         )
     try:
         data = YAML(typ="safe").load(match.group(1))
+    except RecursionError:
+        raise ConfigError.single("", FRONTMATTER_TOO_NESTED, source=source) from None
     except YAMLError as exc:
         mark = getattr(exc, "problem_mark", None)
         line = mark.line + 2 if mark else None  # +1 for 1-based, +1 for the `---` line
@@ -180,6 +254,8 @@ def _parse_frontmatter(text: str, source: str) -> dict[str, Any]:
             source=source,
             line=line,
         ) from None
+    if too_nested(data):
+        raise ConfigError.single("", FRONTMATTER_TOO_NESTED, source=source)
     if not isinstance(data, dict):
         raise ConfigError.single(
             "",
@@ -214,16 +290,13 @@ def load_skill(path: str | Path) -> SkillInfo:
     skill_file = folder / SKILL_FILE
     source = str(skill_file)
     try:
-        text = skill_file.read_text(encoding="utf-8")
+        text = read_text_file(skill_file)
     except FileNotFoundError:
         raise ConfigError.single(
             "", f"Im Ordner „{folder.name}“ fehlt die Datei {SKILL_FILE}.", source=source
         ) from None
-    except (OSError, UnicodeDecodeError) as exc:
-        reason = exc.strerror if isinstance(exc, OSError) else "keine gültige UTF-8-Datei"
-        raise ConfigError.single(
-            "", f"Die Datei ist nicht lesbar ({reason}).", source=source
-        ) from None
+    except SkillFileError as exc:
+        raise ConfigError.single("", exc.message, source=source) from None
 
     data = _parse_frontmatter(text, source)
     front = validate_model(SkillFrontmatter, data, source=source)
@@ -282,6 +355,14 @@ def discover_skills(skills_dir: str | Path) -> SkillCatalog:
             catalog.skills[entry.name] = load_skill(entry)
         except ConfigError as exc:
             catalog.problems[entry.name] = exc
+        except Exception as exc:  # noqa: BLE001 - one broken skill never blocks the others
+            log.warning("Skill %s ließ sich nicht laden", entry.name, exc_info=True)
+            catalog.problems[entry.name] = ConfigError.single(
+                "",
+                f"Die SKILL.md ließ sich nicht prüfen ({type(exc).__name__}). Vereinfache die "
+                "Datei oder lege sie neu an.",
+                source=str(entry / SKILL_FILE),
+            )
     return catalog
 
 

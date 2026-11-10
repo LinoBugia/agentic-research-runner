@@ -471,7 +471,18 @@ async def test_projects_states() -> None:
         await see(user, "Die Projekte werden gelesen …")
 
 
-async def test_skills_read_only_with_tabs_and_errors() -> None:
+async def editor_text(user: User, retries: int = 40) -> str:
+    """The text in the skill editor's textarea (W4-02: the file tabs are editors)."""
+    for _ in range(retries):
+        with user.client:
+            for node in _walk(user.client.layout):
+                if node.tag == "textarea" and node.props.get("value"):
+                    return str(node.props["value"])
+        await asyncio.sleep(0.05)
+    raise AssertionError("no skill editor with text on the page")
+
+
+async def test_skills_with_tabs_and_errors() -> None:
     async with gui_user(MockApi()) as user:
         await user.open("/skills/proof-review")
         html = await see(user, "Ablauf (Topologie Review)")
@@ -479,7 +490,7 @@ async def test_skills_read_only_with_tabs_and_errors() -> None:
             assert text in html, text
         assert "/neuer-run?skill=proof-review" in html
         await user.open("/skills/proof-review?tab=yaml")
-        await see(user, "kind: research-group")
+        assert "kind: research-group" in await editor_text(user)
         await user.open("/skills/latex-writeup?tab=pruefung")
         await see(user, "Beschreibung fehlt im Kopf.")
         await user.open("/skills/exploration?zustand=fehler")

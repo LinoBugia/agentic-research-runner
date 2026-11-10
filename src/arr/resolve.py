@@ -57,8 +57,11 @@ __all__ = [
     "dump_yaml_model",
     "load_group_spec",
     "load_run_input",
+    "line_of_path",
     "load_yaml_model",
+    "parse_yaml_text",
     "resolve_run",
+    "too_nested",
     "validate_model",
     "validation_issues",
 ]
@@ -78,15 +81,51 @@ OVERRIDES_SOURCE = "Start-Parameter"
 # --------------------------------------------------------------------------------------------
 
 
-def _to_plain(node: Any, loc: Loc, lines: dict[Loc, int]) -> Any:
-    """Convert ruamel round-trip nodes to plain Python values and record key lines."""
+MAX_YAML_DEPTH = 64
+"""Deepest nesting of sections and lists arr accepts in a YAML file (W4-02.1)."""
+MAX_YAML_NODES = 50_000
+"""Most values a YAML file may expand to, with its aliases (`*name`) resolved (W4-02.1)."""
+TOO_NESTED = (
+    "Die Datei ist zu verschachtelt: mehr als {depth} Ebenen oder mehr als {nodes} Einträge, "
+    "wenn man die Verweise (&name, *name) auflöst. Vereinfache die Struktur und verzichte auf "
+    "verschachtelte Verweise."
+).format(depth=MAX_YAML_DEPTH, nodes=f"{MAX_YAML_NODES:,}".replace(",", "."))
+"""Message for a YAML alias bomb or a nesting deeper than `MAX_YAML_DEPTH`."""
+
+
+class _TooNested(Exception):
+    """A YAML document exceeds `MAX_YAML_DEPTH` or `MAX_YAML_NODES`."""
+
+
+class _Budget:
+    """Counts the values `_to_plain` creates; aliases count every time they are used."""
+
+    def __init__(self) -> None:
+        self.nodes = 0
+
+    def take(self, depth: int) -> None:
+        self.nodes += 1
+        if self.nodes > MAX_YAML_NODES or depth > MAX_YAML_DEPTH:
+            raise _TooNested
+
+
+def _to_plain(
+    node: Any, loc: Loc, lines: dict[Loc, int], budget: _Budget | None = None, depth: int = 0
+) -> Any:
+    """Convert ruamel round-trip nodes to plain Python values and record key lines.
+
+    Every value counts against `budget`, also each use of an alias, so a small file whose
+    aliases expand to millions of values (an alias bomb) stops early with `_TooNested`.
+    """
+    budget = budget if budget is not None else _Budget()
+    budget.take(depth)
     if isinstance(node, CommentedMap):
         out: dict[Any, Any] = {}
         for key, value in node.items():
             child = (*loc, key)
             with contextlib.suppress(KeyError, TypeError, AttributeError):
                 lines[child] = node.lc.key(key)[0] + 1
-            out[key] = _to_plain(value, child, lines)
+            out[key] = _to_plain(value, child, lines, budget, depth + 1)
         return out
     if isinstance(node, CommentedSeq):
         items = []
@@ -94,7 +133,7 @@ def _to_plain(node: Any, loc: Loc, lines: dict[Loc, int]) -> Any:
             child = (*loc, index)
             with contextlib.suppress(KeyError, TypeError, AttributeError, IndexError):
                 lines[child] = node.lc.item(index)[0] + 1
-            items.append(_to_plain(value, child, lines))
+            items.append(_to_plain(value, child, lines, budget, depth + 1))
         return items
     if isinstance(node, bool):
         return bool(node)
@@ -105,6 +144,25 @@ def _to_plain(node: Any, loc: Loc, lines: dict[Loc, int]) -> Any:
     if isinstance(node, str):
         return str(node)
     return node
+
+
+def too_nested(data: Any) -> bool:
+    """True if plain data (e.g. from a safe YAML load) is deeper than `MAX_YAML_DEPTH` or has
+    more than `MAX_YAML_NODES` values, shared objects counted at every use. Iterative, so it
+    never recurses itself."""
+    stack: list[tuple[Any, int]] = [(data, 0)]
+    nodes = 0
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_YAML_NODES or depth > MAX_YAML_DEPTH:
+            return True
+        if isinstance(value, dict):
+            stack.extend((v, depth + 1) for v in value.values())
+            stack.extend((k, depth + 1) for k in value if isinstance(k, tuple))
+        elif isinstance(value, list | tuple):
+            stack.extend((v, depth + 1) for v in value)
+    return False
 
 
 def _read_yaml(path: Path, source: str) -> tuple[Any, dict[Loc, int]]:
@@ -118,8 +176,19 @@ def _read_yaml(path: Path, source: str) -> tuple[Any, dict[Loc, int]]:
         raise ConfigError.single(
             "", f"Datei nicht lesbar: {path} ({exc.strerror}).", source=source
         ) from None
+    return parse_yaml_text(text, source)
+
+
+def parse_yaml_text(text: str, source: str) -> tuple[Any, dict[Loc, int]]:
+    """Parse YAML text into plain values and the 1-based line of every key and list item.
+
+    Raises `ConfigError` (with the line) for invalid YAML, an empty text or a text that is no
+    section of `key: value` entries. Used for files and for the skill check (W4-02).
+    """
     try:
         raw = YAML(typ="rt").load(text)
+    except RecursionError:
+        raise ConfigError.single("", TOO_NESTED, source=source) from None
     except DuplicateKeyError as exc:
         line = exc.problem_mark.line + 1 if exc.problem_mark else None
         raise ConfigError.single(
@@ -139,7 +208,10 @@ def _read_yaml(path: Path, source: str) -> tuple[Any, dict[Loc, int]]:
             line=line,
         ) from None
     lines: dict[Loc, int] = {}
-    data = _to_plain(raw, (), lines)
+    try:
+        data = _to_plain(raw, (), lines)
+    except (_TooNested, RecursionError):
+        raise ConfigError.single("", TOO_NESTED, source=source) from None
     if data is None:
         raise ConfigError.single("", "Die Datei ist leer.", source=source)
     if not isinstance(data, dict):
@@ -337,6 +409,20 @@ def validation_issues(
         seen.add(path)
         issues.append(ConfigIssue(path, _message(error), _line_for(loc, lines)))
     return issues
+
+
+_PATH_PART_RE = re.compile(r"([^.\[\]]+)|\[(\d+)\]")
+
+
+def line_of_path(path: str, lines: Mapping[Loc, int] | None) -> int | None:
+    """The line of a path like `agents[1].role` (or of its nearest parent) in a YAML file.
+
+    `lines` comes from `parse_yaml_text`. Used to give every issue of a check a line (W4-02).
+    """
+    loc: list[str | int] = []
+    for match in _PATH_PART_RE.finditer(path):
+        loc.append(int(match[2]) if match[2] is not None else match[1])
+    return _line_for(tuple(loc), lines)
 
 
 def _line_for(loc: Loc, lines: Mapping[Loc, int] | None) -> int | None:
