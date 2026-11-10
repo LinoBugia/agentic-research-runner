@@ -391,7 +391,9 @@ async def test_recover_and_meta_survive_a_fifo(wf: Path) -> None:
 
 async def test_a_transcript_link_is_not_followed(wf: Path, tmp_path: Path) -> None:
     folder = make_run_folder(wf, agents=["a"], status=RunStatus.DONE)
-    outside = tmp_path / "outside.jsonl"
+    deep = tmp_path / ("x" * 200)  # the link itself is longer than the line it points to
+    deep.mkdir()
+    outside = deep / "outside.jsonl"
     outside.write_text(
         transcript_line(1, "a", folder.name, "text", {"text": "GEHEIM-MARKER-4711"}) + "\n",
         "utf-8",
