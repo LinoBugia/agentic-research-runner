@@ -1,6 +1,6 @@
 # Security model
 
-> Status: 2026-11-06 · Platform implemented: macOS · Maintained with every change to sandbox, permissions or logins, every security review and every update of macOS, Claude Code CLI or Codex.
+> Status: 2026-11-10 · Platform implemented: macOS · Maintained with every change to sandbox, permissions or logins, every security review and every update of macOS, Claude Code CLI or Codex.
 
 This document describes how `arr` keeps research agents from harming the machine they run on, which ways out we know of, and which of them are closed. It is written so that the general part can serve as a template for other operating systems and for servers. The platform part currently covers macOS only.
 
@@ -49,7 +49,7 @@ These hold on every platform.
 
 | Layer | What it does | Decides |
 |---|---|---|
-| 0 Purpose | Prompts state the limits and tell agents not to retry a denied step another way but to ask. Planned: "not solved" stated as a valid result | – |
+| 0 Purpose | Prompts state the limits. "Not solved" and partial results are valid results; a blocked agent stops and says so or asks instead of retrying a denied step another way (the same text for both backends) | – |
 | 1 OS sandbox | Every shell command: write only inside the run, read only from an allowlist, no network | kernel |
 | 2 Fixed rules | Permission engine: hard denies (keychain tools, `sudo`, protected paths, `.git` via file tools, any file change outside the run, extra write roots) | code |
 | 3 Approval request | Grey zone goes to an inbox with a one-line reason | – |
@@ -67,7 +67,7 @@ These hold on every platform.
 - **Keychain lock probe:** Before a run, a probe checks inside the sandbox that the keychain cannot be read.
 - **Outside processes:** The CLI's `PATH` contains no write root; the run's virtual environment appears only in the agent's own shell environment. The chat server starts with `python -I`. The Codex app server gets a `HOME` of its own, outside the run's temp folder. CLI, app server and chat server find a `git` stub first on their `PATH` that does nothing, so no `git` runs outside the sandbox; agents keep the real `git` in their shell. The CLI runs with Node's compile cache off.
 - **File tools:** One deny list in the permission engine covers `.git`, `.gitattributes`, `.gitmodules`, `.claude`, `.codex`, `.agents`, `.mcp.json`, shell start files and similar names, checked case-insensitively before and after resolving links. Write, Edit, MultiEdit, NotebookEdit and Codex file changes on these paths are denied, and no approval lifts that. The same list goes to the Claude sandbox as `denyWrite`. Codex `apply_patch` cannot be switched off, so the Codex profile makes the top-level names read-only and a patch there becomes an approval request that is denied.
-- **Codex approvals:** Every Codex file change is checked with all its paths, the target of a move included. `arr` denies, without asking anyone: any move (the agent can use `mv` in its shell instead), any request for an extra write root (`grantRoot`), any write outside the run or onto the deny list, and any change of an unknown kind or with unknown fields. `arr` runs no tool on behalf of the app server. An approved command still runs inside the sandbox, on both backends.
+- **Codex approvals:** Every Codex file change is checked with all its paths, the target of a move included. `arr` denies, without asking anyone: any move (the agent can use `mv` in its shell instead), any request for an extra write root (`grantRoot`), any write outside the run or onto the deny list, any change of an unknown kind or with unknown fields, and any command request with an unknown field, a value of the wrong type or extra permissions (`additionalPermissions`). A request method `arr` does not know gets a JSON-RPC error. A fixed test holds the methods, fields and value types against the schema of the pinned Codex version (with its experimental fields) and turns red on another version. `arr` runs no tool on behalf of the app server. An approved command still runs inside the sandbox, on both backends.
 - **Waiting on a marker file:** An agent may wait for a file in its own work folder (`until_file`, for long scripts). This is the one place where something outside the sandbox looks at an agent-chosen path. The room server and the orchestrator only check whether the file exists: relative path inside the work folder, no `..`, no absolute path, no link followed, no content read, nothing started. Tests cover link chains, races between check and use, hard links and FIFOs.
 - **Codex project config:** `arr` records the state of the work folder's `.codex/` at run start and starts no further thread once it has changed.
 - **Tests:** Escape tests run the real CLIs against a fake model server in a test `HOME` with random bait files, and check results by exit code only. A `security` stub keeps the real keychain out of every lab.
@@ -86,7 +86,7 @@ These hold on every platform.
 | 3f | The CLI's Node writes its compile cache into the run's temp folder and loads it as code on the next start | closed (W3-06.4) |
 | 3g | Codex `apply_patch` with `Move to` writes outside the run and onto the deny list; the approval request named only the source, so `arr` approved it and Codex applied it outside the sandbox | closed (W3-06.5) |
 | 3h | Codex applies moves and patches inside the run without asking, also to protected names below the top level such as `sub/.git` or `sub/.codex` | not closable with the pinned Codex version; measured: no effect outside the sandbox, the same as `mv` in the shell |
-| 3i | `arr` answers an approval method it does not know with an empty result instead of an error | the pinned Codex version has no such method; fix planned for wave 4 |
+| 3i | `arr` answered an approval method it does not know with an empty result instead of an error | closed (W4-00): an unknown method gets the JSON-RPC error `-32601`, a request for a token `-32000`; a fixed test holds the methods and fields against the schema of the pinned Codex version and turns red on another version |
 | 4 | Processes an agent starts in the background (`&`, `nohup`, `disown`, or a process detached with its own session) keep running after the run ends and after the kill switch. They stay inside the sandbox but keep using CPU and writing to the run folder | **open**, measured in W3-07. Prompts allow only Claude's `run_in_background`, which the CLI ends with the run; Codex agents run long scripts in the foreground. A follow-up makes run end and kill switch end every process of the run; layer 7 closes it fully |
 
 Closing the ways we found does not prove that there are no others. Every review so far has found new ones.
