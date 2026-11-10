@@ -39,7 +39,7 @@ from typing import Any
 
 from arr.backends.base import TurnStatus
 from arr.errors import ConfigIssue
-from arr.models import ResolvedRun
+from arr.models import ResolvedRun, WorkspaceMode
 from arr.room.types import Rating, Result
 from arr.runs import topologies
 from arr.runs.context import RunContext
@@ -198,7 +198,45 @@ def check(resolved: ResolvedRun) -> list[ConfigIssue]:
                     "Ratings nach ihnen würden abgelehnt.",
                 )
             )
+    if exchange in ("none", "digest"):
+        issues += _isolation_issues(resolved, explorers)
     issues += phase_issues(resolved, PHASES)
+    return issues
+
+
+def _isolation_issues(resolved: ResolvedRun, explorers: list[str]) -> list[ConfigIssue]:
+    """G-N1: isolated explorers (`none`, `digest`) share no working folder and read no
+    `shared/` folder of another explorer through `read_dirs`, as judges in `review`."""
+    issues = []
+    folders: dict[str, list[str]] = {}
+    for agent in resolved.agents:
+        if agent.id in explorers and agent.workspace.mode is WorkspaceMode.SHARED:
+            folders.setdefault(str(agent.workspace.name), []).append(agent.id)
+    for folder, shared in folders.items():
+        if len(shared) > 1:
+            issues.append(
+                ConfigIssue(
+                    "agents",
+                    f"Die Explorer {', '.join(shared)} teilen den Arbeitsordner „{folder}“. Bei "
+                    "„exchange: none“ oder „digest“ arbeitet jeder Explorer für sich: Gib jedem "
+                    "einen eigenen oder nimm „exchange: channel“.",
+                )
+            )
+    for index, agent in enumerate(resolved.agents):
+        if agent.id not in explorers:
+            continue
+        for entry in agent.read_dirs:
+            name = entry.removeprefix("run:shared/").strip("/").split("/")[0]
+            owners = [o for o in folders.get(name, []) if o != agent.id]
+            if entry.startswith("run:shared/") and owners:
+                issues.append(
+                    ConfigIssue(
+                        f"agents[{index}].read_dirs",
+                        f"Der Explorer „{agent.id}“ liest den Arbeitsordner von "
+                        f"{', '.join(owners)} („{entry}“). Bei „exchange: none“ oder „digest“ "
+                        "liest kein Explorer die Arbeit eines anderen.",
+                    )
+                )
     return issues
 
 

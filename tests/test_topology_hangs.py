@@ -274,13 +274,18 @@ def hostile_version(size: int, step: int) -> str:
     return "".join(lines)
 
 
-async def longest_stall(task: "asyncio.Task[Any]") -> float:
-    """The longest time the event loop did not come back to this coroutine while `task` ran."""
-    worst, last = 0.0, time.monotonic()
+async def longest_stall(task: "asyncio.Task[Any]", within: float = 90) -> float:
+    """The longest time the event loop did not come back to this coroutine while `task` ran;
+    fails after `within` seconds (a diff without its deadline must not hang the test, G-N5)."""
+    worst = 0.0
+    started = last = time.monotonic()
     while not task.done():
         await asyncio.sleep(0.02)
         now = time.monotonic()
         worst, last = max(worst, now - last), now
+        if now - started > within:
+            task.cancel()
+            raise AssertionError(f"the run did not end within {within} s")
     return worst
 
 
@@ -362,7 +367,7 @@ async def test_h2_a_stop_during_a_long_diff_ends_the_run_in_time(
     task = asyncio.create_task(manager.run())
     await eventually(lambda: bool(begun) or task.done(), within=30)
     manager.stop()
-    status = await asyncio.wait_for(task, 60)
+    status = await asyncio.wait_for(task, 60)  # G-N5: never without a time limit
     latency = time.monotonic() - begun[0]
     if naive:
         assert latency > cost / 2, (latency, cost)

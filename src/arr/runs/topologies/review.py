@@ -54,6 +54,7 @@ from arr.errors import ArrError, ConfigIssue
 from arr.models import ChannelMode, ResolvedRun, WorkspaceMode
 from arr.room.types import Result
 from arr.runs.context import RunContext
+from arr.runs.finalize import one_line
 from arr.runs.topologies import (
     agent_param,
     agents_param,
@@ -673,7 +674,8 @@ class _ReviewRun:
                 f"als {MAX_TEXT_BYTES // 1024} KB. {compare}\n"
             )
         elif any(
-            len(t.encode("utf-8")) > MAX_DIFF_BYTES or t.count("\n") > MAX_DIFF_LINES
+            # every line break `splitlines` knows counts, not only "\n" (G-N2)
+            len(t.encode("utf-8")) > MAX_DIFF_BYTES or len(t.splitlines()) > MAX_DIFF_LINES
             for t in (before, after)
         ):
             text = (
@@ -954,7 +956,7 @@ class _ReviewRun:
                 lines.append(f"| {item.n} | v{item.version} | {given} | {item.verdict or '–'} |")
         still = [o for o in self.objections if o.status != "behoben"]
         lines += ["", f"**Offene Einwände:** {len(still)} von {len(self.objections)}"]
-        lines += [f"- {o.id} ({o.status}, {name(o.by)}): {o.text}" for o in still]
+        lines += [f"- {o.id} ({o.status}, {name(o.by)}): {one_line(o.text)}" for o in still]
         return "\n".join(lines)
 
     async def _finish(self, verdict: str | None, reason: str, version: _Version | None) -> None:
