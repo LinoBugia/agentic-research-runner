@@ -128,6 +128,7 @@ TERMINAL_HINT = (
 ESCALATION_HINT = (
     "Der Run wartet auf eine Entscheidung in der GUI. Weiter geht es nur über die Eskalation."
 )
+WAITING_HINT = "Der Run wartet auf die Freigabe in der GUI. Nachrichten gehen, sobald er läuft."
 FINISHED_HINT = "Der Run ist beendet. {what} geht nur bei einem laufenden Run."
 TASK_MISSING = "Die Aufgabe fehlt. Schreib, woran die Agenten arbeiten sollen."
 TASK_PLACEHOLDER = "(noch keine Aufgabe)"
@@ -590,6 +591,18 @@ def _merged_agents(
     return specs
 
 
+MANDATE_FIXED = (
+    "Vollmacht und Modell des Aufsichts-Agenten legt nur der User fest (Einstellungen → "
+    "Vollmacht). Claude Code kann sie nicht setzen; lass „gatekeeper“ weg."
+)
+
+
+def _refuse_mandate(approvals: Any, path: str) -> None:
+    """`approvals.gatekeeper` (mandate, model) never comes from Claude Code (M1, W4-01.1)."""
+    if isinstance(approvals, Mapping) and "gatekeeper" in approvals:
+        raise _issue(f"{path}.gatekeeper", MANDATE_FIXED)
+
+
 def request_data(
     spec: Mapping[str, Any], adjust: Mapping[str, Any] | None
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
@@ -611,6 +624,7 @@ def request_data(
             f"„{project}“. Runs gehen nur im eigenen Projekt.",
         )
     data["project"] = project
+    _refuse_mandate(data.get("approvals"), "config.approvals")
     if data.get("task_file") is not None:
         raise _issue(
             "config.task_file",
@@ -637,6 +651,7 @@ def request_data(
             f"„{unknown[0]}“ lässt sich über „overrides“ nicht ändern. Erlaubt sind "
             f"{', '.join(OVERRIDE_KEYS)}; alles andere gehört in „config“.",
         )
+    _refuse_mandate(overrides.get("approvals"), "overrides.approvals")
     agents = _agent_overrides(overrides.pop("agents", None))
     if adjust:
         _apply_adjust(data, params, overrides, agents, adjust)
@@ -1200,9 +1215,13 @@ class RunsArea:
         record = self._record(run_id)
         if record.status.is_final:
             raise not_allowed("Der Run ist beendet. Nachrichten gehen nur an laufende Runs.")
+        if record.status is RunStatus.AWAITING_APPROVAL:  # G6, W4-01.1
+            raise not_allowed(WAITING_HINT)
         handle = self.state.registry.get(run_id)
-        if not self.state.registry.owns(run_id) or handle is None or handle.manager is None:
+        if not self.state.registry.owns(run_id) or handle is None:
             raise not_allowed(TERMINAL_HINT)
+        if handle.manager is None:
+            raise not_allowed("Der Run wird noch vorbereitet; der Gruppenchat ist noch nicht da.")
         room = handle.manager.room
         if room is None:
             raise not_allowed("Der Run wird noch vorbereitet; der Gruppenchat ist noch nicht da.")

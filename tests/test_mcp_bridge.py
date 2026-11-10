@@ -340,9 +340,12 @@ async def test_start_run_creates_an_item_and_a_notification(wf: Path) -> None:
             approvals = await call(service, project(wf), "list_approvals")
             assert [a["gui_url"] for a in approvals["open"]] == [started["gui_url"]]
             await until(lambda: sent, within=10)
+            # compared while the start still waits: ending the service stops it, and
+            # „Run gestoppt …“ may follow (M4, W4-01.1)
+            assert sent[0] == "Run wartet auf Freigabe – runde in demo (von Claude Code)"
+            assert [t for t in sent if t.startswith("Run wartet")] == sent[:1]
     finally:
         await api.close()
-    assert sent == ["Run wartet auf Freigabe – runde in demo (von Claude Code)"]
 
 
 async def test_wait_run_returns_on_approval(wf: Path) -> None:

@@ -23,10 +23,12 @@ check lives here, never in the bridge (§6 of the order):
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -36,7 +38,8 @@ from pydantic import ValidationError
 
 from arr.errors import ArrError
 from arr.models import RunStatus
-from arr.permissions.types import ApprovalStatus
+from arr.permissions.types import ApprovalStatus, ApprovalType
+from arr.room.types import MessageVia
 from arr.service.api_models import (
     ApiException,
     PostMessageRequest,
@@ -62,9 +65,18 @@ MAX_TEXT = 4_000
 MAX_SUMMARY = 20_000
 MAX_ANSWER = 40_000
 """Characters of all agent text of one answer; then the page ends and `next` says how on."""
+RESULTS_PAGE = 50
+RESULTS_PAGE_MAX = 100
+MAX_RATINGS = 20
 WAIT_MAX_S = 600
 WAIT_POLL_S = 0.25
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f​-‏‪-‮⁦-⁩]")
+_KEEP = {"\t", "\n"}
+_LINE_BREAKS = {"\r", "\u0085", "\u2028", "\u2029"}
+VIA = MessageVia.USER_AGENT
+"""Origin of every message of `post_to_run`: Claude Code (the user agent), never the GUI."""
+QUESTION_HINT = "Deine Nachricht beantwortet die Frage nicht; nur der User beantwortet sie in arr."
+_MENTION = re.compile(r"@([A-Za-z0-9][A-Za-z0-9_-]*)")
+_FOUND_VALUE = re.compile(r"gefunden „[^“]*“")
 INTERNAL = "Bei dieser Anfrage ist in arr ein interner Fehler aufgetreten. Versuch es noch einmal."
 
 
@@ -72,9 +84,30 @@ class ToolProblem(Exception):
     """A German answer for Claude Code instead of a result (becomes an MCP tool error)."""
 
 
+def clean_text(value: Any) -> str:
+    """Text without invisible or controlling characters (G1, W4-01.1).
+
+    Removed: every C0 and C1 control character (category `Cc`) except tab and line break, and
+    every format character (`Cf`): bidi controls, zero-width characters, word joiner, BOM, soft
+    hyphen and the Unicode tag characters U+E0000–U+E007F, which can carry instructions that no
+    reader sees. Line and paragraph separators (and CR, NEL) become a plain line break.
+    """
+    out = []
+    for char in str(value or ""):
+        if char in _KEEP:
+            out.append(char)
+        elif char in _LINE_BREAKS:
+            out.append("\n")
+        elif unicodedata.category(char) in ("Cc", "Cf") or 0xE0000 <= ord(char) <= 0xE007F:
+            continue
+        else:
+            out.append(char)
+    return "".join(out)
+
+
 def agent_text(value: Any, limit: int = MAX_TEXT) -> str:
-    """Text of an agent for an answer: without control characters, at most `limit` characters."""
-    text = _CONTROL.sub("", str(value or ""))
+    """Text of an agent for an answer: cleaned (`clean_text`), at most `limit` characters."""
+    text = clean_text(value)
     if len(text) > limit:
         return f"{text[:limit]} … [gekürzt: {limit} von {len(text)} Zeichen]"
     return text
@@ -216,7 +249,7 @@ class UserApi:
         try:
             launch, card = await self.api.plan_run_request(request)
         except ApiException as exc:
-            raise ToolProblem(_problem(exc)) from None
+            raise ToolProblem(_problem(exc, params, overrides, config)) from None
         resolved = launch.resolved
         return {
             "project": project,
@@ -400,7 +433,10 @@ class UserApi:
         stage: str | None = None,
         kind: str | None = None,
         offset: int = 0,
+        limit: int = RESULTS_PAGE,
     ) -> dict[str, Any]:
+        """Results with ratings, page by page: at most `limit` entries and `MAX_ANSWER`
+        characters of agent text per answer, every text of an entry counted (M2, W4-01.1)."""
         await self._record(project, run_id)
         results = await self.api.get_results(run_id)
         items = [
@@ -408,32 +444,43 @@ class UserApi:
             for r in results.items
             if (stage is None or r.stage == stage) and (kind is None or r.kind.value == kind)
         ]
-        budget = Budget()
-        out = []
+        limit = max(1, min(int(limit), RESULTS_PAGE_MAX))
+        left = MAX_ANSWER
+        out: list[dict[str, Any]] = []
         start = max(0, int(offset))
         next_offset = None
         for index, result in enumerate(items[start:], start=start):
-            body = budget.take(result.body_excerpt) if result.body_excerpt else ""
-            if body is None:
+            if len(out) >= limit:
                 next_offset = index
                 break
-            out.append(
+            ratings = [
                 {
-                    "id": result.id,
-                    "agent": result.agent,
-                    "stage": result.stage,
-                    "kind": result.kind.value,
-                    "status": result.status.value,
-                    "title": agent_text(result.title, 300),
-                    "agent_text": body,
-                    "avg_score": result.avg_score,
-                    "ratings": [
-                        {"rater": x.rater, "score": x.score, "comment": agent_text(x.comment, 1000)}
-                        for x in result.ratings
-                    ],
-                    "path": result.path,
+                    "rater": agent_text(x.rater, 100),
+                    "score": x.score,
+                    "comment": agent_text(x.comment, 1000),
                 }
-            )
+                for x in result.ratings[:MAX_RATINGS]
+            ]
+            entry: dict[str, Any] = {
+                "id": result.id,
+                "agent": agent_text(result.agent, 100),
+                "stage": agent_text(result.stage, 100) if result.stage else None,
+                "kind": result.kind.value,
+                "status": result.status.value,
+                "title": agent_text(result.title, 300),
+                "agent_text": agent_text(result.body_excerpt) if result.body_excerpt else "",
+                "avg_score": result.avg_score,
+                "ratings": ratings,
+                "path": agent_text(result.path, 300) if result.path else None,
+            }
+            if len(result.ratings) > MAX_RATINGS:
+                entry["ratings_more"] = len(result.ratings) - MAX_RATINGS
+            cost = len(json.dumps(entry, ensure_ascii=False))
+            if cost > left and out:
+                next_offset = index
+                break
+            left -= cost
+            out.append(entry)
         answer: dict[str, Any] = {
             "run_id": run_id,
             "notice": NOTICE,
@@ -585,7 +632,7 @@ class UserApi:
         try:
             started = await self.api.request_run_start(request)
         except ApiException as exc:
-            raise ToolProblem(_problem(exc)) from None
+            raise ToolProblem(_problem(exc, params, overrides, config, name)) from None
         run_dir = self.api.state.workfolder / "runs" / started.run_id
         return {
             "run_id": started.run_id,
@@ -602,16 +649,38 @@ class UserApi:
     async def post_to_run(
         self, project: str, run_id: str, channel: str, body: str, to: list[str] | None = None
     ) -> dict[str, Any]:
+        """A hint of Claude Code into a channel: always `via: user_agent` (Claude Code), whatever
+        the arguments say; it never answers a question to the user (E15, H1 W4-01.1)."""
         await self._record(project, run_id)
         try:
             request = PostMessageRequest(body=body, to=list(to or []))
         except ValidationError as exc:
             raise ToolProblem(_validation(exc)) from None
+        asked = await self._open_questions_of(run_id, {*request.to, *_MENTION.findall(body)})
         try:
-            message = await self.api.runs.post_message(run_id, channel, request, via="user_agent")
+            message = await self.api.runs.post_message(run_id, channel, request, via=VIA)
         except ApiException as exc:
             raise ToolProblem(exc.error.message) from None
-        return {"run_id": run_id, "channel": channel, "message_id": message.id, "sender": "user"}
+        answer: dict[str, Any] = {
+            "run_id": run_id,
+            "channel": channel,
+            "message_id": message.id,
+            "sender": "user",
+            "via": VIA.value,
+        }
+        if asked:
+            answer["hint"] = QUESTION_HINT
+            answer["questions"] = [{"agent": a, "gui_url": url} for a, url in asked]
+        return answer
+
+    async def _open_questions_of(self, run_id: str, agents: set[str]) -> list[tuple[str, str]]:
+        """Open questions to the user of these agents, with the link to answer them in arr."""
+        if not agents:
+            return []
+        items = await self.api.list_approvals(
+            status=[ApprovalStatus.OPEN], run_id=run_id, type=ApprovalType.QUESTION
+        )
+        return [(i.agent.id, i.gui_url) for i in items if i.agent and i.agent.id in agents]
 
     async def control_run(self, project: str, run_id: str, action: str) -> dict[str, Any]:
         await self._record(project, run_id)
@@ -641,13 +710,44 @@ def _clock(ts: float | None) -> str | None:
     return time.strftime("%d.%m.%Y %H:%M", time.localtime(ts)) if ts else None
 
 
-def _problem(exc: ApiException) -> str:
-    """An API error for Claude Code: the message and the problems at their fields."""
+def _strings(value: Any) -> list[str]:
+    """Every text value in the arguments of a call (not the keys: they name fields), for
+    `scrub`."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [t for v in value.values() for t in _strings(v)]
+    if isinstance(value, list | tuple):
+        return [t for v in value for t in _strings(v)]
+    return []
+
+
+def scrub(text: str, *inputs: Any) -> str:
+    """A message without the values Claude Code sent (G3, W4-01.1): a value can be a key.
+
+    Quoted findings („gefunden „…““) become „gefunden einen anderen Wert“, every text of the
+    arguments (and the cut form `…` of the core's messages) becomes „…“, then `redact`.
+    """
+    from arr.permissions.policy import redact
+
+    text = _FOUND_VALUE.sub("gefunden einen anderen Wert", text)
+    for value in sorted({v for i in inputs for v in _strings(i)}, key=len, reverse=True):
+        if len(value) < 4:
+            continue
+        for form in (value, value[:37] + "…", value[:37]):
+            if len(form) >= 4:
+                text = text.replace(form, "…")
+    return redact(text)
+
+
+def _problem(exc: ApiException, *inputs: Any) -> str:
+    """An API error for Claude Code: the message and the problems at their fields, without
+    any value of the arguments (`scrub`)."""
     issues = exc.error.issues
     if not issues:
-        return exc.error.message
+        return scrub(exc.error.message, *inputs)
     lines = [f"- {i.path}: {i.message}" if i.path else f"- {i.message}" for i in issues[:10]]
-    return "Der Run lässt sich so nicht anlegen:\n" + "\n".join(lines)
+    return scrub("Der Run lässt sich so nicht anlegen:\n" + "\n".join(lines), *inputs)
 
 
 def _answer_of(exc: BaseException) -> str:
@@ -801,8 +901,9 @@ def build_server(api: Any) -> Any:
         stage: str | None = None,
         kind: str | None = None,
         offset: int = 0,
+        limit: int = RESULTS_PAGE,
     ) -> dict[str, Any]:
-        return await call(lambda p: users.read_results(p, run_id, stage, kind, offset), ctx)
+        return await call(lambda p: users.read_results(p, run_id, stage, kind, offset, limit), ctx)
 
     @server.tool(description=TOOL_DOCS["read_groupchat"])
     async def read_groupchat(

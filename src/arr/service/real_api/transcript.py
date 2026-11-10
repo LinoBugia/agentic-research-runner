@@ -12,8 +12,11 @@ only its new bytes; a shrunken one (truncated, replaced) is indexed afresh. A to
 page size counts bundled entries. `to_event` maps one line (with its result) to the API model.
 """
 
+import errno
 import json
+import os
 import re
+import stat
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +48,22 @@ _POST = re.compile(rb'"name":\s*"mcp__arr-room__post_message"')
 
 TOOL_CALL = "tool_call"
 TOOL_RESULT = "tool_result"
+
+
+_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+
+
+def open_regular(path: Path) -> Any:
+    """`open(path, "rb")` for a regular file only: no link followed, a FIFO never blocks
+    (W4-01.1, G2). `OSError` for anything else."""
+    fd = os.open(path, _OPEN_FLAGS)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "keine normale Datei", str(path))
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 @dataclass(slots=True)
@@ -88,7 +107,7 @@ class TranscriptIndex:
     def refresh(self) -> list[Line]:
         """Read what the file gained since the last call; returns the new complete lines."""
         try:
-            size = self.path.stat().st_size
+            size = os.lstat(self.path).st_size  # a link is no transcript (W4-01.1, G2)
         except OSError:
             if self.lines or self._rest:
                 self._reset()
@@ -98,7 +117,7 @@ class TranscriptIndex:
         if size == self._end:
             return []
         try:
-            with self.path.open("rb") as handle:
+            with open_regular(self.path) as handle:
                 handle.seek(self._end)
                 chunk = handle.read(size - self._end)
         except OSError:
@@ -191,7 +210,7 @@ class TranscriptIndex:
         if not wanted:
             return out
         try:
-            with self.path.open("rb") as handle:
+            with open_regular(self.path) as handle:
                 for index in wanted:
                     line = self.lines[index]
                     handle.seek(line.offset)

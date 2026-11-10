@@ -25,8 +25,8 @@ Run starts have no deadline. A waiting run start lives in this process: when the
 Deviations (`deviations`) compare the requested run with the same skill, project and task
 without `config` and `overrides`, and the limits with `arr.yaml` over `BUILTIN_LIMITS` (a
 `group.yaml` can switch a limit off, Codeplan §8 W1-01.1). Rights that grow are `sensitive`:
-web, extra read folders, another working-folder mode, another auth profile, more agents, a
-weaker decider; limits above the standard are listed as not sensitive.
+web, extra read folders, another working-folder mode, another auth profile, more agents,
+another decider; limits above the standard are listed as not sensitive.
 """
 
 import asyncio
@@ -102,11 +102,6 @@ DECIDER_TEXT = {
     Decider.USER.value: "immer du",
     Decider.GATEKEEPER_THEN_USER.value: "Aufsichts-Agent, bei Zweifel du",
     Decider.GATEKEEPER.value: "nur Aufsichts-Agent",
-}
-_DECIDER_STRENGTH = {
-    Decider.USER.value: 2,
-    Decider.GATEKEEPER_THEN_USER.value: 1,
-    Decider.GATEKEEPER.value: 0,
 }
 _LIMIT_KEYS = (
     ("wall_time_s", "Laufzeit"),
@@ -370,7 +365,7 @@ def deviations(
                 default_text=DECIDER_TEXT.get(std_decider, std_decider),
                 default=std_decider,
                 value=decider,
-                sensitive=_DECIDER_STRENGTH.get(decider, 0) < _DECIDER_STRENGTH.get(std_decider, 2),
+                sensitive=True,  # another decider always changes who grants rights (M1, W4-01.1)
             )
         )
     std = standard_limits(settings)
@@ -789,7 +784,8 @@ class RunStartsArea:
         try:
             launch = await pending.decided
         except asyncio.CancelledError:
-            self._end_waiting(pending, STOPPED_WAITING)
+            if self.pending.get(pending.run_id) is pending:  # not taken back already (G5)
+                self._end_waiting(pending, STOPPED_WAITING)
             raise
         if launch is None:
             pending.lock.release()
@@ -824,13 +820,16 @@ class RunStartsArea:
         return True
 
     def recover(self) -> list[str]:
+        from arr.runs.prepare import RunMeta
+        from arr.service.real_api.rundir import read_regular
+
         """Folders left `awaiting_approval` without a lock (the service ended): `stopped`."""
         runs_dir = Path(self.state.workfolder) / "runs"
         ended = []
         for meta_path in sorted(runs_dir.glob("*/meta.json")):
             run_dir = meta_path.parent
-            try:
-                meta = load_run_meta(run_dir)
+            try:  # no link, no FIFO: a folder of the workfolder must never hold the start (G2)
+                meta = RunMeta.model_validate_json(read_regular(meta_path, 100_000))
             except (OSError, ValueError):
                 continue
             if meta.status is not RunStatus.AWAITING_APPROVAL or run_dir.name in self.pending:
@@ -840,7 +839,7 @@ class RunStartsArea:
             try:
                 entries = [
                     json.loads(line)
-                    for line in (run_dir / APPROVALS_FILE).read_text("utf-8").splitlines()
+                    for line in read_regular(run_dir / APPROVALS_FILE).splitlines()
                     if line.strip()
                 ]
             except (OSError, ValueError):

@@ -585,9 +585,11 @@ class ApprovalCard:
             f"</td><td>{_WORKSPACE[a.workspace_mode]}</td></tr>"
             for a in item.agents
         )
-        agents = (
+        agents = (  # scrolls in a narrow window instead of being cut off (G11, W4-01.1)
+            '<div class="tbl-scroll" tabindex="0" role="region" aria-label="Agenten">'
             '<table class="tbl compact"><thead><tr><th>Agent</th><th>Modell · Profil</th>'
-            f"<th>Web</th><th>Arbeitsordner</th></tr></thead><tbody>{agent_rows}</tbody></table>"
+            f"<th>Web</th><th>Arbeitsordner</th></tr></thead><tbody>{agent_rows}</tbody>"
+            "</table></div>"
         )
         channels = "".join(
             f'<div><span class="mono">#{esc(c.name)}</span> · {esc(", ".join(c.members))}'

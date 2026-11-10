@@ -46,7 +46,7 @@ from arr.room.types import Message as RoomMessage
 from arr.runs.eventlog import RATE_LIMIT_PASSING
 from arr.runs.inspect import describe_checkpoint, open_approvals, run_lock_held, run_reason
 from arr.runs.launch import CHANNEL_WAIT_TEXT, ORPHAN_MIN_AGE_S, describe_entry
-from arr.runs.prepare import AgentFile, RunMeta, load_agent_file, load_run_meta
+from arr.runs.prepare import AgentFile, RunMeta, load_agent_file
 from arr.runs.slim import SLIM_MARKER
 from arr.service.api_models import (
     Action,
@@ -100,6 +100,7 @@ from arr.service.real_api.transcript import (
     TOOL_RESULT,
     TranscriptIndex,
     input_summary,
+    open_regular,
     to_event,
 )
 from arr.usage import USAGE_FILE, RunUsage
@@ -169,7 +170,7 @@ class JsonlTail:
     def refresh(self) -> list[dict[str, Any]]:
         """Read new complete lines; returns the new entries."""
         try:
-            size = self.path.stat().st_size
+            size = os.lstat(self.path).st_size
         except OSError:
             if self.entries or self._rest:
                 self.entries, self._end, self._rest = [], 0, b""
@@ -179,7 +180,7 @@ class JsonlTail:
         if size == self._end:
             return []
         try:
-            with self.path.open("rb") as handle:
+            with open_regular(self.path) as handle:
                 handle.seek(self._end)
                 chunk = handle.read(size - self._end)
         except OSError:
@@ -537,8 +538,9 @@ class RunRecord:
 
     def refresh_meta(self) -> bool:
         """Reload `meta.json` if it changed; True when it did (or vanished)."""
+        path = self.run_dir / "meta.json"
         try:
-            st = (self.run_dir / "meta.json").stat()
+            st = os.lstat(path)
         except OSError:
             changed = self.meta is not None
             self.meta, self._meta_key = None, None
@@ -546,8 +548,8 @@ class RunRecord:
         key = (st.st_mtime_ns, st.st_size)
         if key == self._meta_key:
             return False
-        try:
-            self.meta = load_run_meta(self.run_dir)
+        try:  # no link, no FIFO (W4-01.1, G2)
+            self.meta = RunMeta.model_validate_json(read_regular(path, 100_000))
         except (OSError, ValueError):
             return False  # half written: keep the last good one, try again next time
         self._meta_key = key
