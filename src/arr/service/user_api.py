@@ -75,7 +75,6 @@ _LINE_BREAKS = {"\r", "\u0085", "\u2028", "\u2029"}
 VIA = MessageVia.USER_AGENT
 """Origin of every message of `post_to_run`: Claude Code (the user agent), never the GUI."""
 QUESTION_HINT = "Deine Nachricht beantwortet die Frage nicht; nur der User beantwortet sie in arr."
-_MENTION = re.compile(r"@([A-Za-z0-9][A-Za-z0-9_-]*)")
 _FOUND_VALUE = re.compile(r"gefunden „[^“]*“")
 INTERNAL = "Bei dieser Anfrage ist in arr ein interner Fehler aufgetreten. Versuch es noch einmal."
 
@@ -89,8 +88,9 @@ def clean_text(value: Any) -> str:
 
     Removed: every C0 and C1 control character (category `Cc`) except tab and line break, and
     every format character (`Cf`): bidi controls, zero-width characters, word joiner, BOM, soft
-    hyphen and the Unicode tag characters U+E0000–U+E007F, which can carry instructions that no
-    reader sees. Line and paragraph separators (and CR, NEL) become a plain line break.
+    hyphen, the Unicode tag characters U+E0000–U+E007F and the supplementary variation
+    selectors up to U+E01EF, which can carry instructions that no reader sees. Line and
+    paragraph separators (and CR, NEL) become a plain line break.
     """
     out = []
     for char in str(value or ""):
@@ -98,7 +98,7 @@ def clean_text(value: Any) -> str:
             out.append(char)
         elif char in _LINE_BREAKS:
             out.append("\n")
-        elif unicodedata.category(char) in ("Cc", "Cf") or 0xE0000 <= ord(char) <= 0xE007F:
+        elif unicodedata.category(char) in ("Cc", "Cf") or 0xE0000 <= ord(char) <= 0xE01EF:
             continue
         else:
             out.append(char)
@@ -106,8 +106,15 @@ def clean_text(value: Any) -> str:
 
 
 def agent_text(value: Any, limit: int = MAX_TEXT) -> str:
-    """Text of an agent for an answer: cleaned (`clean_text`), at most `limit` characters."""
-    text = clean_text(value)
+    """Text of an agent for an answer: cleaned (`clean_text`), at most `limit` characters.
+
+    Only twice the limit is cleaned: an 8 MB text never runs through `clean_text` whole.
+    """
+    raw = str(value or "")
+    head = raw[: 2 * limit + 64]
+    text = clean_text(head)
+    if len(raw) > len(head):
+        return f"{text[:limit]} … [gekürzt: {limit} von {len(raw)} Zeichen]"
     if len(text) > limit:
         return f"{text[:limit]} … [gekürzt: {limit} von {len(text)} Zeichen]"
     return text
@@ -488,7 +495,14 @@ class UserApi:
             "results": out,
         }
         if next_offset is not None:
-            answer["next"] = f"read_results(run_id={run_id!r}, offset={next_offset})"
+            answer["next"] = call_text(
+                "read_results",
+                run_id=run_id,
+                stage=stage,
+                kind=kind,
+                limit=limit,
+                offset=next_offset,
+            )
         return answer
 
     async def read_groupchat(
@@ -580,8 +594,13 @@ class UserApi:
             "events": out,
         }
         if next_seq is not None:
-            answer["next"] = (
-                f"read_transcript(run_id={run_id!r}, agent_id={agent_id!r}, from_seq={next_seq})"
+            answer["next"] = call_text(
+                "read_transcript",
+                run_id=run_id,
+                agent_id=agent_id,
+                kinds=list(kinds) if kinds else None,
+                limit=limit,
+                from_seq=next_seq,
             )
         return answer
 
@@ -656,7 +675,9 @@ class UserApi:
             request = PostMessageRequest(body=body, to=list(to or []))
         except ValidationError as exc:
             raise ToolProblem(_validation(exc)) from None
-        asked = await self._open_questions_of(run_id, {*request.to, *_MENTION.findall(body)})
+        asked = await self._open_questions_of(
+            run_id, {*request.to, *await self._mentioned(run_id, channel, body)}
+        )
         try:
             message = await self.api.runs.post_message(run_id, channel, request, via=VIA)
         except ApiException as exc:
@@ -672,6 +693,23 @@ class UserApi:
             answer["hint"] = QUESTION_HINT
             answer["questions"] = [{"agent": a, "gui_url": url} for a, url in asked]
         return answer
+
+    async def _mentioned(self, run_id: str, channel: str, body: str) -> list[str]:
+        """Members `body` addresses, resolved like the room does (`@name`, alias, `@alle`/`@all`
+        in any case; N1, W4-01.2)."""
+        from arr.room.address import mentions
+
+        try:
+            infos = await self.api.list_channels(run_id)
+        except ApiException:
+            return []
+        info = next((c for c in infos if c.name == channel), None)
+        if info is None:
+            return []
+        members = [m.agent for m in info.members]
+        names = {m.agent.casefold(): m.agent for m in info.members}
+        names.update({m.alias.casefold(): m.agent for m in info.members if m.alias})
+        return mentions(body, members, "user", lambda name: names.get(name.casefold()))
 
     async def _open_questions_of(self, run_id: str, agents: set[str]) -> list[tuple[str, str]]:
         """Open questions to the user of these agents, with the link to answer them in arr."""
@@ -710,6 +748,12 @@ def _clock(ts: float | None) -> str | None:
     return time.strftime("%d.%m.%Y %H:%M", time.localtime(ts)) if ts else None
 
 
+def call_text(tool: str, **arguments: Any) -> str:
+    """How to call `tool` for the next page, with every filter and limit (N2, W4-01.2)."""
+    given = ", ".join(f"{k}={v!r}" for k, v in arguments.items() if v is not None)
+    return f"{tool}({given})"
+
+
 def _strings(value: Any) -> list[str]:
     """Every text value in the arguments of a call (not the keys: they name fields), for
     `scrub`."""
@@ -734,7 +778,8 @@ def scrub(text: str, *inputs: Any) -> str:
     for value in sorted({v for i in inputs for v in _strings(i)}, key=len, reverse=True):
         if len(value) < 4:
             continue
-        for form in (value, value[:37] + "…", value[:37]):
+        forms = [value, value[:37] + "…", value[:37], *value.splitlines()]
+        for form in sorted(set(forms), key=len, reverse=True):
             if len(form) >= 4:
                 text = text.replace(form, "…")
     return redact(text)
@@ -817,7 +862,7 @@ def build_server(api: Any) -> Any:
             try:
                 return await super().call_tool(name, arguments, context)
             except Exception as exc:  # noqa: BLE001 - every error is a sentence for Claude Code
-                text = _answer_of(exc)
+                text = scrub(_answer_of(exc), arguments)  # no value of any argument (N3)
                 return CallToolResult(content=[TextContent(type="text", text=text)], is_error=True)
 
     server = ArrServer("arr", instructions="arr: Research-Groups für Mathe-Projekte (docs/04 §2).")

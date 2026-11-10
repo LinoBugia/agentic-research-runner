@@ -166,7 +166,15 @@ def _mcp_state(file: Path) -> tuple[bool, str]:
         and server.get("command") == arr_command()
         and server.get("args") == ["mcp"]
     ):
-        return True, ".mcp.json vorhanden"
+        extra = sorted(str(k) for k in server if k not in ("command", "args"))
+        if not extra:
+            return True, ".mcp.json vorhanden"
+        # `env` or anything else changes what the bridge loads or reads (N4, W4-01.2)
+        names = ", ".join(f"„{k}“" for k in extra)
+        return False, (
+            f".mcp.json: Der Server „arr“ trägt zusätzlich {names}. Das ändert, was die Bridge "
+            "lädt oder liest; arr überschreibt es nicht. Entferne es in der .mcp.json."
+        )
     if _arr_server_stale(server):
         return False, ".mcp.json: „arr“ zeigt nicht auf das arr dieser Installation"
     return False, (

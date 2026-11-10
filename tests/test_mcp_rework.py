@@ -670,3 +670,198 @@ def test_an_unexpected_error_is_a_german_sentence() -> None:
 
     text = _answer_of(RuntimeError(f"Error executing tool x: {SECRET}"))
     assert text.startswith("Die Angaben passen nicht") and SECRET not in text
+
+
+# ============================================================================================
+# W4-01.2 Teil A: N1-N5 of the re-review
+# ============================================================================================
+
+
+@pytest.mark.parametrize("spelling", ["@alle", "@ALL", "@All"])
+async def test_n1_the_hint_also_for_everybody(wf: Path, spelling: str) -> None:
+    api = make_api(wf, question_scripts())
+    async with Service(api) as service:
+        run_id = (
+            await api.start_run({"project": "demo", "skill": "runde", "task_md": "Prüfe."})
+        ).run_id
+
+        async def asked() -> Any:
+            items = await api.list_approvals(status=[ApprovalStatus.OPEN], run_id=run_id)
+            return [i for i in items if i.type is ApprovalType.QUESTION]
+
+        [question] = await until(asked, within=30)
+        answer = await call(
+            service, "post_to_run", run_id=run_id, channel="main", body=f"{spelling} Band 10."
+        )
+    assert answer["hint"] == QUESTION_HINT
+    assert answer["questions"] == [{"agent": "m-1", "gui_url": question.gui_url}]
+
+
+def _next_args(text: str) -> dict[str, Any]:
+    """The arguments of a `next` like `read_results(run_id='…', kind='proof', offset=10)`."""
+    import ast
+
+    call_ = ast.parse(text, mode="eval").body
+    assert isinstance(call_, ast.Call)
+    return {k.arg: ast.literal_eval(k.value) for k in call_.keywords if k.arg}
+
+
+async def test_n2_next_keeps_the_filters_of_read_results(wf: Path) -> None:
+    folder = make_run_folder(wf, agents=["a"], status=RunStatus.DONE)
+    agent = RoomStore.create(folder).for_agent("a")
+    for index in range(60):
+        agent.submit_result(kind="proof" if index % 2 else "sketch", title=f"{index}", body="x")
+    wanted = [r for r in range(1, 61) if r % 2 == 0]
+    async with Service(make_api(wf)) as service:
+        args: dict[str, Any] = {"run_id": folder.name, "kind": "proof", "limit": 7}
+        seen: list[int] = []
+        while True:
+            page = await call(service, "read_results", **args)
+            assert all(r["kind"] == "proof" for r in page["results"])
+            seen += [r["id"] for r in page["results"]]
+            if "next" not in page:
+                break
+            args = _next_args(page["next"])
+            assert (args["kind"], args["limit"]) == ("proof", 7)
+    assert seen == wanted
+
+
+async def test_n2_next_keeps_the_filters_of_read_transcript(wf: Path) -> None:
+    folder = make_run_folder(wf, agents=["a"], status=RunStatus.DONE)
+    lines = [
+        transcript_line(i, "a", folder.name, "text" if i % 3 else "thinking", {"text": f"t{i}"})
+        for i in range(1, 40)
+    ]
+    (folder / "agents" / "a" / "transcript.jsonl").write_text("\n".join(lines) + "\n", "utf-8")
+    async with Service(make_api(wf)) as service:
+        args: dict[str, Any] = {
+            "run_id": folder.name,
+            "agent_id": "a",
+            "kinds": ["thinking"],
+            "limit": 4,
+        }
+        seen: list[int] = []
+        for _ in range(20):
+            page = await call(service, "read_transcript", **args)
+            assert all(e["kind"] == "thinking" for e in page["events"])
+            seen += [e["seq"] for e in page["events"]]
+            if "next" not in page:
+                break
+            args = _next_args(page["next"])
+            assert (args["kinds"], args["limit"]) == (["thinking"], 4)
+    assert seen == [i for i in range(1, 40) if i % 3 == 0]
+
+
+def _secrets() -> list[str]:
+    import secrets
+    import string
+
+    alphabet = string.ascii_letters + string.digits
+    plain = "".join(secrets.choice(alphabet) for _ in range(40))  # no known pattern
+    key = "sk-ant-api03-" + "".join(secrets.choice(alphabet) for _ in range(40))
+    return [plain, key, f"{plain}\n{plain}"]
+
+
+def _fields(run_id: str, secret: str) -> dict[str, tuple[str, dict[str, Any]]]:
+    return {
+        "describe_skill.name": ("describe_skill", {"name": secret}),
+        "list_skills.kind": ("list_skills", {"kind": secret}),
+        "list_runs.status": ("list_runs", {"status": secret}),
+        "run_status.run_id": ("run_status", {"run_id": secret}),
+        "wait_run.run_id": ("wait_run", {"run_id": secret, "timeout_s": 1}),
+        "read_run_summary.run_id": ("read_run_summary", {"run_id": secret}),
+        "read_results.run_id": ("read_results", {"run_id": secret}),
+        "read_groupchat.channel": ("read_groupchat", {"run_id": run_id, "channel": secret}),
+        "read_transcript.agent_id": ("read_transcript", {"run_id": run_id, "agent_id": secret}),
+        "read_transcript.kinds": (
+            "read_transcript",
+            {"run_id": run_id, "agent_id": "a", "kinds": [secret]},
+        ),
+        "post_to_run.channel": ("post_to_run", {"run_id": run_id, "channel": secret, "body": "x"}),
+        "control_run.action": ("control_run", {"run_id": run_id, "action": secret}),
+        "list_approvals.run_id": ("list_approvals", {"run_id": secret}),
+        "start_run.skill": ("start_run", {"task": "t", "skill": secret}),
+        "start_run.name": ("start_run", {"task": "t", "skill": "gibtsnicht", "name": secret}),
+        "start_run.params": (
+            "start_run",
+            {"task": "t", "skill": "runde", "params": {"rounds": secret}},
+        ),
+        "start_run.model": (
+            "start_run",
+            {"task": "t", "skill": "runde", "overrides": {"agents": {"critic": {"model": secret}}}},
+        ),
+        "estimate_run.skill": ("estimate_run", {"skill": secret}),
+    }
+
+
+async def test_n3_no_tool_error_returns_a_value(wf: Path) -> None:
+    folder = make_run_folder(wf, agents=["a"], status=RunStatus.DONE)
+    RoomStore.create(folder).for_agent("a").post_message("main", "hallo")
+    leaks: dict[str, str] = {}
+    errors = 0
+    async with Service(make_api(wf)) as service, service.client(project(wf)) as client:
+        for secret in _secrets():
+            for name, (tool, args) in _fields(folder.name, secret).items():
+                result = await client.call_tool(tool, args)
+                text = "".join(getattr(c, "text", "") for c in result.content)
+                errors += bool(result.is_error)
+                windows = {secret[i : i + 12] for i in range(0, len(secret) - 12, 4)}
+                hits = [w for w in windows if "\n" not in w and w in text]
+                if hits:
+                    leaks[name] = text[:120]
+    assert leaks == {}
+    assert errors >= 40, "the fields really end in an error"
+
+
+async def test_n4_the_mcp_check_names_extra_keys(wf: Path) -> None:
+    from arr.workfolder import arr_command
+
+    api = make_api(wf)
+    await api.setup_project("demo")
+    file = project(wf) / ".mcp.json"
+    entry = {"command": arr_command(), "args": ["mcp"], "env": {"ARR_HOME": "/tmp/fremd"}}
+    file.write_text(json.dumps({"mcpServers": {"arr": entry}}), "utf-8")
+    check = {c.key: c for c in (await api.get_project("demo")).checks}["mcp_json"]
+    assert not check.ok and "„env“" in check.message
+    await api.setup_project("demo")
+    assert json.loads(file.read_text("utf-8"))["mcpServers"]["arr"] == entry, "not overwritten"
+    entry.pop("env")
+    file.write_text(json.dumps({"mcpServers": {"arr": entry}}), "utf-8")
+    check = {c.key: c for c in (await api.get_project("demo")).checks}["mcp_json"]
+    assert check.ok, "Gegenprobe"
+
+
+async def test_n5_more_than_twenty_ratings(wf: Path) -> None:
+    raters = [f"r{i}" for i in range(1, 24)]
+    channel = {"name": "main", "members": ["a", *raters]}
+    folder = make_run_folder(wf, agents=["a", *raters], status=RunStatus.DONE, channels=[channel])
+    store = RoomStore.create(folder)
+    store.for_agent("a").submit_result(kind="sketch", title="Skizze", body="x")
+    for rater in raters:
+        store.for_agent(rater).submit_rating(1, 5, f"Kommentar von {rater}")
+    async with Service(make_api(wf)) as service:
+        page = await call(service, "read_results", run_id=folder.name)
+    [entry] = page["results"]
+    assert len(entry["ratings"]) == 20 and entry["ratings_more"] == 3
+
+
+@pytest.mark.parametrize("name", ["approvals.jsonl", "orchestrator.jsonl"])
+def test_n5_a_log_link_is_not_followed(wf: Path, tmp_path: Path, name: str) -> None:
+    folder = make_run_folder(wf, agents=["a"], status=RunStatus.DONE)
+    deep = tmp_path / ("x" * 200)  # the link is longer than the line it points to
+    deep.mkdir()
+    outside = deep / name
+    line = {"ts": 1.0, "event": "open", "item_id": "apr_x_0001", "kind": "status", "data": {}}
+    outside.write_text(json.dumps({**line, "note": "GEHEIM-MARKER"}) + "\n", "utf-8")
+    target = folder / name
+    target.unlink(missing_ok=True)
+    target.symlink_to(outside)
+    record = make_api(wf).state.store.get(folder.name)
+    assert record is not None
+    tail = record.approvals if name == "approvals.jsonl" else record.log
+    tail.refresh()
+    assert "GEHEIM-MARKER" not in json.dumps(tail.entries)
+    target.unlink()
+    target.write_bytes(outside.read_bytes())
+    tail.refresh()
+    assert "GEHEIM-MARKER" in json.dumps(tail.entries), "Gegenprobe: a real file is read"
