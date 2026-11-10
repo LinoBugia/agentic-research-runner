@@ -25,6 +25,7 @@ from arr.models import (
 from arr.resolve import dump_yaml_model, resolve_run
 from arr.room.store import (
     CONVERSATION_RULES,
+    STAGING_DIR,
     AgentRoom,
     ChannelState,
     RoomStore,
@@ -669,7 +670,8 @@ def test_submit_result_with_body_and_file(store: RoomStore) -> None:
     write(store, "explorer-1", "proof.md", "Beweis")
     store.add_assignment("explorer-1", 2, "Nachbessern", stage="prove", context={"attempt": 2})
     r2 = e1.submit_result("proof", "Lemma A", path="proof.md")
-    assert r2.path == f"output/results/{r2.id:03d}-explorer-1-proof.md"
+    # W4-03 F4: explorer-1 is in an anonymous channel, so the file carries its alias
+    assert r2.path == f"output/results/{r2.id:03d}-mitglied-a-proof.md"
     assert (store.run_dir / r2.path).read_text() == "Beweis"
     assert (r2.stage, r2.attempt) == ("prove", 2)
     assert [r.id for r in store.results()] == [r1.id, r2.id]
@@ -678,8 +680,9 @@ def test_submit_result_with_body_and_file(store: RoomStore) -> None:
         e1.submit_result("idea", "leer")
     with pytest.raises(RoomError, match="gibt es in deinem Arbeitsordner nicht"):
         e1.submit_result("idea", "x", path="fehlt.md")
-    staged = [p for p in (store.run_dir / "output" / "results").iterdir() if p.name[0] == "."]
-    assert staged == []
+    for folder in ("output/results", STAGING_DIR):
+        staged = [p for p in (store.run_dir / folder).iterdir() if p.name[0] == "."]
+        assert staged == [], folder
 
 
 def test_submit_rating(store: RoomStore) -> None:

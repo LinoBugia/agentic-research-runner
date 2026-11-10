@@ -199,6 +199,19 @@ SENSITIVE_NAME_PATTERNS = ("*.kdbx", "*.keychain", "*.keychain-db", "*.agilekeyc
 SENSITIVE_ABSOLUTE_PATHS = ("/Library/Keychains",)
 """Sensitive paths outside `~`."""
 
+RUN_HIDDEN_PATHS = (
+    "groupchats/sealed",
+    "groupchats/staging",
+    "groupchats/room.sqlite",
+    "groupchats/room.sqlite-wal",
+    "groupchats/room.sqlite-shm",
+    "groupchats/room.sqlite-journal",
+)
+"""Paths of the run that no agent may read, not even with an approval (W4-03 F4): results of
+a sealed stage (independent reviews), the copies on their way there and the room database,
+which holds every result. The same names as `arr.room.store` (`SEALED_DIR`, `STAGING_DIR`,
+`ROOM_DB_FILES`), held equal by a test."""
+
 READ_BLOCKED_ROOTS = ("/Volumes",)
 """Besides `~` and the workfolder: roots that are not readable unless on the allowlist."""
 
@@ -832,7 +845,8 @@ def profile_for(
     there only the run venv, the base venv and the toolchain stay open, a read folder or an
     always rule inside it is dropped. The base venv is never a write root: several runs
     share it. `tools.web` switches the web tools on; always-allow host rules become allowed
-    domains of the Claude sandbox.
+    domains of the Claude sandbox. `RUN_HIDDEN_PATHS` of the run (sealed results, the room
+    database) are sensitive: never readable, also not with an approval (W4-03 F4).
     """
     rules = rules or PermissionRules()
     home = Path(os.path.realpath(home or Path.home()))
@@ -886,6 +900,7 @@ def profile_for(
     sensitive = [norm(home / p) for p in SENSITIVE_HOME_PATHS]
     sensitive += [norm(p) for p in SENSITIVE_ABSOLUTE_PATHS]
     sensitive += [norm(app_dir()), norm(workfolder / ".arr")]
+    sensitive += [norm(run_dir / p) for p in RUN_HIDDEN_PATHS]  # W4-03 F4
     sensitive += [norm(p) for p in rules.sensitive_paths]
     sensitive += [norm(p) for p in _existing_matches(home, SENSITIVE_HOME_PATTERNS)]
 

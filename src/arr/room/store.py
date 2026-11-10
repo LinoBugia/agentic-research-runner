@@ -73,6 +73,14 @@ ROOM_DIR = "groupchats"
 DB_NAME = "room.sqlite"
 ATTACHMENTS_DIR = "attachments"
 RESULTS_DIR = "output/results"
+SEALED_DIR = f"{ROOM_DIR}/sealed"
+"""Result files of a sealed stage (W4-03 F4): beside `room.sqlite`, readable for no agent (the
+read profile denies the run folder, the policy names it a hard block) until `release`."""
+STAGING_DIR = f"{ROOM_DIR}/staging"
+"""Where `submit_result` copies a file first; readable for no agent, so a sealed result never
+passes through `output/` (W4-03 F4)."""
+ROOM_DB_FILES = (DB_NAME, f"{DB_NAME}-wal", f"{DB_NAME}-shm", f"{DB_NAME}-journal")
+"""The database files below `groupchats/`: they hold every result body (W4-03 F4)."""
 ORCHESTRATOR = "orchestrator"
 USER = "user"
 
@@ -124,12 +132,16 @@ CREATE TABLE IF NOT EXISTS agent_wait(agent TEXT, kind TEXT, since REAL, until R
 CREATE TABLE IF NOT EXISTS wait_guard(agent TEXT PRIMARY KEY, waited REAL NOT NULL DEFAULT 0,
     seen INTEGER, last_end TEXT, yield_to TEXT, end_turn TEXT,
     until_streak INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS sealed_stage(stage TEXT PRIMARY KEY, channel TEXT, ts REAL);
+CREATE TABLE IF NOT EXISTS sealed_result(result_id INTEGER PRIMARY KEY, stage TEXT);
 """
 """Tables of docs/02 §5 plus `channel.state`, `msg.via`/`msg.delivery`, `poll`, `floor`,
 `agent_report` (the status an agent reported itself), `agent_wait` (one row per agent and
 kind of wait, docs/09 §4.3) and `wait_guard` (the limits of waiting, L7, L10, L12). Rooms of
 runs before W3-07 lack the last three, rooms before W3-09 the column `agent_wait.result_from`
-(L14); readers treat that as „no rows“ or „none“."""
+(L14); readers treat that as „no rows“ or „none“. Since W4-03: `sealed_stage` (stages whose
+results stay hidden until `release`) and `sealed_result` (results not released yet); rooms
+before W4-03 lack them, which means „nothing sealed“."""
 
 WAIT_GUARD_FIELDS = frozenset(
     {"waited", "seen", "last_end", "yield_to", "end_turn", "until_streak"}
@@ -366,6 +378,8 @@ class RoomStore:
         """Create `groupchats/` with the schema (idempotent) and return the store."""
         db_path = Path(run_dir) / ROOM_DIR / DB_NAME
         (db_path.parent / ATTACHMENTS_DIR).mkdir(parents=True, exist_ok=True)
+        for folder in (SEALED_DIR, STAGING_DIR):
+            (Path(run_dir) / folder).mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(db_path, timeout=busy_timeout_s, isolation_level=None)
         try:
             con.execute("PRAGMA journal_mode=WAL")
@@ -503,6 +517,92 @@ class RoomStore:
             con.execute("UPDATE msg SET open=0 WHERE channel=? AND open=1", (channel,))
         return cur.rowcount > 0
 
+    # ----------------------------------------------------------------------------------------
+    # Sealed stages (W4-03 F4: independent reviews)
+    # ----------------------------------------------------------------------------------------
+
+    def seal(self, stage: str, channel: str | None = None) -> None:
+        """Results submitted in `stage` from now on stay hidden: their files go to
+        `SEALED_DIR`, readable for no agent, until `release(stage)`. `channel` names the
+        anonymous channel whose aliases the file names use (else the first anonymous channel
+        of the agent, else its ID)."""
+        with self._write() as con:
+            con.execute(
+                "INSERT INTO sealed_stage(stage, channel, ts) VALUES(?,?,?) "
+                "ON CONFLICT(stage) DO UPDATE SET channel=excluded.channel, ts=excluded.ts",
+                (stage, channel, _now()),
+            )
+
+    def sealed_stages(self) -> dict[str, str | None]:
+        """Sealed stages with their alias channel; empty for a room before W4-03."""
+        try:
+            with self._read() as con:
+                rows = con.execute("SELECT stage, channel FROM sealed_stage").fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        return {r["stage"]: r["channel"] for r in rows}
+
+    def is_sealed(self, result_id: int) -> bool:
+        """True while a result of a sealed stage is not released."""
+        try:
+            with self._read() as con:
+                row = con.execute(
+                    "SELECT 1 FROM sealed_result WHERE result_id=?", (result_id,)
+                ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return row is not None
+
+    def release(self, stage: str) -> list[Result]:
+        """Unseal `stage`: its hidden result files move to `output/results/` (their names
+        carry aliases, see `seal`); later results of the stage are no longer sealed. Returns
+        the released results, oldest first."""
+        results_dir = self.run_dir / RESULTS_DIR
+        results_dir.mkdir(parents=True, exist_ok=True)
+        released = []
+        with self._write() as con:
+            con.execute("DELETE FROM sealed_stage WHERE stage=?", (stage,))
+            ids = [
+                r[0]
+                for r in con.execute(
+                    "SELECT result_id FROM sealed_result WHERE stage=? ORDER BY result_id",
+                    (stage,),
+                )
+            ]
+            for result_id in ids:
+                row = con.execute("SELECT * FROM result WHERE id=?", (result_id,)).fetchone()
+                result = _row_to_result(row)
+                if result.path:
+                    source = self.run_dir / result.path
+                    target = results_dir / source.name
+                    os.replace(source, target)
+                    rel = target.relative_to(self.run_dir).as_posix()
+                    con.execute("UPDATE result SET path=? WHERE id=?", (rel, result_id))
+                    result = result.model_copy(update={"path": rel})
+                con.execute("DELETE FROM sealed_result WHERE result_id=?", (result_id,))
+                released.append(result)
+        return released
+
+    def result_text(self, result_id: int, max_bytes: int) -> str:
+        """Body of a result, or the start of its file (also a sealed one) as text, for arr's
+        own reading (verdicts, digests); at most `max_bytes`, never through a link."""
+        result = self.result(result_id)
+        if not result.path:
+            return result.body or ""
+        try:
+            fd = os.open(self.run_dir / result.path, _FILE_FLAGS)
+        except OSError:
+            return result.body or ""
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return result.body or ""
+            data = os.read(fd, max_bytes)
+        finally:
+            os.close(fd)
+        text = data.decode("utf-8", errors="replace")
+        return f"{result.body}\n\n{text}" if result.body else text
+
     def _resolved(self) -> ResolvedRun | None:
         if not hasattr(self, "_run"):
             run_yaml = self.run_dir / "run.yaml"
@@ -524,8 +624,13 @@ class RoomStore:
         return [r[0] for r in rows]
 
     def open_channel(self, channel: str) -> None:
-        """Open a channel whose `open_from` stage has been reached (W2-03)."""
+        """Open a channel whose `open_from` stage has been reached (W2-03), or open it again."""
         self.set_channel_state(channel, ChannelState.OPEN)
+
+    def hold_channel(self, channel: str) -> None:
+        """Close a channel for the agents again (W4-03 F3): like `waiting`, they can neither
+        read nor write it and get no hints; its history stays for GUI and export."""
+        self.set_channel_state(channel, ChannelState.WAITING)
 
     def _load_channel(self, con: sqlite3.Connection, name: str) -> _Channel | None:
         row = con.execute("SELECT config, state FROM channel WHERE name=?", (name,)).fetchone()
@@ -1184,9 +1289,14 @@ class AgentRoom:
                 raise RoomError(f"Den Kanal #{name} gibt es nicht. Deine Kanäle: {mine}.")
             raise RoomError(f"Du bist nicht Mitglied im Kanal #{name}. Deine Kanäle: {mine}.")
         if ch.state is ChannelState.WAITING:
+            if ch.config.open_from:
+                raise RoomError(
+                    f"Der Kanal #{name} ist noch geschlossen. "
+                    f"Er öffnet ab Phase „{ch.config.open_from}“."
+                )
             raise RoomError(
-                f"Der Kanal #{name} ist noch geschlossen. "
-                f"Er öffnet ab Phase „{ch.config.open_from}“."
+                f"Der Kanal #{name} ist gerade geschlossen. arr öffnet ihn wieder, wenn die "
+                "Phase es vorsieht."
             )
         if write and ch.state is ChannelState.CLOSED:
             raise RoomError(
@@ -1242,9 +1352,10 @@ class AgentRoom:
 
     def shown_name(self, agent: str) -> str:
         """How this agent sees `agent`: its alias when an anonymous channel of mine hides it,
-        else its ID (W3-09.1, B2; the same rule as `_check_result_from`)."""
+        also one that is closed (W4-03 F4), else its ID (W3-09.1, B2; the same rule as
+        `_check_result_from`)."""
         with self.store._read() as con:
-            for ch in self._readable(con):
+            for ch in self._my_channels(con):
                 if ch.anonymous and agent in ch.members:
                     return ch.display(agent)
         return agent
@@ -1865,7 +1976,8 @@ class AgentRoom:
             )
         with self.store._read() as con:
             channels = self._readable(con)
-            hidden = {a for ch in channels if ch.anonymous for a in ch.members}
+            # an anonymous channel hides its members also while it is closed (W4-03 F4)
+            hidden = {a for ch in self._my_channels(con) if ch.anonymous for a in ch.members}
             agent = next((a for ch in channels if (a := ch.resolve(wanted)) is not None), None)
             if agent is None and wanted in self.store.agent_ids() and wanted not in hidden:
                 agent = wanted
@@ -1943,6 +2055,29 @@ class AgentRoom:
                 if address(m, self.agent_id, sender_of) is not None
             ]
 
+    def _file_label(self, con: sqlite3.Connection, channel: str | None) -> str:
+        """How my result files are named: by my alias in `channel` or, without it, in my
+        first anonymous channel (also a closed one), else by my ID (W4-03 F4)."""
+        channels = self._my_channels(con)
+        if channel is not None:
+            channels = [ch for ch in channels if ch.name == channel] + channels
+        for ch in channels:
+            if ch.anonymous and ch.members.get(self.agent_id):
+                alias = str(ch.members[self.agent_id])
+                return "".join(c if c.isalnum() else "-" for c in alias.casefold())
+        return self.agent_id
+
+    @staticmethod
+    def _sealed(con: sqlite3.Connection, stage: str | None) -> tuple[bool, str | None]:
+        if stage is None:
+            return False, None
+        try:
+            row = con.execute("SELECT channel FROM sealed_stage WHERE stage=?", (stage,))
+            found = row.fetchone()
+        except sqlite3.OperationalError:  # a room from before W4-03
+            return False, None
+        return (True, found["channel"]) if found is not None else (False, None)
+
     def submit_result(
         self,
         kind: str,
@@ -1950,47 +2085,54 @@ class AgentRoom:
         body: str | None = None,
         path: str | None = None,
     ) -> Result:
-        """Submit a result; a file in `path` is copied to `output/results/NNN-<agent>-<kind>`."""
+        """Submit a result; a file in `path` is copied to `output/results/NNN-<name>-<kind>`.
+
+        `<name>` is my alias if I am in an anonymous channel, else my ID (W4-03 F4). The copy
+        is made in `STAGING_DIR` first; in a sealed stage (`RoomStore.seal`) the file stays in
+        `SEALED_DIR` until the stage is released, so no other agent can read it before.
+        """
         if not kind.strip() or not title.strip():
             raise RoomError("„kind“ und „title“ dürfen nicht leer sein.")
         if not (body and body.strip()) and not path:
             raise RoomError("Gib den Inhalt in „body“ an oder eine Datei in „path“.")
-        results_dir = self.store.run_dir / RESULTS_DIR
+        run_dir = self.store.run_dir
         staged: Path | None = None
         final: Path | None = None
         suffix = ""
         if path:
-            results_dir.mkdir(parents=True, exist_ok=True)
-            staged = results_dir / f".staging-{uuid.uuid4().hex}"
+            staging = run_dir / STAGING_DIR
+            staging.mkdir(parents=True, exist_ok=True)
+            staged = staging / f".staging-{uuid.uuid4().hex}"
             suffix = Path(self._copy_source(path, staged)).suffix
         try:
             with self.store._write() as con:
                 assignment = self.store._latest_assignment(con, self.agent_id)
+                stage = assignment.stage if assignment else None
                 attempt = 1
                 if assignment and isinstance(assignment.context.get("attempt"), int):
                     attempt = max(1, assignment.context["attempt"])
+                sealed, channel = self._sealed(con, stage)
                 cur = con.execute(
                     "INSERT INTO result(ts, agent, stage, kind, title, body, path, attempt) "
                     "VALUES(?,?,?,?,?,?,?,?)",
-                    (
-                        _now(),
-                        self.agent_id,
-                        assignment.stage if assignment else None,
-                        kind,
-                        title,
-                        body,
-                        None,
-                        attempt,
-                    ),
+                    (_now(), self.agent_id, stage, kind, title, body, None, attempt),
                 )
                 result_id = cur.lastrowid
                 assert result_id is not None
+                if sealed:
+                    con.execute(
+                        "INSERT INTO sealed_result(result_id, stage) VALUES(?,?)",
+                        (result_id, stage),
+                    )
                 if staged is not None:
+                    folder = run_dir / (SEALED_DIR if sealed else RESULTS_DIR)
+                    folder.mkdir(parents=True, exist_ok=True)
                     safe_kind = "".join(c if c.isalnum() or c in "-_" else "-" for c in kind)
-                    final = results_dir / f"{result_id:03d}-{self.agent_id}-{safe_kind}{suffix}"
+                    label = self._file_label(con, channel)
+                    final = folder / f"{result_id:03d}-{label}-{safe_kind}{suffix}"
                     staged.rename(final)
                     staged = None
-                    rel = final.relative_to(self.store.run_dir).as_posix()
+                    rel = final.relative_to(run_dir).as_posix()
                     con.execute("UPDATE result SET path=? WHERE id=?", (rel, result_id))
                 row = con.execute("SELECT * FROM result WHERE id=?", (result_id,)).fetchone()
                 result = _row_to_result(row)
@@ -2000,6 +2142,12 @@ class AgentRoom:
             for leftover in (staged, final):
                 if leftover is not None:
                     leftover.unlink(missing_ok=True)
+
+    def copy_file(self, rel: str, target: Path) -> str:
+        """Copy a regular file of my working folder to `target` (no link followed, no FIFO,
+        no hardlink, at most `MAX_ATTACHMENT_BYTES`); returns its name. `RoomError` with a
+        German reason otherwise. For arr's own copies, e.g. versions of an artifact (W4-03)."""
+        return self._copy_source(rel, target)
 
     def submit_rating(
         self,
