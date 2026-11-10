@@ -370,6 +370,9 @@ class FakeBackend:
         self.run_id = run_id
         self.room = room
         self._session = f"fake-{config.id}"
+        self._sessions = 1
+        self.history: list[str] = []
+        """Prompts of the current session: what the agent „remembers“ (cleared by `reset`)."""
         self._turn = 0
         self._played: dict[str | None, int] = {}  # turns played per `by_stage` key / `turns`
         self._started = False
@@ -411,6 +414,19 @@ class FakeBackend:
         self._wake.set()
         return True
 
+    async def reset(self) -> None:
+        """A fresh session with the next turn (W4-03 F5): a new session mark, empty `history`.
+
+        Like the real backends only between turns; a no-op after `close()`.
+        """
+        if self._closed:
+            return
+        if self._running:
+            raise RuntimeError("FakeBackend: reset während eines Turns")
+        self._sessions += 1
+        self._session = f"fake-{self.config.id}-{self._sessions}"
+        self.history = []
+
     def session_ref(self) -> dict[str, str]:
         """Session / thread ID for `session.json`, named like the real backend's."""
         if not self._started:
@@ -446,6 +462,7 @@ class FakeBackend:
         self._wake.clear()
         self._hints.clear()
         self._turn += 1
+        self.history.append(prompt)
         state = _TurnState(self._turn)
         try:
             yield self._event(

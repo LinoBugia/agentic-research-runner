@@ -14,7 +14,10 @@ hands it to the topology (`async def run(ctx: RunContext) -> None`, E8). The orc
   `arr.runs.pacing` (`discuss`);
 - sets the status after a turn (docs/09 §4.2): `done` when the agent reported it, submitted a
   result without an open question of its own, or was `done` before and was woken by a message
-  to it (L13); `waiting` after `wait_until`; `idle` otherwise;
+  to it (L13); `waiting` after `wait_until`; `idle` otherwise. `done` counts per phase (W4-03
+  F1): a turn or a discussion of another stage makes a finished agent `idle` again;
+- opens and closes channels for the topology (F3), seals and releases the results of a phase
+  (F4), starts fresh sessions (F5) and keeps files in `output/` (`save_output`, `read_output`);
 - turns a question of an agent to the user (`@user`, L16) into an open item „Frage“ of the
   approval inbox and closes it when the user answers in the channel or in the inbox, or when
   the run ends;
@@ -27,12 +30,15 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import stat
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from arr.backends.base import (
@@ -50,11 +56,19 @@ from arr.models import AgentStatus, ResolvedRun, Rubric
 from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.types import ApprovalType, EscalationOption
 from arr.room.address import address, is_user_question
-from arr.room.store import ORCHESTRATOR, USER, WAIT_UNTIL_MAX_MIN, AgentRoom, RoomStore
+from arr.room.store import (
+    ORCHESTRATOR,
+    USER,
+    WAIT_UNTIL_MAX_MIN,
+    AgentRoom,
+    ChannelState,
+    RoomStore,
+)
 from arr.room.types import (
     DeliveryStatus,
     Message,
     MessageKind,
+    MessageVia,
     Rating,
     Result,
     RoomError,
@@ -409,6 +423,10 @@ class Orchestrator(RunContext):
             for agent_id, agent in prepared.agents.items()
         }
         self._waiting = {c.name for c in prepared.resolved.groupchats if c.open_from}
+        self._held: set[str] = set()
+        """Channels the topology closed (F3): no stage opens them, only `open_channel`."""
+        self._phase: dict[str, str] = {}
+        """The stage of each agent's latest turn or discussion: `done` counts per phase (F1)."""
         self._active: dict[str, _ActiveTurn] = {}
         self._listeners: list[_Listener] = []
         self._senders: dict[int, str] = {}
@@ -624,6 +642,8 @@ class Orchestrator(RunContext):
         full_prompt = self._prompt_with_inbox(agent_id, prompt)
         self.room.add_assignment(agent_id, number, prompt, stage=stage, context=context)
         before = max((r.id for r in self.room.results(agent=agent_id)), default=0)
+        if stage is not None:
+            self._enter_phase(handle, stage)
         was_done = handle.status is AgentStatus.DONE
         self._end_long_wait(agent_id)
         self._yielding.pop(agent_id, None)
@@ -841,6 +861,18 @@ class Orchestrator(RunContext):
         if reason is not None and not (was_done and reason == "reported"):
             self.log.write("agent_done", agent=agent_id, reason=reason, turn=handle.turns_used)
 
+    def _enter_phase(self, handle: AgentHandle, stage: str) -> None:
+        """F1: `done` counts per phase. When the agent enters another stage than its last one,
+        a `done` of the earlier phase ends: it is `idle` again (not after its turn quota)."""
+        previous = self._phase.get(handle.id)
+        self._phase[handle.id] = stage
+        if previous == stage or handle.status is not AgentStatus.DONE:
+            return
+        if handle.id in self._exhausted:
+            return
+        self._set_status(handle, AgentStatus.IDLE)
+        self.log.write("agent_phase", agent=handle.id, stage=stage, previous=previous)
+
     def _posted_result(self, agent_id: str, mark: int) -> bool:
         return any(
             m.sender == agent_id and m.kind is MessageKind.RESULT
@@ -1022,7 +1054,7 @@ class Orchestrator(RunContext):
 
     def _reach_stage(self, stage: str) -> None:
         self.stage = stage
-        for name in sorted(self._waiting):
+        for name in sorted(self._waiting - self._held):
             open_from = self.config.channel(name).open_from
             if open_from == stage or (
                 open_from in self.plan
@@ -1077,6 +1109,9 @@ class Orchestrator(RunContext):
             raise ArrError(f"Den Kanal „{channel}“ gibt es in diesem Run nicht.") from None
         if stage is not None:
             await self.checkpoint(stage, channel=channel, phase="discussion")
+            for member in config.members:  # F1: a new phase, `done` from before ends
+                if member in self._handles and not self.is_busy(member):
+                    self._enter_phase(self._handles[member], stage)
         if channel in self._waiting:
             raise ArrError(
                 f"Der Kanal #{channel} ist noch geschlossen. Er öffnet ab Stufe "
@@ -1095,6 +1130,132 @@ class Orchestrator(RunContext):
             turns=len(outcome.outcomes),
         )
         return outcome
+
+    # ----------------------------------------------------------------------------------------
+    # W4-03: channels, sealed results, sessions, files
+    # ----------------------------------------------------------------------------------------
+
+    def _channel_config(self, channel: str) -> None:
+        try:
+            self.config.channel(channel)
+        except KeyError:
+            raise ArrError(f"Den Kanal „{channel}“ gibt es in diesem Run nicht.") from None
+
+    @property
+    def run_folder(self) -> Path:
+        """Absolute run folder (for paths in context packages)."""
+        return self.prepared.run_dir.absolute()
+
+    def open_channel(self, channel: str) -> None:
+        """Open a channel for its members (again), see `RunContext.open_channel` (F3)."""
+        self._channel_config(channel)
+        self._held.discard(channel)
+        if channel in self._waiting or self.room.channel_state(channel) is not ChannelState.OPEN:
+            self.room.open_channel(channel)
+            self._waiting.discard(channel)
+            self.log.write("channel_open", channel=channel, stage=self.stage, by="topology")
+
+    def close_channel(self, channel: str) -> None:
+        """Close a channel for its members like a `waiting` one (F3); hints about it that
+        wait for a running turn are dropped. Only `open_channel` opens it again."""
+        self._channel_config(channel)
+        self._held.add(channel)
+        if channel in self._waiting:
+            return
+        self.room.hold_channel(channel)
+        self._waiting.add(channel)
+        for active in self._active.values():
+            active.pending = [m for m in active.pending if m.channel != channel]
+        self.log.write("channel_close", channel=channel, stage=self.stage)
+
+    async def reset_session(self, agent_id: str) -> None:
+        """The agent's next turn starts a fresh session (F5); after its running turn."""
+        self._handle(agent_id)
+        async with self._locks[agent_id]:
+            await self.backends[agent_id].reset()
+        self.log.write("session_reset", agent=agent_id, stage=self.stage)
+
+    def seal_results(self, stage: str, channel: str | None = None) -> None:
+        """Hide the results of `stage` until `release_results` (F4)."""
+        if channel is not None:
+            self._channel_config(channel)
+        self.room.seal(stage, channel)
+        self.log.write("results_sealed", stage=stage, channel=channel)
+
+    def release_results(self, stage: str) -> list[Result]:
+        """Release the sealed results of `stage` (F4); returns them."""
+        released = self.room.release(stage)
+        self.log.write("results_released", stage=stage, results=[r.id for r in released])
+        return released
+
+    def shown_name(self, viewer: str, agent: str) -> str:
+        """How `viewer` sees `agent` (alias in an anonymous channel of `viewer`, F4)."""
+        return self._views[viewer].shown_name(agent)
+
+    def result_text(self, result_id: int, max_bytes: int = 64 * 1024) -> str:
+        """Body or start of the file of a result, also of a sealed one (arr's own reading)."""
+        return self.room.result_text(result_id, max_bytes)
+
+    def _run_path(self, rel: str, *, under: str = "") -> Path:
+        path = PurePosixPath(rel)
+        if path.is_absolute() or not path.parts or ".." in path.parts or "\0" in rel:
+            raise ArrError(f"„{rel}“ ist kein Pfad innerhalb des Runs.")
+        return self.prepared.run_dir / under / path
+
+    def save_output(
+        self,
+        dest: str,
+        *,
+        text: str | None = None,
+        agent: str | None = None,
+        source: str | None = None,
+    ) -> str:
+        """Write `output/<dest>` from `text` or a safe copy of `source` (see `RunContext`)."""
+        if (text is None) == (source is None):
+            raise ValueError("save_output needs either text or source")
+        target = self._run_path(dest, under="output")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}")
+        try:
+            if text is not None:
+                temp.write_text(text, encoding="utf-8")
+            else:
+                assert source is not None
+                if agent is not None:
+                    view = self._views[agent]
+                else:  # a file of the run folder (`base/…`, `output/…`), no agent's view
+                    view = AgentRoom(self.room, next(iter(self._handles)), self.prepared.run_dir)
+                try:
+                    view.copy_file(source, temp)
+                except RoomError as exc:
+                    raise ArrError(str(exc)) from None
+            os.replace(temp, target)
+        finally:
+            temp.unlink(missing_ok=True)
+        return target.relative_to(self.prepared.run_dir).as_posix()
+
+    def read_output(self, rel: str, max_bytes: int) -> str | None:
+        """Text of a file below the run folder that arr wrote, or None (see `RunContext`)."""
+        try:
+            path = self._run_path(rel)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except (ArrError, OSError):
+            return None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+                return None
+            data = os.read(fd, max_bytes + 1)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+        if len(data) > max_bytes:
+            return None
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
 
     # helpers for arr.runs.pacing
 
@@ -1191,8 +1352,8 @@ class Orchestrator(RunContext):
                         self.reset_until_streak(agent_id)  # L10: a message to it
             if is_user_question(msg) and msg.open and msg.sender in self._handles:
                 self._open_user_question(msg)
-            elif msg.sender == USER and self._questions:
-                self._close_answered_questions(msg)
+            elif msg.sender == USER and self._questions and msg.via is not MessageVia.USER_AGENT:
+                self._close_answered_questions(msg)  # never by Claude Code (E15, W4-01 H1)
             for listener in list(self._listeners):
                 listener.on_message(msg)
         self._sync_blocked()

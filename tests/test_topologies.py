@@ -191,12 +191,10 @@ def resolved_run(kind: str, agents: list[dict[str, Any]], **extra: Any) -> Resol
 # --------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ["exploration", "review"])
-def test_exploration_and_review_are_not_available_yet(kind: str) -> None:
-    with pytest.raises(ArrError, match=f"Die Topologie „{kind}“ ist noch nicht verfügbar"):
-        topology_for(kind)
-    with pytest.raises(ArrError, match="noch nicht verfügbar. Verfügbar sind: solo, roundtable"):
-        check_topology(resolved_run(kind, [agent("a")]))
+@pytest.mark.parametrize("kind", ["solo", "roundtable", "exploration", "waterfall", "review"])
+def test_every_topology_is_available(kind: str) -> None:
+    """Since W4-03 all five topologies of docs/03 §4 run."""
+    assert callable(topology_for(kind))
 
 
 def test_unknown_topology_kind() -> None:

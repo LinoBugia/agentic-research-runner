@@ -35,13 +35,19 @@ from dataclasses import dataclass, field
 from statistics import fmean
 from typing import Any
 
-from arr.backends.base import TurnOutcome, TurnStatus
 from arr.errors import ConfigIssue
 from arr.models import ResolvedRun, Rubric, StageSpec
 from arr.permissions.types import EscalationOption
 from arr.room.types import Rating, Result
 from arr.runs.context import RunContext, TurnJob
-from arr.runs.topologies import describe, ensure_valid, int_param, require_task
+from arr.runs.topologies import (
+    ask_for_result,
+    describe,
+    ensure_valid,
+    int_param,
+    require_task,
+    result_ref,
+)
 
 PLAN = "plan"
 MAX_REWORK = 2
@@ -154,18 +160,6 @@ class _Attempt:
     @property
     def score(self) -> float | None:
         return fmean(r.score for r in self.ratings) if self.ratings else None
-
-
-def _result_ref(result: Result) -> dict[str, Any]:
-    ref: dict[str, Any] = {
-        "id": result.id,
-        "stage": result.stage,
-        "title": result.title,
-        "path": result.path,
-    }
-    if result.path is None:
-        ref["body"] = result.body
-    return ref
 
 
 class _Waterfall:
@@ -306,7 +300,7 @@ class _Waterfall:
             "stage": stage.name,
             "attempt": number,
             "produces": stage.produces,
-            "accepted": [_result_ref(r) for r in self.accepted],
+            "accepted": [result_ref(r) for r in self.accepted],
         }
         if last:
             previous = last[0]
@@ -340,19 +334,16 @@ class _Waterfall:
             prompt += " Das ist eine Nacharbeit: Die Ratings deines letzten Versuchs stehen dort "
             prompt += "unter `rework`."
         prompt += " Gib dein Ergebnis mit `submit_result` ab."
-        outcome = await self.ctx.turn(stage.agent, prompt, stage=stage.name, context=context)
+        attempt.result = await ask_for_result(
+            self.ctx,
+            stage.agent,
+            prompt,
+            f"Du hast für {what} noch kein Ergebnis abgegeben. Gib es jetzt mit "
+            "`submit_result` ab.",
+            stage=stage.name,
+            context=context,
+        )
         self._check_stop()
-        attempt.result = _last_result(outcome)
-        if attempt.result is None:
-            outcome = await self.ctx.turn(
-                stage.agent,
-                f"Du hast für {what} noch kein Ergebnis abgegeben. Gib es jetzt mit "
-                "`submit_result` ab.",
-                stage=stage.name,
-                context=context,
-            )
-            self._check_stop()
-            attempt.result = _last_result(outcome)
         if attempt.result is not None:
             attempt.ratings = await self._ratings(stage, attempt.result, context)
         return attempt
@@ -367,7 +358,7 @@ class _Waterfall:
             "attempt": context["attempt"],
             "result_id": result.id,
             "result_ids": [result.id],
-            "result": _result_ref(result),
+            "result": result_ref(result),
             "accepted": context["accepted"],
             "scale": list(self.rubric.scale),
             "criteria": self.rubric.criteria,
@@ -393,13 +384,6 @@ class _Waterfall:
 
     def _raters_of(self, result: Result) -> set[str]:
         return {r.rater for r in self.ctx.ratings(result.id)}
-
-
-def _last_result(outcome: TurnOutcome) -> Result | None:
-    """The last result of a turn; a turn with status `error` counts as one without result."""
-    if outcome.status is TurnStatus.ERROR or not outcome.results:
-        return None
-    return outcome.results[-1]
 
 
 async def run(ctx: RunContext) -> None:

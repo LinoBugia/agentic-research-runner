@@ -18,7 +18,9 @@ does not stop the others):
    name), `output/results.json`, `output/ratings.json`.
 5. `usage.json`, and an empty `approvals.jsonl` if there were no requests.
 6. `output/summary.md` (German): status and reason, duration, agents, stages with attempts and
-   scores, results with links, a summarizer's summary, usage sums, hints.
+   scores, the overview a topology built itself (`review`: verdict and rounds, `exploration`:
+   ranking; the latest checkpoint with `overview`, W4-03 F8/F9), results with links, a
+   summarizer's summary, usage sums, hints.
 
 Running it again overwrites every file with the same content (idempotent).
 See docs/02-workfolder-und-runs.md §4, §7.
@@ -156,6 +158,17 @@ def _duration(seconds: float) -> str:
 def _safe_kind(kind: str) -> str:
     """Same file-name rule as `AgentRoom.submit_result`."""
     return "".join(c if c.isalnum() or c in "-_" else "-" for c in kind)
+
+
+def one_line(text: str, limit: int = 200) -> str:
+    """Agent text inside a line of `summary.md` (W4-03.1 G4): one line, at most `limit`
+    characters, Markdown marks escaped, so a title cannot add a heading or break a link."""
+    line = " ".join(str(text).split())
+    if len(line) > limit:
+        line = line[: limit - 1].rstrip() + "…"
+    for mark in ("\\", "|", "*", "_", "`", "#", "[", "]", "<", ">"):
+        line = line.replace(mark, "\\" + mark)
+    return line
 
 
 def result_file(result: Result) -> str:
@@ -507,6 +520,7 @@ class _Finalizer:
             role = f", Rolle {Path(agent.role).stem}" if agent.role else ""
             lines.append(f"- `{agent.id}`: {agent.provider.value}, {agent.model}{role}")
         lines += self._stages(entries)
+        lines += self._overview(entries)
         lines += self._results_section(entries)
         lines += self._summarizer()
         lines += self._usage_section()
@@ -578,6 +592,16 @@ class _Finalizer:
             lines += ["", *ends] if rows else ends
         return lines
 
+    @staticmethod
+    def _overview(entries: Sequence[Mapping[str, Any]]) -> list[str]:
+        """The overview of the latest checkpoint that has one (review, exploration)."""
+        found = [
+            e["data"]["overview"]
+            for e in entries
+            if e["kind"] == "checkpoint" and isinstance(e["data"].get("overview"), str)
+        ]
+        return ["", "## Übersicht", "", found[-1]] if found else []
+
     def _results_section(self, entries: Sequence[Mapping[str, Any]]) -> list[str]:
         lines = ["", "## Ergebnisse", ""]
         if not self.results:
@@ -592,7 +616,8 @@ class _Finalizer:
             scores.setdefault(rating.result_id, []).append(rating.score)
         for result in self.results:
             link = Path(result_file(result)).relative_to("output").as_posix()
-            text = f"- [#{result.id} {result.title}]({link}) · `{result.agent}` · {result.kind}"
+            title = one_line(result.title)
+            text = f"- [#{result.id} {title}]({link}) · `{result.agent}` · {one_line(result.kind)}"
             if result.stage:
                 text += f" · Stufe {result.stage}, Versuch {result.attempt}"
             if result.id in scores:
@@ -613,7 +638,14 @@ class _Finalizer:
             return []
         last = summaries[-1]
         body = last.body or f"Siehe [{Path(str(last.path)).name}](../{last.path})."
-        return ["", f"## Zusammenfassung von {last.agent}", "", f"**{last.title}**", "", body]
+        return [
+            "",
+            f"## Zusammenfassung von {last.agent}",
+            "",
+            f"**{one_line(last.title)}**",
+            "",
+            body,
+        ]
 
     def _usage_section(self) -> list[str]:
         if self.usage is None:
@@ -682,7 +714,7 @@ def _usage_line(label: str, total: UsageTotal) -> str:
 
 
 def _result_markdown(result: Result, ratings: Iterable[Rating]) -> str:
-    lines = [f"# {result.title}", ""]
+    lines = [f"# {one_line(result.title)}", ""]
     meta = [f"Ergebnis #{result.id}", f"`{result.agent}`", result.kind]
     if result.stage:
         meta.append(f"Stufe {result.stage}, Versuch {result.attempt}")

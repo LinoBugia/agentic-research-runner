@@ -1122,3 +1122,44 @@ def test_w3_06_3_an_inherited_env_file_is_replaced(setup: Setup, monkeypatch) ->
     """Started from a Claude Code session, arr must not hand its env file to the agents."""
     options = options_for(setup, env={**CLAUDE_SWITCHES, "CLAUDE_ENV_FILE": "/elsewhere"})
     assert options.env["CLAUDE_ENV_FILE"] == str(setup.agent().agent_dir / "shell-env.sh")
+
+
+# --------------------------------------------------------------------------------------------
+# W4-03 F5: a fresh session per review round
+# --------------------------------------------------------------------------------------------
+
+
+async def test_w4_03_reset_starts_a_new_cli_session_with_the_context_again(setup: Setup) -> None:
+    """`reset` disconnects the CLI; the next turn connects a new one (a new session), sends
+    `context.md` again and counts cost from zero. Counter-check: without `reset` the second
+    turn runs in the same client without the context."""
+    first = [_result(session_id="s-alt", total_cost_usd=0.5)]
+    # larger than the first sum: only a new cost basis counts it in full (M22 of the review)
+    second = [_result(session_id="s-neu", total_cost_usd=0.8)]
+    backend, clients = make_backend(setup, [first, second, [_result()]])
+    try:
+        await collect(backend, "Runde 1")
+        assert backend.session_ref() == {"session_id": "s-alt"}
+        await backend.reset()
+        assert clients[0].disconnected
+        events = await collect(backend, "Runde 2")
+        await collect(backend, "Runde 2b")  # without reset: same client, no context
+    finally:
+        await backend.close()
+    assert len(clients) == 2, "a new client, so a new CLI session"
+    assert clients[1].queries[0].startswith("## Projektkontext")
+    assert clients[1].queries[0].endswith("Runde 2")
+    assert clients[1].queries[1] == "Runde 2b"
+    assert not any("Runde 1" in q for q in clients[1].queries)
+    end = events[-1].data
+    assert end["session"] == "s-neu"
+    assert end["cost_usd"] == pytest.approx(0.8), "cost counts from zero in the new session"
+    assert end["usage"]["input"] == 10, "tokens count from zero in the new session"
+
+
+async def test_w4_03_reset_after_close_does_nothing(setup: Setup) -> None:
+    backend, clients = make_backend(setup, [[_result()]])
+    await collect(backend, "Los")
+    await backend.close()
+    await backend.reset()
+    assert len(clients) == 1

@@ -191,7 +191,7 @@ def build_lab(
     run = prepare_run(wf, run_input, resolved, settings)
     agent = run.agents[agent_id]
     run_paths = RunPaths(wf, run.run_dir, settings.toolchain)
-    (run_paths.tmp_dir / "home" / agent_id).mkdir(parents=True, exist_ok=True)
+    (run_paths.agent_tmp_dir(agent.file.config) / "home").mkdir(parents=True, exist_ok=True)
     create_run_venv(run_paths, agent.file.base_python, with_pip=with_pip)
     RoomStore.create(run.run_dir).setup_channels(resolved.groupchats, {})
     subprocess.run(["git", "init", "-q", str(agent.work_dir)], check=True)

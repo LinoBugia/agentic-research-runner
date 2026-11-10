@@ -3,12 +3,17 @@
 A topology is `async def run(ctx: RunContext) -> None` (E8). The orchestrator (W2-03)
 implements `RunContext`; tests can implement it on top of the FakeBackend.
 See docs/01-architektur.md §3, §6 and docs/03-skills-und-research-groups.md §4.
+
+Since W4-03: a phase is a stage (`turn`/`turns`/`discuss` with `stage`); finished (`done`)
+counts per phase (F1). Topologies open and close channels (F3), seal the results of a phase
+until they are released (F4), start fresh sessions (F5) and keep files in `output/`.
 """
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from arr.backends.base import TurnOutcome
@@ -201,3 +206,69 @@ class RunContext(ABC):
         - Wake-up turns get `stage` and `context` like the kick-off turns. Hints mid-turn and
           the inbox work in and outside of discussions.
         """
+
+    # -- W4-03: phases, channels, sealed results, sessions, files ---------------------------
+
+    @property
+    @abstractmethod
+    def run_folder(self) -> Path:
+        """Absolute run folder: context packages name files with absolute paths (W4-03), since
+        agents do not know where the run lies."""
+
+    @abstractmethod
+    def open_channel(self, channel: str) -> None:
+        """Open a channel for its members (again): they can read and write it (F3)."""
+
+    @abstractmethod
+    def close_channel(self, channel: str) -> None:
+        """Close a channel for its members like a `waiting` one: not readable, not writable,
+        no hints, no wake-ups (F3). It stays closed until `open_channel`; reaching a stage
+        does not open it again. The history stays for GUI and export."""
+
+    @abstractmethod
+    async def reset_session(self, agent_id: str) -> None:
+        """The agent's next turn starts a fresh session that knows no earlier turn (F5).
+
+        Waits for a running turn of the agent to end first.
+        """
+
+    @abstractmethod
+    def seal_results(self, stage: str, channel: str | None = None) -> None:
+        """Results submitted in `stage` from now on stay hidden from every other agent, in
+        the room and as files, until `release_results(stage)` (F4). File names use the
+        aliases of `channel` if it is anonymous."""
+
+    @abstractmethod
+    def release_results(self, stage: str) -> list[Result]:
+        """Release the sealed results of `stage` (files to `output/results/`); returns them."""
+
+    @abstractmethod
+    def shown_name(self, viewer: str, agent: str) -> str:
+        """How `viewer` sees `agent`: its alias when an anonymous channel of `viewer` hides it
+        (also a closed one), else its ID. For context packages (F4)."""
+
+    @abstractmethod
+    def result_text(self, result_id: int, max_bytes: int = 64 * 1024) -> str:
+        """Body or start of the file of a result as text (also of a sealed one), for arr's
+        own reading: verdicts, objections, digests. Never follows a link."""
+
+    @abstractmethod
+    def save_output(
+        self,
+        dest: str,
+        *,
+        text: str | None = None,
+        agent: str | None = None,
+        source: str | None = None,
+    ) -> str:
+        """Write `output/<dest>` and return its path relative to the run folder.
+
+        Either `text`, or a copy of `source`: relative to the working folder of `agent`, or,
+        without `agent`, relative to the run folder (e.g. `base/…`, `output/results/…`).
+        Copies follow no link and refuse FIFOs, hardlinks and huge files (`ArrError`).
+        """
+
+    @abstractmethod
+    def read_output(self, rel: str, max_bytes: int) -> str | None:
+        """Text of a file arr wrote below the run folder (e.g. `output/artifacts/…`); None if
+        it is missing, a link, not a regular file, larger than `max_bytes` or not UTF-8."""

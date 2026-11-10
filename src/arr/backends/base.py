@@ -308,6 +308,15 @@ class AgentBackend(Protocol):
         """Return session/thread IDs for `session.json`, e.g. `{"session_id": …}`."""
         ...
 
+    async def reset(self) -> None:
+        """Start a fresh session with the next turn: it knows no earlier turn (W4-03 F5).
+
+        Claude disconnects its CLI and connects anew with the next turn, sending `context.md`
+        again; Codex starts a new thread; the FakeBackend takes a new session mark. Only
+        between turns; a no-op after `close()`.
+        """
+        ...
+
     async def close(self) -> None:
         """Release the SDK client and subprocesses; safe to call more than once."""
         ...
