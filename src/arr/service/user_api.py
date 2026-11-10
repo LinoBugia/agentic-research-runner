@@ -778,8 +778,7 @@ def scrub(text: str, *inputs: Any) -> str:
     for value in sorted({v for i in inputs for v in _strings(i)}, key=len, reverse=True):
         if len(value) < 4:
             continue
-        forms = [value, value[:37] + "…", value[:37], *value.splitlines()]
-        for form in sorted(set(forms), key=len, reverse=True):
+        for form in (value, value[:37] + "…", value[:37]):
             if len(form) >= 4:
                 text = text.replace(form, "…")
     return redact(text)
