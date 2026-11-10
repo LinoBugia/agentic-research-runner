@@ -163,7 +163,7 @@ def test_row_read_in_work_dir_run_and_read_dirs_is_allowed(env: Env) -> None:
         read("~/Literatur/paper.pdf"),
         read(env.run / "shared" / "other" / "lemma.tex"),
         read(env.workfolder / "projects" / "collatz", tool="Grep"),
-        read(env.run / "tmp" / "scratch.txt"),
+        read(env.run / "tmp" / "explorer-1" / "scratch.txt"),  # own Run-tmp (W4-03.2)
     ]:
         decision = engine.evaluate(request)
         assert decision.action is ALLOW, (request.paths, decision.reason)
@@ -175,7 +175,7 @@ def test_row_write_in_work_dir_and_released_run_folders_is_allowed(env: Env) -> 
     for request in [
         write(env.work / "solve.py"),
         write("sub/dir/result.txt", tool="Edit"),
-        write(env.run / "tmp" / "x.bin"),
+        write(env.run / "tmp" / "explorer-1" / "x.bin"),
         write(env.run_venv / "lib" / "site.py", tool="fileChange"),
     ]:
         assert engine.evaluate(request).action is ALLOW, request.paths
@@ -736,9 +736,10 @@ def test_l11_system_paths(views: Views) -> None:
 def test_claude_translation_is_complete(views: Views, env: Env) -> None:
     claude = views.claude
     assert claude.cwd == str(env.work)
-    assert claude.add_dirs == [str(env.run / "tmp"), str(env.run_venv)]
+    own_tmp = env.run / "tmp" / "explorer-1"
+    assert claude.add_dirs == [str(own_tmp), str(env.run_venv)]
     assert claude.permission_mode == "acceptEdits"
-    assert claude.env == {"TMPDIR": str(env.run / "tmp")}
+    assert claude.env == {"TMPDIR": str(own_tmp)}
     assert claude.allowed_tools[0] == "mcp__arr-room__*"
     bare = {"Read", "Grep", "Glob", "Bash", "Write", "Edit", "WebFetch", "WebSearch"}
     assert not bare & set(claude.allowed_tools)
@@ -757,8 +758,12 @@ def test_claude_translation_is_complete(views: Views, env: Env) -> None:
     assert sandbox["failIfUnavailable"] is True
     assert sandbox["network"] == {"allowedDomains": []}
     fs = sandbox["filesystem"]
-    assert fs["allowWrite"] == [str(env.work), str(env.run / "tmp"), str(env.run_venv)]
+    assert fs["allowWrite"] == [str(env.work), str(own_tmp), str(env.run_venv)]
     assert {str(env.home), "/Volumes", str(env.workfolder)} <= set(fs["denyRead"])
+    # W4-03.2: Codex gets `agents/`, `shared/`, `tmp/` as deny; the Claude CLI not (it would
+    # also deny the own folders below them; its shell keeps the others out, probe N1/N2)
+    private = {str(env.run / "agents"), str(env.run / "shared"), str(env.run / "tmp")}
+    assert not private & set(fs["denyRead"])
     assert str(env.home / ".ssh") in fs["denyRead"]
     assert str(env.literature) in fs["allowRead"]
 
@@ -769,17 +774,20 @@ def test_codex_translation_is_complete(views: Views, env: Env) -> None:
     assert codex.sandbox == "workspace_write"
     assert codex.approvals_reviewer == "user"
     assert codex.sandbox_workspace_write == {
-        "writable_roots": [str(env.run / "tmp"), str(env.run_venv)],
+        "writable_roots": [str(env.run / "tmp" / "explorer-1"), str(env.run_venv)],
         "network_access": False,
         "exclude_slash_tmp": True,
         "exclude_tmpdir_env_var": True,
     }
-    assert codex.env == {"TMPDIR": str(env.run / "tmp")}
+    assert codex.env == {"TMPDIR": str(env.run / "tmp" / "explorer-1")}
     access = {e["path"]: e["access"] for e in codex.permission_profile["filesystem"]}
     assert access[str(env.work)] == "write"
     assert access[str(env.literature)] == "read"
     assert access[str(env.home)] == "deny"
     assert access[str(env.home / ".ssh")] == "deny"
+    for private in ("agents", "shared", "tmp"):  # W4-03.2 N1, N2
+        assert access[str(env.run / private)] == "deny", private
+    assert access[str(env.run / "tmp" / "explorer-1")] == "write"
     assert codex.permission_profile["name"] == "arr-explorer-1"
 
 
@@ -1749,7 +1757,8 @@ def test_w2011_user_temp_dirs_are_blocked_by_default(
         profile = env.profile(env.agent(provider=provider))
         assert claude_tmp in profile.read_deny and process_tmp in profile.read_deny
         assert not profile.can_read(claude_tmp / "scratchpad" / "notes.md")
-        assert profile.can_read(env.work / "a.py") and profile.can_read(env.run / "tmp" / "x")
+        own_tmp = env.run / "tmp" / "explorer-1"
+        assert profile.can_read(env.work / "a.py") and profile.can_read(own_tmp / "x")
         if provider == "claude":
             deny_read = claude_options(profile).sandbox["filesystem"]["denyRead"]
             assert str(claude_tmp) in deny_read and str(process_tmp) in deny_read
@@ -1768,13 +1777,14 @@ def test_w2011_temp_dirs_deny_reading_but_keep_run_tmp(env: Env, tmp_path: Path)
         assert not profile.can_read(path)
         assert engine.evaluate(read(path)).action is ASK
         assert engine.evaluate(bash(f"cat {path}")).action is DENY
-    run_tmp = env.run / "tmp" / "cache" / "pip"
+    own_tmp = env.run / "tmp" / "explorer-1"
+    run_tmp = own_tmp / "cache" / "pip"
     assert profile.can_read(run_tmp) and profile.can_write(run_tmp)
-    assert engine.evaluate(bash(f"python3 -c 1 > {env.run / 'tmp' / 'out.txt'}")).action is ALLOW
+    assert engine.evaluate(bash(f"python3 -c 1 > {own_tmp / 'out.txt'}")).action is ALLOW
 
 
 def test_w2011_temp_dir_below_run_tmp_stays_readable(env: Env) -> None:
-    inside = env.run / "tmp" / "T"
+    inside = env.run / "tmp" / "explorer-1" / "T"  # below the agent's own Run-tmp (W4-03.2)
     profile = env.profile(temp_dirs=[inside])
     assert inside not in profile.read_deny
     assert profile.can_read(inside / "x.txt")
@@ -1883,7 +1893,8 @@ def test_w3_00_a10_claude_sandbox_and_file_tools_follow(venv_env) -> None:
     assert open_in_root == sorted(
         [str(env.run_venv), str(root / "venvs" / "mathe"), str(root / "venvs" / "tools" / "bin")]
     )
-    assert fs["allowWrite"] == [str(env.work), str(env.run / "tmp"), str(env.run_venv)]
+    own_tmp = env.run / "tmp" / "explorer-1"
+    assert fs["allowWrite"] == [str(env.work), str(own_tmp), str(env.run_venv)]
     other = root / "runs" / "20261029-1200_other_custom_beef" / "c.txt"
     assert not claude_sandbox_reads(claude, str(other))
     assert claude_sandbox_reads(claude, str(env.run_venv / "bin" / "python"))
@@ -2039,7 +2050,7 @@ def test_w3_03_1_the_exact_flag_survives_arr_yaml(env: Env) -> None:
     assert env.engine(rules=rules).evaluate(bash("pip install evilpkg")).action is ASK
 
 
-@pytest.mark.parametrize("host", ["*.example.com", "*", "ex?mple.com", "[ab].example.com"])
+@pytest.mark.parametrize("host", ["*.example.com", "ex?mple.com", "[ab].example.com"])
 def test_w3_03_2_a_host_pattern_becomes_no_rule(env: Env, host: str) -> None:
     engine = env.engine()
     request = req("SandboxNetworkAccess", hosts=[host])
@@ -2051,7 +2062,7 @@ def test_w3_03_2_a_host_pattern_becomes_no_rule(env: Env, host: str) -> None:
     assert engine.evaluate(other).action is ASK
 
 
-@pytest.mark.parametrize("command", ["curl https://*.example.com/x", "curl https://*/x"])
+@pytest.mark.parametrize("command", ["curl https://*.example.com/x"])
 def test_w3_03_2_a_curl_with_a_host_pattern_leaves_the_sandbox_alone(
     env: Env, command: str
 ) -> None:
@@ -2067,7 +2078,7 @@ def test_w3_03_2_a_curl_with_a_host_pattern_leaves_the_sandbox_alone(
 
 
 def test_w3_03_2_exact_holds_up_to_the_sandbox(env: Env) -> None:
-    exact = AlwaysRule(action="allow", hosts=["*.example.com", "*", "oeis.org"], exact=True)
+    exact = AlwaysRule(action="allow", hosts=["*.example.com", "oeis.org"], exact=True)
     profile = env.profile(rules=PermissionRules(always=[exact]))
     assert profile.allowed_domains == ("oeis.org",)
     assert claude_options(profile).sandbox["network"]["allowedDomains"] == ["oeis.org"]
@@ -2198,8 +2209,13 @@ def url_host(host: str) -> str:
 
 @pytest.mark.parametrize("host", LOOPBACK)
 def test_w4_01_g8_loopback_is_denied_without_question_also_with_always(env: Env, host: str) -> None:
-    always = AlwaysRule(action="allow", hosts=[host, "*"], exact=False)
-    for engine in (env.engine(), env.engine(env.profile(), rules=PermissionRules(always=[always]))):
+    """The fixed loopback rule goes before every rule: also before an allow rule that names
+    the host or `*` (built here past its check, as an old `arr.yaml` might hold it)."""
+    smuggled = AlwaysRule.model_construct(
+        action="allow", hosts=[host, "*"], exact=False, tools=[], paths=[], commands=[], reason=""
+    )
+    rules = PermissionRules.model_construct(always=[smuggled], sensitive_paths=[])
+    for engine in (env.engine(), env.engine(env.profile(), rules=rules)):
         for request in (
             req("SandboxNetworkAccess", hosts=[host]),
             bash(f"curl -s http://{url_host(host)}/api"),
@@ -2207,11 +2223,104 @@ def test_w4_01_g8_loopback_is_denied_without_question_also_with_always(env: Env,
             decision = engine.evaluate(request)
             assert decision.action is DENY, (host, request.tool, decision.action)
             assert "diesem Rechner selbst" in decision.reason
-    profile = env.profile(rules=PermissionRules(always=[always]))
-    assert host.lower().strip("[]") not in profile.allowed_domains
+    profile = env.profile(rules=rules)
+    assert profile.allowed_domains == (), "neither the host nor `*` reaches the sandbox"
 
 
 def test_w4_01_g8_counter_check_other_hosts_still_ask(env: Env) -> None:
     engine = env.engine()
     for host in ("oeis.org", "10.0.0.1", "local.example.com", "localhost.example.com"):
         assert engine.evaluate(req("SandboxNetworkAccess", hosts=[host])).action is ASK, host
+
+
+# --------------------------------------------------------------------------------------------
+# W4-03.2 N3, G-N3: no pattern opens loopback, *.localhost with a port is loopback
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "host", ["*", "*.*", "*localhost*", "*.localhost", "127.*", "localhost", "[::1]", "*:*"]
+)
+def test_w4_03_2_n3_a_rule_with_a_host_reaching_loopback_does_not_load(host: str) -> None:
+    with pytest.raises(ValueError, match="Verbindungen zu diesem Rechner selbst"):
+        PermissionRules.from_settings({"always": [{"action": "allow", "hosts": [host]}]})
+
+
+def test_w4_03_2_n3_counter_check_other_patterns_load_and_deny_rules_stay(env: Env) -> None:
+    rules = PermissionRules.from_settings(
+        {
+            "always": [
+                {"action": "allow", "hosts": ["*.example.com", "oeis.org"]},
+                {"action": "deny", "hosts": ["*"]},
+            ]
+        }
+    )
+    assert env.profile(rules=rules).allowed_domains == ("*.example.com", "oeis.org")
+
+
+@pytest.mark.parametrize("host", ["*", "*.*", "*localhost*"])
+def test_w4_03_2_n3_a_requested_pattern_reaching_loopback_is_denied(env: Env, host: str) -> None:
+    decision = env.engine().evaluate(req("SandboxNetworkAccess", hosts=[host]))
+    assert decision.action is DENY and "diesem Rechner selbst" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["a1b2c3.localhost:7777", "foo.localhost:8080", "localhost:8080", "127.0.0.1:8080",
+     "[::1]:8080", "a1b2c3.localhost"],
+)  # fmt: skip
+def test_w4_03_2_g_n3_loopback_with_port(env: Env, host: str) -> None:
+    """From the reviewer's `test_w4031_loopback_ports.py`: tool, shell and WebFetch."""
+    engine = env.engine()
+    url = f"http://{host}/api"
+    for request in (
+        req("SandboxNetworkAccess", hosts=[host]),
+        bash(f"curl -s {url}"),
+        req("WebFetch", urls=[url]),
+    ):
+        assert engine.evaluate(request).action is DENY, (host, request.tool)
+
+
+def test_w4_03_2_n2_another_agents_run_tmp_is_foreign(env: Env) -> None:
+    """User 10.11.: Run-tmp per agent; another agent's is never readable, also with an
+    „immer“ rule for the run. Counter-check: the own Run-tmp is readable and writable."""
+    other = env.run / "tmp" / "judge-2" / "entwurf.md"
+    output = env.run / "tmp" / "judge-2" / "claude-501" / "x" / "tasks" / "b1.output"
+    always = AlwaysRule(action="allow", paths=[str(env.run)])
+    for profile in (env.profile(), env.profile(rules=PermissionRules(always=[always]))):
+        engine = env.engine(profile)
+        for path in (other, output, env.run / "tmp"):
+            for request in (read(path), read(path, tool="Grep"), bash(f"cat {path}")):
+                assert engine.evaluate(request).action is DENY, (path, request.tool)
+        assert not profile.can_read(other)
+        codex = codex_access(codex_options(profile), str(other))
+        assert codex == "deny"
+        assert not claude_sandbox_reads(claude_options(profile), str(other))
+    own = env.profile()
+    mine = env.run / "tmp" / "explorer-1" / "entwurf.md"
+    assert own.can_read(mine) and own.can_write(mine)
+    assert own.tmp_dir == env.run / "tmp" / "explorer-1"
+
+
+def test_w4_03_2_n1_a_rule_for_the_run_opens_no_other_agents_folder_in_the_sandboxes(
+    env: Env,
+) -> None:
+    """Codex and Claude sandbox: `agents/`, `shared/` and `tmp/` of the run are denied, so a
+    read rule „immer“ for the run folder (also one made from a decision) opens no folder of
+    another agent. Counter-check: the own folders and `output/` stay open."""
+    engine = env.engine()
+    request = read(env.run / "groupchats" / "attachments" / "x" / "a.png")  # some run path
+    assert engine.evaluate(request).action in (ALLOW, ASK)
+    always = AlwaysRule(action="allow", tools=["Read"], paths=[str(env.run)])
+    profile = env.profile(rules=PermissionRules(always=[always]))
+    codex, claude = codex_options(profile), claude_options(profile)
+    for foreign in (
+        env.run / "agents" / "judge-2" / "work" / "review.md",
+        env.run / "agents" / "judge-2" / "transcript.jsonl",
+        env.run / "shared" / "beweis" / "lemma.tex",
+    ):
+        assert codex_access(codex, str(foreign)) == "deny", foreign
+        assert not claude_sandbox_reads(claude, str(foreign)), foreign
+    for own in (env.work / "a.py", env.run / "output" / "summary.md"):
+        assert codex_access(codex, str(own)) in ("read", "write"), own
+        assert claude_sandbox_reads(claude, str(own)), own

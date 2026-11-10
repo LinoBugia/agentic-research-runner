@@ -175,7 +175,7 @@ def test_every_existing_entry_follows_profile(layout: dict[str, Path]) -> None:
     _, profile, paths = setup(layout)
     entries = filesystem_entries(profile, paths, ["main"])
     run, home = layout["run"], layout["home"]
-    allowed = [layout["work"], run / "tmp", run / "output", home / "readdir"]
+    allowed = [layout["work"], run / "tmp" / "gpt-1", run / "output", home / "readdir"]
     allowed.append(run / "groupchats" / "attachments" / "main")
     assert entries[str(home)] == "deny"
     for path in [home, *tree(home)]:
@@ -209,7 +209,8 @@ def test_write_roots_and_system(layout: dict[str, Path]) -> None:
     run = layout["run"]
     assert entries[":root"] == "read"
     assert codex_access(entries, layout["work"] / "new.py") == "write"
-    assert codex_access(entries, run / "tmp" / "x") == "write"
+    assert codex_access(entries, run / "tmp" / "gpt-1" / "x") == "write"  # own Run-tmp
+    assert codex_access(entries, run / "tmp" / "gpt-2" / "x") == "deny"  # W4-03.2 N2
     assert codex_access(entries, run_venv(paths) / "bin" / "python") == "write"
     assert codex_access(entries, run / ".venv" / "bin" / "python") == "deny"  # no <run>/.venv
     assert codex_access(entries, layout["home"] / "readdir" / "x.txt") == "read"
@@ -535,11 +536,11 @@ def test_launch_env_and_thread_config(layout: dict[str, Path], tmp_path: Path) -
     run = layout["run"]
     env = launch.env
     assert env["CODEX_HOME"] == str(tmp_path / "ch")
-    assert env["TMPDIR"] == str(run / "tmp")
+    assert env["TMPDIR"] == str(run / "tmp" / "gpt-1")
     # the app-server's git reads $HOME/.gitconfig: no write root (W3-06.3), the commands
     # get a writable HOME of their own
     assert env["HOME"] == str(run / "agents" / "gpt-1" / "home")
-    assert launch.shell_env["HOME"] == str(run / "tmp" / "home" / "gpt-1")
+    assert launch.shell_env["HOME"] == str(run / "tmp" / "gpt-1" / "home")  # W4-03.2
     assert not profile.can_write(Path(env["HOME"]) / ".gitconfig")
     venv = str(paths.venv_dir / "bin")  # outside the run folder (W3-00)
     # the app-server runs outside the sandbox: the run venv is for the commands only (B1)
@@ -743,7 +744,7 @@ def test_no_source_puts_a_write_root_on_the_app_servers_path(
 ) -> None:
     """W3-06.3, B1: run venv, `path_prepend` and the inherited PATH, each with a write root."""
     agent, profile, paths = setup(layout)
-    work_bin, tmp_bin = str(layout["work"] / "bin"), str(layout["run"] / "tmp" / "bin")
+    work_bin, tmp_bin = str(layout["work"] / "bin"), str(layout["run"] / "tmp" / "gpt-1" / "bin")
     file = agent.file.model_copy(update={"path_prepend": [work_bin, "/opt/base/bin"]})
     agent = PreparedAgent(file, agent.run_dir)
     environ = {"PATH": f"{tmp_bin}:bin:/usr/bin"}

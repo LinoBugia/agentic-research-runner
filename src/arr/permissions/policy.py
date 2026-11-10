@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from arr.errors import ArrError
 from arr.models import (
@@ -608,6 +608,20 @@ class AlwaysRule(StrictModel):
     reason: str = ""
     exact: bool = False
 
+    @model_validator(mode="after")
+    def _no_loopback(self) -> "AlwaysRule":
+        """An allow rule never includes this machine (W4-03.2 N3): `localhost` or a pattern
+        such as `*` that matches it does not load, with a German message."""
+        if self.action == "allow":
+            bad = [h for h in self.hosts if reaches_loopback(h)]
+            if bad:
+                raise ValueError(
+                    f"Die Regel „immer“ erlaubt {', '.join(repr(h) for h in bad)} und damit "
+                    "Verbindungen zu diesem Rechner selbst (localhost, 127.0.0.1 …). Das ist nie "
+                    "erlaubt: Nenne die Hosts einzeln, ohne „*“ für alle oder für localhost."
+                )
+        return self
+
 
 class PermissionRules(StrictModel):
     """Schema of `permissions:` in `arr.yaml` (docs/02 §1.1, docs/07 §3 ②).
@@ -634,8 +648,9 @@ class PermissionRules(StrictModel):
 class RunPaths:
     """Folders of one run that the profile needs (docs/02 §1, §4).
 
-    Run-tmp is `<run>/tmp`, the run venv `<venv root>/runs/<run-id>/` outside `~`
-    (`arr.venvs`, W3-00), the Claude plugin of an agent `agents/<id>/plugin` (Codex skills
+    Run-tmp is `<run>/tmp`, one folder `tmp/<id>/` per agent (W4-03.2), the run venv
+    `<venv root>/runs/<run-id>/` outside `~` (`arr.venvs`, W3-00), the Claude plugin of an
+    agent `agents/<id>/plugin` (Codex skills
     live in `work/.agents/skills`). Relative read folders are resolved against the
     workfolder.
     """
@@ -646,8 +661,13 @@ class RunPaths:
 
     @property
     def tmp_dir(self) -> Path:
-        """Run-tmp; `TMPDIR` of every agent points here (docs/07 §3 ①)."""
+        """Run-tmp, the root of the agents' temp folders `tmp/<id>/` (docs/07 §3 ①)."""
         return self.run_dir / "tmp"
+
+    def agent_tmp_dir(self, agent: AgentConfig) -> Path:
+        """The agent's own Run-tmp `tmp/<id>/`: its `TMPDIR`, `CLAUDE_CODE_TMPDIR`, Codex
+        command `HOME` and a write root. Another agent's is foreign (W4-03.2 N2, User 10.11.)."""
+        return self.tmp_dir / agent.id
 
     @property
     def venv_dir(self) -> Path:
@@ -726,10 +746,11 @@ class SandboxProfile:
     hidden: tuple[Path, ...] = ()
     """The `RUN_HIDDEN_PATHS` of the run (also in `sensitive`): sealed results, room database."""
     private_roots: tuple[Path, ...] = ()
-    """`agents/` and `shared/` of the run: below them only `own` is this agent's (W4-03.1 H1)."""
+    """`agents/`, `shared/` and `tmp/` of the run: below them only `own` is this agent's
+    (W4-03.1 H1, W4-03.2 N2)."""
     own: tuple[Path, ...] = ()
-    """This agent's folder `agents/<id>/`, its working folder and the run folders its
-    configuration names in `read_dirs` (`run:shared/<name>`)."""
+    """This agent's folder `agents/<id>/`, its working folder, its Run-tmp `tmp/<id>/` and the
+    run folders its configuration names in `read_dirs` (`run:shared/<name>`)."""
 
     def resolve(self, raw: str | Path, base: Path | None = None) -> Path:
         """Normalize a path given by the agent (relative to `base` or the work folder)."""
@@ -902,7 +923,8 @@ def profile_for(
         return normalize_path(raw, base=base, home=home)
 
     work_dir = norm(paths.work_dir(agent))
-    tmp_dir = norm(paths.tmp_dir)
+    tmp_dir = norm(paths.agent_tmp_dir(agent))
+    run_tmp = norm(paths.tmp_dir)
     run_venv = paths.toolchain.run_venv is RunVenvMode.OVERLAY
     write_roots = [work_dir, tmp_dir] + ([norm(paths.venv_dir)] if run_venv else [])
 
@@ -941,7 +963,7 @@ def profile_for(
             domains += [
                 h.lower()
                 for h in rule.hosts
-                if (not rule.exact or _plain_host(h)) and not is_loopback(h)  # W4-01 G8
+                if (not rule.exact or _plain_host(h)) and not reaches_loopback(h)  # G8, N3
             ]
 
     sensitive = [norm(home / p) for p in SENSITIVE_HOME_PATHS]
@@ -963,7 +985,11 @@ def profile_for(
     for path in in_venvs:
         if not any(_key_within(_key(path, ci), _key(t, ci)) for t in toolchain):
             read_allow.remove(path)
-    read_deny = [home, *(norm(p) for p in READ_BLOCKED_ROOTS), workfolder, venvs]
+    # the folders of the agents: denied for the shells too, so that no read folder or rule
+    # „immer“ for the run opens another agent's (W4-03.2 N1, N2); the agent's own folders
+    # are more specific write or read entries
+    private = [norm(run_dir / "agents"), norm(run_dir / "shared"), run_tmp]
+    read_deny = [home, *(norm(p) for p in READ_BLOCKED_ROOTS), workfolder, venvs, *private]
     for raw in user_temp_dirs() if temp_dirs is None else temp_dirs:
         temp = norm(raw)
         if not _key_within(_key(temp, ci), _key(tmp_dir, ci)):
@@ -987,8 +1013,8 @@ def profile_for(
         venv_dir=venv_dir,
         base_venv=base_venv,
         hidden=_dedupe(hidden, ci),
-        private_roots=(norm(run_dir / "agents"), norm(run_dir / "shared")),
-        own=_dedupe([norm(run_dir / "agents" / agent.id), work_dir, *configured], ci),
+        private_roots=tuple(private),
+        own=_dedupe([norm(run_dir / "agents" / agent.id), work_dir, tmp_dir, *configured], ci),
     )
 
 
@@ -1051,6 +1077,16 @@ def claude_options(profile: SandboxProfile) -> ClaudeOptions:
         key = profile.key(path)
         return any(_key_within(profile.key(d), key) for d in profile.read_deny)
 
+    def opens_private(path: Path) -> bool:
+        """A read folder in the workfolder above `agents/`, `shared/` or `tmp/` of the run,
+        e.g. the run folder of a read rule „immer“: in `allowRead` it would open the other
+        agents' folders for the shell (measured, W4-03.2 N1), and denying those again also
+        denies the own folders below them. The Read tool still reads it through the rule."""
+        key = profile.key(path)
+        return _key_within(key, profile.key(profile.workfolder)) and any(
+            _key_within(profile.key(r), key) for r in profile.private_roots
+        )
+
     allowed = [f"{ROOM_TOOL_PREFIX}*"]
     allowed += [
         f"Read({_claude_path(p, tree=True)})"
@@ -1078,8 +1114,15 @@ def claude_options(profile: SandboxProfile) -> ClaudeOptions:
         "filesystem": {
             "allowWrite": [str(p) for p in profile.write_roots],
             "denyWrite": protected_write_globs(profile),
-            "denyRead": [str(p) for p in (*profile.read_deny, *profile.sensitive)],
-            "allowRead": [str(p) for p in profile.read_allow],
+            # not `agents/`, `shared/`, `tmp/` of the run: the CLI then also denies the own
+            # folders below them when a read rule „immer“ covers the run (measured, W4-03.2);
+            # its shell keeps the other agents out by the workfolder deny (probe N1, N2)
+            "denyRead": [
+                str(p)
+                for p in (*profile.read_deny, *profile.sensitive)
+                if p not in profile.private_roots
+            ],
+            "allowRead": [str(p) for p in profile.read_allow if not opens_private(p)],
         },
     }
     return ClaudeOptions(
@@ -2162,11 +2205,11 @@ def is_loopback(host: str) -> bool:
     name = host.strip().lower()
     if name.startswith("[") and "]" in name:  # [::1] or [::1]:80
         name = name[1 : name.index("]")]
-    name = name.rstrip(".")
-    if name.rsplit(":", 1)[0] in ("localhost",) or name.endswith(".localhost"):
-        return True
-    if name.count(":") == 1:  # host:port
+    if name.count(":") == 1:  # host:port, also <name>.localhost:7777 (G-N3)
         name = name.rsplit(":", 1)[0]
+    name = name.rstrip(".")
+    if name == "localhost" or name.endswith(".localhost"):
+        return True
     try:
         address = ipaddress.ip_address(name.split("%", 1)[0])
     except ValueError:
@@ -2179,6 +2222,33 @@ def is_loopback(host: str) -> bool:
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
         address = address.ipv4_mapped
     return address.is_loopback or address.is_unspecified
+
+
+_LOOPBACK_SAMPLES = (
+    "localhost",
+    "arr.localhost",
+    "a.b.localhost",
+    "127.0.0.1",
+    "127.1",
+    "0.0.0.0",
+    "::1",
+    "[::1]",
+    "::",
+    "::ffff:127.0.0.1",
+    "2130706433",
+)
+
+
+def reaches_loopback(host: str) -> bool:
+    """True for a host or host pattern that includes this machine (W4-03.2 N3): a loopback
+    host itself or a pattern such as `*`, `*.*`, `*localhost*`, `127.*` that matches one. Such
+    a host never goes into `allowedDomains`, and an allow rule with it does not load."""
+    if is_loopback(host):
+        return True
+    pattern = host.strip().lower()
+    if not any(c in pattern for c in "*?["):
+        return False
+    return any(fnmatch.fnmatchcase(sample, pattern) for sample in _LOOPBACK_SAMPLES)
 
 
 def _plain_host(host: str) -> bool:
@@ -2480,7 +2550,7 @@ class PolicyEngine:
         hosts += [h for h in (_host_of(u) for u in request.urls) if h]
         for host in dict.fromkeys(hosts):
             key: ItemKey = ("host", host.rsplit(":", 1)[0])
-            if is_loopback(host):
+            if reaches_loopback(host):
                 analysis.ban(_R_LOOPBACK, RequestCategory.NETWORK)
             elif tool in WEB_TOOLS:
                 analysis.facts.add(key)  # allowed with tools.web, but always-deny rules apply
@@ -2577,7 +2647,7 @@ class PolicyEngine:
         normalized = _normalize_command(command)
         analysis.facts.add(("command", normalized))
         for host in info.hosts:
-            if is_loopback(host):
+            if reaches_loopback(host):
                 analysis.ban(_R_LOOPBACK, RequestCategory.NETWORK)
             else:
                 analysis.ask(("host", host), RequestCategory.NETWORK)

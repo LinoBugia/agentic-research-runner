@@ -3,10 +3,11 @@
 `RunManager.run()` goes through docs/02 §7 and writes every status change with its time to
 `meta.json` at once (atomically) and to `orchestrator.jsonl`:
 
-- `preparing`: `prepare_run` (also into a reserved folder), `tmp/`, the run venv (with
-  `run_venv: overlay`), `groupchats/room.sqlite` with the channels, the PolicyEngine with one
-  profile per agent, the `ApprovalInbox` with the given decider, one EventLogger and one
-  backend per agent (from the backend factory, after the profiles are registered), `start()`.
+- `preparing`: `prepare_run` (also into a reserved folder), `tmp/<id>/` per agent, the run
+  venv (with `run_venv: overlay`), `groupchats/room.sqlite` with the channels, the
+  PolicyEngine with one profile per agent, the `ApprovalInbox` with the given decider, one
+  EventLogger and one backend per agent (from the backend factory, after the profiles are
+  registered), `start()`.
 - `running` ⇄ `paused`: the topology runs with the `Orchestrator` as `RunContext`; limits,
   concurrency per auth profile, rate limits, hints and pacing are the orchestrator's job.
   The wall time is watched here.
@@ -523,6 +524,8 @@ class RunManager:
         resolved = prepared.resolved
         paths = RunPaths(self.workfolder, run_dir, self.settings.toolchain)
         paths.tmp_dir.mkdir(exist_ok=True)
+        for agent in resolved.agents:  # one Run-tmp per agent, foreign for the others (W4-03.2)
+            paths.agent_tmp_dir(agent).mkdir(exist_ok=True)
         if self.settings.toolchain.run_venv is RunVenvMode.OVERLAY:
             base = next((a.file.base_python for a in prepared.agents.values()), None)
             await asyncio.to_thread(create_run_venv, paths, base, with_pip=self.venv_with_pip)
