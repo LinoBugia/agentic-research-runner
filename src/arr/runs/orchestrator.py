@@ -68,6 +68,7 @@ from arr.room.types import (
     DeliveryStatus,
     Message,
     MessageKind,
+    MessageVia,
     Rating,
     Result,
     RoomError,
@@ -1351,8 +1352,8 @@ class Orchestrator(RunContext):
                         self.reset_until_streak(agent_id)  # L10: a message to it
             if is_user_question(msg) and msg.open and msg.sender in self._handles:
                 self._open_user_question(msg)
-            elif msg.sender == USER and self._questions:
-                self._close_answered_questions(msg)
+            elif msg.sender == USER and self._questions and msg.via is not MessageVia.USER_AGENT:
+                self._close_answered_questions(msg)  # never by Claude Code (E15, W4-01 H1)
             for listener in list(self._listeners):
                 listener.on_message(msg)
         self._sync_blocked()

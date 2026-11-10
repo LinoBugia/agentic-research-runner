@@ -584,24 +584,26 @@ class RoomStore:
         return released
 
     def result_text(self, result_id: int, max_bytes: int) -> str:
-        """Body of a result, or the start of its file (also a sealed one) as text, for arr's
-        own reading (verdicts, digests); at most `max_bytes`, never through a link."""
+        """Body of a result and the start of its file (also a sealed one) as text, for arr's
+        own reading (verdicts, digests): together at most `max_bytes` characters (W4-03.1 H2:
+        `body` is as long as the agent wants), never through a link."""
         result = self.result(result_id)
-        if not result.path:
-            return result.body or ""
+        body = (result.body or "")[:max_bytes]
+        if not result.path or len(body) >= max_bytes:
+            return body
         try:
             fd = os.open(self.run_dir / result.path, _FILE_FLAGS)
         except OSError:
-            return result.body or ""
+            return body
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):
-                return result.body or ""
+                return body
             data = os.read(fd, max_bytes)
         finally:
             os.close(fd)
         text = data.decode("utf-8", errors="replace")
-        return f"{result.body}\n\n{text}" if result.body else text
+        return (f"{body}\n\n{text}" if body else text)[:max_bytes]
 
     def _resolved(self) -> ResolvedRun | None:
         if not hasattr(self, "_run"):
@@ -772,7 +774,8 @@ class RoomStore:
         The user answers open questions to the user in the channel (L16): a message with
         `reply_to` on such a question, or one to its asker (`to`, `@name`), closes it. A message
         without addressee and without `reply_to` answers nothing: a note to all stays a note to
-        all (User 08.11., W3-09.1).
+        all (User 08.11., W3-09.1). A message with `via: user_agent` (Claude Code) answers no
+        question to the user, whatever it addresses (E15, W4-01 H1); it still wakes.
         """
         if sender not in RESERVED_SENDERS:
             raise ValueError(f"post() writes as orchestrator or user, not as {sender!r}")
@@ -797,7 +800,10 @@ class RoomStore:
             if sender == USER:  # `@name` of the user addresses like `to` (docs/09 §4.1)
                 named = mentions(body, ch.members, USER, lambda n: n if n in ch.members else None)
                 to = [*to, *named]
-                asked = self._open_user_questions(con, channel)
+                # E15 (W4-01 H1): only the user answers a question to the user; a message of
+                # the user agent (Claude Code, `post_to_run`) addresses and wakes, nothing more
+                if via is not MessageVia.USER_AGENT:
+                    asked = self._open_user_questions(con, channel)
             if reply_to is not None:
                 self._check_reply_to(con, ch.name, reply_to, ArrError)
             for question in asked:

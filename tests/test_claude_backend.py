@@ -1134,7 +1134,8 @@ async def test_w4_03_reset_starts_a_new_cli_session_with_the_context_again(setup
     `context.md` again and counts cost from zero. Counter-check: without `reset` the second
     turn runs in the same client without the context."""
     first = [_result(session_id="s-alt", total_cost_usd=0.5)]
-    second = [_result(session_id="s-neu", total_cost_usd=0.2)]
+    # larger than the first sum: only a new cost basis counts it in full (M22 of the review)
+    second = [_result(session_id="s-neu", total_cost_usd=0.8)]
     backend, clients = make_backend(setup, [first, second, [_result()]])
     try:
         await collect(backend, "Runde 1")
@@ -1152,7 +1153,8 @@ async def test_w4_03_reset_starts_a_new_cli_session_with_the_context_again(setup
     assert not any("Runde 1" in q for q in clients[1].queries)
     end = events[-1].data
     assert end["session"] == "s-neu"
-    assert end["cost_usd"] == pytest.approx(0.2), "cost counts from zero in the new session"
+    assert end["cost_usd"] == pytest.approx(0.8), "cost counts from zero in the new session"
+    assert end["usage"]["input"] == 10, "tokens count from zero in the new session"
 
 
 async def test_w4_03_reset_after_close_does_nothing(setup: Setup) -> None:

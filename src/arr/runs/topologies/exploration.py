@@ -9,10 +9,11 @@ Phases (`PHASES`, the plan of the run; `open_from` must name one of them, F2):
    the other). The explorers work in parallel, in lockstep: `turns_per_idea` turns per idea,
    each ending with a state `submit_result(kind="exploration")`; the latest one counts. A
    silent explorer is asked once more after its last turn, then the idea stays without result.
-   `exchange`: `none` (isolated: the results of the phase are sealed until the ranking, F4),
-   `channel` (the explorers talk in their channel, `channel` names it if there are several),
-   `digest` (sealed as well; arr puts title and start of the other explorers' latest results
-   into every package, without a model).
+   `exchange`: `none` (isolated: the results of the phase are sealed until the ranking, F4,
+   and channels the explorers share are closed in the phase, F3), `channel` (the explorers
+   talk in their channel, `channel` names it if there are several), `digest` (isolated as
+   well; arr puts title and start of the other explorers' latest results into every package,
+   without a model).
 2. `bewertung`: the `rankers` rate every result with `submit_rating` (scores per criterion of
    `criteria`), in parallel, a missing rating is asked once more; nobody rates their own.
    The ranking is the mean of the rankers' scores, ties and ideas without score stay in the
@@ -31,6 +32,7 @@ empty; default `ranker*`), `turns_per_idea` (1), `exchange` (`none`), `channel`,
 """
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from statistics import fmean
 from typing import Any
@@ -41,6 +43,7 @@ from arr.models import ResolvedRun
 from arr.room.types import Rating, Result
 from arr.runs import topologies
 from arr.runs.context import RunContext
+from arr.runs.finalize import one_line
 from arr.runs.topologies import (
     agent_param,
     agents_param,
@@ -204,6 +207,17 @@ def check(resolved: ResolvedRun) -> list[ConfigIssue]:
 # --------------------------------------------------------------------------------------------
 
 
+def counted_ratings(ratings: list[Rating], rankers: list[str], since: float) -> list[Rating]:
+    """F8, G3: only ratings of the rankers that were given (or changed) in the phase
+    `bewertung` count; an explorer who is also a ranker cannot rate blind before it."""
+    return [r for r in ratings if r.rater in rankers and r.ts >= since]
+
+
+def table_cell(text: str | None, limit: int = 80) -> str:
+    """Agent text for a Markdown table cell (G4), see `arr.runs.finalize.one_line`."""
+    return one_line(text, limit) if text else "–"
+
+
 class _Stopped(Exception):
     """The run stops (user stop or limit): the topology returns."""
 
@@ -243,6 +257,7 @@ class _Exploration:
         self.scale = list(rubric.scale) if rubric else None
         self.guide = read_template("prompts", "exploration_explorer.md")
         self.ideas: list[_Idea] = []
+        self.rating_since = float("inf")
 
     def _check_stop(self) -> None:
         if self.ctx.stop_requested:
@@ -290,7 +305,7 @@ class _Exploration:
             found = self._new_ideas(mark)
         for index, result in enumerate(found[:n], 1):
             text = self.ctx.result_text(result.id, TEXT_BYTES) or result.title
-            self.ideas.append(_Idea(f"I{index}", result.title, text))
+            self.ideas.append(_Idea(f"I{index}", _short(result.title), text))
         await self.ctx.checkpoint(
             IDEEN,
             ideas=len(self.ideas),
@@ -306,8 +321,11 @@ class _Exploration:
 
     async def _explore(self) -> None:
         sealed = self.exchange in ("none", "digest")
+        closed = self._shared_channels() if sealed else []
         if sealed:  # isolated explorers do not read each other's files (F4 as a variable)
             self.ctx.seal_results(EXPLORATION, None)
+        for name in closed:  # … and do not talk to each other (M1, F3)
+            self.ctx.close_channel(name)
         explorers = self.explorers
         slots = [
             self.ideas[start : start + len(explorers)]
@@ -333,12 +351,25 @@ class _Exploration:
         finally:
             if sealed:
                 self.ctx.release_results(EXPLORATION)
+            for name in closed:
+                self.ctx.open_channel(name)
         await self.ctx.checkpoint(
             EXPLORATION,
             phase="end",
             results={i.id: i.result.id if i.result else None for i in self.ideas},
             missing=[i.id for i in self.ideas if i.result is None],
         )
+
+    def _shared_channels(self) -> list[str]:
+        """Channels two or more explorers share and that are open in this phase (no
+        `open_from` after `exploration`): closed while the explorers work isolated (M1)."""
+        reached = PHASES[: PHASES.index(EXPLORATION) + 1]
+        return [
+            chat.name
+            for chat in self.ctx.config.groupchats
+            if sum(e in chat.members for e in self.explorers) > 1
+            and (chat.open_from is None or chat.open_from in reached)
+        ]
 
     def _package(self, explorer: str, idea: _Idea, turn: int) -> dict[str, Any]:
         package: dict[str, Any] = {
@@ -368,7 +399,7 @@ class _Exploration:
                 {
                     "idea": idea.title,
                     "by": self.ctx.shown_name(explorer, result.agent),
-                    "title": result.title,
+                    "title": _short(result.title, 200),
                     "start": text[:DIGEST_CHARS] + (" …" if len(text) > DIGEST_CHARS else ""),
                 }
             )
@@ -423,7 +454,7 @@ class _Exploration:
             entry: dict[str, Any] = {
                 "result_id": result.id,
                 "idea": idea.title,
-                "title": result.title,
+                "title": _short(result.title, 200),
                 "by": self.ctx.shown_name(ranker, result.agent),
                 "excerpt": text[:EXCERPT_CHARS] + (" …" if len(text) > EXCERPT_CHARS else ""),
             }
@@ -438,13 +469,17 @@ class _Exploration:
             "scale": self.scale,
         }
 
+    def _counted(self, result: Result) -> list[Rating]:
+        """The ratings of a result that count: from the rankers, in the phase `bewertung`."""
+        return counted_ratings(self.ctx.ratings(result.id), self.rankers, self.rating_since)
+
     def _todo(self, ranker: str) -> list[_Idea]:
         return [
             i
             for i in self.ideas
             if i.result is not None
             and i.result.agent != ranker
-            and not any(r.rater == ranker for r in self.ctx.ratings(i.result.id))
+            and not any(r.rater == ranker for r in self._counted(i.result))
         ]
 
     async def _rank(self) -> None:
@@ -454,12 +489,13 @@ class _Exploration:
                 BEWERTUNG, ratings=0, reason="no_rankers" if rated else "no_results"
             )
             return
+        self.rating_since = time.time()  # G3: a rating before the phase was given blind
         await self.ctx.checkpoint(BEWERTUNG, rankers=self.rankers, results=len(rated))
         await asyncio.gather(*(self._ranker(r) for r in self.rankers))
         self._check_stop()
         for idea in rated:
             assert idea.result is not None
-            idea.ratings = [r for r in self.ctx.ratings(idea.result.id) if r.rater in self.rankers]
+            idea.ratings = self._counted(idea.result)
         await self.ctx.checkpoint(
             BEWERTUNG,
             phase="end",
@@ -530,7 +566,8 @@ class _Exploration:
             score = "–" if row["score"] is None else f"{row['score']:.1f}".replace(".", ",")
             result = f"#{row['result']}" if row["result"] else "keins"
             who = name(row["agent"]) if row["agent"] else "–"
-            lines.append(f"| {row['rank']} | {row['title']} | {who} | {result} | {score} |")
+            title = table_cell(row["title"])
+            lines.append(f"| {row['rank']} | {title} | {table_cell(who)} | {result} | {score} |")
         if not self.rankers:
             lines += ["", "Ohne Ranker: Die Reihenfolge ist die der Ideen."]
         return "\n".join(lines)
@@ -556,7 +593,7 @@ class _Exploration:
                 "task": self.task,
                 "overview": self._overview(ranking, lambda a: self.ctx.shown_name(viewer, a)),
                 "results": [
-                    {"idea": i.title, "result": i.result.id, "title": i.result.title}
+                    {"idea": i.title, "result": i.result.id, "title": _short(i.result.title, 200)}
                     for i in self.ideas
                     if i.result is not None
                 ],

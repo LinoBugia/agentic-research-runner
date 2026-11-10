@@ -11,21 +11,26 @@ the hang it prevents:
 - W3 a discussion without contributions ends after its rounds (naive: no round limit).
 - W6 a fresh judge after `close` waits in the closed channel for messages: L7 ends its turn,
   the topology asks once more (naive: no L7 limit).
+
+W4-03.1 H2: hostile versions and reviews do not hold the event loop (naive: the diff in the
+loop without limits, the old verdict pattern); a stop during a long diff ends the run at once.
 """
 
 import asyncio
+import re
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
-from run_kit import agent, channel, log_entries, room, say
+from run_kit import agent, channel, eventually, log_entries, room, say
 from test_review_exploration import E1, J1, J2, R, a_review, author, explorer, judge, ranker
-from test_topologies import Recorder, checkpoints, setup, stage, staged
+from test_topologies import Recorder, checkpoints, setup, stage, staged, submit
 
 from arr.models import RunStatus
 from arr.room import waiting
 from arr.runs import topologies
+from arr.runs.topologies import review
 
 WALL = "6s"
 ENDLESS = 10**6
@@ -251,3 +256,163 @@ async def test_w6_a_fresh_judge_after_close_waits_in_the_closed_channel(
         ended = [e["data"] for e in log_entries(manager.run_dir, "end_turn")]
         assert [e["agent"] for e in ended] == [J1] and ended[0]["reason"] == "nobody"
         assert [c["verdict"] for c in checkpoints(manager, "urteil")] == ["major", "accept"]
+
+
+# --------------------------------------------------------------------------------------------
+# W4-03.1 H2: no hostile text holds the event loop
+# --------------------------------------------------------------------------------------------
+
+
+def hostile_version(size: int, step: int) -> str:
+    """Lines from only 150 different values: the worst case of `difflib` (review W4-03)."""
+    lines, total, i = [], 0, 0
+    while total < size:
+        line = f"{(i * step + 3) % 150}\n"
+        lines.append(line)
+        total += len(line)
+        i += 1
+    return "".join(lines)
+
+
+async def longest_stall(task: "asyncio.Task[Any]") -> float:
+    """The longest time the event loop did not come back to this coroutine while `task` ran."""
+    worst, last = 0.0, time.monotonic()
+    while not task.done():
+        await asyncio.sleep(0.02)
+        now = time.monotonic()
+        worst, last = max(worst, now - last), now
+    return worst
+
+
+def run_in_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Counter-check of H2: the diff runs in the event loop again, without size limits."""
+
+    async def inline(before: str, after: str, names: Any, **_: Any) -> str:
+        return review.unified_diff(before, after, *names)
+
+    monkeypatch.setattr(review, "MAX_DIFF_LINES", ENDLESS)
+    monkeypatch.setattr(review, "MAX_DIFF_BYTES", ENDLESS)
+    monkeypatch.setattr(review, "diff_elsewhere", inline)
+
+
+def revision_with(workfolder: Path, v1: str, v2: str) -> Any:
+    scripts = {
+        "author": author(v1, v2),
+        J1: judge([a_review("major", "x")], [a_review("accept")]),
+        J2: judge([a_review("major")], [a_review("accept")]),
+    }
+    return setup(
+        workfolder,
+        "review",
+        scripts,
+        params={"max_revisions": 1, "discussion_rounds": 0},
+        agents=[agent(a) for a in scripts],
+        groupchats=judges_chat(),
+    )
+
+
+@both
+async def test_h2_hostile_versions_do_not_hold_the_event_loop(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """Two 20 KB versions of 150 repeated lines: the diff alone takes about a second (measured
+    here). Guarded, arr writes a note instead and the loop never stops for long; naive (the
+    diff in the loop, no limits), the loop stands still that long."""
+    v1, v2 = hostile_version(20 * 1024, 1), hostile_version(20 * 1024, 7)
+    started = time.monotonic()
+    review.unified_diff(v1, v2, "a", "b")
+    cost = time.monotonic() - started
+    if naive:
+        run_in_the_loop(monkeypatch)
+    manager = revision_with(workfolder, v1, v2)
+    task = asyncio.create_task(manager.run())
+    stall = await longest_stall(task)
+    assert await task is RunStatus.DONE
+    diff = (manager.run_dir / "output/artifacts/v2/diff.patch").read_text()
+    if naive:
+        assert stall > cost / 2, (stall, cost)
+    else:
+        assert stall < cost / 3, (stall, cost)
+        assert diff.startswith("Kein Diff von v1 zu v2: Eine Fassung ist größer als 2000 Zeilen")
+
+
+@both
+async def test_h2_a_stop_during_a_long_diff_ends_the_run_in_time(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """Limits off, so the diff of hostile versions runs long: guarded in a thread, a stop ends
+    the run at once; naive (in the loop) the stop waits for the diff."""
+    v1, v2 = hostile_version(20 * 1024, 1), hostile_version(20 * 1024, 7)
+    started = time.monotonic()
+    review.unified_diff(v1, v2, "a", "b")
+    cost = time.monotonic() - started
+    monkeypatch.setattr(review, "MAX_DIFF_LINES", ENDLESS)
+    monkeypatch.setattr(review, "MAX_DIFF_BYTES", ENDLESS)
+    if naive:
+        run_in_the_loop(monkeypatch)
+    begun: list[float] = []
+    original = review.diff_elsewhere
+
+    async def diff(*args: Any, **kwargs: Any) -> Any:
+        begun.append(time.monotonic())
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(review, "diff_elsewhere", diff)
+    manager = revision_with(workfolder, v1, v2)
+    task = asyncio.create_task(manager.run())
+    await eventually(lambda: bool(begun) or task.done(), within=30)
+    manager.stop()
+    status = await asyncio.wait_for(task, 60)
+    latency = time.monotonic() - begun[0]
+    if naive:
+        assert latency > cost / 2, (latency, cost)
+    else:
+        assert status is RunStatus.STOPPED and latency < cost / 2, (status, latency, cost)
+
+
+_OLD_VERDICT_LINE = re.compile(
+    r"^[\s*_>#-]*(?:urteil|verdict)[\s*_]*[:=][\s*_]*(accept|minor|major|reject)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+"""The pattern of W4-03 before the review: quadratic on a text without a verdict (H2b)."""
+
+
+def old_parse_verdict(title: str, text: str) -> str | None:
+    found = _OLD_VERDICT_LINE.search(title) or _OLD_VERDICT_LINE.search(text)
+    return found.group(1).lower() if found else None
+
+
+@both
+async def test_h2_a_hostile_review_text_does_not_hold_the_event_loop(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """A review of 12 000 line breaks and a heading full of blanks, without a verdict: arr reads
+    it several times (check, asking again). Guarded each read is linear; naive (the old
+    pattern) the loop stands still for every read."""
+    hostile = "\n" * 12_000 + "kein Urteil\n# a" + " " * 12_000 + "b\n"
+    started = time.monotonic()
+    old_parse_verdict("Gutachten", hostile)
+    cost = time.monotonic() - started
+    if naive:
+        monkeypatch.setattr(review, "parse_verdict", old_parse_verdict)
+    scripts = {
+        "author": author("v1"),
+        J1: judge([submit("Gutachten", "review", hostile)]),
+        J2: judge([a_review("accept")]),
+    }
+    scripts[J1]["by_stage"]["pruefung"]["repeat_last"] = True
+    manager = setup(
+        workfolder,
+        "review",
+        scripts,
+        params={"max_revisions": 0},
+        agents=[agent(a) for a in scripts],
+        groupchats=judges_chat(),
+    )
+    task = asyncio.create_task(manager.run())
+    stall = await longest_stall(task)
+    assert await task is RunStatus.DONE
+    if naive:
+        assert stall > cost / 2, (stall, cost)
+    else:
+        assert stall < max(cost / 5, 0.15), (stall, cost)

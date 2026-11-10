@@ -160,6 +160,17 @@ def _safe_kind(kind: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "-" for c in kind)
 
 
+def one_line(text: str, limit: int = 200) -> str:
+    """Agent text inside a line of `summary.md` (W4-03.1 G4): one line, at most `limit`
+    characters, Markdown marks escaped, so a title cannot add a heading or break a link."""
+    line = " ".join(str(text).split())
+    if len(line) > limit:
+        line = line[: limit - 1].rstrip() + "…"
+    for mark in ("\\", "|", "*", "_", "`", "#", "[", "]", "<", ">"):
+        line = line.replace(mark, "\\" + mark)
+    return line
+
+
 def result_file(result: Result) -> str:
     """`output/results/NNN-<agent>-<kind>.md`, relative to the run folder."""
     return f"{RESULTS_DIR}/{result.id:03d}-{result.agent}-{_safe_kind(result.kind)}.md"
@@ -605,7 +616,8 @@ class _Finalizer:
             scores.setdefault(rating.result_id, []).append(rating.score)
         for result in self.results:
             link = Path(result_file(result)).relative_to("output").as_posix()
-            text = f"- [#{result.id} {result.title}]({link}) · `{result.agent}` · {result.kind}"
+            title = one_line(result.title)
+            text = f"- [#{result.id} {title}]({link}) · `{result.agent}` · {one_line(result.kind)}"
             if result.stage:
                 text += f" · Stufe {result.stage}, Versuch {result.attempt}"
             if result.id in scores:
@@ -626,7 +638,14 @@ class _Finalizer:
             return []
         last = summaries[-1]
         body = last.body or f"Siehe [{Path(str(last.path)).name}](../{last.path})."
-        return ["", f"## Zusammenfassung von {last.agent}", "", f"**{last.title}**", "", body]
+        return [
+            "",
+            f"## Zusammenfassung von {last.agent}",
+            "",
+            f"**{one_line(last.title)}**",
+            "",
+            body,
+        ]
 
     def _usage_section(self) -> list[str]:
         if self.usage is None:
@@ -695,7 +714,7 @@ def _usage_line(label: str, total: UsageTotal) -> str:
 
 
 def _result_markdown(result: Result, ratings: Iterable[Rating]) -> str:
-    lines = [f"# {result.title}", ""]
+    lines = [f"# {one_line(result.title)}", ""]
     meta = [f"Ergebnis #{result.id}", f"`{result.agent}`", result.kind]
     if result.stage:
         meta.append(f"Stufe {result.stage}, Versuch {result.attempt}")
