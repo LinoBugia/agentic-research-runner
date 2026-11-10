@@ -46,6 +46,8 @@ def seal_a_review(lab: Any) -> tuple[RoomStore, Path, str]:
     work = run_dir / "agents" / OTHER / "work"
     work.mkdir(parents=True)
     (work / "review.md").write_text(f"Urteil: major\n{bait}\n")
+    transcript = {"kind": "tool_call", "data": {"input": {"body": f"Urteil: major {bait}"}}}
+    (work.parent / "transcript.jsonl").write_text(json.dumps(transcript) + "\n")
     store = RoomStore(run_dir)
     store.seal("pruefung", None)
     store.add_assignment(OTHER, 1, "Prüfe.", stage="pruefung")
@@ -150,3 +152,60 @@ def _profile_without_hidden_paths(lab: Any) -> Any:
         return profile_for(lab.agent.file.config, lab.run_paths, PermissionRules(), home=lab.home)
     finally:
         policy.RUN_HIDDEN_PATHS = saved
+
+
+# --------------------------------------------------------------------------------------------
+# W4-03.1 H1 (User 10.11.): the other judge's draft and transcript, before the sealing
+# --------------------------------------------------------------------------------------------
+
+
+def foreign_targets(lab: Any) -> dict[str, Path]:
+    home = lab.run.run_dir / "agents" / OTHER
+    return {"Entwurf": home / "work" / "review.md", "Transkript": home / "transcript.jsonl"}
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_h1_the_shell_reads_no_folder_of_another_agent(provider: str) -> None:
+    """The draft lies in the other judge's working copy before `submit_result`, the text of
+    the review in its transcript. Counter-check: the same way reads a file of the agent's own
+    working folder."""
+    import login_guard_kit as kit
+
+    shell = claude_shell if provider == "claude" else codex_shell
+    with kit.open_lab(provider) as lab:
+        _, _, bait = seal_a_review(lab)
+        for name, target in foreign_targets(lab).items():
+            seen = shell(kit, lab, target)
+            assert seen["read"] == "denied: PermissionError", (name, seen["read"][:80])
+            assert bait not in json.dumps(seen)
+        own = lab.agent.work_dir / "eigen.md"
+        own.write_text(f"{bait}\n")
+        assert bait in shell(kit, lab, own)["read"]
+
+
+def test_h1_read_and_grep_read_no_folder_of_another_agent_not_even_with_an_approval() -> None:
+    import login_guard_kit as kit
+    from fake_messages_api import ToolCall
+
+    with kit.open_lab("claude") as lab:
+        _, _, bait = seal_a_review(lab)
+        targets = foreign_targets(lab)
+        calls = [ToolCall("Read", {"file_path": str(p)}) for p in targets.values()]
+        calls.append(
+            ToolCall(
+                "Grep",
+                {
+                    "pattern": bait,
+                    "path": str(targets["Entwurf"].parent.parent),
+                    "output_mode": "content",
+                },
+            )
+        )
+        for decider in (None, Allow()):
+            for call in calls:
+                [answer] = kit.run_file_tools(lab, [call], decider).results
+                assert bait not in answer, (call.name, answer[:120])
+        # counter-check: without the rule an approval opens the other agent's folder
+        opened = replace(lab, profile=replace(lab.profile, private_roots=()))
+        [answer] = kit.run_file_tools(opened, [calls[0]], Allow()).results
+        assert bait in answer

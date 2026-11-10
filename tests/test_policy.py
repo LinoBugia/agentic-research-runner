@@ -692,8 +692,9 @@ def test_l8_run_folder_shared(env: Env) -> None:
     other = env.run / "shared" / "other" / "x.tex"  # via read_dirs run:shared/other
     assert engine.evaluate(read(other)).action is ALLOW
     assert engine.evaluate(bash(f"cat {other}")).action is ALLOW
-    # Not on the list: another agent's shared folder.
-    assert engine.evaluate(read(shared)).action is ASK
+    # Another agent's shared folder: never readable, also not with an approval (W4-03.1 H1)
+    decision = engine.evaluate(read(shared))
+    assert decision.action is DENY and "Ordner eines anderen Agenten" in decision.reason
 
 
 def test_l9_read_dir_is_readable_but_not_writable(views: Views, env: Env) -> None:
@@ -2118,3 +2119,99 @@ def test_w3_03_1_rule_for_is_none_where_no_rule_comes_of_it(
 ) -> None:
     engine = env.engine(env.profile(env.agent(provider=request_.provider or "claude")))
     assert engine.rule_for(request_) is None
+
+
+# --------------------------------------------------------------------------------------------
+# W4-03.1 H1 (User 10.11.): the folders of other agents are never readable
+# --------------------------------------------------------------------------------------------
+
+
+def test_w4_03_1_other_agents_folders_are_closed_even_with_always_rules(env: Env) -> None:
+    """Transcripts, raw events, working copies and shared folders of other agents: denied by a
+    fixed rule (no question, so no approval opens them), also with an „immer“ rule. Counter-
+    check: the agent's own folders and a shared folder its configuration names stay open."""
+    other = env.run / "agents" / "judge-2"
+    targets = [
+        other / "transcript.jsonl",
+        other / "raw.jsonl",
+        other / "work" / "review.md",
+        other / "plugin" / "x.md",
+        env.run / "shared" / "beweis" / "lemma.tex",  # another agent's shared folder
+        env.run / "agents",
+    ]
+    always = AlwaysRule(action="allow", paths=[str(env.run / "agents"), str(env.run / "shared")])
+    for rules in (None, PermissionRules(always=[always])):
+        engine = env.engine(env.profile(rules=rules) if rules else env.profile())
+        for target in targets:
+            for request in (read(target), read(target, tool="Grep"), bash(f"cat {target}")):
+                decision = engine.evaluate(request)
+                assert decision.action is DENY, (target, request.tool)
+                assert decision.decided_by is DecidedBy.FIXED_RULE
+        reason = engine.evaluate(read(other / "transcript.jsonl")).reason
+        assert "Ordner eines anderen Agenten" in reason and "Zugangsdaten" not in reason
+        searched = engine.evaluate(read(env.run, tool="Grep"))
+        assert searched.action is DENY
+    engine = env.engine()
+    assert engine.evaluate(read(env.work / "notes.md")).action is ALLOW
+    assert engine.evaluate(read(env.run / "shared" / "other" / "x.tex")).action is ALLOW
+    own = env.run / "agents" / "explorer-1" / "transcript.jsonl"
+    assert engine.evaluate(read(own)).action is ASK  # not foreign: the usual question
+    assert engine.evaluate(write(other / "work" / "x.py")).reason.startswith("Schreiben außerhalb")
+
+
+def test_w4_03_1_a_shared_folder_is_open_for_its_members(env: Env) -> None:
+    sharer = env.profile(env.agent("prover-1", workspace={"mode": "shared", "name": "beweis"}))
+    lemma = env.run / "shared" / "beweis" / "lemma.tex"
+    assert not sharer.is_foreign(lemma) and sharer.can_read(lemma) and sharer.can_write(lemma)
+    assert sharer.is_foreign(env.run / "agents" / "explorer-1" / "work" / "a.py")
+
+
+def test_w4_03_1_sealed_results_get_their_own_reason(env: Env) -> None:
+    """G9: a sealed review is refused as what it is, not as „Zugangsdaten“."""
+    reason = env.engine().evaluate(read(env.run / "groupchats" / "sealed" / "007-x.md")).reason
+    assert "versiegelt" in reason and "Zugangsdaten" not in reason
+
+
+# --------------------------------------------------------------------------------------------
+# W4-01 G8: loopback is never approvable
+# --------------------------------------------------------------------------------------------
+
+LOOPBACK = [
+    "localhost",
+    "LocalHost.",
+    "5ja1lq0w1xhtmvdgprmv.localhost",
+    "127.0.0.1",
+    "127.1",
+    "2130706433",
+    "0x7f.1",
+    "::1",
+    "[::1]:8765",
+    "0.0.0.0",
+    "::ffff:127.0.0.1",
+]
+
+
+def url_host(host: str) -> str:
+    """The host as it stands in a URL: IPv6 in brackets."""
+    return f"[{host}]" if host.count(":") > 1 and not host.startswith("[") else host
+
+
+@pytest.mark.parametrize("host", LOOPBACK)
+def test_w4_01_g8_loopback_is_denied_without_question_also_with_always(env: Env, host: str) -> None:
+    always = AlwaysRule(action="allow", hosts=[host, "*"], exact=False)
+    for engine in (env.engine(), env.engine(env.profile(), rules=PermissionRules(always=[always]))):
+        for request in (
+            req("SandboxNetworkAccess", hosts=[host]),
+            bash(f"curl -s http://{url_host(host)}/api"),
+        ):
+            decision = engine.evaluate(request)
+            assert decision.action is DENY, (host, request.tool, decision.action)
+            assert "diesem Rechner selbst" in decision.reason
+    profile = env.profile(rules=PermissionRules(always=[always]))
+    assert host.lower().strip("[]") not in profile.allowed_domains
+
+
+def test_w4_01_g8_counter_check_other_hosts_still_ask(env: Env) -> None:
+    engine = env.engine()
+    for host in ("oeis.org", "10.0.0.1", "local.example.com", "localhost.example.com"):
+        assert engine.evaluate(req("SandboxNetworkAccess", hosts=[host])).action is ASK, host
