@@ -166,8 +166,12 @@ def test_plan_loads_the_group_skill_and_the_param_overrides(workfolder: Path) ->
     with pytest.raises(ConfigError, match="max_turns"):
         plan_launch(run_file, params={"max_turns": 9}, cwd=workfolder)
     (skill / "group.yaml").unlink()
-    with pytest.raises(ConfigError, match="kein Group-Skill"):
+    with pytest.raises(ConfigError, match="kein Group-Skill") as caught:
         plan_launch(run_file, cwd=workfolder)
+    # W4-00.1 Punkt 8: no absolute path in a message to the user (08 §8.4)
+    text = str(caught.value)
+    assert "Ihm fehlt die group.yaml" in text and str(skill) not in text
+    assert str(workfolder) not in text.split("\n")[-1]
 
 
 def test_plan_reports_missing_file_project_and_profile(workfolder: Path, arr_home: Path) -> None:

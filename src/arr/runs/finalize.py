@@ -43,7 +43,7 @@ from arr.models import RunStatus, WorkspaceMode
 from arr.room.store import RESULTS_DIR, ROOM_DIR, RoomStore
 from arr.room.types import Rating, Result
 from arr.runs.eventlog import TRANSCRIPT_FILE, read_events, write_transcript_md
-from arr.runs.orchestrator import ORCHESTRATOR_LOG, OrchestratorLog
+from arr.runs.orchestrator import ORCHESTRATOR_LOG, OrchestratorLog, stopped_text
 from arr.runs.prepare import AgentFile, PreparedRun, RunMeta, load_run_meta
 from arr.usage import RunUsage, UsageTotal, compute_run_usage, write_usage_json
 
@@ -739,9 +739,7 @@ def _status_and_reason(
     else:
         status = RunStatus.DONE
     if status is RunStatus.STOPPED:
-        reason = (
-            "Der User hat den Run gestoppt." if ran else "Der Run wurde vor dem Start gestoppt."
-        )
+        reason = stopped_text(entries, ran=ran)
     elif status is RunStatus.FAILED and errors:
         reason = f"Fehler: {errors[0].get('message') or errors[0].get('type')}"
     elif status is RunStatus.INTERRUPTED:

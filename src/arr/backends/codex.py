@@ -50,6 +50,7 @@ from arr.backends.codex_config import (
 )
 from arr.backends.codex_events import TurnEvents, read_rollout, rollout_calls
 from arr.backends.codex_sdk import (
+    RpcError,
     install_approval_handler,
     install_message_hooks,
     internals_available,
@@ -410,7 +411,8 @@ class CodexBackend:
             type="server_request",
             recoverable=True,
         )
-        raw = {"request": {"method": method, "params": params}, "answer": answer}
+        sent = {"error": dict(answer)} if isinstance(answer, RpcError) else answer
+        raw = {"request": {"method": method, "params": params}, "answer": sent}
         return self._event(EventKind.ERROR, dict(data), raw=raw)
 
     async def _pump(self, handle: Any, queue: asyncio.Queue[Any]) -> None:

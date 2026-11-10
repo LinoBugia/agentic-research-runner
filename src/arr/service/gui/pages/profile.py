@@ -100,6 +100,11 @@ MIN_TEST_S = 0.8
 """„Testen …“ stays at least this long, so the result does not flash by (§5.8 „lädt“)."""
 
 
+def running_runs(count: int) -> str:
+    """„1 laufender Run“, „2 laufende Runs“ (W4-00 B12; the GUI does not import the service)."""
+    return f"{count} laufender Run" if count == 1 else f"{count} laufende Runs"
+
+
 def uses_mac_login(profile: ProfileInfo) -> bool:
     """A Claude subscription profile without a token of its own that works anyway."""
     test = profile.last_test
@@ -108,9 +113,10 @@ def uses_mac_login(profile: ProfileInfo) -> bool:
 
 
 def usage_cells(row: ProfileUsageSum) -> str:
-    """Tokens by kind and the cost, „–“ where nothing is known (§8.7)."""
+    """Exact tokens by kind (W4-00 B13: „1 zu 1“, not „1 k“) and the cost, „–“ where nothing
+    is known (§8.7)."""
     numbers = (row.input, row.output, row.cache_read, row.cache_write, row.reasoning)
-    cells = "".join(f'<td class="num">{fmt.tokens(n)}</td>' for n in numbers)
+    cells = "".join(f'<td class="num">{fmt.exact(n)}</td>' for n in numbers)
     costs = []
     if row.cost_billed_usd:
         costs.append(fmt.money(row.cost_billed_usd, CostKind.BILLED))
@@ -127,8 +133,39 @@ USAGE_HEAD = (
 )
 
 
+def _folder_name(path: str | None, usage: ProfileUsage) -> str:
+    for folder in usage.workfolders:
+        if folder.path == path:
+            return folder.name
+    return path or ""
+
+
+def _workfolders_html(usage: ProfileUsage) -> str:
+    """Which workfolders were counted, and every one that was not, with the reason (B15)."""
+    counted = [f for f in usage.workfolders if f.problem is None]
+    parts = []
+    for folder in counted:
+        runs = "1 Run" if folder.runs == 1 else f"{folder.runs} Runs"
+        here = ", dieser" if folder.current else ""
+        if folder.unreadable_runs:
+            runs += f", {folder.unreadable_runs} Run-Ordner nicht lesbar"
+        parts.append(f'<span title="{esc(folder.path)}">{esc(folder.name)}</span> ({runs}{here})')
+    word = "Workfolder" if len(counted) == 1 else "Workfoldern"
+    text = f"Gezählt in {len(counted)} {word}: {', '.join(parts)}." if counted else ""
+    problems = "".join(
+        f'<p class="small" style="margin-top:4px; color: var(--wait)" data-problem="{esc(f.path)}">'
+        f"Nicht gezählt: {esc(f.path)} {esc(f.problem or '')}"
+        f"{'' if (f.problem or '').endswith('.') else '.'}</p>"
+        for f in usage.workfolders
+        if f.problem is not None
+    )
+    head = f'<p class="small muted" style="margin-top:8px">{text}</p>' if text else ""
+    return f"{head}{problems}"
+
+
 def usage_html(usage: ProfileUsage, now: float) -> str:
-    """Sums for today, 7 days and all, then one row per run with a link to it (W3-06)."""
+    """Sums for today, 7 days and all, then one row per run with its workfolder and a link to
+    runs of this workfolder (W3-06, W4-00 B15)."""
     sums = "".join(
         f"<tr><th>{esc(row.label)}</th><td class='num'>{row.runs}</td>{usage_cells(row)}</tr>"
         for row in (usage.today, usage.week, usage.total)
@@ -139,10 +176,15 @@ def usage_html(usage: ProfileUsage, now: float) -> str:
         period = fmt.when(run.started, now)
         if run.ended:
             period += f" bis {fmt.clock(run.ended)}"
+        name = esc(run.run_id)
+        link = f'<a href="{esc(run.url)}">{name}</a>' if run.url else name
+        folder = _folder_name(run.workfolder, usage)
         rows += (
-            f'<tr><td><a href="{esc(run.url)}">{esc(run.run_id)}</a>'
+            f'<tr data-run="{name}"><td>{link}'
             f'<span class="small muted" style="display:block">{esc(", ".join(run.agents))} · '
-            f"{esc(period)}{esc(mark)}</span></td><td></td>{usage_cells(run)}</tr>"
+            f"{esc(period)}{esc(mark)} · Workfolder "
+            f'<span title="{esc(run.workfolder or "")}">{esc(folder)}</span></span></td>'
+            f"<td></td>{usage_cells(run)}</tr>"
         )
     runs = (
         f'<table class="tbl compact" style="margin-top:8px"><thead><tr><th>Run</th><th></th>'
@@ -153,6 +195,7 @@ def usage_html(usage: ProfileUsage, now: float) -> str:
     return (
         f'<table class="tbl compact"><thead><tr><th>Zeitraum</th><th class="num">Runs</th>'
         f"{USAGE_HEAD}</tr></thead><tbody>{sums}</tbody></table>{runs}"
+        f"{_workfolders_html(usage)}"
         f'<p class="small muted" style="margin-top:8px">{esc(usage.note)}</p>'
     )
 
@@ -398,9 +441,10 @@ class ProfilePage:
         except ApiException as exc:
             self.frame.toast(exc.error.message, error=True)
             return
+        n = len(preview.runs)
         stopping = (
-            f"{len(preview.runs)} laufende Runs in diesem Workfolder stoppen sofort, auch aus "
-            "„arr run“. Zusammenfassung und Secret-Scan laufen danach."
+            f"{running_runs(n)} in diesem Workfolder {'stoppt' if n == 1 else 'stoppen'} "
+            "sofort, auch aus „arr run“. Zusammenfassung und Secret-Scan laufen danach."
             if preview.runs
             else "In diesem Workfolder läuft gerade kein Run auf dem Profil."
         )
@@ -929,10 +973,15 @@ class ProfilePage:
             if p.login_dir
             else "Das Secret wird aus dem Schlüsselbund entfernt."
         )
+        n = p.concurrency.in_use
         in_use = (
-            f"{p.concurrency.in_use} laufende Agenten nutzen das Profil gerade. Löschen geht "
-            "erst, wenn sie fertig sind."
-            if p.concurrency.in_use
+            (
+                "1 laufender Agent nutzt das Profil gerade. Löschen geht erst, wenn er fertig ist."
+                if n == 1
+                else f"{n} laufende Agenten nutzen das Profil gerade. Löschen geht erst, wenn "
+                "sie fertig sind."
+            )
+            if n
             else "Kein laufender Run nutzt das Profil."
         )
 

@@ -181,6 +181,21 @@ def profile_info(
     )
 
 
+def disabled_text(name: str, verb: str) -> str:
+    """Why a blocked profile cannot be tested or logged in; the CLI says the same (W4-00 B10)."""
+    return f"„{name}“ ist gesperrt. Entsperre es, dann kannst du es wieder {verb}."
+
+
+def running_runs(count: int) -> str:
+    """„1 laufender Run“, „2 laufende Runs“ (W4-00 B12)."""
+    return f"{count} laufender Run" if count == 1 else f"{count} laufende Runs"
+
+
+def _be(count: int, one: str, more: str) -> str:
+    """The singular or plural word for `count`."""
+    return one if count == 1 else more
+
+
 class ProfilesArea:
     """Profile methods of `ApiClient` (see the module docstring)."""
 
@@ -408,9 +423,7 @@ class ProfilesArea:
 
     def _refuse_disabled(self, profile: AuthProfile, verb: str) -> None:
         if profile.disabled:
-            raise not_allowed(
-                f"„{profile.name}“ ist gesperrt. Entsperre es, dann kannst du es wieder {verb}."
-            )
+            raise not_allowed(disabled_text(profile.name, verb))
 
     def _write_disabled(self, name: str, disabled: bool) -> AuthProfile:
         file = self._load()
@@ -460,7 +473,8 @@ class ProfilesArea:
         profile, unsaved = self._find_for_block(name)
         if dry_run:
             ids = self._run_ids(name)
-            text = f"{len(ids)} laufende Runs würden gestoppt." if ids else "Es läuft kein Run."
+            text = f"{running_runs(len(ids))} {_be(len(ids), 'würde', 'würden')} gestoppt."
+            text = text if ids else "Es läuft kein Run."
             info = self._info(profile) if profile is not None else None
             return ProfileActionResult(message=text, runs=ids, profile=info)
         if unsaved is None:
@@ -476,12 +490,16 @@ class ProfilesArea:
             return self._unsaved_block(name, unsaved, ids, failed, profile)
         text = f"„{name}“ ist gesperrt. "
         if failed:
+            n = len(failed)
             text += (
-                f"{len(failed)} Runs ließen sich nicht stoppen: {', '.join(failed)}. Beende die "
-                "Prozesse im Terminal."
+                f"{n} {_be(n, 'Run ließ', 'Runs ließen')} sich nicht stoppen: "
+                f"{', '.join(failed)}. Beende {_be(n, 'den Prozess', 'die Prozesse')} im Terminal."
             )
         elif ids:
-            text += f"{len(ids)} Runs werden gestoppt, danach laufen Zusammenfassung und Scan."
+            text += (
+                f"{running_runs(len(ids))} {_be(len(ids), 'wird', 'werden')} gestoppt, danach "
+                "laufen Zusammenfassung und Scan."
+            )
         else:
             text += "Es lief kein Run."
         return ProfileActionResult(
@@ -503,9 +521,14 @@ class ProfilesArea:
         text = f"„{name}“ ist nicht gesperrt: {cause.error.message} "
         stopped = [run_id for run_id in ids if run_id not in failed]
         if stopped:
-            text += f"Die laufenden Runs hier werden trotzdem gestoppt ({len(stopped)}). "
+            n = len(stopped)
+            text += f"{running_runs(n)} hier {_be(n, 'wird', 'werden')} trotzdem gestoppt. "
         if failed:
-            text += f"Nicht stoppen ließen sich: {', '.join(failed)}. Beende sie im Terminal. "
+            n = len(failed)
+            text += (
+                f"Nicht stoppen {_be(n, 'ließ', 'ließen')} sich: {', '.join(failed)}. Beende "
+                f"{_be(n, 'ihn', 'sie')} im Terminal. "
+            )
         if not ids:
             text += "Hier lief kein Run. "
         text += "Runs in anderen Workfoldern laufen weiter, bis die Sperre gespeichert ist."

@@ -316,6 +316,8 @@ class RunManager:
         self._status: RunStatus | None = None
         self._started = False
         self._stop_early = False
+        self._blocked: str | None = None
+        """Set by a stop before the agents run while a profile of the run is blocked."""
         self._tasks: list[asyncio.Task[None]] = []
         self._stop_task: asyncio.Task[None] | None = None
 
@@ -343,12 +345,35 @@ class RunManager:
         """
         if self._status is not None and self._status not in STOPPABLE_STATUSES:
             return
+        blocked = self._blocked_profile()
         orch = self.orchestrator
         if orch is None or self._status is None or self._status is RunStatus.PREPARING:
             self._stop_early = True
+            self._blocked = self._blocked or blocked
             return
         if not orch.stop_requested:
-            self._stop_task = asyncio.get_running_loop().create_task(orch.halt(StopReason.USER))
+            reason = StopReason.PROFILE_BLOCKED if blocked else StopReason.USER
+            info = {"profile": blocked} if blocked else {}
+            self._stop_task = asyncio.get_running_loop().create_task(orch.halt(reason, **info))
+
+    def _blocked_profile(self) -> str | None:
+        """A profile of this run that is blocked now, else None (W4-00 B11).
+
+        Every way the Not-Aus stops a run ends here: the service's own run, `stop.request`
+        for a run of `arr run`, `watch_blocked_profiles` in another workfolder. So the stop
+        names the profile, whichever came first. An unreadable `profiles.yaml` names none.
+        """
+        from arr.runs.launch import UNREADABLE, blocked_profiles  # launch imports this module
+
+        names = {agent.auth for agent in self.resolved.agents if agent.auth}
+        known = self._prepare_args.get("profiles")
+        if not isinstance(known, ProfilesFile):
+            known = ProfilesFile()
+        try:
+            found = blocked_profiles(names, known)
+        except UNREADABLE:
+            return None
+        return found[0] if found else None
 
     def pause(self) -> None:
         """Pause between turns (status `paused`); running turns go on."""
@@ -428,6 +453,10 @@ class RunManager:
             logger.exception("Run %s fehlgeschlagen", self.prepared.run_id)
             self.error = exc
             self.log.write("error", message=str(exc), type=type(exc).__name__)
+        if self._stop_early and self._blocked is not None and not cancelled:
+            # stopped before the agents ran: the finalizer reads the reason from the log
+            reason = StopReason.PROFILE_BLOCKED.value
+            self.log.write("stop", reason=reason, profile=self._blocked)
         # `finalizing` before the teardown: a stop that arrives while the backends close must
         # not turn a regularly finished run into `stopped` (W2-03.1 G8, W2-05).
         self._set_status(RunStatus.FINALIZING)
@@ -468,7 +497,8 @@ class RunManager:
 
     def _final_status(self) -> RunStatus:
         orch = self.orchestrator
-        if self._stop_early or (orch is not None and orch.stop_reason is StopReason.USER):
+        stopped = (StopReason.USER, StopReason.PROFILE_BLOCKED)
+        if self._stop_early or (orch is not None and orch.stop_reason in stopped):
             return RunStatus.STOPPED
         if self.error is not None:
             return RunStatus.FAILED

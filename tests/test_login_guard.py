@@ -5,12 +5,15 @@ backends, with arr's real profiles and a test `HOME` full of baits (`login_guard
 model and no real login: Codex runs through `codex sandbox`, Claude through the real CLI
 against `fake_messages_api.py`. Only `reached` flags and counts leave the probe.
 
-The version guard runs everywhere, also in the CI: no update passes without a new probe.
+The version guard runs everywhere, also in the CI: no update passes without a new probe. The
+macOS version is checked on the Mac only (W4-00 B7): Seatbelt and `KERN_PROCARGS2` belong to
+the system, so an update of macOS asks for the probe again, like one of SDK, CLI or Codex.
 """
 
 import importlib.metadata
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -88,9 +91,33 @@ def version_problems(recorded: dict[str, str], installed: dict[str, str]) -> lis
     ]
 
 
+MACOS = "macos"
+"""Key of the macOS version in the fixture; compared on the Mac only."""
+
+
+def installed_macos() -> dict[str, str]:
+    return {MACOS: platform.mac_ver()[0]}
+
+
 def test_versions_are_the_ones_of_the_last_green_probe() -> None:
     recorded = json.loads(FIXTURE.read_text())
+    recorded.pop(MACOS)  # the CI runs on Linux: see the test below
     assert version_problems(recorded, installed_versions()) == []
+
+
+@mac
+def test_the_macos_version_is_the_one_of_the_last_green_probe() -> None:
+    recorded = json.loads(FIXTURE.read_text())
+    assert version_problems({MACOS: recorded.get(MACOS, "")}, installed_macos()) == []
+
+
+def test_a_macos_update_asks_for_the_probe_again() -> None:
+    """The countertest of the one above, on every machine: another macOS is reported."""
+    recorded = json.loads(FIXTURE.read_text())
+    assert recorded.get(MACOS), "the fixture knows the macOS of the last green probe"
+    [problem] = version_problems({MACOS: recorded[MACOS]}, {MACOS: "99.0"})
+    assert f"Sperr-Probe zuletzt grün mit {recorded[MACOS]}, installiert ist 99.0" in problem
+    assert "tests/fixtures/login_guard.json" in problem and "-m macos" in problem
 
 
 def test_another_version_is_reported_in_german() -> None:

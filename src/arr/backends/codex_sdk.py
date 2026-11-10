@@ -21,6 +21,7 @@ from typing import Any
 __all__ = [
     "SDK_VERSION",
     "ApprovalHandler",
+    "RpcError",
     "internals_available",
     "install_approval_handler",
     "install_message_hooks",
@@ -60,9 +61,37 @@ def internals_available(codex: Any) -> bool:
     return all(hasattr(sync, name) for name in needed)
 
 
+class RpcError(dict[str, Any]):
+    """A JSON-RPC error as the answer to a server request, instead of a result (W4-00, H1).
+
+    The SDK's reader loop always sends the handler's return value as `result`. A handler that
+    returns an `RpcError` gets `{"id": …, "error": {"code": …, "message": …}}` sent instead,
+    by the writer `install_approval_handler` puts in front (`_send_errors`).
+    """
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(code=code, message=message)
+
+
 def install_approval_handler(codex: Any, handler: ApprovalHandler) -> None:
-    """Replace the SDK's accept-everything default handler (before the client starts)."""
-    _sync_client(codex)._approval_handler = handler
+    """Replace the SDK's accept-everything default handler (before the client starts).
+
+    The writer is wrapped too, so that an `RpcError` from the handler goes out as a JSON-RPC
+    error and never as a `result` the app-server could read as consent.
+    """
+    sync = _sync_client(codex)
+    sync._approval_handler = handler
+    sync._write_message = _send_errors(sync._write_message)
+
+
+def _send_errors(write: Callable[[dict[str, Any]], None]) -> Callable[[dict[str, Any]], None]:
+    def write_answer(payload: dict[str, Any]) -> None:
+        result = payload.get("result")
+        if isinstance(result, RpcError) and "id" in payload:
+            payload = {"id": payload["id"], "error": dict(result)}
+        write(payload)
+
+    return write_answer
 
 
 def install_message_hooks(

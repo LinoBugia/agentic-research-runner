@@ -241,7 +241,10 @@ async def test_w3_09_1_b9_m35_reachable_only_while_a_discussion_runs(wf: Path) -
             return b is not None and b.state is AgentDisplayState.DONE and b.reachable is want
 
         async def in_summary() -> bool:
-            return (await api.get_run(run_id)).discussion is None and await b_reachable(False)
+            # W4-00 B17: in the summary while the run still runs, not after it (M70)
+            detail = await api.get_run(run_id)
+            running = detail.run.status is RunStatus.RUNNING
+            return running and detail.discussion is None and await b_reachable(False)
 
         await until(lambda: b_reachable(True), what="b done and reachable in the discussion")
         await until(in_summary, what="b done, not reachable in the summary")

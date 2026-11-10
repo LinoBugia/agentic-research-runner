@@ -65,7 +65,7 @@ from arr.runs.inspect import (
     run_reason,
 )
 from arr.runs.manager import Finalizer, RunManager, mark_interrupted_runs, set_run_status
-from arr.runs.orchestrator import ORCHESTRATOR_LOG, OrchestratorLog
+from arr.runs.orchestrator import ORCHESTRATOR_LOG, OrchestratorLog, profile_shown
 from arr.runs.prepare import PreparedAgent, RunMeta, load_run_meta, new_run_id
 from arr.runs.secret_scan import (
     SCAN_KIND,
@@ -228,8 +228,9 @@ def refuse_disabled(names: Iterable[str], known: ProfilesFile) -> None:
         ) from None
     if blocked:
         raise ArrError(
-            f"Das Profil „{blocked[0]}“ ist gesperrt, der Agent läuft nicht an. Entsperre es auf "
-            "der Seite „Auth-Profile“ oder nimm ein anderes Profil."
+            f"Das Profil „{blocked[0]}“ ist gesperrt, der Agent läuft nicht an. Entsperre es "
+            "unter „Auth-Profile“ oder wähle unter „Einstellungen → Standards und Limits“ ein "
+            "anderes Profil als Standard."
         )
 
 
@@ -285,8 +286,8 @@ def _group_spec(workfolder: Path, run_input: RunInput, source: str) -> GroupSpec
     if info.group_file is None:
         raise ConfigError.single(
             "skill",
-            f"Der Skill „{run_input.skill}“ ist kein Group-Skill: im Ordner {info.path} fehlt "
-            "die group.yaml.",
+            f"Der Skill „{run_input.skill}“ ist kein Group-Skill: Ihm fehlt die group.yaml. "
+            "Wähle einen Skill der Art „Group“ oder lege die group.yaml im Skill an.",
             source=source,
         )
     return load_group_spec(info.group_file)
@@ -898,7 +899,11 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
             limit = str(data.get("limit"))
             return "Limit erreicht: " + LIMIT_TEXT.get(limit, limit)
         case "stop":
-            return "Stopp: laufende Turns werden unterbrochen, danach läuft der Finalizer."
+            text = "Stopp: laufende Turns werden unterbrochen, danach läuft der Finalizer."
+            profile = profile_shown(data.get("profile"))
+            if data.get("reason") == "profile_blocked" and profile is not None:
+                text = f"Profil „{profile}“ wurde gesperrt (Not-Aus). {text}"
+            return text
         case "pause":
             return f"Pause ({data.get('reason')}): neue Turns warten."
         case "resume":

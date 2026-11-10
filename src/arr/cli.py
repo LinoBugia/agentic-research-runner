@@ -173,6 +173,9 @@ def run(
     except ArrError as exc:
         _fail(str(exc))
     typer.echo(f"Workfolder: {launch.workfolder}")
+    from arr.service.state import record_workfolder
+
+    record_workfolder(launch.workfolder)  # for „Nachweis je Profil“ (W4-00.1); never raises
     try:
         result = asyncio.run(run_launch(launch, decider=TerminalDecider(), report=typer.echo))
     except ArrError as exc:
@@ -282,7 +285,10 @@ app.add_typer(auth_app, name="auth")
 
 
 def _codex_profile(name: str) -> "AuthProfile":
-    """The profile from `profiles.yaml`, or a new `codex_chatgpt` profile with that name."""
+    """The profile from `profiles.yaml`, or a new `codex_chatgpt` profile with that name.
+
+    A blocked profile is refused with the text of the GUI, before any app-server starts.
+    """
     from arr.models import AuthKind, AuthProfile, ProfilesFile
     from arr.resolve import load_yaml_model
 
@@ -295,6 +301,10 @@ def _codex_profile(name: str) -> "AuthProfile":
                         f"Das Profil „{name}“ ist kein ChatGPT-Profil (Art: {profile.kind}). "
                         "Der Codex-Login geht nur für Profile der Art „codex_chatgpt“."
                     )
+                if profile.disabled:  # the Not-Aus holds here too (W4-00 B10)
+                    from arr.service.real_api.profiles import disabled_text
+
+                    raise ArrError(disabled_text(name, "anmelden"))
                 return profile
     return AuthProfile(name=name, kind=AuthKind.CODEX_CHATGPT)
 

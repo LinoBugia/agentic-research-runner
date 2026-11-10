@@ -191,6 +191,41 @@ def test_codex_login_already_logged_in(arr_home: Path, login_fake: _LoginFake) -
     assert "Code:" not in result.output
 
 
+def test_w4_00_b10_codex_login_refuses_a_blocked_profile(
+    arr_home: Path, login_fake: _LoginFake
+) -> None:
+    """Same refusal and text as the GUI (`_refuse_disabled`), and no app-server starts."""
+    from arr.service.api_models import ApiException
+    from arr.service.real_api.profiles import ProfilesArea
+
+    arr_home.mkdir(parents=True, exist_ok=True)
+    (arr_home / "profiles.yaml").write_text(
+        "version: 1\nprofiles:\n  - {name: chatgpt-privat, kind: codex_chatgpt, disabled: true}\n",
+        "utf-8",
+    )
+    result = runner.invoke(app, ["auth", "codex-login", "chatgpt-privat"])
+    assert result.exit_code == 1
+    assert login_fake.homes == [], "no app-server for a blocked profile"
+    expected = "„chatgpt-privat“ ist gesperrt. Entsperre es, dann kannst du es wieder anmelden."
+    assert expected in result.output
+    # the GUI says the same
+    area = ProfilesArea.__new__(ProfilesArea)  # `_refuse_disabled` needs no service state
+    [blocked] = _profiles(arr_home)
+    try:
+        area._refuse_disabled(blocked, "anmelden")
+    except ApiException as exc:
+        assert exc.error.message == expected
+    else:
+        raise AssertionError("the GUI must refuse too")
+
+
+def _profiles(arr_home: Path) -> list:
+    from arr.models import ProfilesFile
+    from arr.resolve import load_yaml_model
+
+    return load_yaml_model(arr_home / "profiles.yaml", ProfilesFile).profiles
+
+
 def test_codex_login_failure(arr_home: Path, login_fake: _LoginFake) -> None:
     login_fake.succeed = False
     result = runner.invoke(app, ["auth", "codex-login", "chatgpt-privat"])

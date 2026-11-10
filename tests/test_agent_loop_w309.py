@@ -833,18 +833,27 @@ def test_w3_09_1_b4_only_at_signs_name_no_agent(store: RoomStore) -> None:
 
 async def test_w3_09_1_b11_m47_an_older_result_does_not_wake(workfolder: Path) -> None:
     """S22: D2 already gave a result but is not done (open question). D1 waits for its
-    result: the old one does not wake it, the next one does (M47)."""
+    result: the old one does not wake it, the next one does (M47).
+
+    W4-00 B14: „old“ is a result from before the waiting turn; one in the waiting turn before
+    `wait_until` counts (`test_w4_00_b14_…`). So D1 begins to wait in a later turn, woken by
+    D3's message, after D2's first result."""
     scripts = {
-        D1: turns([wait(0.6), room("wait_until", minutes=0.5, until_result_from=D2)], [done()]),
+        D1: turns([say("bereit")],
+                  [room("wait_until", minutes=0.5, until_result_from=D2)], [done()]),
         D2: turns([post("main", f"@{D3} stimmt das?", kind="question"),
                    room("submit_result", kind="x", title="Alt", body="alt")],
                   [wait(0.8), room("submit_result", kind="x", title="Neu", body="neu"), done()],
                   repeat_last=True),
-        D3: turns([wait(2.0), post("main", "Ja.", kind="answer", reply_to=2), done()]),
+        D3: turns([wait(1.0), post("main", f"@{D1} {D2} rechnet noch."), wait(1.0),
+                   post("main", "Ja.", kind="answer", reply_to=2), done()]),
     }  # fmt: skip
     manager, outcome, _ = await discuss(workfolder, scripts, IDLE)
-    woken = prompts_of(manager, D1)[1]
-    assert "„Neu“" in woken and "„Alt“" not in woken
+    [result] = [e for e in log_entries(manager.run_dir, "wake") if e["data"]["agent"] == D1
+                and e["data"]["reasons"] == ["result_from"]]  # fmt: skip
+    woken = [p for p in prompts_of(manager, D1) if "hat ein Ergebnis abgegeben" in p]
+    assert result and len(woken) == 1
+    assert "„Neu“" in woken[0] and "„Alt“" not in woken[0]
 
 
 def test_w3_09_1_b11_new_result_looks_only_after_the_mark(tmp_path: Path) -> None:
@@ -962,3 +971,139 @@ def test_w3_09_1_m34_the_card_skips_an_allowed_rate_limit(tmp_path: Path) -> Non
 
     assert activity("allowed").label == "Bash"
     assert activity("rejected").label == "Nutzungslimit erreicht"
+
+
+# --------------------------------------------------------------------------------------------
+# W4-00: B14 (S26), B15 (S31), B16 (S30, M58), B18 (S10, M65)
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("naive", [False, True], ids=["b14", "naive"])
+async def test_w4_00_b14_a_result_in_the_waiting_turn_counts(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """S26: D2 submits while D1 is still in its turn; D1 calls `wait_until(result_from=D2)`
+    after that. The result counts: D1 is woken with it at once (`result_from`) and is never
+    told „ohne ein neues Ergebnis“. Counter-check with the old window (from the call):
+    D1 sleeps until D2 is done and hears `result_missing`."""
+    if naive:
+        monkeypatch.setattr(Orchestrator, "_result_since", lambda self, agent, wait: wait.since)
+    scripts = {
+        D1: turns([wait(0.8), room("wait_until", minutes=0.5, until_result_from=D2)], [done()]),
+        D2: turns([wait(0.3), room("submit_result", kind="x", title="Früh", body="früh"),
+                   wait(1.5), done()]),
+    }  # fmt: skip
+    manager, outcome, took = await discuss(workfolder, scripts, IDLE)
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 15
+    [first] = [r for a, r in wakes(manager) if a == D1][:1]
+    woken = prompts_of(manager, D1)[1]
+    if naive:
+        assert first == ["result_missing"] and "ohne ein neues Ergebnis" in woken
+        return
+    assert first == ["result_from"]
+    assert f"{D2} hat ein Ergebnis abgegeben" in woken and "„Früh“" in woken
+    assert "ohne ein neues Ergebnis" not in woken
+
+
+def _old_close_user_questions(self: Orchestrator, note: str) -> None:
+    """`close_user_questions` before W4-00 (B15): `closed` only if the inbox still had it."""
+    for msg_id, item_id in list(self._questions.items()):
+        del self._questions[msg_id]
+        self.room.close_question(msg_id)
+        if self.inbox.close_question(item_id, note):
+            self.log.write("user_question", msg=msg_id, item=item_id, state="closed")
+
+
+@pytest.mark.parametrize("naive", [False, True], ids=["b15", "naive"])
+async def test_w4_00_b15_a_stop_logs_the_closed_question(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
+) -> None:
+    """S31: a stop with a question to the user open. `cancel_all` makes the item `obsolete`
+    first; the log still says `closed` with `reason: stopped`. Counter-check: the old code
+    leaves the log at `open`."""
+    from test_agent_loop_hangs import run_case
+
+    if naive:
+        monkeypatch.setattr(Orchestrator, "close_user_questions", _old_close_user_questions)
+
+    async def stopper(manager: Any) -> None:
+        await eventually(lambda: bool(manager.orchestrator.inbox.pending()), within=10)
+        await asyncio.sleep(0.2)
+        manager.stop()
+
+    ask = post("main", "@user welches Band?", kind="question")
+    scripts = {D1: turns([ask, wait(20)]), D2: turns([wait(20)])}
+    manager, line = await run_case(workfolder, scripts, IDLE, during=stopper, wall="30s")
+    assert line["ended_by"] is DiscussionEnd.STOPPED and not log_entries(manager.run_dir, "error")
+    [item] = manager.inbox.items()
+    assert item.status is ApprovalStatus.OBSOLETE
+    assert RoomStore(manager.run_dir).open_user_questions() == []
+    entries = [e["data"] for e in log_entries(manager.run_dir, "user_question")]
+    if naive:
+        assert [e["state"] for e in entries] == ["open"]
+        return
+    assert [e["state"] for e in entries] == ["open", "closed"]
+    assert entries[1]["reason"] == "stopped" and entries[1]["item"] == item.id
+
+
+async def test_w4_00_b15_a_limit_logs_the_closed_question_too(workfolder: Path) -> None:
+    """The same gap with `wall_time`: `cancel_all` runs for a limit as well."""
+    from test_agent_loop_hangs import run_case
+
+    ask = post("main", "@user welches Band?", kind="question")
+    scripts = {D1: turns([ask, wait(20)]), D2: turns([wait(20)])}
+    manager, _line = await run_case(workfolder, scripts, IDLE, wall="2s")
+    entries = [e["data"] for e in log_entries(manager.run_dir, "user_question")]
+    assert [(e["state"], e.get("reason")) for e in entries] == [("open", None), ("closed", "limit")]
+
+
+async def test_w4_00_b16_l15_wakes_the_member_behind_the_guard_with_its_request(
+    workfolder: Path,
+) -> None:
+    """S30: after a real ping-pong (guard) D2 sends 15 requests to the finished D1 in one turn.
+    After `ping_pong` a `wake_scheduled {unread}` for D1 must come, and the requests must be in
+    its prompt (M58: with L15 behind the guard again, neither happens)."""
+    scripts = {
+        D1: turns([post("main", "Ergebnis 1", kind="result"), wait(0.3), post("main", f"@{D2} a?")],
+                  [wait(0.05), post("main", f"@{D2} b?")],
+                  [wait(0.05), post("main", f"@{D2} c?")],
+                  [wait(0.05), post("main", f"@{D2} d?")],
+                  [say("gesehen")], repeat_last=True),
+        D2: turns([post("main", "Ergebnis 2", kind="result")],
+                  [wait(0.05), post("main", f"@{D1} x!")],
+                  [wait(0.05), post("main", f"@{D1} y!")],
+                  [wait(0.05), post("main", f"@{D1} z!")],
+                  [wait(0.05), *[post("main", f"@{D1} Bitte {i}") for i in range(15)]],
+                  [say("ruhig")], repeat_last=True),
+    }  # fmt: skip
+    manager, outcome, took = await discuss(workfolder, scripts, IDLE, within=40)
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE and took < 30
+    entries = log_entries(manager.run_dir)
+    [guard] = [i for i, e in enumerate(entries) if e["kind"] == "ping_pong"][:1]
+    behind = [
+        e["data"]
+        for e in entries[guard:]
+        if e["kind"] == "wake_scheduled" and "unread" in e["data"] and e["data"]["agent"] == D1
+    ]
+    assert behind, "L15 wakes the member behind the guard"
+    guarded_at = entries[guard]["ts"]
+    later = [t["data"]["prompt"] for t in turn_starts(manager.run_dir, D1) if t["ts"] > guarded_at]
+    assert any("Bitte" in prompt for prompt in later), "the request is in its prompt"
+
+
+async def test_w4_00_b18_the_end_of_the_run_closes_the_question_in_the_room(
+    workfolder: Path,
+) -> None:
+    """S10: after the run `open_user_questions()` is empty, not only the inbox item (M65)."""
+    from test_agent_loop_hangs import run_case
+
+    ask = post("main", "@user welches Band?", kind="question")
+    scripts = {D1: turns([ask, done()]), D2: turns([done()])}
+    manager, line = await run_case(workfolder, scripts, IDLE, wall="30s")
+    assert not line["hang"]
+    [item] = manager.inbox.items()
+    assert item.status is ApprovalStatus.OBSOLETE
+    store = RoomStore(manager.run_dir)
+    assert store.open_user_questions() == [], "closed in the room with the run"
+    [question] = [m for m in store.messages("main") if m.kind is MessageKind.QUESTION]
+    assert not question.open

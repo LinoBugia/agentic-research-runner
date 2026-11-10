@@ -182,14 +182,44 @@ def _clock(ts: float) -> str:
     return time.strftime("%H:%M", time.localtime(ts))
 
 
-def render_wait(outcome: WaitOutcome) -> str:
-    """Result of `wait_for_messages`: why it ended, how long it waited, the new messages."""
+USER_MAY_NOT_ANSWER = (
+    "Deine Frage an den User ist noch offen, und er antwortet vielleicht lange nicht. Warte "
+    "nicht länger auf ihn, auch nicht mit `wait_until`: Arbeite mit einer begründeten Annahme "
+    "weiter und nenne sie in deinem Ergebnis. Antwortet er später, weckt dich das; prüfe dann "
+    "deine Annahme."
+)
+"""V10 (c), User 09.11.: on a question to the user, advise a reasoned assumption, not a
+long wait. Advice only: a `wait_until` is still accepted (option a is not decided)."""
+
+USER_WAITED_LONG = (
+    "Beachte: Deine Frage an den User ist noch offen, und er antwortet vielleicht lange nicht. "
+    "Warte danach nicht noch einmal auf ihn: Arbeite besser mit einer begründeten Annahme weiter "
+    "und nenne sie in deinem Ergebnis. Eine späte Antwort weckt dich auch dann; prüfe dann deine "
+    "Annahme."
+)
+"""The answer to a `wait_until` while the agent's question to the user is open (V10): the
+wait stands, the turn ends as usual, and the advice is for the turn after it."""
+
+
+def render_wait(outcome: WaitOutcome, *, asked_user: bool = False) -> str:
+    """Result of `wait_for_messages`: why it ended, how long it waited, the new messages.
+
+    `asked_user`: a question of the agent to the user is open; then „nobody answers“ advises
+    a reasoned assumption instead of `wait_until` (V10).
+    """
     waited = f"nach {outcome.waited_s:.0f} s"
     if outcome.ended_by is WaitEnd.MESSAGE:
         head = f"Warten beendet {waited}: Es gibt eine Nachricht an dich."
         return head + "\n\n" + render_messages(outcome.messages)
     if outcome.ended_by is WaitEnd.FILE:
         return f"Warten beendet {waited}: Die Datei „{outcome.file}“ ist da."
+    if outcome.ended_by is WaitEnd.NOBODY and asked_user:
+        return (
+            f"Warten beendet {waited}: Niemand antwortet, du hast in diesem Turn "
+            f"{STREAK_MAX_S / 60:.0f} min ohne neue Nachricht an dich gewartet. "
+            f"{USER_MAY_NOT_ANSWER} Rufst du `wait_for_messages` noch einmal auf, beendet arr "
+            "deinen Turn."
+        )
     if outcome.ended_by is WaitEnd.NOBODY:
         return (
             f"Warten beendet {waited}: Niemand antwortet, du hast in diesem Turn "
@@ -216,18 +246,24 @@ def render_wait(outcome: WaitOutcome) -> str:
     return text
 
 
-def render_wait_until(until: float, file: str | None, result_from: str | None = None) -> str:
-    """Answer of `wait_until`: end the turn now, arr wakes the agent."""
+def render_wait_until(
+    until: float, file: str | None, result_from: str | None = None, *, asked_user: bool = False
+) -> str:
+    """Answer of `wait_until`: end the turn now, arr wakes the agent. With a question of the
+    agent to the user open, the wait is accepted, but the answer advises against it (V10)."""
     minutes = max(1, round((until - time.time()) / 60))
     reasons = ["eine Nachricht an dich kommt"]
     if file:
         reasons.append(f"die Datei „{file}“ da ist")
     if result_from:
         reasons.append(f"{result_from} ein Ergebnis abgibt")
-    return (
+    text = (
         "Gut. Beende jetzt deinen Turn mit einer kurzen Zusammenfassung. arr weckt dich, "
         f"sobald {' oder '.join(reasons)}, spätestens um {_clock(until)} (in {minutes} min)."
     )
+    if asked_user:
+        text += f" {USER_WAITED_LONG}"
+    return text
 
 
 def _attachment_text(path: Path) -> str:
@@ -423,13 +459,17 @@ def build_server(room: AgentRoom) -> MCPServer:
         except Exception:
             log.exception("agent %s: wait_for_messages failed", room.agent_id)
             raise ToolError(await asyncio.to_thread(_with_footer, room, INTERNAL_ERROR)) from None
-        return await asyncio.to_thread(_with_footer, room, render_wait(outcome))
+        asked = outcome.ended_by is WaitEnd.NOBODY and await asyncio.to_thread(room.asked_the_user)
+        text = render_wait(outcome, asked_user=asked)
+        return await asyncio.to_thread(_with_footer, room, text)
 
     def _wait_until(minutes: float, until_file: str | None, result_from: str | None) -> str:
         def call() -> str:
             state = room.wait_until(minutes, until_file, result_from)
             shown = result_from.strip().removeprefix("@") if state.result_from else None
-            return render_wait_until(state.until, state.file, shown)
+            return render_wait_until(
+                state.until, state.file, shown, asked_user=room.asked_the_user()
+            )
 
         return _respond(room, "wait_until", call)
 

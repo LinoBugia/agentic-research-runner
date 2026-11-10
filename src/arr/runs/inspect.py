@@ -17,7 +17,7 @@ from typing import Any
 
 from arr.errors import ArrError
 from arr.models import RunStatus
-from arr.runs.orchestrator import OrchestratorLog
+from arr.runs.orchestrator import OrchestratorLog, stopped_text
 from arr.runs.prepare import RunMeta, load_run_meta
 from arr.usage import USAGE_FILE, RunUsage
 
@@ -261,7 +261,7 @@ def run_reason(meta: RunMeta, entries: Sequence[Mapping[str, Any]]) -> str:
         None,
     )
     if status is RunStatus.STOPPED:
-        return "Der User hat den Run gestoppt." if ran else "Der Run wurde vor dem Start gestoppt."
+        return stopped_text(entries, ran=ran)
     if status is RunStatus.FAILED:
         first = errors[0] if errors else {}
         return f"Fehler: {first.get('message') or first.get('type') or 'unbekannt'}"

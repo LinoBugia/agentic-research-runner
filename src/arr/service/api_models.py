@@ -1482,7 +1482,8 @@ class ProfileUsageSum(ApiModel):
 
 
 class ProfileRunUsage(ProfileUsageSum):
-    """One run in the record of a profile; only the agents on this profile count."""
+    """One run in the record of a profile; only the agents on this profile count. `url` is
+    empty for a run in another workfolder (W4-00 B15): this service cannot open it."""
 
     run_id: str
     status: RunStatus
@@ -1492,10 +1493,12 @@ class ProfileRunUsage(ProfileUsageSum):
     aborted: bool = Field(default=False, description="stopped, failed or interrupted")
     active: bool = False
     url: str
+    workfolder: str | None = Field(default=None, description="Path of the run's workfolder (B15)")
 
 
 class ProfileUsage(ApiModel):
-    """„Nachweis je Profil“: what ran through arr on this profile (W3-06)."""
+    """„Nachweis je Profil“: what ran through arr on this profile (W3-06), in every known
+    workfolder (W4-00 B15)."""
 
     profile: str
     today: ProfileUsageSum
@@ -1503,6 +1506,10 @@ class ProfileUsage(ApiModel):
     total: ProfileUsageSum
     runs: list[ProfileRunUsage] = Field(default_factory=list)
     note: str
+    workfolders: list["ProfileUsageFolder"] = Field(
+        default_factory=list,
+        description="The workfolders looked at, also those that are missing or unreadable",
+    )
 
 
 class ProjectCheck(ApiModel):
@@ -2328,3 +2335,17 @@ class PostReplyRequest(PostMessageRequest):
     the ID of the question; the room closes it when the user is among its addressees."""
 
     reply_to: int | None = Field(default=None, ge=1)
+
+
+class ProfileUsageFolder(ApiModel):
+    """A workfolder of „Nachweis je Profil“ (W4-00 B15): counted, or why not."""
+
+    path: str
+    name: str
+    current: bool = Field(default=False, description="The workfolder of this service")
+    runs: int = Field(default=0, ge=0, description="Runs on the profile found here")
+    unreadable_runs: int = Field(default=0, ge=0, description="Run folders that could not be read")
+    problem: str | None = Field(default=None, description="Why it was not counted, German")
+
+
+ProfileUsage.model_rebuild()
