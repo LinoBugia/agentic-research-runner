@@ -158,14 +158,85 @@ async def test_an_answer_within_the_deadline_wakes_the_asker_and_ends_the_wait(
     assert item.decision is not None and item.decision.action is DecisionAction.ANSWER
     starts = [e for e in _events(manager, J2) if e["kind"] == "turn_start"]
     assert len(starts) == 2, "one more turn for the asker"
-    assert "Der User hat deine Frage beantwortet" in starts[1]["data"]["prompt"]
     assert "Nur n ≥ 1." in starts[1]["data"]["prompt"], "the answer is in its inbox"
     [wake] = [e["data"] for e in log_entries(manager.run_dir, "wake") if e["data"]["agent"] == J2]
-    assert wake["reasons"] == ["answer"] and wake["count"] == 1
+    assert wake["count"] == 1
+    if mode == "rounds":  # after the rounds: the hold's own wake-up
+        assert wake["reasons"] == ["answer"]
+        assert "Der User hat deine Frage beantwortet" in starts[1]["data"]["prompt"]
+    else:  # event: back in the discussion, L15 wakes for the unread answer (N2)
+        assert wake["reasons"] != ["answer"]
+        assert "Du wurdest in #judges geweckt" in starts[1]["data"]["prompt"]
     [end] = log_entries(manager.run_dir, "discussion_end")
     assert end["data"]["wakeups"] == {J2: 1}, "B13 counts the wake-up of the answer"
     assert outcome.wakeups == {J2: 1}
     assert waits(manager)[-1] == "none"
+
+
+@pytest.mark.parametrize("old", [False, True], ids=["n2", "naive"])
+async def test_n2_in_event_mode_the_asker_can_wake_another_member_after_the_answer(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch, old: bool
+) -> None:
+    """W4-06.2 N2 (review): after the answer the asker writes `@judge-1 …`. In `event` this
+    wakes judge-1 like during the discussion (L13). Counter-check `naive`: the hold's own
+    wake-up of W4-06.1, after which nothing wakes judge-1."""
+    monkeypatch.setattr(waiting, "STREAK_MAX_S", 30.0)
+    if old:
+
+        async def w4061(orch, config, stage, context, outcome, rounds, answered):  # noqa: ANN001
+            for question in answered:  # the hold's own wake-up, as in W4-06.1
+                await pacing._wake_for_answer(orch, config, stage, context, question, outcome)
+
+        monkeypatch.setattr(pacing, "_answered_in_event", w4061)
+
+    async def user(orch: Orchestrator) -> None:
+        await eventually(lambda: "user" in waits_of(orch), within=10)
+        [question] = [m for m in orch.room.messages("judges") if m.kind is MessageKind.QUESTION]
+        orch.room.post(
+            "judges", "Nur n ≥ 1.", sender=USER, kind=MessageKind.ANSWER, to=[J2],
+            reply_to=question.id, via=MessageVia.GUI,
+        )  # fmt: skip
+
+    scripts = {
+        J1: turns([done("major")], [done("geprüft")]),
+        J2: turns([ASK, done("major")], [post("judges", "@judge-1 prüfst du n ≥ 1?"), done()]),
+    }
+    manager, outcome, _ = await judges(workfolder, scripts, mode="event", during=user)
+    j1 = [e for e in _events(manager, J1) if e["kind"] == "turn_start"]
+    if old:
+        assert len(j1) == 1, "W4-06.1: the request to judge-1 waits"
+        return
+    assert len(j1) == 2, "the request of the asker woke judge-1"
+    assert outcome.ended_by is DiscussionEnd.ALL_DONE
+
+
+async def test_a_question_in_another_channel_does_not_hold(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N4 (c): only questions of the phase's own channel hold it."""
+    monkeypatch.setattr(waiting, "STREAK_MAX_S", 30.0)
+    other = post("andere", "@user Frage dort?", kind="question")
+    scripts = {J1: turns([done("major")]), J2: turns([other, done("major")])}
+    results: list[DiscussionOutcome] = []
+
+    async def topology(ctx: RunContext) -> None:
+        results.append(await ctx.discuss("judges", "Besprecht.", rounds=1))
+
+    manager = make_manager(
+        workfolder,
+        topology,
+        scripts,
+        groupchats=[
+            channel("judges", [J1, J2], mode="rounds"),
+            channel("andere", [J1, J2], mode="rounds"),
+        ],
+        run_extra={"limits": {"wall_time": "60s"}},
+    )
+    started = time.monotonic()
+    assert await asyncio.wait_for(manager.run(), 20) is RunStatus.DONE
+    assert time.monotonic() - started < 5, "the question in #andere did not hold #judges"
+    assert results[0].ended_by is DiscussionEnd.ALL_DONE
+    assert waits(manager) == []
 
 
 async def test_a_stop_while_the_phase_waits_ends_at_once(

@@ -356,7 +356,9 @@ async def run_discussion(
     else:
         raise ArrError(f"Die Taktung „moderated“ (Kanal #{channel}) gibt es erst ab Welle 4.")
     if outcome.ended_by not in (DiscussionEnd.STOPPED, DiscussionEnd.LIMIT):
-        await _hold_for_user_questions(orch, config, stage, context, outcome)
+        await _hold_for_user_questions(
+            orch, config, stage, context, outcome, rounds or DEFAULT_ROUNDS
+        )
     return outcome
 
 
@@ -379,13 +381,16 @@ async def _hold_for_user_questions(
     stage: str | None,
     context: Mapping[str, Any] | None,
     outcome: DiscussionOutcome,
+    rounds: int = DEFAULT_ROUNDS,
 ) -> None:
     """B3 (W4-06.1, User 11.11., option a): the phase does not end while a member's question
     to the user in this channel is open, until the user answers or `user_question_hold_s()`
     after the question passed. An answer wakes its asker once (L13, counted like every
-    wake-up); then the phase looks again. After the deadline V10 (c) holds: the question stays
-    open until the run ends, the agent worked on with an assumption. No new limit for agents:
-    a stop or limit ends the wait at once.
+    wake-up); then the phase looks again. In `event` the answer leads back into the event
+    discussion (W4-06.2, N2): it is an unread direct message, so L15 wakes the asker, and what
+    the asker writes then wakes others as during the discussion. After the deadline V10 (c)
+    holds: the question stays open until the run ends, the agent worked on with an assumption.
+    No new limit for agents: a stop or limit ends the wait at once.
     """
     watched: dict[int, Any] = {}
     reported = False
@@ -407,9 +412,14 @@ async def _hold_for_user_questions(
             item = orch.inbox.get(question.item_id)
             if item.decision is not None and item.decision.action is DecisionAction.ANSWER:
                 answered.append(question)
-        for question in answered:
-            await _wake_for_answer(orch, config, stage, context, question, outcome)
         if answered:
+            if config.mode is ChannelMode.EVENT:
+                await _answered_in_event(orch, config, stage, context, outcome, rounds, answered)
+            else:
+                for question in answered:
+                    await _wake_for_answer(orch, config, stage, context, question, outcome)
+            if outcome.ended_by in (DiscussionEnd.STOPPED, DiscussionEnd.LIMIT):
+                break
             continue
         now = time.time()
         hold = user_question_hold_s()
@@ -423,6 +433,25 @@ async def _hold_for_user_questions(
         await asyncio.sleep(orch.pacing.poll_interval_s)
     if reported:
         orch.log.write("waiting", channel=config.name, reason="none")
+
+
+async def _answered_in_event(
+    orch: "Orchestrator",
+    config: GroupChatConfig,
+    stage: str | None,
+    context: Mapping[str, Any] | None,
+    outcome: DiscussionOutcome,
+    rounds: int,
+    answered: list[Any],
+) -> None:
+    """N2 (W4-06.2): in `event` an answer leads back into the event discussion, without a
+    kick-off. The answer is an unread direct message to the asker, so L15 wakes it; what it
+    writes then wakes others as during the discussion (L13)."""
+    more = await _EventDiscussion(orch, config, None, stage, context, False, rounds).run()
+    outcome.outcomes += more.outcomes
+    outcome.wakeups.update(more.wakeups)
+    if more.ended_by in (DiscussionEnd.STOPPED, DiscussionEnd.LIMIT):
+        outcome.ended_by = more.ended_by
 
 
 async def _wake_for_answer(
