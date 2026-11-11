@@ -21,4 +21,4 @@ Am Ende jeder Arbeitsrunde einen Stand (Ergebnisart `exploration`) mit den Absch
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`); den Pfad von deinem Arbeitsordner aus nennt dein Auftrag. Die Ergebnisse der anderen Explorer siehst du nur, wenn der Run es vorsieht: als Auszug in deinem Auftrag oder im Austausch in `#werkstatt`.
+Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`). Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind. Die Ergebnisse der anderen Explorer siehst du nur, wenn der Run es vorsieht: als Auszug in deinem Auftrag oder im Austausch in `#werkstatt`.

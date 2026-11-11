@@ -17,8 +17,12 @@ python <skill-ordner>/scripts/check.py gleich "sqrt(x^2)" "x" --symbol x:positiv
 python <skill-ordner>/scripts/check.py vereinfache "sin(x)^2 + cos(x)^2"
 ```
 
-- `gleich A B`: prüft, ob `A - B` zu 0 vereinfacht. Ausgabe `gleich`, `nicht gleich` (mit Differenz) oder `nicht entschieden`. Exit-Code 0, 1 oder 2.
+- `gleich A B`: prüft, ob `A - B` zu 0 vereinfacht. Ausgabe `gleich`, `nicht gleich` (mit Differenz) oder `nicht entschieden`.
 - `vereinfache A`: gibt die vereinfachte Form aus.
+- **Exit-Codes:** 0 gleich bzw. vereinfacht, 1 nicht gleich, 2 nicht entschieden, 3 Fehler (abgelehnt, nicht lesbar, Grenze erreicht, SymPy fehlt). Nur 1 heißt „nicht gleich“.
+- Ein Ausdruck darf mit `-` beginnen (`gleich -x "(-1)*x"`); sicher geht es mit `--` vor den Ausdrücken.
+- **Grenzen:** höchstens 10 s CPU-Zeit; Potenzen von Zahlen nur bis etwa 4200 Stellen, `factorial`, `binomial` und Verwandte nur bis zum Argument 1000, Zahlen höchstens 100 Ziffern. Größeres rechnest du symbolisch mit einer Variablen.
+- Dezimalzahlen sind Näherungen: `2^0.5` ist nicht gleich `sqrt(2)`. Schreib Brüche (`1/2`) statt `0.5`.
 - `--symbol name:annahme,annahme` setzt Annahmen, z. B. `n:integer,positive`. Ohne Annahmen gelten Symbole als komplex; manche Identitäten gelten dann nicht. Eine unbekannte Annahme (z. B. `positiv`) ist ein Fehler.
 - `^` ist die Potenz.
 - **Konstanten:** `I` ist die imaginäre Einheit, `E` die eulersche Zahl, `pi` und `oo` (unendlich). Meinst du `I` oder `E` als Variable, lege sie mit `--symbol I` an. Andere Namen wie `N`, `S`, `beta`, `gamma` sind Variablen, solange du sie nicht aufrufst.

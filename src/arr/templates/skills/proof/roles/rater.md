@@ -23,4 +23,4 @@ Ein Rating des Ergebnisses: Gesamt-Score, Scores je Kriterium und ein Kommentar 
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`); den Pfad von deinem Arbeitsordner aus nennt dein Auftrag. Pfade im Auftrag sind relativ zum Run-Ordner.
+Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`). Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind.

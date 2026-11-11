@@ -84,6 +84,10 @@ FIELDS = {
     "summary_md",
 }
 """Names in backticks that are fields or parameters, not tools."""
+RUN_FOLDER_SENTENCE = (
+    "Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner "
+    "über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`)"
+)
 PROTOCOL_WORDS = ("wait_for_messages", "wait_until", "inbox(", "read_messages", "set_status")
 """The fixed protocol explains these; roles do not repeat it (docs/03 §5, docs/09 §4.7)."""
 
@@ -318,6 +322,9 @@ async def test_a2_fake_run_of_each_group_skill_ends_done(wf: Path, name: str) ->
     if name in ("exploration", "roundtable"):  # the summarizer wrote its summary
         results = [p.name for p in (manager.run_dir / "output" / "results").iterdir()]
         assert any("summarizer-summary" in r for r in results), results
+    # the roles say: with `copy` the run folder is three levels above the work folder
+    for prepared in manager.prepared.agents.values():
+        assert prepared.work_dir.parent.parent.parent == manager.run_dir, prepared.id
     # the skills listed for agents are in the run's snapshot
     assert (manager.run_dir / "skills" / "sympy-check" / "scripts" / "check.py").is_file()
 
@@ -394,8 +401,9 @@ def test_a5_roles_name_the_result_path_and_the_standard(name: str) -> None:
         if not path.startswith("roles/"):
             continue
         assert "output/results/" in text, path
-        assert "den Pfad von deinem Arbeitsordner aus nennt dein Auftrag" in text, path
-        assert "../" not in text, "no fixed number of ../: wrong for workspace shared (W4-05.1)"
+        # the run folder for `copy`/`empty` (agents/<id>/work) and `shared` (shared/<name>),
+        # see prepare.py; tasks name paths from `output/` or absolute ones (W4-05.2 N1)
+        assert RUN_FOLDER_SENTENCE in " ".join(text.split()), path
         assert "## Wo Ergebnisse liegen" in text, path
         assert "Korrektheit vor Vollständigkeit" in text, path
         assert "## Abgabe" in text and "## Auftrag" in text and "## Maßstab" in text, path
@@ -553,7 +561,7 @@ def test_sympy_check_script(tmp_path: Path) -> None:
         import sympy  # noqa: F401
     except ImportError:
         result = run_check(tmp_path, "gleich", "a", "b")
-        assert result.returncode == 2 and "SymPy fehlt" in result.stdout
+        assert result.returncode == 3 and "SymPy fehlt" in result.stdout
         return
     assert run_check(tmp_path, "gleich", "(n+1)^2", "n^2+2*n+1").returncode == 0
     unequal = run_check(tmp_path, "gleich", "n+1", "n")
@@ -602,7 +610,7 @@ def test_w4_05_1_sympy_check_refuses_code(tmp_path: Path, text: str) -> None:
     with pytest.raises(module.Refused):
         module.names_of(text)
     result = run_check(tmp_path, "vereinfache", text)
-    assert result.returncode == 2 and result.stdout.startswith("Abgelehnt:"), result.stdout
+    assert result.returncode == 3 and result.stdout.startswith("Abgelehnt:"), result.stdout
     assert not (tmp_path / "marker").exists() and not Path("marker").exists()
 
 
@@ -810,3 +818,71 @@ def test_w4_05_1_arr_init_failing_start_skills_leaves_no_arr_yaml(
     monkeypatch.undo()
     init_workfolder(tmp_path / "wf")
     assert len(list((tmp_path / "wf" / "skills").iterdir())) == len(START_SKILLS)
+
+
+def test_w4_05_2_run_folder_levels_match_prepare(tmp_path: Path) -> None:
+    """The levels in the roles: work folders of `copy` and `shared` as `prepare_run` makes them."""
+    import inspect
+
+    from arr.runs import prepare
+
+    source = inspect.getsource(prepare)
+    assert 'work_dir = run_dir / "shared" / name' in source  # shared: two levels
+    assert 'work_dir = agent_dir / "work"' in source  # copy and empty: agents/<id>/work
+    assert 'agent_dir = run_dir / "agents" / agent.id' in source
+
+
+@pytest.mark.parametrize(
+    "text", ["٣+x", "x\u00a0+ 1", "atan２(1, 2)", "ｘ + 1", "x\u2028+1", "1" * 101 + "+x"]
+)
+def test_w4_05_2_sympy_check_only_ascii_and_short_numbers(tmp_path: Path, text: str) -> None:
+    module = check_module()
+    with pytest.raises(module.Refused):
+        module.names_of(text)
+    with pytest.raises(module.Refused, match="kein erlaubter Symbolname"):
+        module.symbol_specs(["٣:real"])
+
+
+def test_w4_05_2_sympy_check_reads_a_leading_minus_as_an_expression() -> None:
+    module = check_module()
+    assert module.split_args(["gleich", "-x", "(-1)*x"]) == ("gleich", ["-x", "(-1)*x"], [])
+    assert module.split_args(["gleich", "--", "-x", "--symbol"]) == (
+        "gleich",
+        ["-x", "--symbol"],
+        [],
+    )
+    assert module.split_args(["vereinfache", "-2", "--symbol", "x:real"]) == (
+        "vereinfache",
+        ["-2"],
+        ["x:real"],
+    )
+    with pytest.raises(module.Refused, match="braucht 2"):
+        module.split_args(["gleich", "x"])
+
+
+def test_w4_05_2_sympy_check_exit_codes(tmp_path: Path) -> None:
+    """3 is an error, never 1 (\u201enicht gleich\u201c); the help ends with 0."""
+    assert run_check(tmp_path, "--help").returncode == 0
+    for args in (["gleich", "x"], ["teile", "x"], ["vereinfache", "x.y"], []):
+        result = run_check(tmp_path, *args)
+        assert result.returncode == 3, (args, result.stdout)
+    try:
+        import sympy  # noqa: F401
+    except ImportError:
+        return
+    assert run_check(tmp_path, "gleich", "n+1", "n").returncode == 1
+    assert run_check(tmp_path, "gleich", "(x, y)", "(x, y)").returncode == 3
+
+
+@pytest.mark.parametrize(
+    "text", ["2^10^9", "9^9^9", "factorial(10^8)", "100000!", "binomial(10^9, 3)", "2^-10^9"]
+)
+def test_w4_05_2_sympy_check_refuses_numbers_too_large(text: str) -> None:
+    try:
+        import sympy  # noqa: F401
+    except ImportError:
+        pytest.skip("SymPy fehlt in dieser Umgebung; die Run-venv hat es (Bericht).")
+    module = check_module()
+    with pytest.raises(module.Refused, match="zu groß"):
+        module.check_size(text, {})
+    module.check_size("2^100 + factorial(20) + 10^4000", {})  # counter-check: small enough
