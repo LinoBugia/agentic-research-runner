@@ -75,6 +75,7 @@ from arr.workfolder import (
     init_workfolder,
     load_workfolder_settings,
     os_reason,
+    path_within,
     read_template,
     set_setting,
     update_settings_file,
@@ -118,6 +119,20 @@ def make_api(wf: Path, scripts: dict[str, Any] | None = None) -> RealApi:
 
 def snapshot(folder: Path) -> dict[str, bytes]:
     return {str(p.relative_to(folder)): p.read_bytes() for p in folder.rglob("*") if p.is_file()}
+
+
+@pytest.fixture
+def own_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A `HOME` of the test's own that holds neither the test venvs nor `sys.base_prefix`
+    (W4-04.2). The Python of the test run may lie below the real home (uv's Python on the CI
+    runner), and then `toolchain_notice` rightly speaks up for Codex agents; tests that do not
+    check that notice must not depend on where this Python lives."""
+    folder = tmp_path / "eigenes-home"
+    folder.mkdir()
+    monkeypatch.setenv("HOME", str(folder))
+    for place in (Path(sys.base_prefix), Path(sys.executable).parent, base_venv_dir("x").parent):
+        assert not path_within(Path(os.path.realpath(place)), folder.resolve()), place
+    return folder
 
 
 def fake_base_venv(name: str) -> Path:
@@ -999,7 +1014,7 @@ async def test_new_workfolder_takes_the_offered_base_venv(wf: Path, tmp_path: Pa
     assert error.value.error.field == "toolchain.python" and not (tmp_path / "drei").exists()
 
 
-async def test_toolchain_test_runs_the_interpreter(fresh: Path) -> None:
+async def test_toolchain_test_runs_the_interpreter(fresh: Path, own_home: Path) -> None:
     api = make_api(fresh)
     venv = fake_base_venv("mathe")
     result = await api.test_toolchain(str(venv))
@@ -1376,7 +1391,11 @@ async def test_new_project_and_folder_errors_are_in_german(
     ],
 )
 async def test_missing_packages_read_right(
-    fresh: Path, monkeypatch: pytest.MonkeyPatch, packages: dict[str, bool], text: str
+    fresh: Path,
+    own_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    packages: dict[str, bool],
+    text: str,
 ) -> None:
     def probe(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         output = json.dumps({"version": "3.12.0", "packages": packages})
