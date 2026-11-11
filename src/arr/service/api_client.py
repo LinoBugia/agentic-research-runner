@@ -60,6 +60,7 @@ from arr.service.api_models import (
     SkillInfo,
     SkillKind,
     StartRunResponse,
+    StartSkillsResult,
     StorageReport,
     ToolchainTestResult,
     TranscriptKind,
@@ -484,4 +485,9 @@ class ApiClient(Protocol):
 
     async def select_workfolder(self, request: WorkfolderRequest) -> WorkfolderInfo:
         """Open or create a workfolder (`POST /api/workfolder`)."""
+        ...
+
+    async def create_start_skills(self) -> StartSkillsResult:
+        """Create the missing start skills (`POST /api/skills/start`, W4-05); skills with the
+        same name are never overwritten and named in `existing`."""
         ...

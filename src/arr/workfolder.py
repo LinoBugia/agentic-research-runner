@@ -26,7 +26,16 @@ from ruamel.yaml.comments import CommentedMap
 from arr.errors import ArrError
 from arr.models import ProjectSettings, WorkfolderSettings
 from arr.resolve import load_yaml_model
-from arr.skills import discover_skills, link_user_skills, skills_for_user_agent
+from arr.skills import (
+    ARR_SKILL,
+    SKILLS_LINK,
+    SkillFileError,
+    discover_skills,
+    install_start_skill,
+    install_start_skills,
+    link_user_skills,
+    skills_for_user_agent,
+)
 
 __all__ = [
     "REMOVE",
@@ -100,16 +109,28 @@ def init_workfolder(path: Path) -> Path:
     """Create the workfolder layout at `path` (idempotent) and return its absolute path.
 
     Writes `arr.yaml` and `README.md` and creates `projects/`, `skills/`, `runs/` and `.arr/`
-    (docs/02 §1). Existing files and folders are never overwritten or changed.
+    (docs/02 §1). A new workfolder (no `arr.yaml` yet) also gets the start skills (W4-05).
+    Existing files and folders are never overwritten or changed.
     """
     root = Path(path).expanduser().absolute()
     if root.exists() and not root.is_dir():
         raise ArrError(
             f"„{root}“ ist kein Ordner. Gib einen Ordner für den Workfolder an, z. B. ~/arr."
         )
+    new = not os.path.lexists(root / SETTINGS_FILE)
+    skills = root / "skills"
+    if new and (skills.is_symlink() or (os.path.lexists(skills) and not skills.is_dir())):
+        raise ArrError(f"Der Workfolder „{root}“ ließ sich nicht anlegen: {SKILLS_LINK}")
     try:
         for sub in _WORKFOLDER_DIRS:
             (root / sub).mkdir(parents=True, exist_ok=True)
+        if new:  # before arr.yaml: a failure leaves no workfolder that looks finished
+            try:
+                install_start_skills(root)
+            except SkillFileError as exc:
+                raise ArrError(
+                    f"Die Start-Skills ließen sich nicht anlegen: {exc.message}"
+                ) from None
         for target, template in _WORKFOLDER_FILES:
             _write_new(root / target, read_template("workfolder", template))
     except PermissionError as exc:
@@ -403,15 +424,6 @@ def _arr_server_stale(server: Any) -> bool:
     return Path(command).name == "arr" and command != arr_command()
 
 
-def _arr_skill_placeholder(root: Path) -> bool:
-    """Create `skills/arr/SKILL.md` from the template if the workfolder has no skill `arr`."""
-    folder = root / "skills" / "arr"
-    if folder.exists() or folder.is_symlink():
-        return False
-    folder.mkdir(parents=True)
-    return _write_new(folder / "SKILL.md", read_template("project", "arr-skill.md"))
-
-
 def setup_project(
     path: Path, *, workfolder: str | Path | None = None, title: str | None = None
 ) -> ProjectSetup:
@@ -496,11 +508,15 @@ def setup_project(
         else:
             result.skipped.append(name)
 
-    # Skill `arr`: a placeholder while the workfolder has none (its text comes with W4-05)
-    if _arr_skill_placeholder(root):
-        result.warnings.append(
-            "Der Skill „arr“ fehlte im Workfolder; arr hat einen Platzhalter angelegt."
-        )
+    # Skill `arr` if the workfolder has none: the installer of the start skills (W4-05)
+    # follows no link and overwrites nothing
+    try:
+        arr_created = install_start_skill(root, ARR_SKILL)
+    except SkillFileError as exc:
+        arr_created = False
+        result.warnings.append(f"Der Skill „arr“ ließ sich nicht anlegen: {exc.message}")
+    if arr_created:
+        result.warnings.append("Der Skill „arr“ fehlte im Workfolder; arr hat ihn angelegt.")
         catalog = discover_skills(root / "skills")
         user_skills = skills_for_user_agent(catalog, settings)
 

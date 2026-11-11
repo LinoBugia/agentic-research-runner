@@ -24,6 +24,7 @@ from arr.service.real_api import RealApi
 from arr.service.real_api import live as live_module
 from arr.service.real_api.runs import SOLO_AGENT
 from arr.service.state import read_app_settings, remember_workfolder, write_app_settings
+from arr.skills import START_SKILLS
 from arr.workfolder import init_workfolder, load_workfolder_settings
 
 CLICK_LIMIT_E1 = 3
@@ -431,24 +432,50 @@ async def test_new_run_shows_the_python_notice_for_codex_agents(
 # --- W3-04.3 ------------------------------------------------------------------------------------
 
 
-async def test_start_skills_on_the_real_service_say_when_they_come(wf: Path) -> None:
+def _empty_skills(wf: Path) -> None:
+    """The workfolder without the start skills `arr init` created (W4-05)."""
+    import shutil
+
+    for entry in (wf / "skills").iterdir():
+        shutil.rmtree(entry)
+
+
+async def test_start_skills_are_created_on_the_real_service(wf: Path) -> None:
+    """W4-05: the button creates the start skills in the workfolder."""
+    _empty_skills(wf)
     async with real_user(wf) as (user, _api):
         await user.open("/skills")
-        html = await see(user, "Die Start-Skills kommen mit Auftrag W4-05.")
-        assert "mit einem Klick" not in html
+        html = await see(user, "Lege die Start-Skills mit einem Klick an")
         user.find(marker="start-skills").click()
-        await see(user, "Start-Skills anlegen")
-        html = await see(user, "Die Start-Skills kommen mit Auftrag W4-05.")
-        assert "simuliert" not in html and "angelegt" not in html.replace("anlegen", "")
-    assert not list((wf / "skills").iterdir())
+        html = await see(user, "Start-Skills angelegt: arr, exploration, latex-writeup", 80)
+        assert "proof-review" in html and "sympy-check" in html
+        assert "Start-Skills anlegen" not in html, "nothing missing: no button"
+    assert sorted(p.name for p in (wf / "skills").iterdir()) == sorted(START_SKILLS)
 
 
-async def test_start_skills_stay_simulated_in_the_prototype() -> None:
+async def test_start_skills_never_overwrite_and_the_page_names_them(wf: Path) -> None:
+    """W4-05: a skill with the same name stays as it is; the toast names it."""
+    _empty_skills(wf)
+    own = wf / "skills" / "proof"
+    own.mkdir()
+    (own / "SKILL.md").write_text("---\nname: proof\ndescription: Mein Beweis.\n---\n", "utf-8")
+    async with real_user(wf) as (user, _api):
+        await user.open("/skills")
+        html = await see(user, "Mein Beweis.")
+        assert "Start-Skills anlegen" in html, "the button shows while start skills are missing"
+        user.find(marker="start-skills").click()
+        await see(user, "Schon vorhanden und nicht verändert: proof.", 80)
+    assert (own / "SKILL.md").read_text() == "---\nname: proof\ndescription: Mein Beweis.\n---\n"
+    assert sorted(p.name for p in own.iterdir()) == ["SKILL.md"]
+
+
+async def test_start_skills_in_the_prototype() -> None:
     async with gui_user(MockApi()) as user:
         await user.open("/skills?zustand=leer")
         await see(user, "Start-Skills anlegen")
         user.find(marker="start-skills").click()
-        await see(user, "im Prototyp simuliert")
+        # the forced empty state only hides the data set, which has the start skills already
+        await see(user, "Alle Start-Skills sind schon da")
 
 
 # --- W3-04.4 ------------------------------------------------------------------------------------
