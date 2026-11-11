@@ -735,6 +735,8 @@ def _topology_turns(resolved: ResolvedRun) -> tuple[int, int | None, list[str]]:
             notes.append("Nach einer Eskalation kann es weitere Versuche geben.")
             return least, None, notes
         return least, most, notes
+    if kind in (TopologyKind.REVIEW, TopologyKind.EXPLORATION):
+        return _w4_03_turns(resolved)
     return agents, None, []
 
 
@@ -1712,3 +1714,65 @@ class RunsArea:
             await asyncio.gather(*tasks, return_exceptions=True)
         for follower in list(self._followers):
             follower.cancel()
+
+
+# --------------------------------------------------------------------------------------------
+# W4-03: estimate of `review` and `exploration`
+# --------------------------------------------------------------------------------------------
+
+
+def _discussion_turns(resolved: ResolvedRun, name: Any, members: int, rounds: int) -> int:
+    """Most turns of one discussion phase of `members` agents (see `_topology_turns`)."""
+    try:
+        channel = resolved.channel(str(name))
+    except KeyError:
+        return members * rounds
+    if channel.mode is ChannelMode.ROUNDS:
+        return members * rounds
+    return members * (1 + channel.max_wakeups_per_agent + rounds)
+
+
+def _w4_03_turns(resolved: ResolvedRun) -> tuple[int, int | None, list[str]]:
+    """Fewest and most turns of `review` and `exploration` (docs/03 §4.3, §4.5, W4-03).
+
+    `review`: the author writes the artifact (unless `artifact`, 1 + 1 asking again), per
+    round every judge reviews (+ asking again) and, with two or more judges, discusses
+    `discussion_rounds`; the author revises up to `max_revisions` times; a summarizer adds
+    one. `exploration`: the ideator (unless `ideas`, 1 + 1), `turns_per_idea` per idea (+ one
+    asking again), every ranker once (+ once again), a summarizer one.
+    """
+    import fnmatch  # here: W4-03 changes only the end of this file
+
+    params = resolved.params
+    ids = [a.id for a in resolved.agents]
+    extra = 1 if params.get("summarizer") else 0
+    if resolved.topology.kind is TopologyKind.REVIEW:
+        name = params.get("channel") or "judges"
+        try:
+            members = list(resolved.channel(str(name)).members)
+        except KeyError:
+            members = []
+        author = params.get("author") or next(
+            (a.id for a in resolved.agents if "author" in (a.id, a.base_id)), None
+        )
+        judges = len([m for m in members if m not in (author, params.get("summarizer"))])
+        revisions = max(0, _int(params.get("max_revisions"), 2))
+        rounds = max(0, _int(params.get("discussion_rounds"), 1))
+        writes = 0 if params.get("artifact") else 1
+        talk = _discussion_turns(resolved, name, judges, rounds) if judges > 1 else 0
+        least = writes + judges + (judges * min(rounds, 1) if judges > 1 else 0) + extra
+        most = 2 * writes + (1 + revisions) * (2 * judges + talk) + 2 * revisions + extra
+        notes = ["Ein Review endet früher, wenn die Judges das Artefakt annehmen."]
+        return least, most, notes
+    ideas = params.get("ideas")
+    n_ideas = len(ideas) if isinstance(ideas, list) and ideas else _int(params.get("n_ideas"), 3)
+    per_idea = max(1, _int(params.get("turns_per_idea"), 1))
+    ideator = 0 if isinstance(ideas, list) and ideas else 1
+    rankers = params.get("rankers")
+    if isinstance(rankers, str):
+        rankers = [rankers]
+    patterns = rankers if isinstance(rankers, list) else ["ranker*"]
+    ranker_count = len([i for i in ids if any(fnmatch.fnmatchcase(i, p) for p in patterns)])
+    least = ideator + n_ideas * per_idea + ranker_count + extra
+    most = 2 * ideator + n_ideas * (per_idea + 1) + 2 * ranker_count + extra
+    return least, most, []

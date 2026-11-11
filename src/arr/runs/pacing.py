@@ -880,6 +880,8 @@ def _result_text(result: Result | Message, shown: str, view: "AgentRoom") -> str
             return None
         head = f"Ergebnis von {shown} (Nachricht #{result.id} in #{result.channel}):"
         body = result.body
+    elif view.store.is_sealed(result.id):
+        return None  # a result of a sealed stage stays hidden until its release (W4-03 F4)
     else:
         head = f"Ergebnis #{result.id} von {shown}: „{result.title}“"
         if result.path:

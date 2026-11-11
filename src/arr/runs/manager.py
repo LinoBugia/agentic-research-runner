@@ -3,10 +3,11 @@
 `RunManager.run()` goes through docs/02 §7 and writes every status change with its time to
 `meta.json` at once (atomically) and to `orchestrator.jsonl`:
 
-- `preparing`: `prepare_run` (also into a reserved folder), `tmp/`, the run venv (with
-  `run_venv: overlay`), `groupchats/room.sqlite` with the channels, the PolicyEngine with one
-  profile per agent, the `ApprovalInbox` with the given decider, one EventLogger and one
-  backend per agent (from the backend factory, after the profiles are registered), `start()`.
+- `preparing`: `prepare_run` (also into a reserved folder), `tmp/<id>/` per agent, the run
+  venv (with `run_venv: overlay`), `groupchats/room.sqlite` with the channels, the
+  PolicyEngine with one profile per agent, the `ApprovalInbox` with the given decider, one
+  EventLogger and one backend per agent (from the backend factory, after the profiles are
+  registered), `start()`.
 - `running` ⇄ `paused`: the topology runs with the `Orchestrator` as `RunContext`; limits,
   concurrency per auth profile, rate limits, hints and pacing are the orchestrator's job.
   The wall time is watched here.
@@ -71,6 +72,7 @@ from arr.runs.prepare import (
     load_run_meta,
     prepare_run,
 )
+from arr.runs.topologies import planned_stages
 from arr.venvs import ensure_run_venvs_dir
 from arr.workfolder import load_workfolder_settings
 
@@ -247,7 +249,8 @@ class RunManager:
     `topology`, `backend_factory`, `decider` and `finalizer` come from outside (W2-04,
     W2-05). The factory is called after room, PolicyEngine (with all profiles) and inbox are
     set up; `manager.inbox` and `manager.room` are available to it then. `stages` are the
-    planned stages for the checkpoint `plan` (default: the names of `run.yaml stages`).
+    planned stages for the checkpoint `plan` (default: the names of `run.yaml stages`, else
+    the phases the topology reports, e.g. those of `review` and `exploration`, W4-03 F2).
     `gates` are the `ProfileGate`s shared by all runs of a process (the service, W3-01):
     missing profiles are added, so concurrency and rate-limit pauses of a profile hold across
     runs. `lock` is the `RunLock` the caller already holds; without one the manager takes the
@@ -290,7 +293,7 @@ class RunManager:
         self.settings = settings or load_workfolder_settings(self.workfolder)
         self.decider = decider
         self.finalizer = finalizer
-        self.stages = list(stages) if stages is not None else [s.name for s in resolved.stages]
+        self.stages = list(stages) if stages is not None else planned_stages(resolved)
         self.pacing = pacing or PacingSettings()
         self.stop_grace_s = stop_grace_s
         self.venv_with_pip = venv_with_pip
@@ -521,6 +524,8 @@ class RunManager:
         resolved = prepared.resolved
         paths = RunPaths(self.workfolder, run_dir, self.settings.toolchain)
         paths.tmp_dir.mkdir(exist_ok=True)
+        for agent in resolved.agents:  # one Run-tmp per agent, foreign for the others (W4-03.2)
+            paths.agent_tmp_dir(agent).mkdir(exist_ok=True)
         if self.settings.toolchain.run_venv is RunVenvMode.OVERLAY:
             base = next((a.file.base_python for a in prepared.agents.values()), None)
             await asyncio.to_thread(create_run_venv, paths, base, with_pip=self.venv_with_pip)

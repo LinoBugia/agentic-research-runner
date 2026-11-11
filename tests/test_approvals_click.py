@@ -301,7 +301,7 @@ async def test_b3_no_always_where_no_rule_can_come_of_it(
     assert "always" not in load_workfolder_settings(wf).permissions
 
 
-@pytest.mark.parametrize("host", ["*.example.com", "*"])
+@pytest.mark.parametrize("host", ["*.example.com"])
 async def test_n2_a_host_pattern_of_an_agent_never_reaches_the_next_sandbox(
     wf: Path, host: str
 ) -> None:
@@ -324,6 +324,21 @@ async def test_n2_a_host_pattern_of_an_agent_never_reaches_the_next_sandbox(
         await svc.open_item()
         engine = svc.api.state.registry.get(second.run_id).manager.inbox.engine
         assert engine.profile("b").allowed_domains == ()
+    assert "always" not in (load_workfolder_settings(wf).permissions or {})
+
+
+async def test_w4_03_2_a_host_pattern_reaching_loopback_is_denied_without_a_card(
+    wf: Path,
+) -> None:
+    """W4-03.2 N3: `*` includes this machine; the fixed rule denies it, no card is shown, so
+    no click can turn it into a rule (before: a card without rule, see the test above)."""
+    command = "curl -s https://*/x"
+    async with Service(wf, {"a": asking(HOST)}) as svc:
+        run_id, inbox = await keep_alive(svc)
+        decision = await asyncio.wait_for(inbox.handle(bash(run_id, command)), 10)
+        assert decision.action is DecisionAction.DENY
+        assert "diesem Rechner selbst" in decision.reason
+        assert not [c for c in await svc.api.list_approvals(status=OPEN) if command in str(c)]
     assert "always" not in (load_workfolder_settings(wf).permissions or {})
 
 

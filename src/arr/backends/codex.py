@@ -188,6 +188,18 @@ class CodexBackend:
         await self.interrupt()
         await self._shutdown()
 
+    async def reset(self) -> None:
+        """A fresh session with the next turn (W4-03 F5): the next turn starts a new thread
+        instead of resuming this one; in `shared` mode its first prompt carries `context.md`
+        again (`AGENTS.md` Codex reads itself). A no-op after `close()`; never during a turn."""
+        if self._closed:
+            return
+        if self._queue is not None:
+            raise RuntimeError("Reset während eines Turns")
+        self._thread_id = None
+        self._rollout = None
+        logger.info("Codex-Agent %s: neuer Thread ab dem nächsten Turn", self.agent.id)
+
     def session_ref(self) -> dict[str, str]:
         """Thread ID and rollout path for `session.json` (resume, S2 §9)."""
         ref = {"thread_id": self._thread_id} if self._thread_id else {}
@@ -281,7 +293,8 @@ class CodexBackend:
             self._queue = None
 
     def _first_prompt(self, prompt: str) -> str:
-        if self._turn != 1 or self.config.workspace.mode is not WorkspaceMode.SHARED:
+        # the first turn of a thread: the run's first one or the first after `reset` (F5)
+        if self._thread_id is not None or self.config.workspace.mode is not WorkspaceMode.SHARED:
             return prompt
         context = self.agent.run_dir / self.agent.file.context_file
         try:

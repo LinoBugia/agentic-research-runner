@@ -20,10 +20,12 @@ reason plus alternative, or `ask` (grey zone, goes to the inbox in `arr.permissi
 """
 
 import fnmatch
+import ipaddress
 import json
 import os
 import re
 import shlex
+import socket
 import sys
 import tempfile
 import threading
@@ -36,7 +38,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from arr.errors import ArrError
 from arr.models import (
@@ -198,6 +200,19 @@ SENSITIVE_NAME_PATTERNS = ("*.kdbx", "*.keychain", "*.keychain-db", "*.agilekeyc
 
 SENSITIVE_ABSOLUTE_PATHS = ("/Library/Keychains",)
 """Sensitive paths outside `~`."""
+
+RUN_HIDDEN_PATHS = (
+    "groupchats/sealed",
+    "groupchats/staging",
+    "groupchats/room.sqlite",
+    "groupchats/room.sqlite-wal",
+    "groupchats/room.sqlite-shm",
+    "groupchats/room.sqlite-journal",
+)
+"""Paths of the run that no agent may read, not even with an approval (W4-03 F4): results of
+a sealed stage (independent reviews), the copies on their way there and the room database,
+which holds every result. The same names as `arr.room.store` (`SEALED_DIR`, `STAGING_DIR`,
+`ROOM_DB_FILES`), held equal by a test."""
 
 READ_BLOCKED_ROOTS = ("/Volumes",)
 """Besides `~` and the workfolder: roots that are not readable unless on the allowlist."""
@@ -386,6 +401,22 @@ TIMEOUT_REASON = "Keine Freigabe erhalten, arbeite ohne weiter oder frage im Cha
 _R_SENSITIVE = (
     "Dieser Pfad ist geschützt (Schlüssel, Zugangsdaten, Browser- oder arr-Daten) und darf "
     "nie gelesen oder geschrieben werden. Arbeite ohne diese Daten weiter."
+)
+_R_HIDDEN = (
+    "Hier liegen Ergebnisse, die arr noch versiegelt hält (z. B. die Gutachten der anderen "
+    "Judges bis zur Diskussion), und die Datenbank der Gruppenchats. Sie sind nie lesbar, auch "
+    "nicht mit Freigabe. Was du sehen darfst, gibt dir arr im Auftrag (get_assignment) oder im "
+    "Chat."
+)
+_R_FOREIGN = (
+    "Das ist der Ordner eines anderen Agenten (Arbeitskopie, Transkript oder Daten). Er ist nie "
+    "lesbar, auch nicht mit Freigabe. Was ein anderer Agent teilen will, hängt er im Chat an "
+    "oder gibt es als Ergebnis ab; frag ihn mit @name."
+)
+_R_LOOPBACK = (
+    "Verbindungen zu diesem Rechner selbst (localhost, 127.0.0.1, ::1 und Ähnliches) sind nie "
+    "erlaubt, auch nicht mit Freigabe: Dort laufen arr und andere Dienste des Users. Arbeite "
+    "ohne diese Verbindung weiter."
 )
 _R_SEARCH_SENSITIVE = (
     "Dieser Ordner enthält geschützte Pfade und darf nicht als Ganzes durchsucht werden. "
@@ -577,6 +608,20 @@ class AlwaysRule(StrictModel):
     reason: str = ""
     exact: bool = False
 
+    @model_validator(mode="after")
+    def _no_loopback(self) -> "AlwaysRule":
+        """An allow rule never includes this machine (W4-03.2 N3): `localhost` or a pattern
+        such as `*` that matches it does not load, with a German message."""
+        if self.action == "allow":
+            bad = [h for h in self.hosts if reaches_loopback(h)]
+            if bad:
+                raise ValueError(
+                    f"Die Regel „immer“ erlaubt {', '.join(repr(h) for h in bad)} und damit "
+                    "Verbindungen zu diesem Rechner selbst (localhost, 127.0.0.1 …). Das ist nie "
+                    "erlaubt: Nenne die Hosts einzeln, ohne „*“ für alle oder für localhost."
+                )
+        return self
+
 
 class PermissionRules(StrictModel):
     """Schema of `permissions:` in `arr.yaml` (docs/02 §1.1, docs/07 §3 ②).
@@ -603,8 +648,9 @@ class PermissionRules(StrictModel):
 class RunPaths:
     """Folders of one run that the profile needs (docs/02 §1, §4).
 
-    Run-tmp is `<run>/tmp`, the run venv `<venv root>/runs/<run-id>/` outside `~`
-    (`arr.venvs`, W3-00), the Claude plugin of an agent `agents/<id>/plugin` (Codex skills
+    Run-tmp is `<run>/tmp`, one folder `tmp/<id>/` per agent (W4-03.2), the run venv
+    `<venv root>/runs/<run-id>/` outside `~` (`arr.venvs`, W3-00), the Claude plugin of an
+    agent `agents/<id>/plugin` (Codex skills
     live in `work/.agents/skills`). Relative read folders are resolved against the
     workfolder.
     """
@@ -615,8 +661,13 @@ class RunPaths:
 
     @property
     def tmp_dir(self) -> Path:
-        """Run-tmp; `TMPDIR` of every agent points here (docs/07 §3 ①)."""
+        """Run-tmp, the root of the agents' temp folders `tmp/<id>/` (docs/07 §3 ①)."""
         return self.run_dir / "tmp"
+
+    def agent_tmp_dir(self, agent: AgentConfig) -> Path:
+        """The agent's own Run-tmp `tmp/<id>/`: its `TMPDIR`, `CLAUDE_CODE_TMPDIR`, Codex
+        command `HOME` and a write root. Another agent's is foreign (W4-03.2 N2, User 10.11.)."""
+        return self.tmp_dir / agent.id
 
     @property
     def venv_dir(self) -> Path:
@@ -692,6 +743,14 @@ class SandboxProfile:
     case_insensitive: bool = field(default_factory=default_case_insensitive)
     venv_dir: Path | None = None
     base_venv: Path | None = None
+    hidden: tuple[Path, ...] = ()
+    """The `RUN_HIDDEN_PATHS` of the run (also in `sensitive`): sealed results, room database."""
+    private_roots: tuple[Path, ...] = ()
+    """`agents/`, `shared/` and `tmp/` of the run: below them only `own` is this agent's
+    (W4-03.1 H1, W4-03.2 N2)."""
+    own: tuple[Path, ...] = ()
+    """This agent's folder `agents/<id>/`, its working folder, its Run-tmp `tmp/<id>/` and the
+    run folders its configuration names in `read_dirs` (`run:shared/<name>`)."""
 
     def resolve(self, raw: str | Path, base: Path | None = None) -> Path:
         """Normalize a path given by the agent (relative to `base` or the work folder)."""
@@ -718,9 +777,26 @@ class SandboxProfile:
     def _pattern_key(self, pattern: str) -> str:
         return pattern.casefold() if self.case_insensitive else pattern
 
+    def is_foreign(self, path: Path) -> bool:
+        """True if `path` belongs to another agent of the run (W4-03.1 H1, User 10.11.): below
+        `agents/` or `shared/`, but not this agent's own folder or working folder. Transcripts,
+        events, blobs, plugins and working copies of others are never readable for it."""
+        return (
+            self._within_any(path, self.private_roots) >= 0 and self._within_any(path, self.own) < 0
+        )
+
+    def sensitive_reason(self, path: Path, *, write: bool = False) -> str:
+        """The German reason for a sensitive `path`: why it is closed and what to do instead."""
+        if self._within_any(path, self.hidden) >= 0:
+            return _R_HIDDEN
+        if self.is_foreign(path):
+            return _R_WRITE_OUTSIDE if write else _R_FOREIGN
+        return _R_SENSITIVE
+
     def is_sensitive(self, path: Path) -> bool:
-        """True if `path` is a sensitive path, lies below one or matches a sensitive pattern."""
-        if self._within_any(path, self.sensitive) >= 0:
+        """True if `path` is a sensitive path, lies below one or matches a sensitive pattern,
+        or belongs to another agent of the run (`is_foreign`)."""
+        if self._within_any(path, self.sensitive) >= 0 or self.is_foreign(path):
             return True
         key = self.key(path)
         names = [self._pattern_key(n) for n in self.sensitive_names]
@@ -749,7 +825,7 @@ class SandboxProfile:
     def contains_sensitive(self, path: Path) -> bool:
         """True if a sensitive path lies below `path` (e.g. `~` or `/`)."""
         key = self.key(path)
-        if any(_key_within(self.key(s), key) for s in self.sensitive):
+        if any(_key_within(self.key(s), key) for s in (*self.sensitive, *self.private_roots)):
             return True
         for pattern in self.sensitive_patterns:
             fixed = pattern.split("*", 1)[0].rsplit("/", 1)[0]
@@ -832,7 +908,9 @@ def profile_for(
     there only the run venv, the base venv and the toolchain stay open, a read folder or an
     always rule inside it is dropped. The base venv is never a write root: several runs
     share it. `tools.web` switches the web tools on; always-allow host rules become allowed
-    domains of the Claude sandbox.
+    domains of the Claude sandbox. `RUN_HIDDEN_PATHS` of the run (sealed results, the room
+    database) are sensitive: never readable, also not with an approval (W4-03 F4). So are the
+    folders of the other agents below `agents/` and `shared/` (W4-03.1 H1, User 10.11.).
     """
     rules = rules or PermissionRules()
     home = Path(os.path.realpath(home or Path.home()))
@@ -845,7 +923,8 @@ def profile_for(
         return normalize_path(raw, base=base, home=home)
 
     work_dir = norm(paths.work_dir(agent))
-    tmp_dir = norm(paths.tmp_dir)
+    tmp_dir = norm(paths.agent_tmp_dir(agent))
+    run_tmp = norm(paths.tmp_dir)
     run_venv = paths.toolchain.run_venv is RunVenvMode.OVERLAY
     write_roots = [work_dir, tmp_dir] + ([norm(paths.venv_dir)] if run_venv else [])
 
@@ -881,11 +960,21 @@ def profile_for(
         if not rule.tools or set(rule.tools) & READ_TOOLS:
             read_allow += [norm(p) for p in rule.paths]
         if not rule.tools or set(rule.tools) & NETWORK_TOOLS:
-            domains += [h.lower() for h in rule.hosts if not rule.exact or _plain_host(h)]
+            domains += [
+                h.lower()
+                for h in rule.hosts
+                if (not rule.exact or _plain_host(h)) and not reaches_loopback(h)  # G8, N3
+            ]
 
     sensitive = [norm(home / p) for p in SENSITIVE_HOME_PATHS]
     sensitive += [norm(p) for p in SENSITIVE_ABSOLUTE_PATHS]
     sensitive += [norm(app_dir()), norm(workfolder / ".arr")]
+    hidden = [norm(run_dir / p) for p in RUN_HIDDEN_PATHS]  # W4-03 F4
+    # a shared folder named in `read_dirs` (`run:shared/<name>`) is configured, not foreign
+    configured = [
+        norm(run_dir / e.removeprefix("run:")) for e in agent.read_dirs if e.startswith("run:")
+    ]
+    sensitive += hidden
     sensitive += [norm(p) for p in rules.sensitive_paths]
     sensitive += [norm(p) for p in _existing_matches(home, SENSITIVE_HOME_PATTERNS)]
 
@@ -896,7 +985,11 @@ def profile_for(
     for path in in_venvs:
         if not any(_key_within(_key(path, ci), _key(t, ci)) for t in toolchain):
             read_allow.remove(path)
-    read_deny = [home, *(norm(p) for p in READ_BLOCKED_ROOTS), workfolder, venvs]
+    # the folders of the agents: denied for the shells too, so that no read folder or rule
+    # „immer“ for the run opens another agent's (W4-03.2 N1, N2); the agent's own folders
+    # are more specific write or read entries
+    private = [norm(run_dir / "agents"), norm(run_dir / "shared"), run_tmp]
+    read_deny = [home, *(norm(p) for p in READ_BLOCKED_ROOTS), workfolder, venvs, *private]
     for raw in user_temp_dirs() if temp_dirs is None else temp_dirs:
         temp = norm(raw)
         if not _key_within(_key(temp, ci), _key(tmp_dir, ci)):
@@ -919,6 +1012,9 @@ def profile_for(
         case_insensitive=ci,
         venv_dir=venv_dir,
         base_venv=base_venv,
+        hidden=_dedupe(hidden, ci),
+        private_roots=tuple(private),
+        own=_dedupe([norm(run_dir / "agents" / agent.id), work_dir, tmp_dir, *configured], ci),
     )
 
 
@@ -981,6 +1077,16 @@ def claude_options(profile: SandboxProfile) -> ClaudeOptions:
         key = profile.key(path)
         return any(_key_within(profile.key(d), key) for d in profile.read_deny)
 
+    def opens_private(path: Path) -> bool:
+        """A read folder in the workfolder above `agents/`, `shared/` or `tmp/` of the run,
+        e.g. the run folder of a read rule „immer“: in `allowRead` it would open the other
+        agents' folders for the shell (measured, W4-03.2 N1), and denying those again also
+        denies the own folders below them. The Read tool still reads it through the rule."""
+        key = profile.key(path)
+        return _key_within(key, profile.key(profile.workfolder)) and any(
+            _key_within(profile.key(r), key) for r in profile.private_roots
+        )
+
     allowed = [f"{ROOM_TOOL_PREFIX}*"]
     allowed += [
         f"Read({_claude_path(p, tree=True)})"
@@ -1008,8 +1114,15 @@ def claude_options(profile: SandboxProfile) -> ClaudeOptions:
         "filesystem": {
             "allowWrite": [str(p) for p in profile.write_roots],
             "denyWrite": protected_write_globs(profile),
-            "denyRead": [str(p) for p in (*profile.read_deny, *profile.sensitive)],
-            "allowRead": [str(p) for p in profile.read_allow],
+            # not `agents/`, `shared/`, `tmp/` of the run: the CLI then also denies the own
+            # folders below them when a read rule „immer“ covers the run (measured, W4-03.2);
+            # its shell keeps the other agents out by the workfolder deny (probe N1, N2)
+            "denyRead": [
+                str(p)
+                for p in (*profile.read_deny, *profile.sensitive)
+                if p not in profile.private_roots
+            ],
+            "allowRead": [str(p) for p in profile.read_allow if not opens_private(p)],
         },
     }
     return ClaudeOptions(
@@ -2085,6 +2198,59 @@ def is_codex_escalation(request: PermissionRequest | Mapping[str, Any]) -> bool:
     )
 
 
+def is_loopback(host: str) -> bool:
+    """True for a host on this machine (W4-01 G8): `localhost`, `*.localhost` (also the random
+    name of arr's service), `127.0.0.0/8`, `::1`, `0.0.0.0`, `::`, IPv4 in IPv6 and short or
+    numeric forms such as `127.1` or `2130706433`. Such hosts are never approvable."""
+    name = host.strip().lower()
+    if name.startswith("[") and "]" in name:  # [::1] or [::1]:80
+        name = name[1 : name.index("]")]
+    if name.count(":") == 1:  # host:port, also <name>.localhost:7777 (G-N3)
+        name = name.rsplit(":", 1)[0]
+    name = name.rstrip(".")
+    if name == "localhost" or name.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(name.split("%", 1)[0])
+    except ValueError:
+        if not name or not all(c in "0123456789abcdefx." for c in name):
+            return False
+        try:  # forms like 127.1, 0x7f.1 or 2130706433, as the C resolver reads them
+            address = ipaddress.ip_address(socket.inet_aton(name))
+        except OSError:
+            return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback or address.is_unspecified
+
+
+_LOOPBACK_SAMPLES = (
+    "localhost",
+    "arr.localhost",
+    "a.b.localhost",
+    "127.0.0.1",
+    "127.1",
+    "0.0.0.0",
+    "::1",
+    "[::1]",
+    "::",
+    "::ffff:127.0.0.1",
+    "2130706433",
+)
+
+
+def reaches_loopback(host: str) -> bool:
+    """True for a host or host pattern that includes this machine (W4-03.2 N3): a loopback
+    host itself or a pattern such as `*`, `*.*`, `*localhost*`, `127.*` that matches one. Such
+    a host never goes into `allowedDomains`, and an allow rule with it does not load."""
+    if is_loopback(host):
+        return True
+    pattern = host.strip().lower()
+    if not any(c in pattern for c in "*?["):
+        return False
+    return any(fnmatch.fnmatchcase(sample, pattern) for sample in _LOOPBACK_SAMPLES)
+
+
 def _plain_host(host: str) -> bool:
     """True for a host name or address; `*` and the like mean more to the sandbox (W3-03.2)."""
     return _PLAIN_HOST_RE.fullmatch(host) is not None
@@ -2384,7 +2550,9 @@ class PolicyEngine:
         hosts += [h for h in (_host_of(u) for u in request.urls) if h]
         for host in dict.fromkeys(hosts):
             key: ItemKey = ("host", host.rsplit(":", 1)[0])
-            if tool in WEB_TOOLS:
+            if reaches_loopback(host):
+                analysis.ban(_R_LOOPBACK, RequestCategory.NETWORK)
+            elif tool in WEB_TOOLS:
                 analysis.facts.add(key)  # allowed with tools.web, but always-deny rules apply
             else:
                 analysis.ask(key, RequestCategory.NETWORK)
@@ -2426,7 +2594,7 @@ class PolicyEngine:
             key: ItemKey = ("read", profile.key(path))
             analysis.facts.add(key)
             if profile.is_sensitive(path):
-                analysis.ban(_R_SENSITIVE, RequestCategory.READ_OUTSIDE)
+                analysis.ban(profile.sensitive_reason(path), RequestCategory.READ_OUTSIDE)
             elif search and profile.contains_sensitive(path):
                 analysis.ban(_R_SEARCH_SENSITIVE, RequestCategory.READ_OUTSIDE)
             elif search and profile.contains_block(path):
@@ -2447,7 +2615,9 @@ class PolicyEngine:
                 continue
             analysis.facts.add(("write", profile.key(path)))
             if profile.is_sensitive(path):
-                analysis.ban(_R_SENSITIVE, RequestCategory.WRITE_OUTSIDE)
+                analysis.ban(
+                    profile.sensitive_reason(path, write=True), RequestCategory.WRITE_OUTSIDE
+                )
             elif profile.is_protected(profile.written(raw, base)):
                 # file tools never write more than Bash in the sandbox (docs/07 §1, W3-06.4);
                 # is_protected resolves links of the written path itself (W3-06.5 N6)
@@ -2477,7 +2647,10 @@ class PolicyEngine:
         normalized = _normalize_command(command)
         analysis.facts.add(("command", normalized))
         for host in info.hosts:
-            analysis.ask(("host", host), RequestCategory.NETWORK)
+            if reaches_loopback(host):
+                analysis.ban(_R_LOOPBACK, RequestCategory.NETWORK)
+            else:
+                analysis.ask(("host", host), RequestCategory.NETWORK)
         if RequestCategory.INSTALL in info.categories:
             if info.user_install:
                 analysis.ban(_R_USER_INSTALL, RequestCategory.INSTALL)
@@ -2526,7 +2699,7 @@ class PolicyEngine:
             return
         analysis.facts.add(("read", profile.key(path)))
         if profile.is_sensitive(path):
-            analysis.ban(_R_SENSITIVE, RequestCategory.READ_OUTSIDE)
+            analysis.ban(profile.sensitive_reason(path), RequestCategory.READ_OUTSIDE)
         elif cut and profile.contains_sensitive(path):
             analysis.ban(_R_SHELL_GLOB, RequestCategory.READ_OUTSIDE)
         elif not (profile.can_read(path) or profile.can_write(path)):
@@ -2548,7 +2721,7 @@ class PolicyEngine:
         analysis.facts.add(("write", profile.key(path)))
         written, _ = self._command_path(raw, base, profile, written=True)
         if profile.is_sensitive(path):
-            analysis.ban(_R_SENSITIVE, RequestCategory.WRITE_OUTSIDE)
+            analysis.ban(profile.sensitive_reason(path, write=True), RequestCategory.WRITE_OUTSIDE)
         elif profile.is_protected(written or path):  # is_protected resolves links (W3-06.5 N6)
             analysis.ban(_R_PROTECTED, RequestCategory.WRITE_OUTSIDE)
         elif profile.can_write(path):

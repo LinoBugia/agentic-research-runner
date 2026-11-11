@@ -455,8 +455,9 @@ def project_config_state(cwd: Path) -> str:
 
 
 def command_home(agent: PreparedAgent, profile: SandboxProfile) -> Path:
-    """`HOME` of the agent's commands: `<Run-tmp>/home/<id>`, writable for them."""
-    return profile.tmp_dir / "home" / agent.id
+    """`HOME` of the agent's commands: `home/` in its own Run-tmp `tmp/<id>/`, writable for
+    it and foreign for every other agent (W4-03.2 N2)."""
+    return profile.tmp_dir / "home"
 
 
 def server_home(agent: PreparedAgent, profile: SandboxProfile) -> Path:
