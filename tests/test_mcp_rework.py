@@ -939,3 +939,68 @@ async def test_h1_claude_code_answers_no_question_through_arr_mcp(wf: Path, arr_
         item = await api.get_approval(question.id)
         assert item.status is ApprovalStatus.DECIDED and item.answer == "Band 12."
         assert not RoomStore.create(run_dir).message(question.msg_id).open
+
+
+# --------------------------------------------------------------------------------------------
+# P1, P2 of the re-review of Teil A
+# --------------------------------------------------------------------------------------------
+
+HALF = "AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJ"
+ESCAPED = {
+    "newline": HALF + "\n" + HALF.lower(),
+    "tab": HALF + "\t" + HALF.lower(),
+    "backslash": HALF[:20] + "\\" + HALF[20:],
+    "both quotes": HALF[:20] + "'\"" + HALF[20:],
+    "NUL": HALF + "\x00" + HALF.lower(),
+    "CR": HALF + "\r" + HALF.lower(),
+}
+MARKS = ("AAAABBBB", "aaaabbbb", "GGGGHHHH", "gggghhhh", "IIIIJJJJ", "iiiijjjj")
+
+
+@pytest.mark.parametrize("case", list(ESCAPED))
+async def test_p1_values_that_repr_rewrites_never_come_back(wf: Path, case: str) -> None:
+    value = ESCAPED[case]
+    calls = [
+        ("start_run", {"task": "t", "skill": "runde", "params": {"rounds": value}}),
+        ("estimate_run", {"skill": "runde", "params": {"rounds": value}}),
+        (
+            "start_run",
+            {"task": "t", "skill": "runde", "overrides": {"limits": {"budget_usd": value}}},
+        ),
+        ("start_run", {"task": "t", "skill": value}),
+        ("run_status", {"run_id": value}),
+        ("describe_skill", {"name": value}),
+    ]
+    async with Service(make_api(wf)) as service, service.client(project(wf)) as client:
+        for tool, args in calls:
+            result = await client.call_tool(tool, args)
+            text = "".join(getattr(c, "text", "") for c in result.content)
+            assert result.is_error, (tool, text)
+            assert not [m for m in MARKS if m in text], (tool, text)
+
+
+def test_p2_supplementary_variation_selectors_are_removed() -> None:
+    hidden = "".join(chr(0xE0100 + i) for i in range(0, 0xF0, 7))
+    assert clean_text(f"a{hidden}b") == "ab"
+    assert clean_text("👍️") == "👍️", "the emoji selector stays"
+
+
+def test_p1_short_pieces_are_caught_in_their_encoded_form() -> None:
+    """Every piece shorter than 4 characters: only the `repr`/JSON form gives it away."""
+    from arr.service.user_api import scrub
+
+    value = "xy\nzw\tqq'r\\s"
+    for quoted in (repr(value)[1:-1], json.dumps(value)[1:-1]):
+        assert quoted not in scrub(f"gefunden Text ('{quoted}')", {"p": value})
+
+
+def test_p1_a_message_that_quotes_one_line_of_a_value() -> None:
+    """A message that quotes only a piece (one line, the part after a quote): that piece goes."""
+    from arr.service.user_api import scrub
+
+    for case in ("newline", "tab", "both quotes", "NUL"):
+        value = ESCAPED[case]
+        tail = value.split({"newline": "\n", "tab": "\t", "both quotes": '"', "NUL": "\x00"}[case])[
+            -1
+        ]
+        assert tail[:8] not in scrub(f"Zeile „{tail}“ ist ungültig.", {"p": value}), case

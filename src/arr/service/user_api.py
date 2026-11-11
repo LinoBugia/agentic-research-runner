@@ -784,19 +784,37 @@ def _strings(value: Any) -> list[str]:
 def scrub(text: str, *inputs: Any) -> str:
     """A message without the values Claude Code sent (G3, W4-01.1): a value can be a key.
 
-    Quoted findings („gefunden „…““) become „gefunden einen anderen Wert“, every text of the
-    arguments (and the cut form `…` of the core's messages) becomes „…“, then `redact`.
+    Quoted findings („gefunden „…““) become „gefunden einen anderen Wert“; every text of the
+    arguments becomes „…“ in every form a message can quote it (`_forms`), then `redact`.
     """
     from arr.permissions.policy import redact
 
     text = _FOUND_VALUE.sub("gefunden einen anderen Wert", text)
-    for value in sorted({v for i in inputs for v in _strings(i)}, key=len, reverse=True):
-        if len(value) < 4:
-            continue
-        for form in (value, value[:37] + "…", value[:37]):
-            if len(form) >= 4:
-                text = text.replace(form, "…")
+    forms = {f for i in inputs for v in _strings(i) for f in _forms(v)}
+    for form in sorted(forms, key=len, reverse=True):
+        text = text.replace(form, "…")
     return redact(text)
+
+
+_SPECIAL = re.compile(r"[\x00-\x1f\x7f\\'\"]")
+"""Where `repr` and JSON rewrite a text: control characters, backslash, quotes (P1)."""
+
+
+def _forms(value: str) -> set[str]:
+    """How a message may quote `value`: as it is, as `repr` or JSON (`\\n`, `\\t`, `\\\\`, …),
+    cut after 37 characters like the core's messages, and every piece between characters that
+    `repr`/JSON rewrite (P1, W4-01.2). Pieces shorter than 4 characters stay."""
+    encoded = {
+        value,
+        repr(value)[1:-1],
+        json.dumps(value)[1:-1],
+        json.dumps(value, ensure_ascii=False)[1:-1],
+    }
+    out: set[str] = set()
+    for form in encoded:
+        out |= {form, form[:37] + "…", form[:37]}
+        out |= set(_SPECIAL.split(form))
+    return {f for f in out if len(f) >= 4}
 
 
 def _problem(exc: ApiException, *inputs: Any) -> str:
