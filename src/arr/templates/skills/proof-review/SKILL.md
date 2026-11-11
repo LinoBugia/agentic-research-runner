@@ -23,14 +23,16 @@ Nicht sinnvoll für offene Fragen ohne klare Aussage (nimm `exploration` oder `r
 
 ## Parameter
 
-| Name | Standard | Bedeutung |
-|---|---|---|
-| judges | 2 | Anzahl der Judges, abwechselnd Claude und ChatGPT |
-| max_revisions | 1 | Überarbeitungen des Autors |
-| discussion_rounds | 1 | Runden in `#judges` nach der Prüfung (0: keine) |
-| verdict | majority | `majority` (bei Gleichstand das strengere) oder `unanimous` |
-| judge_memory | fresh | `fresh`: neue Sitzung je Prüfrunde; `continue`: Sitzung bleibt |
-| artifact | – | Pfad zum Beweis im Projekt; leer: der Autor schreibt ihn zuerst |
+| Name | Standard | Bereich | Bedeutung |
+|---|---|---|---|
+| judges | 2 | 1–5 | Anzahl der Judges, abwechselnd Claude und ChatGPT |
+| max_revisions | 1 | 0–2 | Überarbeitungen des Autors |
+| discussion_rounds | 1 | 0–1 | Runden in `#judges` nach der Prüfung (0: keine) |
+| verdict | majority | | `majority` (bei Gleichstand das strengere) oder `unanimous` |
+| judge_memory | fresh | | `fresh`: neue Sitzung je Prüfrunde; `continue`: Sitzung bleibt |
+| artifact | – | | Pfad zum Beweis im Projekt; leer: der Autor schreibt ihn zuerst |
+
+Die Höchstwerte sind so gewählt, dass 10 Turns je Agent auch im ungünstigsten Fall reichen (ein Judge braucht höchstens 3 Prüfrunden × 3 Turns). Brauchen die Agenten mehr Turns, geht das über `overrides={"limits": {"turns_per_agent": 14}}`.
 
 Agenten: `author` (Claude Opus), `judge-1 …` (Claude Sonnet und ChatGPT im Wechsel; Modell und Profil für ChatGPT kommen aus `arr.yaml`). Limits: 1 h, 10 Turns je Agent, 5 $.
 

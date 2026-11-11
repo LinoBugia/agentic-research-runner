@@ -21,4 +21,4 @@ Am Ende jeder Arbeitsrunde einen Stand (Ergebnisart `exploration`) mit den Absch
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`), von deinem Arbeitsordner aus unter `../../../output/results/`. Die Ergebnisse der anderen Explorer siehst du nur, wenn der Run es vorsieht: als Auszug in deinem Auftrag oder im Austausch in `#werkstatt`.
+Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`); den Pfad von deinem Arbeitsordner aus nennt dein Auftrag. Die Ergebnisse der anderen Explorer siehst du nur, wenn der Run es vorsieht: als Auszug in deinem Auftrag oder im Austausch in `#werkstatt`.

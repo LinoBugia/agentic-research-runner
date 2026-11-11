@@ -81,6 +81,7 @@ FIELDS = {
     "n_rankers",
     "n_diskutanten",
     "agent_id",
+    "summary_md",
 }
 """Names in backticks that are fields or parameters, not tools."""
 PROTOCOL_WORDS = ("wait_for_messages", "wait_until", "inbox(", "read_messages", "set_status")
@@ -392,7 +393,9 @@ def test_a5_roles_name_the_result_path_and_the_standard(name: str) -> None:
     for path, text in files.items():
         if not path.startswith("roles/"):
             continue
-        assert "output/results/" in text and "../../../output/results/" in text, path
+        assert "output/results/" in text, path
+        assert "den Pfad von deinem Arbeitsordner aus nennt dein Auftrag" in text, path
+        assert "../" not in text, "no fixed number of ../: wrong for workspace shared (W4-05.1)"
         assert "## Wo Ergebnisse liegen" in text, path
         assert "Korrektheit vor Vollständigkeit" in text, path
         assert "## Abgabe" in text and "## Auftrag" in text and "## Maßstab" in text, path
@@ -557,3 +560,253 @@ def test_sympy_check_script(tmp_path: Path) -> None:
     assert unequal.returncode == 1 and "nicht gleich" in unequal.stdout
     positive = run_check(tmp_path, "gleich", "sqrt(x^2)", "x", "--symbol", "x:positive")
     assert positive.returncode == 0
+
+
+def check_module() -> Any:
+    """`scripts/check.py` of the skill as a module (the allow-list needs no SymPy)."""
+    import importlib.util
+
+    path = Path(str(resources.files("arr").joinpath("templates/skills/sympy-check/scripts")))
+    spec = importlib.util.spec_from_file_location("sympy_check_script", path / "check.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+ATTACKS = [
+    "__import__('os').system('touch marker')",
+    '__import__("pathlib").Path("marker").write_text("x")',
+    "x.__class__",
+    "(1).real",
+    "Symbol.__init__",
+    "lambda: 1",
+    "[x for x in (1, 2)]",
+    "{1: 2}",
+    "x; import os",
+    "getattr(x, 'y')",
+    "exec(1)",
+    "eval(1)",
+    "open(1)",
+    "_x",
+    "x\\n",
+    "x if y else z",
+    "x == y",
+]
+
+
+@pytest.mark.parametrize("text", ATTACKS)
+def test_w4_05_1_sympy_check_refuses_code(tmp_path: Path, text: str) -> None:
+    """W4-05.1 point 4: no input becomes Python code, also outside a sandbox (Claude Code)."""
+    module = check_module()
+    with pytest.raises(module.Refused):
+        module.names_of(text)
+    result = run_check(tmp_path, "vereinfache", text)
+    assert result.returncode == 2 and result.stdout.startswith("Abgelehnt:"), result.stdout
+    assert not (tmp_path / "marker").exists() and not Path("marker").exists()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "(n+1)^2",
+        "n**2 + 2*n + 1",
+        "sqrt(x^2)",
+        "binomial(n, 2) - n*(n-1)/2",
+        "Sum(k, (k, 1, n))",
+        "n! / factorial(n - 1)",
+        "1.5*x + E + I + pi + oo",
+        "N + S + beta + gamma(x)",
+    ],
+)
+def test_w4_05_1_sympy_check_lets_normal_expressions_pass(text: str) -> None:
+    """Counter-check: ordinary mathematics still passes the allow-list."""
+    check_module().names_of(text)
+
+
+def test_w4_05_1_sympy_check_assumptions_and_constants(tmp_path: Path) -> None:
+    module = check_module()
+    with pytest.raises(module.Refused, match="Unbekannte Annahme „positiv“"):
+        module._symbols(["x:positiv"])
+    with pytest.raises(module.Refused, match="kein erlaubter Symbolname"):
+        module._symbols(["__class__:real"])
+    try:
+        import sympy  # noqa: F401
+    except ImportError:
+        pytest.skip("SymPy fehlt in dieser Umgebung; die Run-venv hat es (Bericht).")
+    notes: set[str] = set()
+    expr = module._parse("I^2 + N", {}, notes)
+    assert notes == {"I"} and str(expr) == "N - 1"
+    declared = module._symbols(["I:integer"])
+    notes = set()
+    assert str(module._parse("I^2 + 1", declared, notes)) == "I**2 + 1" and notes == set()
+
+
+# --------------------------------------------------------------------------------------------
+# W4-05.1 point 3: at every allowed parameter value the turns of the skill are enough
+# --------------------------------------------------------------------------------------------
+
+
+def most_turns(name: str, params: dict[str, Any], agents: list[str]) -> dict[str, int]:
+    """Turns per agent in the worst case, one ask-again per step, no wake-ups (rounds mode).
+
+    The formulas follow the topologies (review §4.5, waterfall §4.4, exploration §4.3,
+    roundtable §4.2) like `W4-05_Review_Skripte/pruefe_standards.py`.
+    """
+    out: dict[str, int] = {}
+    if name == "proof-review":
+        rev, rounds = int(params["max_revisions"]), int(params["discussion_rounds"])
+        judges = [a for a in agents if a.startswith("judge")]
+        talk = rounds if len(judges) > 1 else 0
+        writes = 0 if params.get("artifact") else 1
+        out["author"] = 2 * writes + 2 * rev
+        out |= {j: (1 + rev) * (2 + talk) for j in judges}
+    elif name == "proof":
+        rework = int(params["max_rework"])
+        per_stage = (1 + rework) * 2
+        out["strategist"] = per_stage
+        out["prover"] = 2 * per_stage
+        out |= {r: 3 * per_stage for r in agents if r.startswith("rater")}
+    elif name == "exploration":
+        n_ideas, per_idea = int(params["n_ideas"]), int(params["turns_per_idea"])
+        explorers = [a for a in agents if a.startswith("explorer")]
+        for k, explorer in enumerate(explorers):
+            out[explorer] = len(range(k, n_ideas, len(explorers))) * (per_idea + 1)
+        out |= {a: 2 for a in agents if a.startswith(("ideator", "ranker"))}
+        out["summarizer"] = 1
+    elif name == "roundtable":
+        rounds = int(params["rounds"])
+        out |= {a: rounds for a in agents if a.startswith("diskutant")}
+        out["summarizer"] = rounds + 1
+    return out
+
+
+def corner_cases(spec: Any) -> list[dict[str, Any]]:
+    """Every combination of the smallest and largest value of each number parameter."""
+    import itertools
+
+    ranged = {k: (p.min, p.max) for k, p in spec.params.items() if p.max is not None}
+    keys = sorted(ranged)
+    return [
+        {k: int(v) for k, v in zip(keys, values, strict=True)}
+        for values in itertools.product(*(ranged[k] for k in keys))
+    ]
+
+
+@pytest.mark.parametrize("name", GROUP_SKILLS)
+def test_w4_05_1_turns_per_agent_suffice_at_all_parameter_limits(name: str) -> None:
+    path = resources.files("arr").joinpath("templates/skills", name, "group.yaml")
+    spec = load_group_spec(Path(str(path)))
+    limit = spec.limits.turns_per_agent
+    settings = _check_settings(WorkfolderSettings())
+    for params in corner_cases(spec):
+        resolved = resolve_run(RunInput(project="p", skill=name, task="x"), spec, settings, params)
+        check_topology(resolved)
+        worst = most_turns(name, resolved.params, [a.id for a in resolved.agents])
+        too_many = {a: t for a, t in worst.items() if t > limit}
+        assert not too_many, f"{name} {params}: {too_many} > turns_per_agent {limit}"
+    text = template_texts(name)["SKILL.md"]
+    assert 'overrides={"limits": {"turns_per_agent":' in text
+
+
+def test_w4_05_1_the_turn_check_finds_the_old_maxima() -> None:
+    """Counter-check: the maxima of W4-05 would have run out of turns (review: 15, 24, 15)."""
+    judges = ["author", "judge-1", "judge-2"]
+    assert (
+        most_turns("proof-review", {"max_revisions": 2, "discussion_rounds": 3}, judges)["judge-1"]
+        == 15
+    )
+    raters = ["strategist", "prover", "rater-1"]
+    assert most_turns("proof", {"max_rework": 3}, raters)["rater-1"] == 24
+    explorers = ["ideator", "explorer-1", "summarizer"]
+    assert (
+        most_turns("exploration", {"n_ideas": 3, "turns_per_idea": 5}, explorers)["explorer-1"]
+        == 18
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# W4-05.1 points 2 and 6: no link `skills/` is followed, `arr init` leaves nothing half done
+# --------------------------------------------------------------------------------------------
+
+
+def linked_workfolder(tmp_path: Path) -> tuple[Path, Path]:
+    outside = tmp_path / "draussen"
+    outside.mkdir()
+    root = tmp_path / "wf"
+    (root / "projects" / "demo").mkdir(parents=True)
+    (root / "runs").mkdir()
+    (root / "arr.yaml").write_text("version: 1\n", "utf-8")
+    os.symlink(outside, root / "skills")
+    return root, outside
+
+
+def test_w4_05_1_setup_project_writes_no_skill_through_a_link(tmp_path: Path) -> None:
+    from arr.workfolder import setup_project
+
+    root, outside = linked_workfolder(tmp_path)
+    result = setup_project(root / "projects" / "demo", workfolder=root)
+    assert list(outside.iterdir()) == [], "nothing written through the link"
+    assert any("Der Skill „arr“ ließ sich nicht anlegen" in w for w in result.warnings)
+    assert not any("Platzhalter" in w for w in result.warnings)
+
+
+def test_w4_05_1_setup_project_creates_the_skill_arr_counter_check(tmp_path: Path) -> None:
+    """Counter-check: with a real folder `skills/` the skill `arr` comes with its full text."""
+    from arr.workfolder import setup_project
+
+    root = tmp_path / "wf"
+    (root / "projects" / "demo").mkdir(parents=True)
+    (root / "skills").mkdir()
+    (root / "arr.yaml").write_text("version: 1\n", "utf-8")
+    result = setup_project(root / "projects" / "demo", workfolder=root)
+    assert "Der Skill „arr“ fehlte im Workfolder; arr hat ihn angelegt." in result.warnings
+    assert tree(root / "skills" / "arr") == {"SKILL.md": start_skill_files(ARR_SKILL)["SKILL.md"]}
+    assert (root / "projects" / "demo" / ".claude" / "skills" / "arr").is_symlink()
+    # an own skill `arr` stays as it is, without a warning
+    (root / "skills" / "arr" / "SKILL.md").write_text(
+        "---\nname: arr\ndescription: Meins.\n---\nmeins\n", "utf-8"
+    )
+    again = setup_project(root / "projects" / "demo", workfolder=root)
+    assert (
+        root / "skills" / "arr" / "SKILL.md"
+    ).read_text() == "---\nname: arr\ndescription: Meins.\n---\nmeins\n"
+    assert not any("„arr“" in w for w in again.warnings)
+
+
+def test_w4_05_1_arr_init_with_a_linked_skills_folder_writes_nothing(tmp_path: Path) -> None:
+    from arr.errors import ArrError
+
+    outside = tmp_path / "draussen"
+    outside.mkdir()
+    root = tmp_path / "wf"
+    root.mkdir()
+    os.symlink(outside, root / "skills")
+    for _ in range(2):  # a second run fails the same way, it does not pass silently
+        with pytest.raises(ArrError, match="Link"):
+            init_workfolder(root)
+        assert sorted(p.name for p in root.iterdir()) == ["skills"], "no arr.yaml, no folders"
+        assert list(outside.iterdir()) == []
+    # counter-check: with a real folder it works and brings the start skills
+    (root / "skills").unlink()
+    init_workfolder(root)
+    assert (root / "arr.yaml").is_file()
+    assert sorted(p.name for p in (root / "skills").iterdir()) == sorted(START_SKILLS)
+
+
+def test_w4_05_1_arr_init_failing_start_skills_leaves_no_arr_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from arr import skills as skills_module
+    from arr.errors import ArrError
+
+    def broken(folder: int, files: dict[str, bytes]) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(skills_module, "_write_tree", broken)
+    with pytest.raises(ArrError, match="Start-Skills ließen sich nicht anlegen"):
+        init_workfolder(tmp_path / "wf")
+    assert not (tmp_path / "wf" / "arr.yaml").exists(), "a second `arr init` starts anew"
+    monkeypatch.undo()
+    init_workfolder(tmp_path / "wf")
+    assert len(list((tmp_path / "wf" / "skills").iterdir())) == len(START_SKILLS)

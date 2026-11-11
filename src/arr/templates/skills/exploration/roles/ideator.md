@@ -20,4 +20,4 @@ Jeden Ansatz als eigenes Ergebnis der Art `idea`, so viele, wie der Auftrag verl
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`), von deinem Arbeitsordner aus unter `../../../output/results/`.
+Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`); den Pfad von deinem Arbeitsordner aus nennt dein Auftrag.

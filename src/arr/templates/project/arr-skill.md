@@ -47,7 +47,7 @@ Weitere Tools: `list_runs` (Runs dieses Projekts), `post_to_run` (Hinweis in ein
 
 - Jeder Skill hat Limits für Laufzeit, Budget und Turns je Agent. Erhöhe sie nur, wenn der User es will, über `overrides` (z. B. `{"limits": {"budget_usd": 8}}`), und nenne es ihm.
 - Kleine Parameter zuerst: lieber ein zweiter Run als ein zu großer erster.
-- Endet ein Run mit `limit` oder `budget`, sag das dem User und schlag vor, wie es weitergehen kann; starte nicht selbst nach.
+- Stößt ein Run an ein Limit (Laufzeit, Budget, Turns je Agent), endet er mit Status `done`, und `read_run_summary` nennt den Grund in `summary_md` (Zeile „Grund“, z. B. „Limit: Das Budget des Runs ist erreicht.“). Sag das dem User und schlag vor, wie es weitergehen kann; starte nicht selbst nach.
 - Ist kein Platz in einem Profil frei, wartet der Run. Sag das dem User, statt einen weiteren zu starten.
 
 ## Was du nicht tust

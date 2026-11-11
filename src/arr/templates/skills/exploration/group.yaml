@@ -10,12 +10,12 @@ params:
   n_ideas:
     default: 3
     min: 1
-    max: 6
+    max: 4
     doc: "Anzahl der Ansätze, die der Ideator vorschlägt"
   turns_per_idea:
     default: 2
     min: 1
-    max: 5
+    max: 2
     doc: "Arbeitsrunden je Ansatz"
   exchange:
     default: none

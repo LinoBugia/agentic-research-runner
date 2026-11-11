@@ -235,7 +235,7 @@ async def test_setup_lays_mcp_json_block_and_links(wf: Path) -> None:
     assert "Freigabe" in claude
     link = folder / ".claude" / "skills" / "arr"
     assert link.is_symlink() and (link / "SKILL.md").is_file()
-    assert (wf / "skills" / "arr" / "SKILL.md").is_file(), "placeholder while W4-05 is open"
+    assert (wf / "skills" / "arr" / "SKILL.md").is_file(), "the skill arr of W4-05"
     info = await api.get_project("demo")
     checks = {c.key: c for c in info.checks}
     assert all(checks[k].ok for k in ("claude_md", "mcp_json", "skill_links")), checks

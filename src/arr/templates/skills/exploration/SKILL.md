@@ -23,14 +23,16 @@ Nicht sinnvoll, wenn der Weg schon klar ist (nimm `proof`) oder ein Beweis nur g
 
 ## Parameter
 
-| Name | Standard | Bedeutung |
-|---|---|---|
-| ideas | leer | vorgegebene Ansätze (Liste von Texten); leer: der Ideator schlägt welche vor |
-| n_ideas | 3 | Anzahl vorgeschlagener Ansätze |
-| turns_per_idea | 2 | Arbeitsrunden je Ansatz |
-| exchange | none | `none`: getrennt; `digest`: Auszüge der anderen; `channel`: Austausch in `#werkstatt` |
-| n_explorers | 2 | Anzahl der Explorer, abwechselnd Claude und ChatGPT; mehr Ansätze als Explorer werden reihum verteilt |
-| n_rankers | 1 | Anzahl der Ranker (0: keine Rangliste) |
+| Name | Standard | Bereich | Bedeutung |
+|---|---|---|---|
+| ideas | leer | | vorgegebene Ansätze (Liste von Texten); leer: der Ideator schlägt welche vor |
+| n_ideas | 3 | 1–4 | Anzahl vorgeschlagener Ansätze |
+| turns_per_idea | 2 | 1–2 | Arbeitsrunden je Ansatz |
+| exchange | none | | `none`: getrennt; `digest`: Auszüge der anderen; `channel`: Austausch in `#werkstatt` |
+| n_explorers | 2 | 1–6 | Anzahl der Explorer, abwechselnd Claude und ChatGPT; mehr Ansätze als Explorer werden reihum verteilt |
+| n_rankers | 1 | 0–3 | Anzahl der Ranker (0: keine Rangliste) |
+
+Die Höchstwerte sind so gewählt, dass 12 Turns je Agent auch im ungünstigsten Fall reichen (ein Explorer mit 4 Ansätzen × 3 Turns, mit Nachfrage). Gibst du mehr als 4 Ansätze je Explorer vor oder willst du mehr Arbeitsrunden, erhöhe die Turns: `overrides={"limits": {"turns_per_agent": 20}}`.
 
 Agenten: `ideator` und `ranker-1 …` (Claude Sonnet), `explorer-1 …` (Claude Sonnet und ChatGPT im Wechsel; Modell und Profil für ChatGPT kommen aus `arr.yaml`), `summarizer` (Claude Haiku). Limits: 1 h, 12 Turns je Agent, 5 $.
 

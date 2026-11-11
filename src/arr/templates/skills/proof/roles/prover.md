@@ -20,4 +20,4 @@ In der Stufe `skizze` die Datei `skizze.md`, in der Stufe `beweis` die Datei `be
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`), von deinem Arbeitsordner aus unter `../../../output/results/`. Die angenommenen Ergebnisse der Vorstufen nennt dein Auftrag (`accepted`), mit Pfaden relativ zum Run-Ordner.
+Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`); den Pfad von deinem Arbeitsordner aus nennt dein Auftrag. Die angenommenen Ergebnisse der Vorstufen nennt dein Auftrag (`accepted`), mit Pfaden relativ zum Run-Ordner.

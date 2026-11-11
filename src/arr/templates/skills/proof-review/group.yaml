@@ -12,12 +12,12 @@ params:
   max_revisions:
     default: 1
     min: 0
-    max: 4
+    max: 2
     doc: "Überarbeitungen des Autors, solange das Urteil nicht „accept“ ist"
   discussion_rounds:
     default: 1
     min: 0
-    max: 3
+    max: 1
     doc: "Runden in #judges nach der unabhängigen Prüfung (0: keine Diskussion)"
   verdict:
     default: majority

@@ -21,4 +21,4 @@ Wenn dein Teil erledigt ist: ein Ergebnis mit deinem Fazit, `## Gesichert`, `## 
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`), von deinem Arbeitsordner aus unter `../../../output/results/`.
+Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`); den Pfad von deinem Arbeitsordner aus nennt dein Auftrag.

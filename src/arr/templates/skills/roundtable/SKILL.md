@@ -22,10 +22,12 @@ Nicht sinnvoll, wenn Ansätze unabhängig und gründlich erkundet werden sollen 
 
 ## Parameter
 
-| Name | Standard | Bedeutung |
-|---|---|---|
-| rounds | 3 | Anzahl der Diskussionsrunden |
-| n_diskutanten | 2 | Anzahl der Diskutanten, abwechselnd Claude und ChatGPT |
+| Name | Standard | Bereich | Bedeutung |
+|---|---|---|---|
+| rounds | 3 | 1–6 | Anzahl der Diskussionsrunden |
+| n_diskutanten | 2 | 2–5 | Anzahl der Diskutanten, abwechselnd Claude und ChatGPT |
+
+Die Höchstwerte sind so gewählt, dass 10 Turns je Agent reichen (ein Turn je Runde, der Zusammenfasser einen mehr). Mehr Turns gehen über `overrides={"limits": {"turns_per_agent": …}}`.
 
 Agenten: `diskutant-1 …` (Claude Sonnet und ChatGPT im Wechsel; Modell und Profil für ChatGPT kommen aus `arr.yaml`), `summarizer` (Claude Haiku). Limits: 45 min, 10 Turns je Agent, 3 $.
 

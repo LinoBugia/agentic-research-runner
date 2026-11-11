@@ -22,12 +22,14 @@ Nicht sinnvoll, wenn schon ein Beweis vorliegt (nimm `proof-review`) oder wenn n
 
 ## Parameter
 
-| Name | Standard | Bedeutung |
-|---|---|---|
-| pass_score | 7 | Mindest-Score einer Stufe (Mittel der Rater) |
-| max_rework | 1 | Nacharbeiten je Stufe |
-| on_fail | continue | `continue`: bester Versuch gilt; `stop`: Run endet; `escalate`: der User entscheidet in der GUI |
-| n_raters | 2 | Anzahl der Rater, abwechselnd Claude und ChatGPT |
+| Name | Standard | Bereich | Bedeutung |
+|---|---|---|---|
+| pass_score | 7 | 1–10 | Mindest-Score einer Stufe (Mittel der Rater) |
+| max_rework | 1 | 0–1 | Nacharbeiten je Stufe |
+| on_fail | continue | | `continue`: bester Versuch gilt; `stop`: Run endet; `escalate`: der User entscheidet in der GUI |
+| n_raters | 2 | 1–4 | Anzahl der Rater, abwechselnd Claude und ChatGPT |
+
+Die Höchstwerte sind so gewählt, dass 12 Turns je Agent auch im ungünstigsten Fall reichen (ein Rater bewertet höchstens 3 Stufen × 2 Versuche, mit Nachfrage). Mehr Nacharbeit (`on_fail: escalate`, „Noch ein Versuch“) braucht mehr Turns: `overrides={"limits": {"turns_per_agent": 18}}`.
 
 Agenten: `strategist` (Claude Sonnet), `prover` (Claude Opus), `rater-1 …` (Claude Sonnet und ChatGPT im Wechsel; Modell und Profil für ChatGPT kommen aus `arr.yaml`). Limits: 1 h, 12 Turns je Agent, 5 $.
 

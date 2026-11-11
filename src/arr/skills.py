@@ -45,6 +45,7 @@ __all__ = [
     "copy_skill_tree",
     "discover_skills",
     "install_codex_skills",
+    "install_start_skill",
     "install_start_skills",
     "internal_link_target",
     "link_user_skills",
@@ -756,16 +757,14 @@ def _install_one(root: int, name: str) -> bool:
     return True
 
 
-def install_start_skills(workfolder: str | Path) -> StartSkills:
-    """Create the missing start skills in `<workfolder>/skills/` (W4-05).
+SKILLS_LINK = (
+    f"Der Ordner {SKILLS_DIR} im Workfolder ist ein Link oder kein Ordner. arr folgt dort keinen "
+    "Links. Ersetze ihn durch einen echten Ordner."
+)
 
-    A skill folder (or file or link) with the same name is never overwritten or changed, also
-    when it is broken; it is reported in `existing`. `skills/` itself must not be a link; it is
-    created if missing. Running it again changes nothing. Raises `SkillFileError` with a German
-    message if the folder cannot be written.
-    """
-    created: list[str] = []
-    existing: list[str] = []
+
+def _open_skills_root(workfolder: str | Path) -> int:
+    """Descriptor of `<workfolder>/skills` (created if missing); it must not be a link."""
     try:
         base = os.open(Path(workfolder), os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
     except OSError as exc:
@@ -773,23 +772,35 @@ def install_start_skills(workfolder: str | Path) -> StartSkills:
     try:
         with contextlib.suppress(FileExistsError):
             os.mkdir(SKILLS_DIR, 0o755, dir_fd=base)
-        try:
-            root = os.open(SKILLS_DIR, _DIR_FLAGS, dir_fd=base)
-        except OSError as exc:
-            if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
-                raise SkillFileError(
-                    f"Der Ordner {SKILLS_DIR} im Workfolder ist ein Link oder kein Ordner. arr "
-                    "folgt dort keinen Links. Ersetze ihn durch einen echten Ordner."
-                ) from None
-            raise
+        return os.open(SKILLS_DIR, _DIR_FLAGS, dir_fd=base)
     except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+            raise SkillFileError(SKILLS_LINK) from None
         raise SkillFileError(
             f"Der Ordner {SKILLS_DIR} ließ sich nicht öffnen ({exc.strerror or exc})."
         ) from None
     finally:
         os.close(base)
+
+
+def install_start_skills(
+    workfolder: str | Path, names: Sequence[str] = START_SKILLS
+) -> StartSkills:
+    """Create the missing start skills `names` in `<workfolder>/skills/` (W4-05).
+
+    A skill folder (or file or link) with the same name is never overwritten or changed, also
+    when it is broken; it is reported in `existing`. `skills/` itself must not be a link; it is
+    created if missing. Running it again changes nothing. Raises `SkillFileError` with a German
+    message if the folder cannot be written.
+
+    Accepted (as in W4-02): an empty folder that appears with the same name between the last
+    check and `rename` is replaced (POSIX `rename`); nothing is lost.
+    """
+    created: list[str] = []
+    existing: list[str] = []
+    root = _open_skills_root(workfolder)
     try:
-        for name in START_SKILLS:
+        for name in names:
             try:
                 made = _install_one(root, name)
             except OSError as exc:
@@ -803,6 +814,11 @@ def install_start_skills(workfolder: str | Path) -> StartSkills:
     if created:
         log.info("Start-Skills angelegt: %s", ", ".join(created))
     return StartSkills(created=created, existing=existing)
+
+
+def install_start_skill(workfolder: str | Path, name: str) -> bool:
+    """Create the one start skill `name` unless something is there; True if created."""
+    return name in install_start_skills(workfolder, (name,)).created
 
 
 def start_skills_message(created: Sequence[str], existing: Sequence[str]) -> str:

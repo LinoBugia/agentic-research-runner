@@ -19,8 +19,10 @@ python <skill-ordner>/scripts/check.py vereinfache "sin(x)^2 + cos(x)^2"
 
 - `gleich A B`: prüft, ob `A - B` zu 0 vereinfacht. Ausgabe `gleich`, `nicht gleich` (mit Differenz) oder `nicht entschieden`. Exit-Code 0, 1 oder 2.
 - `vereinfache A`: gibt die vereinfachte Form aus.
-- `--symbol name:annahme,annahme` setzt Annahmen, z. B. `n:integer,positive`. Ohne Annahmen gelten Symbole als komplex; manche Identitäten gelten dann nicht.
+- `--symbol name:annahme,annahme` setzt Annahmen, z. B. `n:integer,positive`. Ohne Annahmen gelten Symbole als komplex; manche Identitäten gelten dann nicht. Eine unbekannte Annahme (z. B. `positiv`) ist ein Fehler.
 - `^` ist die Potenz.
+- **Konstanten:** `I` ist die imaginäre Einheit, `E` die eulersche Zahl, `pi` und `oo` (unendlich). Meinst du `I` oder `E` als Variable, lege sie mit `--symbol I` an. Andere Namen wie `N`, `S`, `beta`, `gamma` sind Variablen, solange du sie nicht aufrufst.
+- **Nur Rechenausdrücke:** Erlaubt sind Zahlen, Namen, `+ - * / ^ ** !`, Kommas, runde Klammern und bekannte Funktionen (`sin`, `exp`, `log`, `sqrt`, `binomial`, `factorial`, `Sum` …). Alles andere lehnt das Skript ab, bevor SymPy die Eingabe sieht; ein Ausdruck wird nie als Python-Code ausgeführt.
 
 ## Gründlicher: ein eigenes Skript
 

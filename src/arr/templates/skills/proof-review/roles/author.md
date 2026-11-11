@@ -16,8 +16,8 @@ Du schreibst den Beweis, den unabhängige Judges prüfen, und überarbeitest ihn
 
 ## Abgabe
 
-Eine Fassung des Beweises als Datei (Ergebnisart `artifact`). Am Ende der Fassung ein Abschnitt `## Änderungen` mit je einer Zeile pro behandeltem Einwand (`[E2] behoben: …`).
+Eine Fassung des Beweises als Datei (Ergebnisart `artifact`). Am Ende der Fassung je eine Zeile pro behandeltem Einwand: in Markdown unter `## Änderungen` (`[E2] behoben: …`), in einer `.tex`-Fassung als Kommentarzeilen (`% [E2] behoben: …`), damit die Datei übersetzbar bleibt.
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`), von deinem Arbeitsordner aus unter `../../../output/results/`. Die Fassungen des Beweises legt arr unter `output/artifacts/v<n>/` ab. Nimm die Pfade, die dein Auftrag nennt.
+Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`); den Pfad von deinem Arbeitsordner aus nennt dein Auftrag. Die Fassungen des Beweises legt arr unter `output/artifacts/v<n>/` ab.
