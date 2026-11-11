@@ -2500,3 +2500,12 @@ def validation_error(exc: ValidationError) -> ApiException:
     issues = validation_issues(exc)
     first = issues[0].message if issues else "Die Angaben sind ungültig."
     return ApiException.of(ErrorCode.INVALID, first, issues=issues)
+
+
+class StartSkillsResult(ApiModel):
+    """Start skills created in the workfolder (`POST /api/skills/start`, W4-05): `created`,
+    `existing` (same name already there, never overwritten), `message`: German sentence."""
+
+    created: list[str] = Field(default_factory=list)
+    existing: list[str] = Field(default_factory=list)
+    message: str

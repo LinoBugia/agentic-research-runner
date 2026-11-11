@@ -1,0 +1,78 @@
+kind: research-group
+version: 1
+description: Ansätze zu einer Frage breit erkunden und bewerten
+topology: exploration
+
+params:
+  ideas:
+    default: []
+    doc: "Vorgegebene Ansätze als Liste von Texten; leer: der Ideator schlägt welche vor"
+  n_ideas:
+    default: 3
+    min: 1
+    max: 4
+    doc: "Anzahl der Ansätze, die der Ideator vorschlägt"
+  turns_per_idea:
+    default: 2
+    min: 1
+    max: 2
+    doc: "Arbeitsrunden je Ansatz"
+  exchange:
+    default: none
+    choices: [none, digest, channel]
+    doc: "none: Explorer arbeiten getrennt; digest: sie sehen Auszüge der anderen; channel: sie reden in #werkstatt"
+  n_explorers:
+    default: 2
+    min: 1
+    max: 6
+    doc: "Anzahl der Explorer, abwechselnd Claude und ChatGPT"
+  n_rankers:
+    default: 1
+    min: 0
+    max: 3
+    doc: "Anzahl der Ranker (0: keine Rangliste)"
+  ideator:
+    default: ideator
+    doc: "Agent, der die Ansätze vorschlägt"
+  summarizer:
+    default: summarizer
+    doc: "Agent, der am Ende zusammenfasst"
+
+rubric:
+  scale: [1, 10]
+  criteria: [tragfaehigkeit, belege, aufwand]
+
+limits:
+  wall_time: 1h
+  turns_per_agent: 12
+  budget_usd: 5
+
+defaults:
+  provider: claude
+  model: claude-sonnet-5-5
+  effort: high
+  workspace: { mode: copy }
+
+agents:
+  - id: ideator
+    role: roles/ideator.md
+  - id: explorer
+    count: "{{ params.n_explorers }}"
+    role: roles/explorer.md
+    skills: [sympy-check]
+    mix:
+      - { provider: claude, model: claude-sonnet-5-5 }
+      - { provider: codex }
+  - id: ranker
+    count: "{{ params.n_rankers }}"
+    role: roles/ranker.md
+  - id: summarizer
+    role: roles/summarizer.md
+    model: claude-haiku-5-5
+    effort: medium
+
+groupchats:
+  - name: werkstatt
+    purpose: "Austausch der Explorer (nur bei exchange: channel)"
+    members: [explorer-*]
+    mode: rounds

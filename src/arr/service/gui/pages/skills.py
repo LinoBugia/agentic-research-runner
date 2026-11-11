@@ -45,6 +45,7 @@ from arr.service.gui.components.params import CHOICE_LABELS, param_text
 from arr.service.gui.components.skill_editor import SkillEditor, install_editor_js, issue_where
 from arr.service.gui.layout import Frame, tab_title
 from arr.service.gui.texts import TOPOLOGY_LABEL, Status
+from arr.skills import START_SKILLS
 
 KIND_GROUPS = [
     (SkillKind.GROUP, "Group · startbar"),
@@ -302,10 +303,7 @@ class SkillsPage:
                 empty_state_html(
                     "auto_awesome",
                     "Noch keine Skills",
-                    "Die Start-Skills lassen sich mit einem Klick anlegen."
-                    if self._prototype
-                    else "Lege einen Skill aus einer Vorlage an. Die Start-Skills kommen mit "
-                    "Auftrag W4-05.",
+                    "Lege die Start-Skills mit einem Klick an oder einen Skill aus einer Vorlage.",
                     [],
                 )
             )
@@ -322,6 +320,14 @@ class SkillsPage:
         with ui.element("div").classes("split"):
             with ui.element("nav").classes("subnav").props('aria-label="Skills"'):
                 button("＋ Neuer Skill", self._new_dialog, classes="btn sk-new").mark("new-skill")
+                missing = [n for n in START_SKILLS if n not in names]
+                if missing:
+                    button(
+                        "Start-Skills anlegen",
+                        self._create_start_skills,
+                        classes="btn sk-new",
+                        title="Fehlt: " + ", ".join(missing),
+                    ).mark("start-skills")
                 self.list_box = raw("", tag="div", classes="list")
             self.detail = ui.element("div")
         self._render_list(skills, selected)
@@ -724,19 +730,17 @@ class SkillsPage:
 
         self.dialog.open("Neuer Skill", "Skill anlegen", build, submit)
 
-    @property
-    def _prototype(self) -> bool:
-        return hasattr(getattr(self.api, "base", self.api), "datasets")
-
-    def _create_start_skills(self) -> None:
-        if not self._prototype:
-            self.frame.toast("Die Start-Skills kommen mit Auftrag W4-05.")
+    async def _create_start_skills(self) -> None:
+        """Create the missing start skills; skills with the same name stay as they are."""
+        try:
+            result = await self.api.create_start_skills()
+        except ApiException as exc:
+            self.frame.toast(exc.error.message, error=True)
             return
-        self.frame.toast(
-            "Start-Skills angelegt: exploration, proof, proof-review, roundtable, sympy-check, "
-            "latex-writeup, arr (im Prototyp simuliert)."
-        )
-        ui.navigate.to("/skills")
+        self.frame.toast(result.message)
+        self.name = ""
+        ui.navigate.history.push("/skills")
+        await self._load()
 
 
 def register() -> None:

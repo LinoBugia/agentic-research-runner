@@ -185,6 +185,7 @@ from arr.service.api_models import (
     StageRef,
     StageStatus,
     StartRunResponse,
+    StartSkillsResult,
     StorageItem,
     StorageParts,
     StorageReport,
@@ -220,7 +221,7 @@ from arr.service.real_api.skill_files import (
     template_files,
     version_of,
 )
-from arr.skills import MAX_SKILL_FILE_BYTES
+from arr.skills import MAX_SKILL_FILE_BYTES, START_SKILLS, start_skill_files, start_skills_message
 from arr.skills import SKILL_FILE as SKILL_FILE_NAME
 
 __all__ = [
@@ -7010,6 +7011,38 @@ class MockApi:
             profiles=list(self.state.profiles),
             toolchain_candidates=_toolchain_candidates(),
             projects=[p.name for p in self.state.projects],
+        )
+
+    async def create_start_skills(self) -> StartSkillsResult:
+        """Add the missing start skills with their real texts (in memory, W4-05)."""
+        created: list[str] = []
+        existing: list[str] = []
+        names = {s.name for s in self.state.skills}
+        for name in START_SKILLS:
+            if name in names:
+                existing.append(name)
+                continue
+            files = {k: v.decode("utf-8") for k, v in start_skill_files(name).items()}
+            match = re.search(r"(?m)^description: (.*)$", files[SKILL_FILE_NAME])
+            if "group.yaml" in files:
+                kind = SkillKind.GROUP
+            elif name == "arr":
+                kind = SkillKind.USER_AGENT
+            else:
+                kind = SkillKind.TOOL
+            skill = SkillInfo(
+                name=name,
+                description=match.group(1).strip() if match else "",
+                kind=kind,
+                audience="user" if kind is not SkillKind.TOOL else "both",
+                files=sorted(files),
+            )
+            self.state.skills.append(skill)
+            for path, text in files.items():
+                self.state.skill_texts[(name, path)] = text
+            created.append(name)
+        return StartSkillsResult(
+            created=created, existing=existing, message=start_skills_message(created, existing)
         )
 
 

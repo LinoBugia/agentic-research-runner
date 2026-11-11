@@ -81,6 +81,7 @@ from arr.service.api_models import (
     SkillInfo,
     SkillKind,
     StartRunResponse,
+    StartSkillsResult,
     StorageReport,
     ToolchainTestResult,
     TranscriptKind,
@@ -426,3 +427,8 @@ class RealApi:
         import asyncio  # here, so this order changes this file at its end only
 
         return await asyncio.to_thread(self.run_starts._plan_with_card, spec, None)
+
+    # -- ApiClient: start skills (W4-05) ------------------------------------------------------
+
+    async def create_start_skills(self) -> StartSkillsResult:
+        return await self.catalog.create_start_skills()
