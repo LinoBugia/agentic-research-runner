@@ -466,3 +466,54 @@ async def test_g29_a_cli_that_reports_tools_or_mcp_at_its_start_is_stopped(
     )
     reply = await clean.ask(SYSTEM_PROMPT, "Anfrage")
     assert reply.text == ALLOW_JSON and reply.usage.cost_usd == 0.001
+
+
+async def test_m1_the_stage_alone_voids_an_answer_withdrawn_during_the_call(env: Env) -> None:
+    """Each layer on its own: the stage asks after the call (mutation N3)."""
+    from arr.permissions.types import EscalatedBy
+
+    withdrawn = [False]
+    model = FakeModel(ALLOW_JSON)
+    model.during = lambda: withdrawn.__setitem__(0, True)
+    assessment = env.engine.assess(host("arxiv.org"))
+    item = ApprovalItem(
+        id="apr_s",
+        type="permission",
+        run_id="r1",
+        agent_id="explorer-1",
+        request=assessment.request,
+    )
+    context = ScreenContext(assessment=assessment, revoked=lambda: withdrawn[0])
+    outcome = await env.stage(model).screen(item, context)
+    assert isinstance(outcome, EscalatedBy) and "zurückgezogen" in outcome.note
+    assert model.finished == 1  # the call ran, its allow did not count
+
+
+async def test_m1_the_inbox_alone_voids_a_late_allow_of_a_withdrawn_request(env: Env) -> None:
+    """Each layer on its own: the inbox asks when it settles (mutation N2)."""
+    from arr.permissions.types import EscalatedBy
+
+    holder: list[ApprovalInbox] = []
+
+    class Late:
+        """Allows everything and withdraws the first decision while it screens the second."""
+
+        async def screen(self, item: ApprovalItem, context: ScreenContext) -> Decision:
+            inbox = holder[0]
+            decided = [i for i in inbox.items() if i.status is ApprovalStatus.DECIDED]
+            if decided:
+                inbox.revoke(decided[0].id)
+            return Decision(action=DecisionAction.ALLOW, decided_by=DecidedBy.GATEKEEPER)
+
+        def failed(self, item: ApprovalItem) -> Decision:
+            raise AssertionError
+
+        def revoked(self, item: ApprovalItem) -> EscalatedBy:
+            return EscalatedBy(decider=DecidedBy.GATEKEEPER, note="zurückgezogen")
+
+    inbox = ApprovalInbox(env.engine, screener=Late(), timeout=0.2)
+    holder.append(inbox)
+    assert (await inbox.handle(host("arxiv.org"))).action is DecisionAction.ALLOW
+    second = await inbox.handle(host("arxiv.org"))
+    assert second.action is DecisionAction.DENY  # at the user, who did not answer
+    assert inbox.items()[-1].escalated_by is not None
