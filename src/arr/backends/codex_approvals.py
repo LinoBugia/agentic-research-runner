@@ -35,6 +35,7 @@ from arr.backends.codex_sdk import RpcError
 from arr.models import Provider
 from arr.permissions.inbox import ApprovalInbox
 from arr.permissions.types import (
+    ApprovalType,
     DecidedBy,
     Decision,
     DecisionAction,
@@ -427,12 +428,17 @@ class ApprovalBridge:
             return bool(self._waiting)
 
     def cancel_waiting(self, *, stop: bool = True) -> None:
-        """End every wait with a `decline`; with `stop`, later requests are declined at once."""
+        """End every wait with a `decline`; with `stop`, later requests are declined at once.
+
+        Only this agent's permission requests end here. Its question to the user stays open
+        until an answer, a result of the agent or the end of the run (L16-L18): the bridge
+        closes after every turn, and a question outlives the turn (W4-06).
+        """
         with self._lock:
             self._stopped = self._stopped or stop
             waiting = list(self._waiting)
         for item in self.inbox.pending():
-            if item.agent_id == self.agent_id:
+            if item.agent_id == self.agent_id and item.type is ApprovalType.PERMISSION:
                 self.inbox.cancel(item.id, "Der Turn wurde gestoppt.")
         for future in waiting:
             future.cancel()

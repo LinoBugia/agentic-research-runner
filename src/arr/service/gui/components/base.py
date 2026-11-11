@@ -214,8 +214,14 @@ def markdown_html(source: str) -> str:
     dollar = f"{_PH_OPEN}D{nonce}{_PH_CLOSE}"
     marked = _MATH_RE.sub(keep_inline, _CODE_RE.sub(code, source))
     marked = marked.replace("\\$", dollar)
-    # `_` inside a word is no emphasis: run IDs and snake_case keep their underscores
-    extras = {"fenced-code-blocks": None, "middle-word-em": False}
+    # `_` inside a word is no emphasis: run IDs and snake_case keep their underscores.
+    # Tables and lists right after a line, as `summary.md` writes them (W4-06).
+    extras = {
+        "fenced-code-blocks": None,
+        "middle-word-em": False,
+        "tables": None,
+        "cuddled-lists": None,
+    }
     rendered = markdown2.markdown(marked, safe_mode="escape", extras=extras)
 
     def back(match: re.Match[str]) -> str:

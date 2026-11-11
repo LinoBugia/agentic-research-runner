@@ -43,7 +43,9 @@ from arr.permissions.types import RequestCategory
 from arr.resolve import parse_yaml_text, validate_model
 from arr.room.store import RoomStore
 from arr.room.types import Message as RoomMessage
+from arr.room.types import Result as RoomResult
 from arr.runs.eventlog import RATE_LIMIT_PASSING
+from arr.runs.finalize import result_file
 from arr.runs.inspect import describe_checkpoint, open_approvals, run_lock_held, run_reason
 from arr.runs.launch import CHANNEL_WAIT_TEXT, ORPHAN_MIN_AGE_S, describe_entry
 from arr.runs.prepare import AgentFile, RunMeta, load_agent_file
@@ -1955,6 +1957,20 @@ def _result_body(record: RunRecord, body: str | None, path: str | None) -> str |
     return None
 
 
+def _result_path(record: RunRecord, result: RoomResult) -> str | None:
+    """The result's own file; for a result without one (e.g. a review) the copy `finalize`
+    writes at the end, once it is there as a regular file (W4-06): Claude Code then reads the
+    whole text instead of only the excerpt in `read_results`."""
+    if result.path:
+        return result.path
+    copy = result_file(result)
+    try:
+        info = os.lstat(record.run_dir / copy)
+    except OSError:
+        return None
+    return copy if stat.S_ISREG(info.st_mode) else None
+
+
 def run_results(record: RunRecord, resolved: ResolvedRun | None = None) -> RunResults:
     """Results with ratings and the summary (docs/08 §6.9)."""
     resolved = resolved or record.load_resolved()
@@ -2011,7 +2027,7 @@ def run_results(record: RunRecord, resolved: ResolvedRun | None = None) -> RunRe
                     kind=_result_kind(result.kind),
                     title=result.title,
                     body_excerpt=_result_body(record, result.body, result.path),
-                    path=result.path,
+                    path=_result_path(record, result),
                     attempt=result.attempt,
                     ratings=rs,
                     avg_score=avg,

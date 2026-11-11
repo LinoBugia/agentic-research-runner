@@ -1136,3 +1136,19 @@ async def test_w4_03_reset_sends_the_context_again_in_shared_mode(setup) -> None
     await backend.reset()
     await play(backend, "Frisch.")
     assert kit.prompts == ["PROJEKTKONTEXT\n\nLos.", "Weiter.", "PROJEKTKONTEXT\n\nFrisch."]
+
+
+async def test_w4_06_a_question_to_the_user_outlives_the_codex_turn(setup) -> None:
+    """W4-06 (live run …_7e7e): the bridge closes after every turn and closed the agent's open
+    question to the user with „Der Turn wurde gestoppt.“, so the user could not answer it. It
+    stays open (L16-L18); only its own permission requests end with the turn."""
+    backend, _, inbox = setup([simple_turn(), simple_turn("zwei")])
+    await backend.start()
+    question = inbox.open_question("R", "gpt-1", "main", 2, "@user Nur n ≥ 1?")
+    await play(backend)
+    assert inbox.get(question.id).status is ApprovalStatus.OPEN
+    await play(backend, "Weiter.")
+    assert inbox.get(question.id).status is ApprovalStatus.OPEN
+    await backend.close()
+    assert inbox.get(question.id).status is ApprovalStatus.OPEN, "the run closes it, not Codex"
+    assert inbox.answered(question.id, "nur n ≥ 1")
