@@ -865,3 +865,77 @@ def test_n5_a_log_link_is_not_followed(wf: Path, tmp_path: Path, name: str) -> N
     target.write_bytes(outside.read_bytes())
     tail.refresh()
     assert "GEHEIM-MARKER" in json.dumps(tail.entries), "Gegenprobe: a real file is read"
+
+
+# ============================================================================================
+# W4-01.2 Teil B: H1 through `arr mcp` (after W4-03.1 in main)
+# ============================================================================================
+
+EVENT_YAML = GROUP_YAML.replace("    mode: rounds", "    mode: event").replace(
+    "turns_per_agent: 6", "turns_per_agent: 12"
+)
+
+
+def h1_scripts() -> dict[str, Any]:
+    from run_kit import say, wait
+
+    ask = post("main", ASK, kind="question")
+    return {
+        # asks, then is idle; every wake gives one more turn
+        "m-1": turns([ask, say("Ich warte auf den User.")], [say("gelesen")], repeat_last=True),
+        "m-2": turns([wait(90), done()]),  # keep the run going while Claude Code writes
+        "critic": turns([wait(90), done()]),
+    }
+
+
+async def test_h1_claude_code_answers_no_question_through_arr_mcp(wf: Path, arr_home: Path) -> None:
+    """E15 (W4-01.1 point 1): `to`, `@name`, `reply_to` and `@alle` from Claude Code wake the
+    asker, but the item „Frage“ stays open; an answer from the GUI closes it (counter-check)."""
+    from mcp import Client
+    from run_kit import log_entries
+    from test_mcp_bridge import bridge_params
+
+    group_skill(wf, "frage", EVENT_YAML)
+    api = make_api(wf, h1_scripts())
+    async with Service(api):  # `arr mcp` finds it through service.json
+        run_id = (
+            await api.start_run({"project": "demo", "skill": "frage", "task_md": "Prüfe."})
+        ).run_id
+        run_dir = wf / "runs" / run_id
+
+        async def asked() -> Any:
+            items = await api.list_approvals(status=[ApprovalStatus.OPEN], run_id=run_id)
+            return [i for i in items if i.type is ApprovalType.QUESTION]
+
+        [question] = await until(asked, within=30)
+        assert question.msg_id is not None
+
+        def woken_by(msg_id: int) -> bool:
+            wakes = [e["data"] for e in log_entries(run_dir, "wake")]
+            return any(w.get("agent") == "m-1" and msg_id in w.get("messages", []) for w in wakes)
+
+        ways = {
+            "to": {"body": "Band 10.", "to": ["m-1"]},
+            "@name": {"body": "@m-1 Band 10."},
+            "reply_to": {"body": "Band 10.", "reply_to": question.msg_id},
+            "@alle": {"body": "@alle Band 10."},
+        }
+        seen: dict[str, Any] = {}
+        async with Client(bridge_params(project(wf), arr_home)) as client:
+            for how, args in ways.items():
+                result = await client.call_tool(
+                    "post_to_run", {"run_id": run_id, "channel": "main", **args}
+                )
+                answer = result_data(result)
+                assert answer.get("hint") == QUESTION_HINT, (how, answer)
+                await until(lambda mid=answer["message_id"]: woken_by(mid), within=20)
+                item = await api.get_approval(question.id)
+                store = RoomStore.create(run_dir)
+                seen[how] = (item.status, store.message(question.msg_id).open)
+        assert seen == {how: (ApprovalStatus.OPEN, True) for how in ways}, seen
+
+        request = DecisionRequest(action=DecisionAction.ANSWER, comment="Band 12.")
+        await api.decide_approval(question.id, request)  # the user in the GUI
+        item = await api.get_approval(question.id)
+        assert item.status is ApprovalStatus.DECIDED and item.answer == "Band 12."
+        assert not RoomStore.create(run_dir).message(question.msg_id).open

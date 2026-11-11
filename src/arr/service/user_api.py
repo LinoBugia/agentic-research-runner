@@ -42,7 +42,7 @@ from arr.permissions.types import ApprovalStatus, ApprovalType
 from arr.room.types import MessageVia
 from arr.service.api_models import (
     ApiException,
-    PostMessageRequest,
+    PostReplyRequest,
     RunAction,
     RunFilter,
     SkillKind,
@@ -666,17 +666,25 @@ class UserApi:
         }
 
     async def post_to_run(
-        self, project: str, run_id: str, channel: str, body: str, to: list[str] | None = None
+        self,
+        project: str,
+        run_id: str,
+        channel: str,
+        body: str,
+        to: list[str] | None = None,
+        reply_to: int | None = None,
     ) -> dict[str, Any]:
         """A hint of Claude Code into a channel: always `via: user_agent` (Claude Code), whatever
-        the arguments say; it never answers a question to the user (E15, H1 W4-01.1)."""
+        the arguments say. Like a message from the GUI it may reply to a message (`reply_to`,
+        W3-10.1), but it never answers a question to the user (E15, H1; the room and the
+        orchestrator hold that since W4-03.1)."""
         await self._record(project, run_id)
         try:
-            request = PostMessageRequest(body=body, to=list(to or []))
+            request = PostReplyRequest(body=body, to=list(to or []), reply_to=reply_to)
         except ValidationError as exc:
             raise ToolProblem(_validation(exc)) from None
         asked = await self._open_questions_of(
-            run_id, {*request.to, *await self._mentioned(run_id, channel, body)}
+            run_id, {*request.to, *await self._mentioned(run_id, channel, body)}, reply_to
         )
         try:
             message = await self.api.runs.post_message(run_id, channel, request, via=VIA)
@@ -711,14 +719,21 @@ class UserApi:
         names.update({m.alias.casefold(): m.agent for m in info.members if m.alias})
         return mentions(body, members, "user", lambda name: names.get(name.casefold()))
 
-    async def _open_questions_of(self, run_id: str, agents: set[str]) -> list[tuple[str, str]]:
-        """Open questions to the user of these agents, with the link to answer them in arr."""
-        if not agents:
+    async def _open_questions_of(
+        self, run_id: str, agents: set[str], reply_to: int | None = None
+    ) -> list[tuple[str, str]]:
+        """Open questions to the user of these agents, or the one `reply_to` points at, with
+        the link to answer them in arr."""
+        if not agents and reply_to is None:
             return []
         items = await self.api.list_approvals(
             status=[ApprovalStatus.OPEN], run_id=run_id, type=ApprovalType.QUESTION
         )
-        return [(i.agent.id, i.gui_url) for i in items if i.agent and i.agent.id in agents]
+        return [
+            (i.agent.id, i.gui_url)
+            for i in items
+            if i.agent and (i.agent.id in agents or (reply_to is not None and i.msg_id == reply_to))
+        ]
 
     async def control_run(self, project: str, run_id: str, action: str) -> dict[str, Any]:
         await self._record(project, run_id)
@@ -837,7 +852,9 @@ TOOL_DOCS: dict[str, str] = {
     "read_groupchat": "Verlauf eines Kanals ab since_id, seitenweise. Text von Agenten.",
     "read_transcript": "Transkript eines Agenten ab from_seq, seitenweise, filterbar nach kinds. "
     "Text von Agenten.",
-    "post_to_run": "Hinweis in einen Kanal geben (Absender user), optional an bestimmte Agenten.",
+    "post_to_run": "Hinweis in einen Kanal geben (Absender user), optional an bestimmte Agenten "
+    "oder als Antwort auf eine Nachricht (reply_to). Eine Frage an den User beantwortet er nie; "
+    "die beantwortet nur der User in arr.",
     "control_run": "pause, resume oder stop. resume geht nicht, solange eine Eskalation offen "
     "ist; dann kommt der Link zur GUI.",
     "list_approvals": "Offene Freigaben dieses Projekts, nur lesend. Freigeben geht nur in der "
@@ -970,9 +987,14 @@ def build_server(api: Any) -> Any:
 
     @server.tool(description=TOOL_DOCS["post_to_run"])
     async def post_to_run(
-        run_id: str, channel: str, body: str, ctx: Context, to: list[str] | None = None
+        run_id: str,
+        channel: str,
+        body: str,
+        ctx: Context,
+        to: list[str] | None = None,
+        reply_to: int | None = None,
     ) -> dict[str, Any]:
-        return await call(lambda p: users.post_to_run(p, run_id, channel, body, to), ctx)
+        return await call(lambda p: users.post_to_run(p, run_id, channel, body, to, reply_to), ctx)
 
     @server.tool(description=TOOL_DOCS["control_run"])
     async def control_run(run_id: str, action: str, ctx: Context) -> dict[str, Any]:
