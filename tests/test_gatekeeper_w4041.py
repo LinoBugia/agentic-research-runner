@@ -282,9 +282,7 @@ async def test_g3_a_command_of_one_agent_never_reaches_the_prompt_for_another(en
     inbox = env.inbox(model, timeout=0.2)
     secret_bit = "https://arxiv.org/abs/1?nachricht=FUER-AGENT-B"
     await inbox.handle(bash(f"curl -s '{secret_bit}'"))  # explorer-1
-    codex_host = host("pypi.org").model_copy(
-        update={"agent_id": "codex-1", "provider": "codex", "tool": "commandExecution"}
-    )
+    codex_host = host("pypi.org", agent_id="codex-1", provider="codex", tool="commandExecution")
     await inbox.handle(codex_host)
     assert "FUER-AGENT-B" not in model.prompts[1]
     assert "explorer-1" not in model.prompts[1]
