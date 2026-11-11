@@ -190,7 +190,11 @@ async def test_a5_a_run_counts_the_calls_and_its_budget(wf: Path) -> None:
     assert usage["by_profile"]["fake-auth"]["cost_estimated_usd"] == pytest.approx(0.4)
 
 
-async def test_a5_a_blocked_profile_never_calls_the_gatekeeper(wf: Path, arr_home: Path) -> None:
+async def test_a5_a_blocked_profile_of_the_gatekeeper_keeps_the_run_from_starting(
+    wf: Path, arr_home: Path
+) -> None:
+    """W4-04.1 (M4): the supervising agent's own profile is a profile of the run, so its
+    Not-Aus keeps the run from starting, like a blocked agent profile."""
     (arr_home / "profiles.yaml").write_text(
         "version: 1\nprofiles:\n  - {name: fake-auth, kind: claude_oauth}\n"
         "  - {name: aufsicht, kind: claude_oauth, disabled: true}\n",
@@ -199,10 +203,8 @@ async def test_a5_a_blocked_profile_never_calls_the_gatekeeper(wf: Path, arr_hom
     model = FakeModel(ALLOW_JSON)
     own = {**GATEKEEPER, "gatekeeper": {**GATEKEEPER["gatekeeper"], "auth": "aufsicht"}}
     async with Service(wf, {"a": asking(PYPI)}, model) as svc:
-        started = await svc.api.start_run(run_input({"id": "a"}, approvals=own))
-        card = (await items_of(svc.api, started.run_id, n=1))[0]
-        assert card.status is ApprovalStatus.OPEN
-        assert "gesperrt (Not-Aus)" in card.escalated_by.note
+        with pytest.raises(ApiException, match="„aufsicht“ ist gesperrt"):
+            await svc.api.start_run(run_input({"id": "a"}, approvals=own))
     assert not model.prompts
 
 
@@ -259,3 +261,36 @@ async def test_a1_switching_on_the_gatekeeper_creates_the_mandate(fresh: Path) -
     await api.update_workfolder_settings(info.model_copy(update={"approvals": approvals}))
     assert (fresh / "mandates" / "standard.md").read_text() == standard_text()
     assert (await api.get_mandate()).exists
+
+
+@pytest.mark.parametrize("own", [True, False], ids=["eigenes Profil", "Profil der Agenten"])
+async def test_m4_not_aus_of_the_gatekeepers_profile_stops_the_run_and_its_call(
+    wf: Path, arr_home: Path, own: bool
+) -> None:
+    """W4-04.1 (M4): the dialog names the run, blocking stops it and ends the running call at
+    once, its answer does not count; while the run uses the profile it cannot be deleted."""
+    write_profiles(arr_home, {"fake-auth": "claude_oauth", "aufsicht": "claude_oauth"})
+    name = "aufsicht" if own else "fake-auth"
+    approvals = {**GATEKEEPER, "gatekeeper": {**GATEKEEPER["gatekeeper"], "auth": name}}
+    model = FakeModel(ALLOW_JSON, delay=30)
+    async with Service(wf, {"a": asking(PYPI)}, model) as svc:
+        started = await svc.api.start_run(run_input({"id": "a"}, approvals=approvals))
+        await until(lambda: bool(model.prompts), 15)
+        dry = await svc.api.disable_profile(name, dry_run=True)
+        assert dry.runs == [started.run_id] and "1 laufender Run würde" in dry.message
+        with pytest.raises(ApiException, match="von laufenden Runs genutzt"):
+            await svc.api.delete_profile(name)
+        loop = asyncio.get_running_loop()
+        begin = loop.time()
+        await svc.api.disable_profile(name)
+        while not (await svc.api.get_run(started.run_id)).run.status.is_final:
+            assert loop.time() - begin < 15
+            await asyncio.sleep(0.05)
+        assert (await svc.api.get_run(started.run_id)).run.status is RunStatus.STOPPED
+        assert loop.time() - begin < 15  # not the 30 s of the call
+    run_dir = wf / "runs" / started.run_id
+    calls = [json.loads(x) for x in (run_dir / "gatekeeper.jsonl").read_text().splitlines()]
+    assert [c["outcome"] for c in calls] in (["cancelled"], ["blocked"])
+    assert model.finished == 0
+    log = (run_dir / "approvals.jsonl").read_text()
+    assert '"decided_by": "gatekeeper"' not in log

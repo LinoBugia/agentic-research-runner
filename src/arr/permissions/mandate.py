@@ -335,7 +335,12 @@ _REQUIREMENT_RE = re.compile(
     r"(?:(?:~=|===|==|!=|<=|>=|<|>)[A-Za-z0-9.*+!_-]{1,64}"
     r"(?:,(?:~=|===|==|!=|<=|>=|<|>)[A-Za-z0-9.*+!_-]{1,64}){0,7})?$"
 )
-_ARCHIVES = (".whl", ".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".egg", ".pyz")
+_PIP_ARCHIVES = (
+    *(".zip", ".whl", ".tar.bz2", ".tbz", ".tar.xz", ".txz", ".tlz", ".tar.lz", ".tar.lzma"),
+    *(".tar.gz", ".tgz", ".tar"),
+)
+"""pip's `ARCHIVE_EXTENSIONS`: a requirement whose name ends in one is a local file for pip."""
+_FILE_ENDINGS = (*_PIP_ARCHIVES, ".gz", ".bz2", ".xz", ".lz", ".lzma", ".egg", ".pyz")
 _PIP_SHORT = frozenset("Uqv")
 _PIP_LONG = frozenset(
     {
@@ -407,12 +412,17 @@ def _check_pip(args: list[str]) -> tuple[str | None, list[str]]:
         lowered = arg.lower()
         if "://" in arg or lowered.startswith(("git+", "hg+", "svn+", "bzr+")) or "@" in arg:
             return "pip install aus einer URL oder einem Versionsverwaltungs-Repository", names
-        if "/" in arg or arg.startswith(".") or lowered.endswith(_ARCHIVES):
+        if "/" in arg or "\\" in arg or arg.startswith("."):
             return "pip install aus einem lokalen Pfad oder einer Datei", names
+        # positive list: a PyPI name (PEP 508/503) with optional extras and version (G1)
         match = _REQUIREMENT_RE.match(arg)
         if match is None:
             return f"pip install mit „{arg[:60]}“, das arr nicht als Paketname liest", names
-        names.append(match.group("name").lower())
+        name = match.group("name").lower()
+        if name.endswith(_FILE_ENDINGS) or lowered.split("[", 1)[0].endswith(_FILE_ENDINGS):
+            # pip reads such a name as a local archive, not as a package of PyPI
+            return "pip install aus einem lokalen Pfad oder einer Datei", names
+        names.append(name)
     if not names:
         return "pip install ohne Paketnamen", names
     return None, names

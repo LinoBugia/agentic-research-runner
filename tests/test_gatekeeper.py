@@ -71,21 +71,31 @@ class FakeModel:
 
     model = "fake-haiku"
 
-    def __init__(self, *answers: str | BaseException, delay: float = 0.0, cost: float = 0.001):
+    def __init__(
+        self,
+        *answers: str | BaseException,
+        delay: float = 0.0,
+        cost: float = 0.001,
+        delays: list[float] | None = None,
+    ):
         self.answers = list(answers)
         self.prompts: list[str] = []
         self.systems: list[str] = []
         self.delay = delay
+        self.delays = list(delays or [])
         self.cost = cost
         self.during: Callable[[], None] | None = None
+        self.finished = 0
 
     async def ask(self, system: str, prompt: str) -> ModelReply:
         self.systems.append(system)
         self.prompts.append(prompt)
         if self.during is not None:
             self.during()
-        if self.delay:
-            await asyncio.sleep(self.delay)
+        delay = self.delays.pop(0) if self.delays else self.delay
+        if delay:
+            await asyncio.sleep(delay)
+        self.finished += 1
         answer = self.answers.pop(0) if self.answers else ALLOW_JSON
         if isinstance(answer, BaseException):
             raise answer

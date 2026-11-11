@@ -50,6 +50,7 @@ from arr.models import (
     Starter,
     WorkfolderSettings,
 )
+from arr.permissions.gatekeeper import run_profiles
 from arr.permissions.inbox import ApprovalDecider
 from arr.resolve import load_group_spec, load_run_input, load_yaml_model, resolve_run
 from arr.runs.finalize import finalize_run, last_turn_error
@@ -352,7 +353,7 @@ def plan_run_input(
     )
     check_topology(resolved)
     known = profiles if profiles is not None else load_profiles()
-    refuse_disabled((a.auth for a in resolved.agents), known)
+    refuse_disabled(run_profiles(resolved, settings), known)  # with the supervising agent's
     return Launch(
         run_file=run_file,
         workfolder=root,
@@ -1142,7 +1143,7 @@ async def run_launch(
     done = asyncio.Event()
     follower = asyncio.create_task(follow_run(manager, report, done, interval_s=interval_s))
     stopper = asyncio.create_task(watch_stop_request(manager, report, done, interval_s=stop_poll_s))
-    names = {a.auth for a in launch.resolved.agents}
+    names = run_profiles(launch.resolved, launch.settings)  # with the supervising agent's
     blocker = asyncio.create_task(
         watch_blocked_profiles(
             manager, names, launch.profiles, report, done, interval_s=block_poll_s

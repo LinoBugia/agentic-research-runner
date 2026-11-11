@@ -150,6 +150,10 @@ class Screener(Protocol):
         """The outcome when screening raised."""
         ...
 
+    def revoked(self, item: ApprovalItem) -> Decision | EscalatedBy:
+        """The outcome for a request equal to a withdrawn decision of the screener."""
+        ...
+
 
 class ApprovalInbox:
     """Queue of open permission requests and escalations of one run (docs/07 §3 ③, §6).
@@ -657,7 +661,11 @@ class ApprovalInbox:
                 for i in self._items.values()
                 if i.decision is not None and i.decision.decided_by is DecidedBy.GATEKEEPER
             ]
-            revoked = bool(assessment.items & self._revoked_items)
+
+        def revoked() -> bool:  # asked anew at every step of the screen (M1)
+            with self._lock:
+                return bool(assessment.items & self._revoked_items)
+
         context = ScreenContext(assessment=assessment, history=history, revoked=revoked)
         outcome: Decision | EscalatedBy
         try:
@@ -688,6 +696,18 @@ class ApprovalInbox:
             item = self._items[item_id]
             if item.status is not ApprovalStatus.OPEN:
                 return  # stopped meanwhile
+            if (
+                isinstance(outcome, Decision)
+                and outcome.decided_by is DecidedBy.GATEKEEPER
+                and assessment.items & self._revoked_items
+                and self.screener is not None
+            ):
+                # withdrawn while it was screened: the user decides, at once (M1)
+                try:
+                    outcome = self.screener.revoked(item)
+                except Exception:
+                    logger.exception("Rückfall nach Zurückziehen für %s fehlgeschlagen", item_id)
+                    outcome = _fallback_deny(item)
             if isinstance(outcome, EscalatedBy):
                 self._publish(item, assessment, outcome)
                 return

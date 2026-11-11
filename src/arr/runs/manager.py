@@ -41,7 +41,6 @@ from arr.models import (
     Decider,
     GatekeeperSettings,
     ProfilesFile,
-    Provider,
     ResolvedRun,
     RunInput,
     RunStatus,
@@ -54,7 +53,9 @@ from arr.permissions.gatekeeper import (
     GatekeeperLog,
     GatekeeperModel,
     GatekeeperStage,
+    gatekeeper_auth,
     gatekeeper_profile,
+    run_profiles,
 )
 from arr.permissions.inbox import ApprovalDecider, ApprovalInbox
 from arr.permissions.policy import (
@@ -393,7 +394,7 @@ class RunManager:
         """
         from arr.runs.launch import UNREADABLE, blocked_profiles  # launch imports this module
 
-        names = {agent.auth for agent in self.resolved.agents if agent.auth}
+        names = run_profiles(self.resolved, self.settings)  # with the supervising agent's
         known = self._prepare_args.get("profiles")
         if not isinstance(known, ProfilesFile):
             known = ProfilesFile()
@@ -607,8 +608,7 @@ class RunManager:
         known = self._prepare_args.get("profiles")
         if not isinstance(known, ProfilesFile):
             known = ProfilesFile()
-        default = self.settings.defaults.get(Provider.CLAUDE)
-        auth = gatekeeper_profile(settings.auth, default.auth if default else None, known)
+        auth = gatekeeper_profile(gatekeeper_auth(self.resolved, self.settings), None, known)
         factory = self.gatekeeper_model or default_gatekeeper_model
         budget = self.resolved.limits.budget_usd
 
