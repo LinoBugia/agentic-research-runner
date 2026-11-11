@@ -517,3 +517,60 @@ async def test_m1_the_inbox_alone_voids_a_late_allow_of_a_withdrawn_request(env:
     second = await inbox.handle(host("arxiv.org"))
     assert second.action is DecisionAction.DENY  # at the user, who did not answer
     assert inbox.items()[-1].escalated_by is not None
+
+
+def _decided(env: Env, agent: str, command: str) -> ApprovalItem:
+    request = env.engine.assess(bash(command, agent=agent)).request
+    return ApprovalItem(
+        id=f"apr_{agent}",
+        type="permission",
+        run_id="r1",
+        agent_id=agent,
+        request=request,
+        status=ApprovalStatus.DECIDED,
+        decision=Decision(action=DecisionAction.ALLOW, decided_by=DecidedBy.GATEKEEPER),
+    )
+
+
+def test_g3_build_prompt_alone_shows_no_other_agent(env: Env) -> None:
+    """Each layer on its own: `build_prompt` filters by agent (mutation N11)."""
+    from arr.permissions.gatekeeper import build_prompt
+
+    other = _decided(env, "codex-1", "curl -s 'https://arxiv.org/abs/1?nachricht=GEHEIM'")
+    mine = env.engine.assess(host("arxiv.org")).request
+    item = ApprovalItem(id="apr_m", type="permission", run_id="r1", request=mine)
+    found = mandate_check(
+        env.engine.assess(host("arxiv.org")), parse_mandate(standard_text()).checks
+    )
+    prompt = build_prompt(item, found, parse_mandate(standard_text()), [other])
+    assert "GEHEIM" not in prompt and "codex-1" not in prompt
+
+
+async def test_g3_the_stage_alone_hands_only_own_decisions_on(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each layer on its own: the stage filters the history it passes on (mutation N10)."""
+    handed: list[list[str]] = []
+    real = gatekeeper_module.build_prompt
+
+    def recording(item: Any, verdict: Any, mandate: Any, history: Any, **kw: Any) -> str:
+        handed.append([old.agent_id for old in history])
+        return real(item, verdict, mandate, history, **kw)
+
+    monkeypatch.setattr(gatekeeper_module, "build_prompt", recording)
+    history = [
+        _decided(env, "codex-1", "pip install sympy"),
+        _decided(env, "explorer-1", "pip install mpmath"),
+    ]
+    assessment = env.engine.assess(host("arxiv.org"))
+    item = ApprovalItem(
+        id="apr_n",
+        type="permission",
+        run_id="r1",
+        agent_id="explorer-1",
+        request=assessment.request,
+    )
+    await env.stage(FakeModel(ALLOW_JSON)).screen(
+        item, ScreenContext(assessment=assessment, history=history)
+    )
+    assert handed == [["explorer-1"]]
