@@ -127,10 +127,10 @@ def serve(
     Läuft arr schon, wird die Oberfläche nur geöffnet. Strg-C stoppt die Runs des Service
     (Finalizer und Secret-Scan laufen) und beendet arr; ein zweites Strg-C bricht hart ab.
     """
-    from arr.log import setup_logging
+    from arr.log import service_log_file, setup_logging
     from arr.service.serve import serve as run_service
 
-    setup_logging("INFO")
+    setup_logging("INFO", file=service_log_file())  # also ~/.arr/logs/service.log (W4-01)
     try:
         run_service(workfolder=workfolder, port=port, open_browser=browser)
     except ArrError as exc:
@@ -348,3 +348,12 @@ def codex_login(
     if not result.success:
         _fail(f"Der Login ist fehlgeschlagen: {result.error}")
     typer.echo(f"Angemeldet: {result.account.describe()}. Profil „{auth.name}“ ist bereit.")
+
+
+@app.command("mcp")
+def mcp_command() -> None:
+    """MCP-Bridge für Claude Code (stdio). Claude Code startet sie über die .mcp.json des
+    Projekts; sie leitet an den laufenden arr-Dienst weiter (W4-01)."""
+    from arr.service.mcp_bridge import run_bridge
+
+    run_bridge()

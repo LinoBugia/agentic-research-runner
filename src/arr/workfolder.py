@@ -384,9 +384,45 @@ def _find_workfolder(project: Path, given: str | Path | None) -> Path:
     return root
 
 
-def _mcp_entry() -> dict[str, Any]:
+def arr_command() -> str:
+    """The `arr` of this installation, absolute: the script next to the interpreter, else the
+    one on `PATH`, else plain `arr` (W4-01: `.mcp.json` names the path, never a token)."""
+    import shutil
+    import sys
+
+    beside = Path(sys.executable).with_name("arr")
+    if beside.is_file() and os.access(beside, os.X_OK):
+        return str(beside)
+    found = shutil.which("arr")
+    return str(Path(found).absolute()) if found else "arr"
+
+
+def mcp_entry() -> dict[str, Any]:
+    """The server `arr` of a project's `.mcp.json`: `arr mcp` of this installation (W4-01)."""
     server: dict[str, Any] = json.loads(read_template("project", ".mcp.json"))["mcpServers"]["arr"]
+    server["command"] = arr_command()
     return server
+
+
+def _mcp_text() -> str:
+    return json.dumps({"mcpServers": {"arr": mcp_entry()}}, ensure_ascii=False, indent=2) + "\n"
+
+
+def _arr_server_stale(server: Any) -> bool:
+    """An `arr` server arr wrote itself (`arr mcp`) that names another `arr` than this one."""
+    if not isinstance(server, dict) or server.get("args") != ["mcp"]:
+        return False
+    command = str(server.get("command") or "")
+    return Path(command).name == "arr" and command != arr_command()
+
+
+def _arr_skill_placeholder(root: Path) -> bool:
+    """Create `skills/arr/SKILL.md` from the template if the workfolder has no skill `arr`."""
+    folder = root / "skills" / "arr"
+    if folder.exists() or folder.is_symlink():
+        return False
+    folder.mkdir(parents=True)
+    return _write_new(folder / "SKILL.md", read_template("project", "arr-skill.md"))
 
 
 def setup_project(
@@ -450,15 +486,16 @@ def setup_project(
         result.skipped.append("CLAUDE.md")
 
     # .mcp.json
+    servers = mcp_data.get("mcpServers", {}) if mcp_data is not None else {}
     if mcp_data is None:
-        if _write_new(mcp_file, read_template("project", ".mcp.json")):
+        if _write_new(mcp_file, _mcp_text()):
             result.created.append(".mcp.json")
         else:
             result.skipped.append(".mcp.json")
-    elif "arr" in mcp_data.get("mcpServers", {}):
+    elif "arr" in servers and not _arr_server_stale(servers["arr"]):
         result.skipped.append(".mcp.json")
     else:
-        mcp_data.setdefault("mcpServers", {})["arr"] = _mcp_entry()
+        mcp_data.setdefault("mcpServers", {})["arr"] = mcp_entry()
         mcp_file.write_text(json.dumps(mcp_data, ensure_ascii=False, indent=2) + "\n", "utf-8")
         result.updated.append(".mcp.json")
 
@@ -471,6 +508,14 @@ def setup_project(
             result.created.append(name)
         else:
             result.skipped.append(name)
+
+    # Skill `arr`: a placeholder while the workfolder has none (its text comes with W4-05)
+    if _arr_skill_placeholder(root):
+        result.warnings.append(
+            "Der Skill „arr“ fehlte im Workfolder; arr hat einen Platzhalter angelegt."
+        )
+        catalog = discover_skills(root / "skills")
+        user_skills = skills_for_user_agent(catalog, settings)
 
     # Skill links
     changed, skipped = link_user_skills(project, root / "skills", user_skills)

@@ -525,7 +525,7 @@ async def test_project_is_created_with_all_checks_green(wf: Path) -> None:
     assert (folder / ".claude" / "skills" / "beweis").is_symlink()
     assert {f.name for f in project.folders} >= {"notes", "tex", "code", "results"}
     links = next(c for c in project.checks if c.key == "skill_links")
-    assert links.message == "Skill-Links: 1 von 1"
+    assert links.message == "Skill-Links: 2 von 2"  # + placeholder skill `arr` (W4-01)
 
 
 async def test_repair_restores_the_mcp_file_and_leaves_the_users_files(wf: Path) -> None:
@@ -546,7 +546,7 @@ async def test_repair_restores_the_mcp_file_and_leaves_the_users_files(wf: Path)
     failing = {c.key: c for c in broken.checks if not c.ok}
     assert set(failing) == {"mcp_json", "skill_links"}
     assert failing["mcp_json"].message == ".mcp.json fehlt"
-    assert failing["skill_links"].message == "Skill-Links: 0 von 1"
+    assert failing["skill_links"].message == "Skill-Links: 1 von 2"  # `arr` (W4-01)
     assert all(c.action is not None and c.action.label == "Reparieren" for c in failing.values())
 
     result = await api.setup_project("p")

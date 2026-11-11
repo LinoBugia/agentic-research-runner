@@ -25,7 +25,6 @@ import os
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +32,7 @@ from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
 from arr.errors import ArrError
-from arr.models import Provider, TopologyKind
+from arr.models import Decider, Provider, Starter, TopologyKind
 from arr.permissions.inbox import ApprovalInbox, install_hosts
 from arr.permissions.policy import AlwaysRule, is_codex_escalation
 from arr.permissions.types import ApprovalItem as CoreApprovalItem
@@ -58,17 +57,24 @@ from arr.service.api_models import (
     ApprovalItem,
     ApprovalRunRef,
     Attempt,
+    CapacityInfo,
     Consequences,
     DecisionInfo,
     DecisionRequest,
     DecisionResponse,
+    Deviation,
     ErrorCode,
     EscalationOptionInfo,
+    Estimate,
     LastRating,
+    LimitsInfo,
     RiskInfo,
     RiskLevel,
+    RunStartAgent,
+    RunStartChannel,
 )
 from arr.service.real_api.base import ServiceState, not_allowed, not_found
+from arr.service.real_api.run_starts import RUN_START_KEY, change_infos, is_run_start
 from arr.service.real_api.rundir import (
     RunRecord,
     item_entries,
@@ -151,7 +157,11 @@ def _item_lines(entries: Sequence[Mapping[str, Any]]) -> dict[str, _Lines]:
         if event == "open":
             if item_id not in items:
                 items[item_id] = _Lines(entry, number=escalations)
-                escalations += entry.get("request") is None and entry.get("question") is None
+                escalations += (
+                    entry.get("request") is None
+                    and entry.get("question") is None
+                    and not is_run_start(entry)
+                )
         elif item_id not in items:
             continue
         elif event == "decision":
@@ -227,10 +237,12 @@ def _decision_info(entry: Mapping[str, Any] | None) -> DecisionInfo | None:
     if not isinstance(data, Mapping):
         return None
     decided_by = DecidedBy(data.get("decided_by"))
+    changes = data.get("changes")
     return DecisionInfo(
         action=DecisionAction(data.get("action")),
         scope=DecisionScope(data.get("scope", DecisionScope.ONCE)),
         option_key=data.get("option"),
+        changes=change_infos(changes) if isinstance(changes, list) else [],
         comment=data.get("comment"),
         decided_by=decided_by,
         decided_at=float(data.get("decided_at") or entry.get("ts") or 0.0),  # type: ignore[union-attr]
@@ -314,6 +326,9 @@ class ApprovalReader:
             **self._state_fields(lines, alive, owned),
         }
         common["terminal"] = common["status"] is ApprovalStatus.OPEN and not owned
+        start = lines.opened.get(RUN_START_KEY)
+        if isinstance(start, Mapping):
+            return self._run_start(lines, start, common)
         request = lines.opened.get("request")
         if isinstance(request, Mapping):
             return self._permission(record, lines, request, common)
@@ -461,6 +476,32 @@ class ApprovalReader:
             **common,
         )
 
+    @staticmethod
+    def _run_start(lines: _Lines, start: Mapping[str, Any], common: dict[str, Any]) -> ApprovalItem:
+        """A run start of Claude Code waiting for the user (W4-01, docs/08 §5.2)."""
+        run = common["run"]
+        skill = start.get("skill")
+        what = f"„{skill}“" if skill else "einen Run ohne Skill"
+        decider = start.get("decider")
+        return ApprovalItem(
+            type=ApprovalType.RUN_START,
+            title=f"Claude Code möchte {what} in {run.project} starten",
+            requested_by=Starter.USER_AGENT,
+            skill=skill,
+            topology=start.get("topology"),
+            params=dict(start.get("params") or {}),
+            task_md=start.get("task_md"),
+            agents=[RunStartAgent.model_validate(a) for a in start.get("agents") or []],
+            channels=[RunStartChannel.model_validate(c) for c in start.get("channels") or []],
+            limits=LimitsInfo.model_validate(start["limits"]) if start.get("limits") else None,
+            decider=Decider(decider) if decider else None,
+            estimate=Estimate.model_validate(start["estimate"]) if start.get("estimate") else None,
+            capacity=[CapacityInfo.model_validate(c) for c in start.get("capacity") or []],
+            deviations=[Deviation.model_validate(d) for d in start.get("deviations") or []],
+            standard_notes=[str(n) for n in start.get("standard_notes") or []],
+            **common,
+        )
+
     def _rule(self, run_id: str, item_id: str) -> AlwaysRule | None:
         """The rule „immer“ would make; only a run of this service can make one."""
         inbox = live_inbox(self.state, run_id)
@@ -559,7 +600,18 @@ class ApprovalsArea:
         self.decider = GuiDecider()
         self.reader = ApprovalReader(state)
         self._rule_stored = True
-        state.store.item_lines = partial(own_lines, state)
+        self.run_starts: Any = None
+        """`RunStartsArea` (W4-01), set by `RealApi`; decides items `run_start`."""
+        state.store.item_lines = self._own_lines
+
+    def _own_lines(self, run_id: str) -> list[dict[str, Any]] | None:
+        """Item lines of a run of this service from memory: its run start (W4-01), then the
+        lines of its inbox; None for other runs (they are read from the file)."""
+        starts = self.run_starts.lines_of(run_id) if self.run_starts is not None else None
+        inbox = own_lines(self.state, run_id)
+        if starts is None:
+            return inbox
+        return [*starts, *(inbox or [])]
 
     def _fresh_items(self, record: RunRecord) -> dict[str, ApprovalItem]:
         if record.status.is_active:
@@ -635,6 +687,10 @@ class ApprovalsArea:
                 item.status_text or "Diese Freigabe ist schon entschieden oder nicht mehr nötig.",
                 gui_url=item.gui_url,
             )
+        if item.type is ApprovalType.RUN_START:
+            if self.run_starts is None:
+                raise not_allowed(NOT_RUNNING)
+            return await self.run_starts.decide(item, request)
         if request.action not in _ACTIONS.get(item.type, set()):
             raise ApiException.of(
                 ErrorCode.INVALID, f"„{request.action}“ passt nicht zu dieser Freigabe."

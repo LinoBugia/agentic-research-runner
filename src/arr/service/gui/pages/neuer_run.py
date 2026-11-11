@@ -1139,6 +1139,8 @@ class NeuerRunPage:
         if not task_has_content(data["task_md"]):
             data["task_md"] = ""
         data["skill"] = data["skill"] or None
+        if self.adjust and self.item is not None:
+            data["von"] = self.item.id  # the service resolves the request with your changes
         if self.adjust or self.repeat_of is not None or self.settings is None:
             # a repeat keeps every limit of the old run, also one equal to your standard: the
             # skill could set another (V8: the same `run.yaml`)

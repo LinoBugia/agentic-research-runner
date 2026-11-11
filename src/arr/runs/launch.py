@@ -476,9 +476,16 @@ least this old: a process that reserved it a moment ago may not have taken the l
 
 
 def reserve_run(
-    launch: Launch, *, now: datetime | None = None, starter: Starter = Starter.CLI
+    launch: Launch,
+    *,
+    now: datetime | None = None,
+    starter: Starter = Starter.CLI,
+    status: RunStatus = RunStatus.QUEUED,
 ) -> Path:
     """Create the run folder with a `meta.json` in status `queued` and return it.
+
+    A run start of Claude Code is reserved `awaiting_approval` instead (W4-01, E15); it goes on
+    only after the user's approval, with the same folder and run ID.
 
     `prepare_run(run_id=…)` takes such a reserved folder over (docs/02 §7, W2-03). Reserving
     first lets `run_launch` hold the lock before the run ever is `preparing`, so no other
@@ -498,7 +505,7 @@ def reserve_run(
             continue
         meta = RunMeta(
             run_id=run_id,
-            status=RunStatus.QUEUED,
+            status=status,
             starter=starter,
             project=resolved.project,
             skill=resolved.skill,
@@ -1073,6 +1080,7 @@ async def run_launch(
     run_dir: Path | None = None,
     starter: Starter = Starter.CLI,
     on_manager: Callable[[RunManager], None] | None = None,
+    lock: RunLock | None = None,
     **manager_kwargs: Any,
 ) -> RunResult:
     """Run a planned run to its end: crash recovery, reservation and lock, RunManager,
@@ -1085,7 +1093,8 @@ async def run_launch(
 
     The service (W3-01) passes a folder it reserved itself (`run_dir`, from `reserve_run`
     with `starter=gui`), `signals=False`, and gets the `RunManager` through `on_manager` as
-    soon as it exists, for pause, resume and stop.
+    soon as it exists, for pause, resume and stop. For a run start of Claude Code it also
+    passes the `lock` it held while the run waited for approval (W4-01).
     """
     for run_id in mark_interrupted_runs(launch.workfolder):
         report(
@@ -1096,8 +1105,9 @@ async def run_launch(
         report(f"Verwaister Run-Ordner {run_id} entfernt (reserviert, aber nie vorbereitet).")
     if run_dir is None:
         run_dir = reserve_run(launch, starter=starter)
-    lock = RunLock(run_dir)
-    lock.acquire()
+    if lock is None:
+        lock = RunLock(run_dir)
+        lock.acquire()  # an approved run start of Claude Code hands its held lock over (W4-01)
     manager = build_manager(
         launch,
         decider=decider,

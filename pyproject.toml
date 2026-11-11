@@ -43,7 +43,7 @@ asyncio_default_fixture_loop_scope = "function"
 addopts = "-m 'not live' --strict-markers"
 markers = [
     "live: uses real models and costs tokens (run manually with -m live)",
-    "macos: runs only on macOS (browser tests: uv run --with playwright python -m pytest -m macos)",
+    "macos: runs only on macOS, skipped on every other system (browser tests: uv run --with playwright python -m pytest -m macos)",
 ]
 
 [dependency-groups]
