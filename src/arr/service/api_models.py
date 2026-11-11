@@ -2424,3 +2424,12 @@ class SkillChangeResult(ApiModel):
     skill: SkillInfo
     left_out: list[str] = Field(default_factory=list)
     message: str
+
+
+class StartSkillsResult(ApiModel):
+    """Start skills created in the workfolder (`POST /api/skills/start`, W4-05): `created`,
+    `existing` (same name already there, never overwritten), `message`: German sentence."""
+
+    created: list[str] = Field(default_factory=list)
+    existing: list[str] = Field(default_factory=list)
+    message: str

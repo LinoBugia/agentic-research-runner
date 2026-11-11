@@ -44,8 +44,10 @@ from arr.resolve import (
 from arr.runs.topologies import check_topology
 from arr.service.api_models import (
     Action,
+    ApiException,
     CreateSkillRequest,
     DuplicateSkillRequest,
+    ErrorCode,
     ParamInfo,
     ProfileInfo,
     ProjectCheck,
@@ -61,6 +63,7 @@ from arr.service.api_models import (
     SkillIssue,
     SkillKind,
     SkillUsage,
+    StartSkillsResult,
 )
 from arr.service.real_api import skill_files
 from arr.service.real_api.base import ServiceState, not_found
@@ -75,8 +78,10 @@ from arr.skills import (
     SkillFileError,
     check_research_skills,
     discover_skills,
+    install_start_skills,
     read_text_file,
     skills_for_user_agent,
+    start_skills_message,
 )
 from arr.skills import SkillInfo as CoreSkill
 from arr.workfolder import (
@@ -754,3 +759,21 @@ class CatalogArea:
         except (UnicodeDecodeError, OSError):
             raise unreadable_profiles() from None
         return [profile_info(self.state, profile, status.get(profile.name)) for profile in profiles]
+
+    # -- start skills (W4-05) ------------------------------------------------------------------
+
+    def _start_skills(self) -> StartSkillsResult:
+        try:
+            done = install_start_skills(self.state.workfolder)
+        except SkillFileError as exc:
+            raise ApiException.of(ErrorCode.NOT_ALLOWED, exc.message) from None
+        return StartSkillsResult(
+            created=done.created,
+            existing=done.existing,
+            message=start_skills_message(done.created, done.existing),
+        )
+
+    async def create_start_skills(self) -> StartSkillsResult:
+        """Create the missing start skills (W4-05); a skill with the same name is never
+        overwritten, also when it is broken (`arr.skills.install_start_skills`)."""
+        return await asyncio.to_thread(self._start_skills)

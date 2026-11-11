@@ -2,6 +2,7 @@
 and the real room (W2-03). Imported by `test_run_manager*.py` and `test_pacing*.py`."""
 
 import asyncio
+import shutil
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
@@ -26,9 +27,16 @@ FAST = PacingSettings(poll_interval_s=0.01, hint_interval_s=60, hint_tool_calls=
 Script = Mapping[str, Any] | Callable[[], Mapping[str, Any]]
 
 
+def empty_skills(workfolder: Path) -> Path:
+    """Remove the start skills `arr init` creates (W4-05): tests put the skills they need."""
+    for entry in (workfolder / "skills").iterdir():
+        shutil.rmtree(entry) if entry.is_dir() and not entry.is_symlink() else entry.unlink()
+    return workfolder
+
+
 def make_workfolder(root: Path) -> Path:
-    """Workfolder with project `demo` (`notes.md`, `check.py`)."""
-    workfolder = init_workfolder(root / "wf")
+    """Workfolder with project `demo` (`notes.md`, `check.py`) and an empty `skills/`."""
+    workfolder = empty_skills(init_workfolder(root / "wf"))
     project = workfolder / "projects" / "demo"
     project.mkdir(parents=True)
     (project / "notes.md").write_text("# Notizen\nLemma A gilt für n ≡ 1 mod 4.\n", "utf-8")

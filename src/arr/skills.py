@@ -7,11 +7,14 @@ A skill is a folder with a `SKILL.md` (frontmatter `name`, `description`, option
 See docs/03-skills-und-research-groups.md §1-3 and docs/spikes/S1_claude.md §3.1.
 """
 
+import contextlib
 import difflib
+import errno
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import stat
 from collections.abc import Sequence
@@ -35,11 +38,14 @@ __all__ = [
     "SkillAudience",
     "SkillCatalog",
     "SkillFileError",
+    "START_SKILLS",
     "SkillInfo",
+    "StartSkills",
     "check_research_skills",
     "copy_skill_tree",
     "discover_skills",
     "install_codex_skills",
+    "install_start_skills",
     "internal_link_target",
     "link_user_skills",
     "load_skill",
@@ -47,6 +53,8 @@ __all__ = [
     "skills_for_research_agent",
     "skills_for_user_agent",
     "snapshot_skills",
+    "start_skill_files",
+    "start_skills_message",
     "write_claude_plugin",
 ]
 
@@ -611,3 +619,201 @@ def install_codex_skills(work_dir: Path, snapshot_dir: Path, names: Sequence[str
     target.mkdir(parents=True, exist_ok=True)
     for name in names:
         copy_skill_tree(snapshot_dir / name, target / name)
+
+
+# --------------------------------------------------------------------------------------------
+# Start skills (W4-05)
+# --------------------------------------------------------------------------------------------
+
+START_SKILLS = (
+    ARR_SKILL,
+    "exploration",
+    "latex-writeup",
+    "proof",
+    "proof-review",
+    "roundtable",
+    "sympy-check",
+)
+"""Skills arr ships (docs/03 §6): package data under `templates/skills/<name>/`; the text of
+`arr` is `templates/project/arr-skill.md` (also the skill W4-01 creates for a new project)."""
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+_NEW_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+@dataclass(frozen=True, slots=True)
+class StartSkills:
+    """Result of `install_start_skills`: names created and names left alone (already there)."""
+
+    created: list[str]
+    existing: list[str]
+
+
+def start_skill_files(name: str) -> dict[str, bytes]:
+    """The files of start skill `name` from the package, as relative POSIX path → content."""
+    from importlib import resources
+
+    templates = resources.files("arr").joinpath("templates")
+    if name == ARR_SKILL:
+        return {SKILL_FILE: templates.joinpath("project", "arr-skill.md").read_bytes()}
+    if name not in START_SKILLS:
+        raise KeyError(name)
+    files: dict[str, bytes] = {}
+
+    def walk(node: Any, prefix: str) -> None:
+        for child in sorted(node.iterdir(), key=lambda c: c.name):
+            if child.name.startswith((".", "_")):
+                continue  # .gitkeep, __pycache__
+            if child.is_dir():
+                walk(child, f"{prefix}{child.name}/")
+            else:
+                files[f"{prefix}{child.name}"] = child.read_bytes()
+
+    walk(templates.joinpath("skills", name), "")
+    return files
+
+
+def _remove_tree(parent: int, name: str) -> None:
+    """Remove a folder arr just built below `parent` (it contains no links)."""
+    try:
+        fd = os.open(name, _DIR_FLAGS, dir_fd=parent)
+    except OSError:
+        return
+    try:
+        for entry in os.listdir(fd):
+            if stat.S_ISDIR(os.stat(entry, dir_fd=fd, follow_symlinks=False).st_mode):
+                _remove_tree(fd, entry)
+            else:
+                os.unlink(entry, dir_fd=fd)
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.rmdir(name, dir_fd=parent)
+
+
+def _write_tree(folder: int, files: dict[str, bytes]) -> None:
+    """Create `files` below the open, new `folder`: new folders and files only, no links."""
+    for rel, data in files.items():
+        *dirs, filename = rel.split("/")
+        current = folder
+        opened: list[int] = []
+        try:
+            for part in dirs:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, 0o755, dir_fd=current)
+                current = os.open(part, _DIR_FLAGS, dir_fd=current)
+                opened.append(current)
+            fd = os.open(filename, _NEW_FILE_FLAGS, 0o644, dir_fd=current)
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view) :]
+            finally:
+                os.close(fd)
+        finally:
+            for fd in opened:
+                os.close(fd)
+
+
+def _exists(parent: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _install_one(root: int, name: str) -> bool:
+    """Create `skills/<name>` from the package unless something is there; True if created.
+
+    Like the editor of W4-02: built in a hidden folder next to the others, renamed at the end,
+    no link followed; on failure nothing stays behind.
+    """
+    if _exists(root, name):
+        return False
+    files = start_skill_files(name)
+    temp = f".{name}.arr-{secrets.token_hex(6)}.tmp"
+    os.mkdir(temp, 0o755, dir_fd=root)
+    try:
+        folder = os.open(temp, _DIR_FLAGS, dir_fd=root)
+        try:
+            _write_tree(folder, files)
+        finally:
+            os.close(folder)
+        if _exists(root, name):
+            _remove_tree(root, temp)
+            return False
+        try:
+            os.rename(temp, name, src_dir_fd=root, dst_dir_fd=root)
+        except OSError as exc:
+            if exc.errno in (errno.EEXIST, errno.ENOTEMPTY, errno.EISDIR, errno.ENOTDIR):
+                _remove_tree(root, temp)
+                return False  # appeared meanwhile: never replaced
+            raise
+    except BaseException:
+        _remove_tree(root, temp)
+        raise
+    return True
+
+
+def install_start_skills(workfolder: str | Path) -> StartSkills:
+    """Create the missing start skills in `<workfolder>/skills/` (W4-05).
+
+    A skill folder (or file or link) with the same name is never overwritten or changed, also
+    when it is broken; it is reported in `existing`. `skills/` itself must not be a link; it is
+    created if missing. Running it again changes nothing. Raises `SkillFileError` with a German
+    message if the folder cannot be written.
+    """
+    created: list[str] = []
+    existing: list[str] = []
+    try:
+        base = os.open(Path(workfolder), os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise SkillFileError(f"Der Workfolder ist nicht lesbar ({exc.strerror or exc}).") from None
+    try:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(SKILLS_DIR, 0o755, dir_fd=base)
+        try:
+            root = os.open(SKILLS_DIR, _DIR_FLAGS, dir_fd=base)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+                raise SkillFileError(
+                    f"Der Ordner {SKILLS_DIR} im Workfolder ist ein Link oder kein Ordner. arr "
+                    "folgt dort keinen Links. Ersetze ihn durch einen echten Ordner."
+                ) from None
+            raise
+    except OSError as exc:
+        raise SkillFileError(
+            f"Der Ordner {SKILLS_DIR} ließ sich nicht öffnen ({exc.strerror or exc})."
+        ) from None
+    finally:
+        os.close(base)
+    try:
+        for name in START_SKILLS:
+            try:
+                made = _install_one(root, name)
+            except OSError as exc:
+                raise SkillFileError(
+                    f"Der Start-Skill „{name}“ ließ sich nicht anlegen ({exc.strerror or exc}). "
+                    "Prüfe die Rechte im Ordner skills."
+                ) from None
+            (created if made else existing).append(name)
+    finally:
+        os.close(root)
+    if created:
+        log.info("Start-Skills angelegt: %s", ", ".join(created))
+    return StartSkills(created=created, existing=existing)
+
+
+def start_skills_message(created: Sequence[str], existing: Sequence[str]) -> str:
+    """German sentence about `install_start_skills` for the GUI and the API."""
+    parts = []
+    if created:
+        parts.append(f"Start-Skills angelegt: {', '.join(created)}.")
+    if existing and created:
+        parts.append(f"Schon vorhanden und nicht verändert: {', '.join(existing)}.")
+    elif existing:
+        parts.append(
+            f"Alle Start-Skills sind schon da ({', '.join(existing)}). arr hat nichts verändert."
+        )
+    return " ".join(parts)

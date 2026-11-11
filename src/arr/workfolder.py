@@ -26,7 +26,13 @@ from ruamel.yaml.comments import CommentedMap
 from arr.errors import ArrError
 from arr.models import ProjectSettings, WorkfolderSettings
 from arr.resolve import load_yaml_model
-from arr.skills import discover_skills, link_user_skills, skills_for_user_agent
+from arr.skills import (
+    SkillFileError,
+    discover_skills,
+    install_start_skills,
+    link_user_skills,
+    skills_for_user_agent,
+)
 
 __all__ = [
     "REMOVE",
@@ -100,13 +106,15 @@ def init_workfolder(path: Path) -> Path:
     """Create the workfolder layout at `path` (idempotent) and return its absolute path.
 
     Writes `arr.yaml` and `README.md` and creates `projects/`, `skills/`, `runs/` and `.arr/`
-    (docs/02 §1). Existing files and folders are never overwritten or changed.
+    (docs/02 §1). A new workfolder (no `arr.yaml` yet) also gets the start skills (W4-05).
+    Existing files and folders are never overwritten or changed.
     """
     root = Path(path).expanduser().absolute()
     if root.exists() and not root.is_dir():
         raise ArrError(
             f"„{root}“ ist kein Ordner. Gib einen Ordner für den Workfolder an, z. B. ~/arr."
         )
+    new = not os.path.lexists(root / SETTINGS_FILE)
     try:
         for sub in _WORKFOLDER_DIRS:
             (root / sub).mkdir(parents=True, exist_ok=True)
@@ -122,6 +130,11 @@ def init_workfolder(path: Path) -> Path:
             f"Der Workfolder „{root}“ ließ sich nicht anlegen ({os_reason(exc)}). Prüfe die "
             "Rechte oder wähle einen anderen Ordner."
         ) from None
+    if new:
+        try:
+            install_start_skills(root)
+        except SkillFileError as exc:
+            raise ArrError(f"Die Start-Skills ließen sich nicht anlegen: {exc.message}") from None
     return root
 
 

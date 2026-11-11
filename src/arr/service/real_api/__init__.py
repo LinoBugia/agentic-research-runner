@@ -81,6 +81,7 @@ from arr.service.api_models import (
     SkillInfo,
     SkillKind,
     StartRunResponse,
+    StartSkillsResult,
     StorageReport,
     ToolchainTestResult,
     TranscriptKind,
@@ -410,3 +411,8 @@ class RealApi:
 
     async def test_toolchain(self, python: str | None = None) -> ToolchainTestResult:
         return await self.setup.test_toolchain(python)
+
+    # -- ApiClient: start skills (W4-05) ------------------------------------------------------
+
+    async def create_start_skills(self) -> StartSkillsResult:
+        return await self.catalog.create_start_skills()

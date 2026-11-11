@@ -5,6 +5,7 @@ from importlib import resources
 from pathlib import Path
 
 import pytest
+from run_kit import empty_skills
 from typer.testing import CliRunner
 
 from arr.cli import app
@@ -30,8 +31,8 @@ runner = CliRunner()
 
 @pytest.fixture
 def workfolder(tmp_path: Path) -> Path:
-    """An initialised workfolder with the fixture skills."""
-    root = init_workfolder(tmp_path / "wf")
+    """An initialised workfolder with the fixture skills instead of the start skills."""
+    root = empty_skills(init_workfolder(tmp_path / "wf"))
     shutil.copytree(FIXTURES / "skills", root / "skills", dirs_exist_ok=True)
     return root
 

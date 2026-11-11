@@ -1,0 +1,62 @@
+kind: research-group
+version: 1
+description: Beweis in Stufen entwickeln, Strategie, Skizze, Beweis, mit Ratings und Nacharbeit
+topology: waterfall
+
+params:
+  pass_score:
+    default: 7
+    min: 1
+    max: 10
+    doc: "Mindest-Score (Mittel der Rater, Skala 1–10), ab dem eine Stufe angenommen ist"
+  max_rework:
+    default: 1
+    min: 0
+    max: 3
+    doc: "Nacharbeiten je Stufe, wenn der Score zu niedrig ist"
+  on_fail:
+    default: continue
+    choices: [continue, stop, escalate]
+    doc: "Stufe nicht bestanden: continue nimmt den besten Versuch, stop beendet den Run, escalate fragt dich in der GUI"
+  n_raters:
+    default: 2
+    min: 1
+    max: 4
+    doc: "Anzahl der Rater, abwechselnd Claude und ChatGPT"
+
+rubric:
+  scale: [1, 10]
+  criteria: [korrektheit, strenge, klarheit]
+
+limits:
+  wall_time: 1h
+  turns_per_agent: 12
+  budget_usd: 5
+
+defaults:
+  provider: claude
+  model: claude-sonnet-5-5
+  effort: high
+  workspace: { mode: copy }
+
+agents:
+  - id: strategist
+    role: roles/strategist.md
+  - id: prover
+    role: roles/prover.md
+    model: claude-opus-5-5
+    skills: [sympy-check, latex-writeup]
+  - id: rater
+    count: "{{ params.n_raters }}"
+    role: roles/rater.md
+    skills: [sympy-check]
+    mix:
+      - { provider: claude, model: claude-sonnet-5-5 }
+      - { provider: codex }
+
+stages:
+  - { name: strategie, agent: strategist, produces: strategie.md }
+  - { name: skizze, agent: prover, produces: skizze.md }
+  - { name: beweis, agent: prover, produces: beweis.md }
+
+raters: [rater-*]

@@ -497,7 +497,7 @@ async def test_skills_with_tabs_and_errors() -> None:
         html = await see(user, "group.yaml, Zeile 31: Rolle roles/critic.md nicht gefunden.")
         assert 'disabled aria-disabled="true"' in html  # „Run mit diesem Skill“ locked
         await user.open("/skills?zustand=leer")
-        await see(user, "Die Start-Skills lassen sich mit einem Klick anlegen.")
+        await see(user, "Lege die Start-Skills mit einem Klick an")
 
 
 # --- Auth-Profile (§5.8) ----------------------------------------------------------------------
