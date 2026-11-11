@@ -57,10 +57,16 @@ MCP_PATH = "/mcp"
 """Mount point of the MCP server for Claude Code (W4-01)."""
 BEARER = "bearer "
 CSP_HEADER = b"content-security-policy"
-CSP = b"img-src 'self' data:; media-src 'self'; object-src 'none'; frame-src 'none'"
+CSP = (
+    b"img-src 'self' data:; media-src 'self'; object-src 'none'; frame-src 'none'; "
+    b"script-src-attr 'none'"
+)
 """On every HTTP answer of the service (W4-06.1, review W4-06 finding 2): the browser loads
 images and media only from the service itself, never from a host an agent names, and no
-plugin or frame. Second wall behind `markdown_html`, which shows external images as text."""
+plugin or frame. Second wall behind `markdown_html`, which shows external images as text.
+`script-src-attr 'none'` (W4-06.2, N1): no inline event handler (`on…=`) runs, also when
+an element with one reached the page; arr's own pages use none. `script-src` stays open:
+NiceGUI writes its page set-up as inline scripts without a nonce."""
 
 Scope = MutableMapping[str, Any]
 Receive = Callable[[], Awaitable[MutableMapping[str, Any]]]

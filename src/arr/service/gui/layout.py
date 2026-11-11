@@ -179,7 +179,7 @@ class Frame:
                 "Die Anzeige ist seit <span data-since>–</span> nicht aktuell. Normalerweise "
                 "startet arr von selbst neu. Sonst klicke im Dock auf arr."
                 '<div class="btn-row" style="margin-top:8px">'
-                '<button class="btn btn-sm" type="button" onclick="location.reload()">'
+                '<button class="btn btn-sm" type="button" data-reload>'
                 "Jetzt verbinden</button></div></div></div>",
                 tag="div",
             )

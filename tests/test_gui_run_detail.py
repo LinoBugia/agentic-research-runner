@@ -366,7 +366,7 @@ def test_w3_08_u4_relative_links_of_a_run_file_open_the_result_or_stay_text() ->
     assert '<span class="run-file" title="Im Run-Ordner: task.md">Aufgabe</span>' in out
     assert 'title="Im Run-Ordner: output/results/collatz.py">Skript</span>' in out
     assert 'title="Bild im Run-Ordner: output/plots/g.png">Graph</span>' in out
-    assert '<a href="https://oeis.org/A006577?a=1&b=2">OEIS</a>' in out  # unchanged
+    assert '<a href="https://oeis.org/A006577?a=1&amp;b=2">OEIS</a>' in out  # & as HTML
     assert '<a href="#ergebnis">oben</a>' in out and '<a href="/runs">Start</a>' in out
     assert 'href="results/' not in out and "<img" not in out and 'href="../' not in out
     # a result's own file links to its neighbour: relative to `output/results/`

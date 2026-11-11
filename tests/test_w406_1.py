@@ -59,6 +59,9 @@ IMAGES = [
     f"> ![beleg](https://{EXFIL}/c)",
     "![beleg](data:image/png;base64,AAAA)",
     "![beleg](javascript:alert(1))",
+    f"![beleg](h&#116;tps://{EXFIL}/c)",  # N4 (a): only the unescaped address is external
+    f"![beleg](&#47;&#47;{EXFIL}/c)",
+    f"![beleg](&sol;&sol;{EXFIL}/c)",
 ]
 
 
@@ -91,6 +94,23 @@ def test_an_external_image_is_text_never_img(text: str) -> None:
 def test_a_relative_image_stays_for_the_run_files() -> None:
     out = markdown_html("![Plot](plots/a.png)")
     assert [a["src"] for t, a in tags_of(out) if t == "img"] == ["plots/a.png"]
+
+
+async def test_n4_the_results_page_shows_the_summary_table(wf: Path) -> None:
+    """N4 (b): `results_html` renders the overview of `summary.md` as a table, through the
+    real run page; an agent's chat with the same lines stays text."""
+    folder = make_run_folder(wf, status=RunStatus.DONE, agents=["a"], name="Tabelle")
+    table = "| Runde | Fassung |\n|---|---|\n| 1 | v1 |\n"
+    (folder / "output").mkdir(exist_ok=True)
+    (folder / "output" / "summary.md").write_text(f"# Zusammenfassung\n\n{table}", "utf-8")
+    RoomStore.create(folder).for_agent("a").post_message("main", f"Chat\n\n{table}")
+    async with real_user(make_api(wf)) as user:
+        await user.open(f"/runs/{folder.name}?ansicht=ergebnisse")
+        html = await see(user, "<th>Runde</th>", retries=200)
+        assert "<td>v1</td>" in html
+        await user.open(f"/runs/{folder.name}?kanal=main")
+        html = await see(user, "Chat", retries=200)
+        assert "<th>Runde</th>" not in html, "agent text gets no table"
 
 
 async def test_no_external_image_in_any_source_of_agent_text(wf: Path) -> None:
@@ -147,6 +167,7 @@ def test_every_answer_of_the_service_carries_the_csp(service: ServiceProcess) ->
     and `/mcp`: each answer has exactly one CSP with `img-src 'self' data:`."""
     csp = guard.CSP.decode()
     assert "img-src 'self' data:" in csp and "object-src 'none'" in csp
+    assert "script-src-attr 'none'" in csp, "W4-06.2: no inline handler runs"
     assert "media-src 'self'" in csp and "frame-src 'none'" in csp
     answers = []
     with service.client(cookie=True) as http:
@@ -176,6 +197,22 @@ def test_long_pipe_lines_render_fast_also_with_tables() -> None:
     assert "<table>" not in markdown_html(table), "agent text gets no tables"
     long_cell = "| " + "x" * base.TABLE_LINE_MAX + " | b |\n|---|---|\n| 1 | 2 |\n"
     assert "<table>" not in markdown_html(long_cell, tables=True), "a too long line: no table"
+
+
+def test_n3_the_summary_limit_is_500_and_fast_at_the_border() -> None:
+    """N3: lines of the summary with `|` up to 500 characters. Agent text reaches the summary
+    only through `one_line` (≤ 200 characters, `|` escaped, so ≤ about 400): 100 objection
+    lines (`MAX_OBJECTIONS`) at the limit under the overview table render fast; one line over
+    the limit switches tables off."""
+    assert base.TABLE_LINE_MAX == 500
+    table = "| Runde | Ergebnis |\n|---|---|\n| 1 | major |\n\n**Offene Einwände:** 500\n"
+    lines = ("- E1 (offen, judge-1): " + "\\|" * 238 + "\n") * 100  # MAX_OBJECTIONS
+    assert all(len(x) <= 500 for x in lines.splitlines())
+    start = time.perf_counter()
+    assert "<table>" in markdown_html(table + lines, tables=True)
+    assert time.perf_counter() - start < 1.0
+    over = table + "- E1: " + "\\|" * 250 + "\n"
+    assert "<table>" not in markdown_html(over, tables=True)
 
 
 @pytest.mark.parametrize("where", ["transcript", "chat"])
