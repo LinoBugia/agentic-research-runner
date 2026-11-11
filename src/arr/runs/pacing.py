@@ -36,6 +36,8 @@ from typing import TYPE_CHECKING, Any
 from arr.backends.base import TurnOutcome
 from arr.errors import ArrError
 from arr.models import AgentStatus, ChannelMode, GroupChatConfig, RoundOrder, WakeOn
+from arr.permissions.types import DecisionAction
+from arr.room import waiting
 from arr.room.address import Address, address, is_user_question
 from arr.room.store import ORCHESTRATOR, USER, WAIT_UNTIL_REPEAT
 from arr.room.types import DeliveryStatus, Inbox, Message, MessageKind, Result
@@ -345,13 +347,111 @@ async def run_discussion(
     """
     config = orch.config.channel(channel)
     if config.mode is ChannelMode.ROUNDS:
-        return await _run_rounds(orch, config, prompt, stage, rounds or DEFAULT_ROUNDS, context)
-    if config.mode is ChannelMode.EVENT:
+        outcome = await _run_rounds(orch, config, prompt, stage, rounds or DEFAULT_ROUNDS, context)
+    elif config.mode is ChannelMode.EVENT:
         discussion = _EventDiscussion(
             orch, config, prompt, stage, context, kickoff, rounds or DEFAULT_ROUNDS
         )
-        return await discussion.run()
-    raise ArrError(f"Die Taktung „moderated“ (Kanal #{channel}) gibt es erst ab Welle 4.")
+        outcome = await discussion.run()
+    else:
+        raise ArrError(f"Die Taktung „moderated“ (Kanal #{channel}) gibt es erst ab Welle 4.")
+    if outcome.ended_by not in (DiscussionEnd.STOPPED, DiscussionEnd.LIMIT):
+        await _hold_for_user_questions(orch, config, stage, context, outcome)
+    return outcome
+
+
+def user_question_hold_s() -> float:
+    """B3 (User 11.11., option a): how long after a question to the user its discussion phase
+    waits for the answer at most: the L7 deadline (`waiting.STREAK_MAX_S`, 5 min, V10)."""
+    return waiting.STREAK_MAX_S
+
+
+_ANSWER_PROMPT = (
+    "Du wurdest in #{channel} geweckt: Der User hat deine Frage beantwortet. Die Antwort steht "
+    "in deinem Posteingang. Prüfe deine Annahme damit. Ändert sich dein Ergebnis, gib es neu "
+    "ab; sonst melde `done`."
+)
+
+
+async def _hold_for_user_questions(
+    orch: "Orchestrator",
+    config: GroupChatConfig,
+    stage: str | None,
+    context: Mapping[str, Any] | None,
+    outcome: DiscussionOutcome,
+) -> None:
+    """B3 (W4-06.1, User 11.11., option a): the phase does not end while a member's question
+    to the user in this channel is open, until the user answers or `user_question_hold_s()`
+    after the question passed. An answer wakes its asker once (L13, counted like every
+    wake-up); then the phase looks again. After the deadline V10 (c) holds: the question stays
+    open until the run ends, the agent worked on with an assumption. No new limit for agents:
+    a stop or limit ends the wait at once.
+    """
+    watched: dict[int, Any] = {}
+    reported = False
+    while True:
+        try:
+            orch.poll()  # an answer just given closes its question first
+        except Exception:  # the watcher keeps polling; a read error ends nothing
+            logger.exception("Lesen des Gruppenchats in #%s fehlgeschlagen", config.name)
+        if orch.stop_requested:
+            outcome.ended_by = _stop_end(orch)
+            break
+        for question in orch.open_user_questions(config.name):
+            watched.setdefault(question.msg_id, question)
+        answered = []
+        for msg_id, question in list(watched.items()):
+            if orch.user_question_open(msg_id):
+                continue
+            del watched[msg_id]
+            item = orch.inbox.get(question.item_id)
+            if item.decision is not None and item.decision.action is DecisionAction.ANSWER:
+                answered.append(question)
+        for question in answered:
+            await _wake_for_answer(orch, config, stage, context, question, outcome)
+        if answered:
+            continue
+        now = time.time()
+        hold = user_question_hold_s()
+        due = [q.asked + hold for q in watched.values()]
+        due = [d for d in due if d > now]
+        if not due:
+            break
+        if not reported:
+            reported = True
+            orch.log.write("waiting", channel=config.name, reason="user", until=max(due))
+        await asyncio.sleep(orch.pacing.poll_interval_s)
+    if reported:
+        orch.log.write("waiting", channel=config.name, reason="none")
+
+
+async def _wake_for_answer(
+    orch: "Orchestrator",
+    config: GroupChatConfig,
+    stage: str | None,
+    context: Mapping[str, Any] | None,
+    question: Any,
+    outcome: DiscussionOutcome,
+) -> None:
+    """The asker's turn after the user's answer (L13), within `max_wakeups_per_agent`; it
+    counts in `outcome.wakeups` like every wake-up of the phase (B13)."""
+    agent = question.agent
+    if orch.wakeups(config.name, agent) >= config.max_wakeups_per_agent:
+        orch.log.write(
+            "wake_skipped",
+            channel=config.name,
+            agent=agent,
+            reason="max_wakeups_per_agent",
+            limit=config.max_wakeups_per_agent,
+        )
+        return
+    count = orch.count_wakeup(config.name, agent)
+    outcome.wakeups[agent] = count
+    orch.log.write(
+        "wake", channel=config.name, agent=agent, reasons=["answer"], messages=[], count=count
+    )
+    prompt = _ANSWER_PROMPT.format(channel=config.name)
+    outcome.outcomes.append(await orch.turn(agent, prompt, stage=stage, context=context))
 
 
 def _stop_end(orch: "Orchestrator") -> DiscussionEnd:

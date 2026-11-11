@@ -1383,6 +1383,8 @@ def discussion_state(view: _FlowView) -> DiscussionState | None:
             text = "wartet auf wartende Agenten"
         case "approval":
             text = "wartet auf deine Freigabe"
+        case "user":  # B3: a question to you holds the phase until your answer or 5 min
+            text = "wartet auf deine Antwort"
         case "capacity":
             text = "wartet auf freien Platz"
         case "mixed":

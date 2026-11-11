@@ -353,6 +353,7 @@ async def test_a1_run_7beb_the_request_to_finished_diskutant_2_wakes_it(
     `all_done` with the request unread, as in the run."""
     if naive:
         old_rules(monkeypatch)
+    monkeypatch.setattr(waiting, "STREAK_MAX_S", 1.0)  # B3: the open question holds ≤ L7
     manager, outcome, _ = await discuss(workfolder, run_7beb(), IDLE)
     assert outcome.ended_by is DiscussionEnd.ALL_DONE
     [request] = [m for m in manager.room.messages("main") if "ergänzen?" in m.body]
@@ -806,10 +807,12 @@ async def test_w3_09_1_e2_a_result_closes_the_question_and_makes_the_asker_done(
 
 
 async def test_w3_09_1_e2_set_status_done_keeps_the_question_until_the_run_ends(
-    workfolder: Path,
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """S20: `set_status("done")` stays as it was: done at once, the question closes only
-    with the run („Der Run ist zu Ende …“)."""
+    with the run („Der Run ist zu Ende …“). Since B3 (W4-06.1) the phase waits for the answer
+    up to the L7 deadline first (here shortened to 1 s)."""
+    monkeypatch.setattr(waiting, "STREAK_MAX_S", 1.0)
     ask = post("main", "@user welches Band?", kind="question")
     scripts = {D1: turns([ask, done()]), D2: turns([done()])}
     manager, outcome, took = await discuss(workfolder, scripts, IDLE)
@@ -1092,10 +1095,13 @@ async def test_w4_00_b16_l15_wakes_the_member_behind_the_guard_with_its_request(
 
 
 async def test_w4_00_b18_the_end_of_the_run_closes_the_question_in_the_room(
-    workfolder: Path,
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """S10: after the run `open_user_questions()` is empty, not only the inbox item (M65)."""
+    """S10: after the run `open_user_questions()` is empty, not only the inbox item (M65).
+    B3 (W4-06.1): the phase waits for the answer up to the L7 deadline (shortened to 1 s)."""
     from test_agent_loop_hangs import run_case
+
+    monkeypatch.setattr(waiting, "STREAK_MAX_S", 1.0)
 
     ask = post("main", "@user welches Band?", kind="question")
     scripts = {D1: turns([ask, done()]), D2: turns([done()])}
