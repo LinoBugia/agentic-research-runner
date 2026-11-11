@@ -2,7 +2,8 @@
 
 Environment: `ARR_HOME`, `ARR_TEST_PORT`, `ARR_TEST_WORKFOLDER`, optional `ARR_TEST_SCRIPTS`
 (JSON file: FakeBackend scripts by agent ID), `ARR_TEST_AUTOSTART` (JSON file: a run input
-that is started right after the service is up) and `ARR_TEST_SWITCH` (a folder: for every
+that is started right after the service is up), `ARR_TEST_GATEKEEPER` (JSON file: the answers
+of a fake supervising agent in order, W4-04) and `ARR_TEST_SWITCH` (a folder: for every
 `<n>.request` with a `WorkfolderRequest`, `select_workfolder` runs in the service and
 `<n>.answer` gets the workfolder or the error code). Run with the tests folder on the path
 (`run_kit`), see `service_kit.start_service`.
@@ -26,12 +27,34 @@ def pending_switches(folder: str) -> list[Path]:
     return sorted(Path(folder).glob("*.request"))
 
 
+def install_fake_gatekeeper(answers: list[str]) -> None:
+    """Every run of the child asks a fake supervising agent that answers `answers` in order."""
+    from arr.backends.base import CostKind, Usage
+    from arr.permissions.gatekeeper import ModelReply
+    from arr.runs import manager
+
+    pending = list(answers)
+
+    class FakeGatekeeper:
+        model = "fake-haiku"
+
+        async def ask(self, system: str, prompt: str) -> ModelReply:
+            text = pending.pop(0) if pending else '{"decision": "ask_user", "reason": "Leer."}'
+            usage = Usage(input=200, output=30, cost_usd=0.001, cost_kind=CostKind.ESTIMATED)
+            return ModelReply(text, usage, self.model)
+
+    manager.default_gatekeeper_model = lambda *_args: FakeGatekeeper()  # type: ignore[assignment]
+
+
 def main() -> None:
     arr.auth._keyring_get = lambda service, account: None  # type: ignore[attr-defined]
     scripts_file = os.environ.get("ARR_TEST_SCRIPTS")
     if scripts_file:
         scripts = json.loads(Path(scripts_file).read_text("utf-8"))
         launch_module.BACKEND_BUILDERS = fake_builders(scripts)  # type: ignore[assignment]
+    gatekeeper = os.environ.get("ARR_TEST_GATEKEEPER")
+    if gatekeeper:
+        install_fake_gatekeeper(json.loads(Path(gatekeeper).read_text("utf-8")))
     autostart = os.environ.get("ARR_TEST_AUTOSTART")
     if autostart:
         from nicegui import app

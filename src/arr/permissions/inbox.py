@@ -16,6 +16,15 @@ A question of an agent to the user (`@user`, docs/09 L16) is an item too: `open_
 opens it, nobody waits on it. It is closed by the user's answer, in the inbox (`resolve` with
 `answer`) or in the channel (`answered`), or when the run ends (`close_question`, `cancel`).
 
+With a supervising agent (`decider: gatekeeper` or `gatekeeper_then_user`, W4-04) a new
+permission item first passes the `screener` (`arr.permissions.gatekeeper.GatekeeperStage`):
+the hard pre-check of the mandate and, if it passes, the supervising agent. While it screens,
+the item is not in the log, no card shows and nothing notifies the user. Its outcome is either
+a decision (one line `decided` with `decided_by` `gatekeeper`, `mandate_rule` or `fixed_rule`)
+or the item opens for the user with `escalated_by` and the reason in its `open` line. Only
+such items reach the decider of the user. A withdrawn decision of the supervising agent makes
+equal requests of the run skip it (docs/07 §4 Nr. 3).
+
 Items live in memory; every step is appended to `approvals.jsonl` (docs/02 §4).
 See docs/07-berechtigungen-und-freigaben.md §3-§6.
 """
@@ -33,6 +42,7 @@ from datetime import timedelta
 from typing import Any, Protocol
 
 from arr.errors import ArrError
+from arr.permissions.gatekeeper import ScreenContext
 from arr.permissions.policy import (
     NETWORK_TOOLS,
     TIMEOUT_REASON,
@@ -40,6 +50,7 @@ from arr.permissions.policy import (
     ApprovalLog,
     ApprovalLogEntry,
     Assessment,
+    ItemKey,
     LogEvent,
     PolicyEngine,
     is_codex_escalation,
@@ -66,6 +77,7 @@ __all__ = [
     "ApprovalDecider",
     "ApprovalInbox",
     "DeciderUnavailable",
+    "Screener",
     "TerminalDecider",
     "format_escalation",
     "format_item",
@@ -123,6 +135,22 @@ class ApprovalDecider(Protocol):
         ...
 
 
+class Screener(Protocol):
+    """Decides a new permission item before it reaches the user (W4-04, the gatekeeper).
+
+    `screen` returns a final decision or an `EscalatedBy` (the item goes to the user with this
+    note). `failed` is the outcome when `screen` itself broke; both must fail closed.
+    """
+
+    async def screen(self, item: ApprovalItem, context: ScreenContext) -> Decision | EscalatedBy:
+        """Decide `item` or pass it on to the user."""
+        ...
+
+    def failed(self, item: ApprovalItem) -> Decision | EscalatedBy:
+        """The outcome when screening raised."""
+        ...
+
+
 class ApprovalInbox:
     """Queue of open permission requests and escalations of one run (docs/07 §3 ③, §6).
 
@@ -149,9 +177,11 @@ class ApprovalInbox:
         log: ApprovalLog | None = None,
         on_rule: Callable[[AlwaysRule], None] | None = None,
         on_note: Callable[[str], None] | None = None,
+        screener: Screener | None = None,
     ) -> None:
         self.engine = engine
         self.decider = decider
+        self.screener = screener
         self.timeout = timeout.total_seconds() if isinstance(timeout, timedelta) else timeout
         self.log = log if log is not None else engine.log
         self.on_rule = on_rule
@@ -162,8 +192,13 @@ class ApprovalInbox:
         self._waiting: dict[str, int] = {}
         self._merge_keys: dict[str, tuple[Any, ...]] = {}
         self._decider_tasks: dict[str, asyncio.Task[None]] = {}
-        self._install_passes: dict[str, tuple[float, frozenset[str], str]] = {}
+        self._install_passes: dict[str, tuple[float, frozenset[str], str, DecidedBy]] = {}
         self._counters: dict[str, int] = {}
+        self._screening: set[str] = set()
+        """Items the screener decides right now: not in the log, never joined."""
+        self._item_keys: dict[str, frozenset[ItemKey]] = {}
+        self._revoked_items: set[ItemKey] = set()
+        """Grey items of withdrawn decisions of the supervising agent (docs/07 §4 Nr. 3)."""
 
     # -- queries ------------------------------------------------------------------------
 
@@ -195,7 +230,9 @@ class ApprovalInbox:
             covered = self._by_install_pass(assessment)
             return covered if covered is not None else await self.ask(assessment)
         if decision.action is DecisionAction.ALLOW and decision.decided_by is DecidedBy.USER:
-            self._grant_install_pass(assessment.request, "aus einer früheren Entscheidung")
+            self._grant_install_pass(
+                assessment.request, "aus einer früheren Entscheidung", DecidedBy.USER
+            )
         return decision
 
     async def ask(self, assessment: Assessment) -> Decision:
@@ -206,20 +243,29 @@ class ApprovalInbox:
         becomes obsolete.
         """
         loop = asyncio.get_running_loop()
+        screening: asyncio.Task[None] | None = None
         with self._lock:
             item = self._equal_open(assessment)
             if item is None:
-                item = self._open(assessment)
+                item = self._new(assessment)
                 waiter: asyncio.Future[Decision | None] = loop.create_future()
                 self._waiters[item.id] = waiter
                 self._waiting[item.id] = 1
-                if self.decider is not None:
-                    self._decider_tasks[item.id] = asyncio.create_task(self._run_decider(item))
+                if self.screener is not None:
+                    self._screening.add(item.id)
+                    screening = asyncio.create_task(self._screen(item, assessment))
+                    self._decider_tasks[item.id] = screening
+                else:
+                    item = self._publish(item, assessment)
             else:
                 item = self._join(item, assessment)
                 waiter = self._waiters[item.id]
                 self._waiting[item.id] += 1
         try:
+            if screening is not None:
+                # a stop (`cancel`) answers the waiter while the screener still works
+                await asyncio.wait({screening, waiter}, return_when=asyncio.FIRST_COMPLETED)
+                item = self.get(item.id)
             remaining = max(0.0, (item.deadline or 0.0) - time.time())
             decision = await asyncio.wait_for(asyncio.shield(waiter), remaining)
             assert decision is not None  # only escalations are released without a decision
@@ -362,7 +408,7 @@ class ApprovalInbox:
             item = self._update(item, ApprovalStatus.DECIDED, decision)
             self._write(LogEvent.DECIDED, item, note=remembered.note)
             if decision.action is DecisionAction.ALLOW and not _high_risk(item.risk):
-                self._grant_install_pass(item.request, item.id)
+                self._grant_install_pass(item.request, item.id, decision.decided_by)
         self._wake(item.id, decision)  # first: a broken `on_rule` must not leave the agent waiting
         if remembered.rule is not None and self.on_rule is not None:
             self.on_rule(remembered.rule)
@@ -448,7 +494,13 @@ class ApprovalInbox:
                     "mit Reichweite „Agent“ oder „Run“."
                 )
             note = None
-            if item.decision.scope is DecisionScope.ONCE:
+            if item.decision.decided_by is DecidedBy.GATEKEEPER:
+                self._revoked_items |= self._item_keys.get(item_id, frozenset())
+                note = (
+                    "Gleiche Anfragen entscheidet in diesem Run nicht mehr der Aufsichts-Agent, "
+                    "sie kommen zu dir."
+                )
+            elif item.decision.scope is DecisionScope.ONCE:
                 note = "Einmalige Entscheidung: Sie galt nur für ihre Anfrage."
             else:
                 try:
@@ -499,12 +551,15 @@ class ApprovalInbox:
         )
         return item
 
-    def _grant_install_pass(self, request: PermissionRequest | None, source: str) -> None:
-        """Let an allowed pip/uv installation reach its package hosts for a while."""
+    def _grant_install_pass(
+        self, request: PermissionRequest | None, source: str, decided_by: DecidedBy
+    ) -> None:
+        """Let an allowed pip/uv installation reach its package hosts for a while; the host
+        requests count as decided by whoever allowed the installation."""
         hosts = install_hosts(request) if request is not None else frozenset()
         if hosts:
             until = time.time() + INSTALL_PASS_S
-            self._install_passes[request.agent_id] = (until, hosts, source)  # type: ignore[union-attr]
+            self._install_passes[request.agent_id] = (until, hosts, source, decided_by)  # type: ignore[union-attr]
 
     def _by_install_pass(self, assessment: Assessment) -> Decision | None:
         """The answer for a host request an allowed installation covers, else None.
@@ -514,10 +569,12 @@ class ApprovalInbox:
         """
         request, risk = assessment.request, assessment.decision.risk
         with self._lock:
-            until, hosts, source = self._install_passes.get(
-                request.agent_id, (0.0, frozenset(), "")
+            until, hosts, source, decided_by = self._install_passes.get(
+                request.agent_id, (0.0, frozenset(), "", DecidedBy.USER)
             )
         wanted = {h.rsplit(":", 1)[0].rstrip(".").lower() for h in request.hosts}
+        if decided_by is DecidedBy.GATEKEEPER and assessment.items & self._revoked_items:
+            return None  # the user withdrew the gatekeeper's decision for such a request
         if (
             time.time() >= until
             or request.tool not in NETWORK_TOOLS
@@ -529,7 +586,7 @@ class ApprovalInbox:
             return None
         decision = Decision(
             action=DecisionAction.ALLOW,
-            decided_by=DecidedBy.USER,
+            decided_by=decided_by,
             reason=f"Gehört zur erlaubten Installation {source}.",
             risk=risk,
         )
@@ -551,7 +608,8 @@ class ApprovalInbox:
         self._counters[prefix] += 1
         return f"{prefix}_{self._counters[prefix]:04d}"
 
-    def _open(self, assessment: Assessment) -> ApprovalItem:
+    def _new(self, assessment: Assessment) -> ApprovalItem:
+        """A new permission item in memory; `_publish` or the screener's outcome follows."""
         now = time.time()
         request = assessment.request
         item = ApprovalItem(
@@ -562,15 +620,94 @@ class ApprovalInbox:
             agent_id=request.agent_id,
             request=request,
             risk=assessment.decision.risk,
-            deadline=now + self.timeout,
+            deadline=None if self.screener is not None else now + self.timeout,
             summary=assessment.decision.reason,
         )
         self._items[item.id] = item
+        self._item_keys[item.id] = assessment.items
+        return item
+
+    def _publish(
+        self, item: ApprovalItem, assessment: Assessment, escalated_by: EscalatedBy | None = None
+    ) -> ApprovalItem:
+        """Open the item for the user: deadline, log line `open`, merging, the user's decider."""
+        now = time.time()
+        item = self._update(
+            item,
+            ApprovalStatus.OPEN,
+            None,
+            created_at=now,
+            deadline=now + self.timeout,
+            escalated_by=escalated_by,
+        )
         key = _merge_key(assessment)
         if key is not None:
             self._merge_keys[item.id] = key
         self._write(LogEvent.OPEN, item, decision=assessment.decision)
+        if self.decider is not None:
+            self._decider_tasks[item.id] = asyncio.create_task(self._run_decider(item))
         return item
+
+    async def _screen(self, item: ApprovalItem, assessment: Assessment) -> None:
+        """Let the screener decide a new item, or open it for the user (fail closed)."""
+        assert self.screener is not None
+        with self._lock:
+            history = [
+                i
+                for i in self._items.values()
+                if i.decision is not None and i.decision.decided_by is DecidedBy.GATEKEEPER
+            ]
+            revoked = bool(assessment.items & self._revoked_items)
+        context = ScreenContext(assessment=assessment, history=history, revoked=revoked)
+        outcome: Decision | EscalatedBy
+        try:
+            outcome = await self.screener.screen(item, context)
+        except asyncio.CancelledError:
+            with self._lock:
+                self._screening.discard(item.id)
+            raise
+        except Exception:
+            logger.exception("Aufsichts-Stufe für %s fehlgeschlagen", item.id)
+            try:
+                outcome = self.screener.failed(item)
+            except Exception:
+                logger.exception("Rückfall der Aufsichts-Stufe für %s fehlgeschlagen", item.id)
+                outcome = _fallback_deny(item)
+        self._settle_screened(item.id, assessment, outcome)
+
+    def _settle_screened(
+        self, item_id: str, assessment: Assessment, outcome: Decision | EscalatedBy
+    ) -> None:
+        """Apply the screener's outcome: open for the user, or decide (one line `decided`).
+
+        Whatever the screener says, it never allows more than once and never as anyone but the
+        supervising agent; anything else becomes a deny.
+        """
+        with self._lock:
+            self._screening.discard(item_id)
+            item = self._items[item_id]
+            if item.status is not ApprovalStatus.OPEN:
+                return  # stopped meanwhile
+            if isinstance(outcome, EscalatedBy):
+                self._publish(item, assessment, outcome)
+                return
+            decision = outcome
+            allowed = decision.action is DecisionAction.ALLOW
+            if decision.action not in (DecisionAction.ALLOW, DecisionAction.DENY) or (
+                allowed
+                and (
+                    decision.decided_by is not DecidedBy.GATEKEEPER
+                    or decision.scope is not DecisionScope.ONCE
+                )
+            ):
+                decision = _fallback_deny(item)
+            if decision.risk is None:
+                decision = decision.model_copy(update={"risk": item.risk})
+            item = self._update(item, ApprovalStatus.DECIDED, decision)
+            self._write(LogEvent.DECIDED, item)
+            if decision.action is DecisionAction.ALLOW and not _high_risk(item.risk):
+                self._grant_install_pass(item.request, item.id, decision.decided_by)
+        self._wake(item_id, decision)
 
     def _expire(self, item_id: str) -> Decision:
         with self._lock:
@@ -662,6 +799,7 @@ class ApprovalInbox:
                 request=request or item.request,
                 decision=decision or item.decision,
                 question=item.question if event is LogEvent.OPEN else None,
+                escalated_by=item.escalated_by if event is LogEvent.OPEN else None,
                 note=note,
             )
         )
@@ -777,6 +915,13 @@ def format_item(item: ApprovalItem) -> str:
         lines.append(f"Begründung des Agenten: {request.reason or '(keine angegeben)'}")
     if item.summary:
         lines.append(f"Einschätzung von arr:   {item.summary}")
+    if item.escalated_by is not None:
+        who = (
+            "Vollmacht (von arr geprüft)"
+            if item.escalated_by.decider is DecidedBy.MANDATE_RULE
+            else "Aufsichts-Agent"
+        )
+        lines.append(f"Warum bei dir:          {who}: {item.escalated_by.note}")
     lines.append("")
     lines.append(_CHOICES)
     return redact("\n".join(lines))
@@ -961,6 +1106,16 @@ def _merge_key(assessment: Assessment) -> tuple[Any, ...] | None:
 
 def _high_risk(risk: Risk | None) -> bool:
     return risk is not None and risk.level is RiskLevel.HIGH
+
+
+def _fallback_deny(item: ApprovalItem) -> Decision:
+    """Deny by arr's own rule when the supervising agent's stage gave no valid outcome."""
+    return Decision(
+        action=DecisionAction.DENY,
+        decided_by=DecidedBy.FIXED_RULE,
+        reason="Der Aufsichts-Agent konnte nicht entscheiden, deshalb abgelehnt. " + TIMEOUT_REASON,
+        risk=item.risk,
+    )
 
 
 def _set_once(future: "asyncio.Future[Any]", value: Any) -> None:

@@ -153,7 +153,6 @@ async def test_empty_areas_raise_unavailable_with_german_message(wf: Path) -> No
     api = make_api(wf)
     cases = [
         (api.get_setup_state(), "W5-02"),
-        (api.get_mandate(), "W4-04"),
         (api.get_usage(), "W5-01"),
         (api.get_storage(), "W5-01"),
     ]

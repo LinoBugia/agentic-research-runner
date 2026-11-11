@@ -9,16 +9,25 @@ change `state.reload_settings()` brings the settings and the `ProfileGate` limit
 App settings live in `~/.arr/settings.yaml` (`arr.service.state`). The port shows what the
 service runs on: only `arr serve` can choose it.
 
-`get_setup_state` comes with W5-02, the mandate with W4-04.
+The mandate of the supervising agent (W4-04) is `mandates/<name>.md` in the workfolder: read,
+checked (`check_mandate`, nothing saved) and saved (`update_mandate`) only when valid, so a
+saved mandate never grants read folders or other domains. A missing file shows the template;
+switching the decider to the supervising agent creates it from the template.
+
+`get_setup_state` comes with W5-02.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
+import re
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -36,6 +45,15 @@ from arr.models import (
     RunVenvMode,
     Toolchain,
     WorkfolderSettings,
+)
+from arr.permissions.mandate import (
+    MandateChecks as CheckedPart,
+)
+from arr.permissions.mandate import (
+    MandateError,
+    mandate_path,
+    parse_mandate,
+    standard_text,
 )
 from arr.permissions.policy import (
     AlwaysRule,
@@ -56,6 +74,7 @@ from arr.service.api_models import (
     ErrorCode,
     FixedRule,
     LimitsInfo,
+    MandateChecks,
     MandateInfo,
     MandateUpdate,
     NotificationEvent,
@@ -107,6 +126,7 @@ from arr.workfolder import (
 log = logging.getLogger("arr.service")
 
 STANDARD_MANDATE = "mandates/standard.md"
+MANDATE_MAX_BYTES = 32 * 1024
 MIN_TIMEOUT_S = 60
 """Lower bound of `ApprovalSettingsInfo.timeout_s`; shorter values in `arr.yaml` show as this."""
 TEST_TIMEOUT_S = 10.0
@@ -382,6 +402,50 @@ def _extra_path_problem(entry: str, profile: SandboxProfile) -> str | None:
     return None
 
 
+_MANDATE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _checks_info(checks: CheckedPart) -> MandateChecks:
+    return MandateChecks(domains=list(checks.domains), install=checks.install)
+
+
+def _read_mandate(path: Path) -> tuple[str, float]:
+    """Text and change time of a mandate file; a link, FIFO or overlong file is refused."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise
+    except OSError:
+        raise MandateError("Die Vollmacht ließ sich nicht öffnen (keine normale Datei?).") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise MandateError("Die Vollmacht ist keine normale Datei.")
+        if info.st_size > MANDATE_MAX_BYTES:
+            raise MandateError("Die Vollmacht ist zu lang (höchstens 32 KB).")
+        raw = os.read(fd, MANDATE_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    try:
+        return raw.decode("utf-8"), info.st_mtime
+    except UnicodeDecodeError:
+        raise MandateError("Die Vollmacht ist nicht in UTF-8 gespeichert.") from None
+
+
+def _write_mandate(path: Path, text: str) -> None:
+    """Write a mandate atomically; an existing link in its place is replaced, not followed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp = tempfile.mkstemp(dir=path.parent, prefix=".mandate-", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as file:
+            file.write(text)
+        os.replace(temp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
+
+
 def fixed_rule_id(rule: AlwaysRule) -> str:
     """Stable ID of an „Immer“ rule; `arr.yaml` has none, and positions change."""
     text = json.dumps(rule.model_dump(mode="json"), sort_keys=True, ensure_ascii=False)
@@ -404,11 +468,85 @@ class SetupArea:
     async def get_setup_state(self) -> SetupState:
         raise unavailable("Der Einrichtungs-Assistent", "W5-02")
 
+    # -- mandate of the supervising agent (W4-04) --------------------------------------------
+
+    def _mandate_file(self, name: str) -> tuple[str, Path]:
+        if not _MANDATE_NAME.fullmatch(name):
+            raise not_found("Vollmacht", name)
+        relative = f"mandates/{name}.md"
+        try:
+            return relative, mandate_path(self.state.workfolder, relative)
+        except MandateError as exc:
+            raise _invalid(exc.message, "mandate") from None
+
+    def _running(self) -> int:
+        return max(len(active_records(self.state)), len(self.state.registry.active()))
+
+    def _mandate_info(
+        self, name: str, relative: str, text: str, *, exists: bool, modified: float | None
+    ) -> MandateInfo:
+        problem = None
+        checks = MandateChecks()
+        try:
+            checks = _checks_info(parse_mandate(text).checks)
+        except MandateError as exc:
+            problem = exc.message
+        return MandateInfo(
+            name=name,
+            path=relative,
+            text=text,
+            modified_at=modified,
+            checked=checks,
+            running_runs=self._running(),
+            example=standard_text(),
+            exists=exists,
+            problem=problem,
+        )
+
     async def get_mandate(self, name: str = "standard") -> MandateInfo:
-        raise unavailable("Die Vollmacht des Aufsichts-Agenten", "W4-04")
+        relative, path = self._mandate_file(name)
+        try:
+            text, modified = _read_mandate(path)
+        except FileNotFoundError:
+            return self._mandate_info(name, relative, standard_text(), exists=False, modified=None)
+        except MandateError as exc:
+            raise _invalid(exc.message, "mandate") from None
+        return self._mandate_info(name, relative, text, exists=True, modified=modified)
+
+    async def check_mandate(self, name: str, update: MandateUpdate) -> MandateInfo:
+        relative, _path = self._mandate_file(name)
+        try:
+            parse_mandate(update.text)
+        except MandateError as exc:
+            raise _invalid(exc.message, "mandate") from None
+        return self._mandate_info(name, relative, update.text, exists=True, modified=None)
 
     async def update_mandate(self, name: str, update: MandateUpdate) -> MandateInfo:
-        raise unavailable("Die Vollmacht des Aufsichts-Agenten", "W4-04")
+        relative, path = self._mandate_file(name)
+        try:
+            parse_mandate(update.text)
+        except MandateError as exc:
+            raise _invalid(exc.message, "mandate") from None
+        try:
+            _write_mandate(path, update.text)
+        except OSError as exc:
+            raise _invalid(
+                f"Die Vollmacht ließ sich nicht speichern ({os_reason(exc)}).", "mandate"
+            ) from None
+        return await self.get_mandate(name)
+
+    def _ensure_mandate(self, relative: str) -> None:
+        """Create a missing mandate from the template when the supervising agent is switched on."""
+        try:
+            path = mandate_path(self.state.workfolder, relative)
+        except MandateError:
+            return
+        if os.path.lexists(path):
+            return
+        try:
+            _write_mandate(path, standard_text())
+        except OSError:
+            log.warning("Vorlage der Vollmacht ließ sich nicht anlegen")
 
     # -- workfolder --------------------------------------------------------------------------
 
@@ -762,6 +900,8 @@ class SetupArea:
                 update_settings_file(self.state.workfolder, edit)
             except ArrError as exc:
                 raise from_arr_error(exc, ErrorCode.CONFIG_INVALID) from None
+        if settings.approvals.decider is not Decider.USER:
+            self._ensure_mandate(settings.approvals.mandate or STANDARD_MANDATE)
         return await self.get_workfolder_settings()
 
     # -- fixed rules -------------------------------------------------------------------------

@@ -615,6 +615,14 @@ class Orchestrator(RunContext):
                 self._start_halt(StopReason.LIMIT, LimitKind.BUDGET_USD, cost_usd=self.cost_usd)
         return self._not_run(handle) if self.stop_requested else None
 
+    def add_cost(self, cost_usd: float | None) -> None:
+        """Book a cost outside an agent's turn on the budget, e.g. a call of the supervising
+        agent (W4-04); reaching the budget stops the run like an agent's turn would."""
+        self.cost_usd += cost_usd or 0.0
+        budget = self.config.limits.budget_usd
+        if budget is not None and self.cost_usd >= budget and not self.stop_requested:
+            self._start_halt(StopReason.LIMIT, LimitKind.BUDGET_USD, cost_usd=self.cost_usd)
+
     def _exhaust(self, handle: AgentHandle) -> None:
         """An exhausted agent would get another turn: it is `done` (reason `limit`, once);
         when every agent is exhausted, the run stops with `limit` (B3: not before)."""

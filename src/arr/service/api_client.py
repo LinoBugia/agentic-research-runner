@@ -396,6 +396,11 @@ class ApiClient(Protocol):
         """Change the mandate, effective at once in running runs (`PUT /api/mandates/{name}`)."""
         ...
 
+    async def check_mandate(self, name: str, update: MandateUpdate) -> MandateInfo:
+        """Check a mandate text without saving it: what arr would check itself, or `invalid`
+        with the reason (`POST /api/mandates/{name}/check`, W4-04)."""
+        ...
+
     async def list_fixed_rules(self) -> list[FixedRule]:
         """Standard rules and own „immer“ rules (`GET /api/rules`)."""
         ...

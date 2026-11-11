@@ -6511,11 +6511,25 @@ class MockApi:
         )
 
     async def update_mandate(self, name: str, update: MandateUpdate) -> MandateInfo:
-        """Replace the mandate text (effective at once)."""
-        await self.get_mandate(name)
+        """Replace the mandate text (effective at once); an invalid mandate is refused."""
+        await self.check_mandate(name, update)
         self.state.mandate_text = update.text
         self.state.mandate_modified = self.now()
         return await self.get_mandate(name)
+
+    async def check_mandate(self, name: str, update: MandateUpdate) -> MandateInfo:
+        """Check a mandate text like the service does (W4-04), without saving it."""
+        from arr.permissions.mandate import MandateError, parse_mandate
+
+        info = await self.get_mandate(name)
+        try:
+            checks = parse_mandate(update.text).checks
+        except MandateError as exc:
+            raise ApiException.of(ErrorCode.INVALID, exc.message, field="mandate") from None
+        checked = info.checked
+        if checks.domains or checks.install:
+            checked = MandateChecks(domains=list(checks.domains), install=checks.install)
+        return info.model_copy(update={"text": update.text, "checked": checked})
 
     async def list_fixed_rules(self) -> list[FixedRule]:
         """Standard rules (fixed) and own rules (removable)."""

@@ -76,11 +76,26 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-def reached(kit: Any, lab: Any, port: int) -> dict[str, bool]:
+class AllowingGatekeeper:
+    """A supervising agent that allows everything it is shown, once (W4-04, Punkt 6)."""
+
+    def __init__(self) -> None:
+        self.shown: list[Any] = []
+
+    async def screen(self, item: Any, context: Any) -> Decision:
+        self.shown.append(item.request)
+        return Decision(action=DecisionAction.ALLOW, decided_by=DecidedBy.GATEKEEPER, reason="ja")
+
+    def failed(self, item: Any) -> Decision:
+        return Decision(action=DecisionAction.DENY, decided_by=DecidedBy.FIXED_RULE, reason="nein")
+
+
+def reached(kit: Any, lab: Any, port: int, screener: Any = None) -> dict[str, bool]:
     work = lab.agent.work_dir
     (work / "loop.py").write_text(PROBE)
     (work / "loop.json").unlink(missing_ok=True)
-    kit.run_file_tools(lab, [kit.bash(f"python3 loop.py {port} {BAIT}", "Loopback")], Allow())
+    script = [kit.bash(f"python3 loop.py {port} {BAIT}", "Loopback")]
+    kit.run_file_tools(lab, script, Allow(), screener=screener)
     return json.loads((work / "loop.json").read_text())
 
 
@@ -109,5 +124,36 @@ def test_n3_no_agent_reaches_a_service_on_loopback_not_even_with_a_rule_star() -
             for domains in (("*",), ("127.0.0.1", "localhost")):
                 opened = replace(lab, profile=replace(lab.profile, allowed_domains=domains))
                 assert any(reached(kit, opened, port).values()), domains
+    finally:
+        server.shutdown()
+
+
+def test_w4_04_a_rule_star_and_an_allowing_gatekeeper_open_no_loopback() -> None:
+    """W4-04 Punkt 6: a hand-written rule `hosts: ["*"]` plus a supervising agent that allows
+    everything: still nothing on this machine is reached, and no loopback request is shown to
+    it. Counter-check: `*` in `allowedDomains` reaches the service through the same stage."""
+    import login_guard_kit as kit
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    try:
+        with kit.open_lab("claude") as lab:
+            star = AlwaysRule.model_construct(
+                action="allow", hosts=["*"], exact=False, tools=[], paths=[], commands=[], reason=""
+            )
+            rules = PermissionRules.model_construct(always=[star], sensitive_paths=[])
+            starred = replace(
+                lab, profile=profile_for(lab.agent.file.config, lab.run_paths, rules, home=lab.home)
+            )
+            gatekeeper = AllowingGatekeeper()
+            seen = reached(kit, starred, port, gatekeeper)
+            assert not any(seen.values()), seen
+            loopback = [
+                r for r in gatekeeper.shown if any("127" in h or "localhost" in h for h in r.hosts)
+            ]
+            assert loopback == []
+            opened = replace(lab, profile=replace(lab.profile, allowed_domains=("*",)))
+            assert any(reached(kit, opened, port, AllowingGatekeeper()).values())
     finally:
         server.shutdown()

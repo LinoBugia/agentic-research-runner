@@ -426,3 +426,9 @@ class RealApi:
         import asyncio  # here, so this order changes this file at its end only
 
         return await asyncio.to_thread(self.run_starts._plan_with_card, spec, None)
+
+    # -- mandate of the supervising agent (W4-04) --------------------------------------------
+
+    async def check_mandate(self, name: str, update: MandateUpdate) -> MandateInfo:
+        """Check a mandate text without saving it (`POST /api/mandates/{name}/check`)."""
+        return await self.setup.check_mandate(name, update)
