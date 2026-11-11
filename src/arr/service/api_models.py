@@ -2424,3 +2424,79 @@ class SkillChangeResult(ApiModel):
     skill: SkillInfo
     left_out: list[str] = Field(default_factory=list)
     message: str
+
+
+# --------------------------------------------------------------------------------------------
+# Validation errors without the input (W4-01, Pflicht-Übertrag W3-05.1 N2)
+# --------------------------------------------------------------------------------------------
+
+from pydantic import ValidationError  # noqa: E402 - new parts of this file stay at its end
+
+
+def validation_issues(exc: ValidationError) -> list[FieldIssue]:
+    """The problems of a pydantic error as `FieldIssue`s, never with the input.
+
+    `errors()` and `.json()` carry the whole input by default, a pasted API key included, also
+    with `hide_input_in_errors` (that only covers `str()`). API errors, also those of the MCP
+    tools, are built from `errors(include_input=False)` only.
+    """
+    out = []
+    for error in exc.errors(include_input=False, include_url=False):
+        path = ".".join(str(part) for part in error.get("loc", ()))
+        out.append(FieldIssue(path=path, message=german_issue(error)))
+    return out
+
+
+_KIND_WORDS = {
+    "string": "einen Text",
+    "int": "eine ganze Zahl",
+    "float": "eine Zahl",
+    "bool": "true oder false",
+    "list": "eine Liste",
+    "dict": "einen Abschnitt",
+    "model": "einen Abschnitt",
+    "tuple": "eine Liste",
+    "set": "eine Liste",
+}
+
+
+def german_issue(error: Any) -> str:
+    """A pydantic error in German: what is expected, never the value (W4-01.1, G3/G4).
+
+    Our own validators raise German `ValueError`s; their text is kept without pydantic's
+    „Value error, “ prefix. Everything else says the field's expected kind.
+    """
+    kind = str(error.get("type") or "")
+    ctx = error.get("ctx") or {}
+    if kind == "missing":
+        return "Pflichtangabe fehlt."
+    if kind == "extra_forbidden":
+        return "Unbekannte Angabe."
+    if kind == "value_error":
+        return str(error.get("msg") or "").removeprefix("Value error, ") or "Ungültiger Wert."
+    for prefix, words in _KIND_WORDS.items():
+        if kind.startswith(prefix + "_") or kind == prefix:
+            return f"Falscher Typ: erwartet {words}."
+    if kind in ("greater_than_equal", "greater_than"):
+        word = "mindestens" if kind.endswith("equal") else "größer als"
+        return f"Der Wert muss {word} {ctx.get('ge', ctx.get('gt'))} sein."
+    if kind in ("less_than_equal", "less_than"):
+        word = "höchstens" if kind.endswith("equal") else "kleiner als"
+        return f"Der Wert darf {word} {ctx.get('le', ctx.get('lt'))} sein."
+    if kind in ("too_short", "string_too_short"):
+        return "Zu kurz."
+    if kind in ("too_long", "string_too_long"):
+        return "Zu lang."
+    if kind in ("enum", "literal_error"):
+        expected = str(ctx.get("expected") or "").replace("'", "")
+        return f"Erlaubt ist: {expected}." if expected else "Dieser Wert ist nicht erlaubt."
+    if kind == "string_pattern_mismatch":
+        return "Hat nicht die erwartete Form."
+    return "Ungültiger Wert."
+
+
+def validation_error(exc: ValidationError) -> ApiException:
+    """A pydantic error of a request as `ApiException` (`invalid`), without the input."""
+    issues = validation_issues(exc)
+    first = issues[0].message if issues else "Die Angaben sind ungültig."
+    return ApiException.of(ErrorCode.INVALID, first, issues=issues)

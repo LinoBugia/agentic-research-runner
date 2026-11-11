@@ -99,6 +99,7 @@ from arr.service.real_api.catalog import CatalogArea
 from arr.service.real_api.live import LiveArea
 from arr.service.real_api.profile_usage import ProfileUsageArea
 from arr.service.real_api.profiles import ProfilesArea
+from arr.service.real_api.run_starts import RunStartsArea
 from arr.service.real_api.runs import RunsArea
 from arr.service.real_api.setup import SetupArea
 from arr.service.real_api.storage import StorageArea
@@ -148,6 +149,8 @@ class RealApi:
         self.profile_usage = ProfileUsageArea(self.state, self.profiles.find)
         self.live = LiveArea(self.state)
         self.notifier = Notifier(self.state.hub, notify or send_notification)
+        self.run_starts = RunStartsArea(self.state, self.runs)  # W4-01: run starts of Claude Code
+        self.runs.run_starts = self.approvals.run_starts = self.run_starts
 
     # -- lifecycle --------------------------------------------------------------------------
 
@@ -164,6 +167,7 @@ class RealApi:
         reservations are removed (like `arr run`, W3-01 §3.1); returns the interrupted IDs."""
         interrupted = mark_interrupted_runs(self.state.workfolder)
         discard_orphaned_reservations(self.state.workfolder)
+        self.run_starts.recover()
         self.state.interrupted_at_start = interrupted
         return interrupted
 
@@ -410,3 +414,15 @@ class RealApi:
 
     async def test_toolchain(self, python: str | None = None) -> ToolchainTestResult:
         return await self.setup.test_toolchain(python)
+
+    # -- run starts of Claude Code (W4-01) ---------------------------------------------------
+
+    async def request_run_start(self, spec: dict[str, Any]) -> StartRunResponse:
+        """`start_run` of Claude Code: reserved `awaiting_approval`, decided only in the GUI."""
+        return await self.run_starts.request(spec)
+
+    async def plan_run_request(self, spec: dict[str, Any]) -> Any:
+        """`estimate_run` of Claude Code: the plan of a request and its card, nothing reserved."""
+        import asyncio  # here, so this order changes this file at its end only
+
+        return await asyncio.to_thread(self.run_starts._plan_with_card, spec, None)

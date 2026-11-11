@@ -89,7 +89,8 @@ def _approval_text(item: ApprovalItem, now: float) -> str:
     if item.type is ApprovalType.ESCALATION:
         return f"Eskalation in {item.run.name}: Stufe „{item.stage}“. Der Run pausiert."
     if item.type is ApprovalType.RUN_START:
-        return f"Run wartet auf Freigabe: {item.run.name}"
+        what = item.skill or "Run ohne Skill"
+        return f"Run wartet auf Freigabe – {what} in {item.run.project} (von Claude Code)"
     agent = item.agent.id if item.agent else "Ein Agent"
     kinds = ", ".join(CATEGORY[c] for c in item.categories) or "eine Berechtigung"
     deadline = f" · {deadline_text(item.deadline, now)}" if item.deadline else ""

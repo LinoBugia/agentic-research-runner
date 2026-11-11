@@ -17,6 +17,7 @@ watcher has already seen; `_follow_delivery` publishes them again (W3-02).
 
 import asyncio
 import contextlib
+import copy
 import dataclasses
 import logging
 import os
@@ -48,7 +49,8 @@ from arr.room.types import DeliveryStatus, MessageVia
 from arr.room.types import Message as RoomMessage
 from arr.runs.launch import Launch, plan_run_input, request_stop, reserve_run, run_launch
 from arr.runs.manager import RunManager, set_run_status
-from arr.runs.prepare import _check_codex_toolchain, _make_plan
+from arr.runs.orchestrator import OrchestratorLog
+from arr.runs.prepare import _check_codex_toolchain, _make_plan, load_run_meta
 from arr.service.api_client import count_active, count_runs_waiting
 from arr.service.api_models import (
     REPEAT_SUFFIX,
@@ -61,6 +63,7 @@ from arr.service.api_models import (
     ChannelInfo,
     ChannelMessageEvent,
     CountsChangedEvent,
+    Deviation,
     ErrorCode,
     Estimate,
     FieldIssue,
@@ -125,6 +128,7 @@ TERMINAL_HINT = (
 ESCALATION_HINT = (
     "Der Run wartet auf eine Entscheidung in der GUI. Weiter geht es nur über die Eskalation."
 )
+WAITING_HINT = "Der Run wartet auf die Freigabe in der GUI. Nachrichten gehen, sobald er läuft."
 FINISHED_HINT = "Der Run ist beendet. {what} geht nur bei einem laufenden Run."
 TASK_MISSING = "Die Aufgabe fehlt. Schreib, woran die Agenten arbeiten sollen."
 TASK_PLACEHOLDER = "(noch keine Aufgabe)"
@@ -201,18 +205,26 @@ def _provider_of(model: str) -> Provider:
 
 
 def _start_failure(exc: Exception, workfolder: Path) -> str:
-    """Why a run could not be prepared, for the page: German, no traceback, no foreign path."""
+    """Why a run could not be prepared, for the page: German, no traceback, no foreign path.
+
+    A file outside the workfolder is named by its last part only (N8, W3-04.4): a path with
+    spaces would otherwise keep everything after the first space.
+    """
+    roots = (workfolder, Path(os.path.realpath(workfolder)))
     if isinstance(exc, ArrError):
         text = exc.message
     elif isinstance(exc, OSError) and exc.filename:
+        name = str(exc.filename)
+        if not any(name.startswith(f"{root}/") for root in roots):
+            name = Path(name).name
         text = (
-            f"Kein Zugriff auf {exc.filename} ({os_reason(exc)}). Prüfe die Rechte und starte "
+            f"Kein Zugriff auf {name} ({os_reason(exc)}). Prüfe die Rechte und starte "
             "den Run erneut."
         )
     else:
         text = "Bei der Vorbereitung ist ein interner Fehler aufgetreten. Starte den Run erneut."
     text = redact(text)
-    for root in (workfolder, Path(os.path.realpath(workfolder))):
+    for root in roots:
         text = text.replace(f"{root}/", "")
     return _FOREIGN_PATH.sub(lambda m: Path(m[0]).name, text)
 
@@ -443,6 +455,229 @@ def _check_prepared(launch: Launch) -> None:
 
 
 # --------------------------------------------------------------------------------------------
+# Requests of Claude Code (W4-01, docs/04 §2 `start_run`/`estimate_run`)
+# --------------------------------------------------------------------------------------------
+
+USER_AGENT_SOURCE = "Claude Code"
+OVERRIDE_KEYS = ("name", "limits", "approvals", "defaults", "agents")
+"""`overrides` is a partial `RunInput`: these keys, `agents` merged per agent ID (Codeplan §8,
+W1-01 review)."""
+
+
+def _deep_merge(base: Mapping[str, Any], change: Mapping[str, Any]) -> dict[str, Any]:
+    """`change` over `base`: mappings merge key by key, everything else replaces."""
+    out = dict(base)
+    for key, value in change.items():
+        if isinstance(value, Mapping) and isinstance(out.get(key), Mapping):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+def _issue(path: str, message: str) -> ConfigError:
+    return ConfigError.single(path, message, source=USER_AGENT_SOURCE)
+
+
+def _agent_overrides(raw: Any) -> dict[str, dict[str, Any]]:
+    """`overrides.agents` as ID → partial agent: a mapping, or a list of entries with `id`."""
+    if raw is None:
+        return {}
+    if isinstance(raw, Mapping):
+        items = list(raw.items())
+    elif isinstance(raw, list):
+        items = []
+        for index, entry in enumerate(raw):
+            if not isinstance(entry, Mapping) or not isinstance(entry.get("id"), str):
+                raise _issue(f"overrides.agents[{index}]", "Jeder Eintrag braucht „id“.")
+            items.append((entry["id"], {k: v for k, v in entry.items() if k != "id"}))
+    else:
+        raise _issue("overrides.agents", "„agents“ ist eine Zuordnung Agent-ID → Änderungen.")
+    out: dict[str, dict[str, Any]] = {}
+    for agent_id, change in items:
+        if not isinstance(change, Mapping):
+            raise _issue(f"overrides.agents.{agent_id}", "Die Änderungen sind eine Zuordnung.")
+        out[str(agent_id)] = copy.deepcopy(dict(change))
+    return out
+
+
+def _limit_override(raw: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(raw)
+    if "wall_time_s" in out:
+        out["wall_time"] = out.pop("wall_time_s")
+    return out
+
+
+def _apply_adjust(
+    data: dict[str, Any],
+    params: dict[str, Any],
+    overrides: dict[str, Any],
+    agents: dict[str, dict[str, Any]],
+    adjust: Mapping[str, Any],
+) -> None:
+    """Your changes of „Anpassen“ (`config` paths) on top of the request (docs/08 §5.4)."""
+    for path, value in adjust.items():
+        parts = path.split(".")
+        if path == "task_md":
+            data["task"] = value
+        elif path == "decider":
+            overrides["approvals"] = {**(overrides.get("approvals") or {}), "decider": value}
+        elif parts[0] == "params" and len(parts) == 2:
+            params[parts[1]] = value
+        elif parts[0] == "limits" and len(parts) == 2:
+            limits = dict(overrides.get("limits") or {})
+            limits.update(_limit_override({parts[1]: value}))
+            overrides["limits"] = limits
+        elif parts[0] == "agents" and len(parts) >= 3:
+            change = agents.setdefault(parts[1], {})
+            rest = parts[2:]
+            if rest == ["tools", "web"]:
+                change["tools"] = {**(change.get("tools") or {}), "web": bool(value)}
+            elif rest == ["read_dirs"]:
+                change["read_dirs"] = list(value or [])
+            elif rest == ["model"]:
+                change["model"] = value
+                change.pop("provider", None)
+                change.pop("auth", None)
+                change.pop("effort", None)
+
+
+def _merged_agents(
+    resolved: ResolvedRun,
+    changes: Mapping[str, Mapping[str, Any]],
+    settings: WorkfolderSettings,
+    profiles: ProfilesFile,
+) -> list[dict[str, Any]]:
+    """The resolved agents as `run.yaml` entries with the changes merged per agent ID.
+
+    A model of the other provider takes profile and effort from `arr.yaml` (like the form),
+    unless the change names them.
+    """
+    known = [a.id for a in resolved.agents]
+    for agent_id in changes:
+        if agent_id not in known:
+            raise _issue(
+                f"overrides.agents.{agent_id}",
+                f"Den Agenten „{agent_id}“ gibt es in diesem Run nicht (Agenten: "
+                f"{', '.join(known)}). Neue Agenten gehören in „config“.",
+            )
+    first = _first_profiles(profiles)
+    specs = []
+    for agent in resolved.agents:
+        spec = agent.model_dump(
+            mode="json", exclude={"base_id", "replica", "channels"}, exclude_none=True
+        )
+        change = changes.get(agent.id)
+        if change:
+            spec = _deep_merge(spec, change)
+            model = change.get("model")
+            if model and "provider" not in change:
+                provider = _provider_of(str(model))
+                if provider is not agent.provider:
+                    standard = settings.defaults.get(provider)
+                    spec["provider"] = provider.value
+                    if "auth" not in change:
+                        spec.pop("auth", None)
+                        auth = (standard.auth if standard is not None else None) or first.get(
+                            provider
+                        )
+                        if auth:
+                            spec["auth"] = auth
+                    if "effort" not in change:
+                        spec.pop("effort", None)
+                        if standard is not None and standard.effort:
+                            spec["effort"] = standard.effort.value
+        specs.append(spec)
+    return specs
+
+
+MANDATE_FIXED = (
+    "Vollmacht und Modell des Aufsichts-Agenten legt nur der User fest (Einstellungen → "
+    "Vollmacht). Claude Code kann sie nicht setzen; lass „gatekeeper“ weg."
+)
+
+
+def _refuse_mandate(approvals: Any, path: str) -> None:
+    """`approvals.gatekeeper` (mandate, model) never comes from Claude Code (M1, W4-01.1)."""
+    if isinstance(approvals, Mapping) and "gatekeeper" in approvals:
+        raise _issue(f"{path}.gatekeeper", MANDATE_FIXED)
+
+
+def request_data(
+    spec: Mapping[str, Any], adjust: Mapping[str, Any] | None
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+    """`RunInput` data, parameters and agent changes of a request of Claude Code.
+
+    `spec` holds `project` (from the folder Claude Code works in), `task`, `skill`, `config`
+    (a whole `run.yaml` as data), `params`, `overrides` and `name` (docs/04 §2). `adjust` are
+    your changes of „Anpassen“.
+    """
+    config = spec.get("config")
+    if config is not None and not isinstance(config, Mapping):
+        raise _issue("config", "„config“ ist der Inhalt einer run.yaml als Zuordnung.")
+    data: dict[str, Any] = copy.deepcopy(dict(config or {}))
+    project = str(spec["project"])
+    if data.get("project") not in (None, project):
+        raise _issue(
+            "config.project",
+            f"„config“ nennt das Projekt „{data['project']}“, Claude Code arbeitet in "
+            f"„{project}“. Runs gehen nur im eigenen Projekt.",
+        )
+    data["project"] = project
+    _refuse_mandate(data.get("approvals"), "config.approvals")
+    if data.get("task_file") is not None:
+        raise _issue(
+            "config.task_file",
+            "Gib die Aufgabe als Text an („task“). Eine Datei liest arr für Claude Code nicht.",
+        )
+    if spec.get("task"):
+        data["task"] = str(spec["task"])
+    skill = spec.get("skill")
+    if skill:
+        if data.get("skill") not in (None, skill):
+            raise _issue("skill", "„skill“ und „config.skill“ nennen verschiedene Skills.")
+        data["skill"] = skill
+    if spec.get("name"):
+        data["name"] = str(spec["name"])
+    params = dict(spec.get("params") or {})
+    raw = spec.get("overrides") or {}
+    if not isinstance(raw, Mapping):
+        raise _issue("overrides", "„overrides“ ist eine Zuordnung (Teil einer run.yaml).")
+    overrides = copy.deepcopy(dict(raw))
+    unknown = sorted(set(overrides) - set(OVERRIDE_KEYS))
+    if unknown:
+        raise _issue(
+            f"overrides.{unknown[0]}",
+            f"„{unknown[0]}“ lässt sich über „overrides“ nicht ändern. Erlaubt sind "
+            f"{', '.join(OVERRIDE_KEYS)}; alles andere gehört in „config“.",
+        )
+    _refuse_mandate(overrides.get("approvals"), "overrides.approvals")
+    agents = _agent_overrides(overrides.pop("agents", None))
+    if adjust:
+        _apply_adjust(data, params, overrides, agents, adjust)
+    if "name" in overrides:
+        data["name"] = overrides.pop("name")
+    if overrides.get("limits") is not None:
+        if not isinstance(overrides["limits"], Mapping):
+            raise _issue("overrides.limits", "„limits“ ist eine Zuordnung.")
+        data["limits"] = {
+            **_limit_override(data.get("limits") or {}),
+            **_limit_override(overrides["limits"]),
+        }
+    for key in ("approvals", "defaults"):
+        if overrides.get(key) is not None:
+            if not isinstance(overrides[key], Mapping):
+                raise _issue(f"overrides.{key}", f"„{key}“ ist eine Zuordnung.")
+            data[key] = _deep_merge(data.get(key) or {}, overrides[key])
+    if not data.get("skill") and not data.get("agents") and not data.get("topology"):
+        data["topology"] = {"kind": "solo"}
+        data["agents"] = [{"id": SOLO_AGENT}]
+    if not data.get("task"):
+        raise _issue("task", TASK_MISSING)
+    return data, params, agents
+
+
+# --------------------------------------------------------------------------------------------
 # Estimate (W4-02, docs/08 §5.4 „Schätzung“, docs/04 §2 `estimate_run`)
 # --------------------------------------------------------------------------------------------
 
@@ -571,6 +806,8 @@ class RunsArea:
         self.state = state
         self.approvals = approvals
         self.storage = storage
+        self.run_starts: Any = None
+        """`RunStartsArea` of the service (W4-01), set by `RealApi`."""
         self._followers: set[asyncio.Task[None]] = set()
 
     # -- helpers ----------------------------------------------------------------------------
@@ -739,10 +976,7 @@ class RunsArea:
         ]
         limits = resolved.limits
         wall = int(limits.wall_time.total_seconds()) if limits.wall_time else None
-        try:
-            text = (record.run_dir / "run.yaml").read_text("utf-8")
-        except OSError:
-            text = None
+        text = record.run_yaml_text  # read once by `load_resolved`, with its guards (W4-01)
         repeat, notes = self._repeat_input(resolved, name, task_md or "")
         if task is not None and task_md != task:
             notes.append(
@@ -869,6 +1103,12 @@ class RunsArea:
             raise not_allowed(FINISHED_HINT.format(what=what))
         handle = self.state.registry.get(run_id)
         owned = self.state.registry.owns(run_id)
+        if status is RunStatus.AWAITING_APPROVAL:
+            message = await self._waiting_action(record, action, dry_run=dry_run)
+            record.refresh_meta()
+            return ActionResult(
+                ok=True, message=message, run=self._summary(record, with_agents=False)
+            )
         if owned and handle is not None:
             if action is RunAction.RESUME:
                 self._refuse_open_escalation(record)
@@ -877,6 +1117,19 @@ class RunsArea:
             message = self._foreign_action(record, action, dry_run=dry_run)
         record.refresh_meta()
         return ActionResult(ok=True, message=message, run=self._summary(record, with_agents=False))
+
+    async def _waiting_action(self, record: RunRecord, action: RunAction, *, dry_run: bool) -> str:
+        """A run start waiting for approval can only be stopped (taken back), never resumed."""
+        if action is not RunAction.STOP:
+            raise not_allowed(
+                "Der Run wartet auf die Freigabe in der GUI. Pausieren und Fortsetzen gehen erst, "
+                "wenn er läuft."
+            )
+        if dry_run:
+            return "Der Run-Start würde zurückgenommen, der Run endet als „Gestoppt“."
+        if self.run_starts is None or not await self.run_starts.withdraw(record.run_id):
+            raise not_allowed("Dieser Run-Start wartet nicht in diesem arr.")
+        return "Run-Start zurückgenommen: Der Run endet als „Gestoppt“."
 
     async def stop_for_profile(self, run_id: str) -> None:
         """The Not-Aus: the normal stop of a run, with finalizer and scan, of either source."""
@@ -952,13 +1205,25 @@ class RunsArea:
             "innerhalb weniger Sekunden, danach läuft der Finalizer."
         )
 
-    async def post_message(self, run_id: str, channel: str, request: PostMessageRequest) -> Message:
+    async def post_message(
+        self,
+        run_id: str,
+        channel: str,
+        request: PostMessageRequest,
+        via: MessageVia | str = MessageVia.GUI,
+    ) -> Message:
+        """A message of the user into a channel; the same rules from the GUI and from Claude
+        Code (`via: user_agent`, `post_to_run`, docs/09 L17)."""
         record = self._record(run_id)
         if record.status.is_final:
             raise not_allowed("Der Run ist beendet. Nachrichten gehen nur an laufende Runs.")
+        if record.status is RunStatus.AWAITING_APPROVAL:  # G6, W4-01.1
+            raise not_allowed(WAITING_HINT)
         handle = self.state.registry.get(run_id)
-        if not self.state.registry.owns(run_id) or handle is None or handle.manager is None:
+        if not self.state.registry.owns(run_id) or handle is None:
             raise not_allowed(TERMINAL_HINT)
+        if handle.manager is None:
+            raise not_allowed("Der Run wird noch vorbereitet; der Gruppenchat ist noch nicht da.")
         room = handle.manager.room
         if room is None:
             raise not_allowed("Der Run wird noch vorbereitet; der Gruppenchat ist noch nicht da.")
@@ -970,7 +1235,7 @@ class RunsArea:
                 kind=request.kind,
                 to=list(request.to),
                 reply_to=getattr(request, "reply_to", None),  # `PostReplyRequest` (W3-10.1)
-                via=MessageVia.GUI,
+                via=MessageVia(via),
             )
         except ArrError as exc:
             raise ApiException.of(ErrorCode.INVALID, exc.message) from None
@@ -1108,7 +1373,162 @@ class RunsArea:
             self._refuse_invalid_skill(str(data["skill"]))
         return launch
 
+    # -- requests of Claude Code (W4-01) --------------------------------------------------------
+
+    def _plan_data(self, data: dict[str, Any], params: dict[str, Any]) -> Launch:
+        def plan() -> Launch:
+            return plan_run_input(
+                validate_model(RunInput, data, source=USER_AGENT_SOURCE),
+                workfolder=self.state.workfolder,
+                params=params,
+                profiles=self._profiles(),
+                source=USER_AGENT_SOURCE,
+            )
+
+        try:
+            return plan()
+        except ConfigError as exc:
+            standards = None if data.get("defaults") else self._form_standards(exc)
+            if standards is None:
+                raise
+            data["defaults"] = standards
+            return plan()
+
+    def plan_request(
+        self, spec: Mapping[str, Any], adjust: Mapping[str, Any] | None = None
+    ) -> Launch:
+        """A `Launch` from a request of Claude Code, checked like „Neuer Run“ (W4-01).
+
+        `ApiException` (`config_invalid`) with the problems at their paths; an invalid group
+        skill is refused here, before anything is reserved (W4-02).
+        """
+        try:
+            data, params, agents = request_data(spec, adjust)
+            try:
+                project_dir(self.state.workfolder, str(data["project"]))
+            except ArrError as exc:
+                raise _issue("project", exc.message) from None
+            launch = self._plan_data(data, params)
+            if agents:
+                resolved = launch.resolved
+                data["agents"] = _merged_agents(resolved, agents, launch.settings, launch.profiles)
+                data["groupchats"] = [c.model_dump(mode="json") for c in resolved.groupchats]
+                data["stages"] = [s.model_dump(mode="json") for s in resolved.stages]
+                data["raters"] = list(resolved.raters)
+                launch = _keep_origin(self._plan_data(data, params), resolved)
+            _check_prepared(launch)
+            if data.get("skill"):
+                self._refuse_invalid_skill(str(data["skill"]))
+        except ConfigError as exc:
+            raise ApiException.of(
+                ErrorCode.CONFIG_INVALID, exc.issues[0].message, issues=_field_issues(exc)
+            ) from None
+        except _NoProfile:
+            raise ApiException.of(
+                ErrorCode.CONFIG_INVALID, NO_PROFILE.message, issues=[NO_PROFILE]
+            ) from None
+        except ArrError as exc:
+            raise ApiException.of(ErrorCode.CONFIG_INVALID, exc.message) from None
+        return launch
+
+    def standard_of(
+        self, spec: Mapping[str, Any], adjust: Mapping[str, Any] | None = None
+    ) -> ResolvedRun | None:
+        """The same skill, project and task without `config` and `overrides`: what the
+        deviations are measured against (None without a skill or when it does not resolve)."""
+        config = spec.get("config") if isinstance(spec.get("config"), Mapping) else {}
+        skill = spec.get("skill") or (config or {}).get("skill")
+        if not skill:
+            return None
+        bare = {
+            "project": spec["project"],
+            "skill": skill,
+            "task": spec.get("task") or (config or {}).get("task") or TASK_PLACEHOLDER,
+            "params": spec.get("params") or {},
+        }
+        try:
+            data, params, _agents = request_data(bare, None)
+            return self._plan_data(data, params).resolved
+        except (ArrError, OSError, ValueError):
+            return None
+
+    def capacity(self, launch: Launch) -> list[CapacityInfo]:
+        """Free places per profile against what the run needs (docs/08 §5.0 `capacity`)."""
+        needed: dict[str, int] = {}
+        for agent in launch.resolved.agents:
+            needed[agent.auth] = needed.get(agent.auth, 0) + 1
+        out = []
+        for profile, count in needed.items():
+            limit = launch.settings.concurrency.get(profile)
+            gate = self.state.gates.get(profile)
+            in_use = gate.active if gate is not None else 0
+            free = max(0, (limit - in_use)) if limit is not None else count
+            out.append(
+                CapacityInfo(
+                    profile=profile,
+                    free=free,
+                    needed=count,
+                    limit=limit if limit is not None else count,
+                )
+            )
+        return out
+
+    def add_waiting(self, run_id: str, run_dir: Path, launch: Launch, waiting: Any) -> None:
+        """A run start of Claude Code waits in this service (task: wait, then run)."""
+        handle = RunHandle(run_id=run_id, run_dir=run_dir, launch=launch)
+        handle.task = asyncio.create_task(waiting, name=f"arr-run-{run_id}")
+        self.state.registry.add(handle)
+        self.state.store.get(run_id)
+
+    async def execute_approved(self, run_id: str, launch: Launch, lock: Any) -> None:
+        """Run a run start after the user's approval, in its reserved folder with its lock."""
+        handle = self.state.registry.get(run_id)
+        if handle is None:  # pragma: no cover - the waiting task registered it
+            lock.release()
+            return
+        handle.launch = launch
+        await self._execute(handle, lock=lock, starter=Starter.USER_AGENT)
+
+    async def _resolve_adjust(self, item_id: str, run_input: dict[str, Any]) -> ResolveResult:
+        """„Neuer Run“ in „Anpassen“: the request with your changes, and its deviations."""
+        from arr.service.real_api.run_starts import check_adjust_paths, form_changes, item_form
+
+        try:
+            item = await self.approvals.get_approval(item_id)
+        except ApiException as exc:
+            return ResolveResult(
+                resolved_run_yaml="", errors=[FieldIssue(path="", message=exc.error.message)]
+            )
+        pending = self.run_starts.pending_of(item.run.id) if self.run_starts else None
+        if pending is None or pending.item_id != item.id:
+            return ResolveResult(
+                resolved_run_yaml="",
+                errors=[FieldIssue(path="", message="Dieser Run-Start ist schon entschieden.")],
+            )
+        form = {k: v for k, v in run_input.items() if k != "von"}
+        changes = form_changes(item_form(item), form)
+        try:
+            check_adjust_paths(changes, [a.id for a in item.agents])
+            launch, card = await asyncio.to_thread(
+                self.run_starts._plan_with_card, pending.spec, changes
+            )
+        except ApiException as exc:
+            return ResolveResult(
+                resolved_run_yaml="",
+                errors=list(exc.error.issues) or [FieldIssue(path="", message=exc.error.message)],
+            )
+        return ResolveResult(
+            resolved_run_yaml=dump_yaml_model(stored_run(launch.resolved)),
+            agents=[RunStartAgent.model_validate(a) for a in card["agents"]],
+            channels=[RunStartChannel.model_validate(c) for c in card["channels"]],
+            capacity=[CapacityInfo.model_validate(c) for c in card["capacity"]],
+            estimate=Estimate.model_validate(card["estimate"]),
+            deviations=[Deviation.model_validate(d) for d in card["deviations"]],
+        )
+
     async def resolve_run(self, run_input: dict[str, Any]) -> ResolveResult:
+        if run_input.get("von"):
+            return await self._resolve_adjust(str(run_input["von"]), run_input)
         missing = []
         if _task_missing(run_input):
             missing.append(FieldIssue(path="task_md", message=TASK_MISSING))
@@ -1123,29 +1543,13 @@ class RunsArea:
                 resolved_run_yaml="", errors=[FieldIssue(path="", message=exc.message)]
             )
         resolved = launch.resolved
-        needed: dict[str, int] = {}
-        for agent in resolved.agents:
-            needed[agent.auth] = needed.get(agent.auth, 0) + 1
-        capacity = []
-        warnings = []
-        for profile, count in needed.items():
-            limit = launch.settings.concurrency.get(profile)
-            gate = self.state.gates.get(profile)
-            in_use = gate.active if gate is not None else 0
-            free = max(0, (limit - in_use)) if limit is not None else count
-            capacity.append(
-                CapacityInfo(
-                    profile=profile,
-                    free=free,
-                    needed=count,
-                    limit=limit if limit is not None else count,
-                )
-            )
-            if count > free:
-                warnings.append(
-                    f"{profile}: {free} von {limit} Plätzen frei, der Run braucht {count}. Seine "
-                    "Agenten warten, bis Plätze frei werden."
-                )
+        capacity = self.capacity(launch)
+        warnings = [
+            f"{c.profile}: {c.free} von {c.limit} Plätzen frei, der Run braucht {c.needed}. Seine "
+            "Agenten warten, bis Plätze frei werden."
+            for c in capacity
+            if c.needed > c.free
+        ]
         if any(a.provider is Provider.CODEX for a in resolved.agents):
             notice = toolchain_notice(launch.settings, self.state.workfolder)
             if notice is not None:
@@ -1223,7 +1627,9 @@ class RunsArea:
             run_id=run_dir.name, status=RunStatus.QUEUED, gui_url=self.state.run_url(run_dir.name)
         )
 
-    async def _execute(self, handle: RunHandle) -> None:
+    async def _execute(
+        self, handle: RunHandle, *, lock: Any = None, starter: Starter = Starter.GUI
+    ) -> None:
         run_id = handle.run_id
 
         def on_manager(manager: RunManager) -> None:
@@ -1243,8 +1649,9 @@ class RunsArea:
                 scan=self.state.scan,
                 secret_reader=self.state.secret_reader,
                 run_dir=handle.run_dir,
-                starter=Starter.GUI,
+                starter=starter,
                 on_manager=on_manager,
+                lock=lock,
                 gates=self.state.gates,
                 **self.state.manager_kwargs,
             )
@@ -1258,16 +1665,41 @@ class RunsArea:
             self._note_failed_start(handle, exc)
 
     def _note_failed_start(self, handle: RunHandle, exc: Exception) -> None:
-        """Keep the reason for the page when `run_launch` removed the reserved folder."""
-        if handle.run_dir.exists():
+        """Keep the reason for the page when `run_launch` removed the reserved folder.
+
+        A run whose `RunManager` had prepared it is not a failed start (N9, W3-04.4): a running
+        run deleted by hand is gone, not „konnte nicht vorbereitet werden“. A run start of
+        Claude Code keeps its folder (its approval lines stay): it ends `failed` with the reason.
+        """
+        manager = handle.manager
+        if manager is not None and manager.prepared is not None:
             return
-        handle.start_failure = _start_failure(exc, handle.launch.workfolder)
+        reason = _start_failure(exc, handle.launch.workfolder)
+        if handle.run_dir.exists():
+            self._fail_reserved(handle.run_dir, reason)
+            return
+        handle.start_failure = reason
         hub = self.state.hub
         hub.publish(
             CountsChangedEvent(
                 seq=hub.next_seq(), ts=time.time(), run_id=None, counts=counts(self.state)
             )
         )
+
+    @staticmethod
+    def _fail_reserved(run_dir: Path, reason: str) -> None:
+        """A reserved folder that never got prepared but stays (approval lines): `failed`."""
+        try:
+            meta = load_run_meta(run_dir)
+        except (OSError, ValueError):
+            return
+        if meta.status not in (RunStatus.QUEUED, RunStatus.AWAITING_APPROVAL):
+            return
+        with contextlib.suppress(OSError, ValueError):
+            set_run_status(run_dir, RunStatus.FAILED)
+            OrchestratorLog(run_dir).write(
+                "status", status=RunStatus.FAILED.value, previous=meta.status.value, reason=reason
+            )
 
     async def stop_all(self) -> None:
         """Stop every run of the service and wait for the finalizers and scans (Ctrl-C)."""

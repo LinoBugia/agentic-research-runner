@@ -13,10 +13,12 @@ The mapping functions at the end turn a record into the models of the API contra
 with the counting rules of docs/08 §8.3.
 """
 
+import errno
 import json
 import os
 import re
 import sqlite3
+import stat
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -32,18 +34,19 @@ from arr.models import (
     Provider,
     ResolvedRun,
     RunStatus,
+    Starter,
     TopologyKind,
     parse_duration,
 )
 from arr.permissions.policy import is_codex_escalation
 from arr.permissions.types import RequestCategory
-from arr.resolve import load_yaml_model
+from arr.resolve import parse_yaml_text, validate_model
 from arr.room.store import RoomStore
 from arr.room.types import Message as RoomMessage
 from arr.runs.eventlog import RATE_LIMIT_PASSING
 from arr.runs.inspect import describe_checkpoint, open_approvals, run_lock_held, run_reason
 from arr.runs.launch import CHANNEL_WAIT_TEXT, ORPHAN_MIN_AGE_S, describe_entry
-from arr.runs.prepare import AgentFile, RunMeta, load_agent_file, load_run_meta
+from arr.runs.prepare import AgentFile, RunMeta, load_agent_file
 from arr.runs.slim import SLIM_MARKER
 from arr.service.api_models import (
     Action,
@@ -60,6 +63,7 @@ from arr.service.api_models import (
     BestResult,
     BlockedBy,
     BlockedKind,
+    ChangeInfo,
     ChannelInfo,
     ChannelMemberInfo,
     DeliveryInfo,
@@ -96,6 +100,7 @@ from arr.service.real_api.transcript import (
     TOOL_RESULT,
     TranscriptIndex,
     input_summary,
+    open_regular,
     to_event,
 )
 from arr.usage import USAGE_FILE, RunUsage
@@ -165,7 +170,7 @@ class JsonlTail:
     def refresh(self) -> list[dict[str, Any]]:
         """Read new complete lines; returns the new entries."""
         try:
-            size = self.path.stat().st_size
+            size = os.lstat(self.path).st_size
         except OSError:
             if self.entries or self._rest:
                 self.entries, self._end, self._rest = [], 0, b""
@@ -175,7 +180,7 @@ class JsonlTail:
         if size == self._end:
             return []
         try:
-            with self.path.open("rb") as handle:
+            with open_regular(self.path) as handle:
                 handle.seek(self._end)
                 chunk = handle.read(size - self._end)
         except OSError:
@@ -262,8 +267,54 @@ def peek_run_yaml(text: str) -> RunPeek | None:
     )
 
 
+MAX_FILE_BYTES = 1_000_000
+"""Upper bound for a file of a run folder read in one piece (`run.yaml`, `task.md`, summary)."""
+_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+
+
+class FileTooLarge(ValueError):
+    """A file of a run folder is larger than the bound of `read_regular`."""
+
+
+def read_regular(path: Path, limit: int = MAX_FILE_BYTES, *, prefix: bool = False) -> str:
+    """Text of a regular file of a run folder, guarded against what an agent could place there.
+
+    W4-01 (review W3-10, finding 5): no link is followed (`O_NOFOLLOW`), a FIFO or device never
+    blocks (`O_NONBLOCK`, then `S_ISREG` on the open file), and at most `limit` bytes are read.
+    A larger file raises `FileTooLarge`, with `prefix` its first `limit` bytes are returned.
+    Invalid UTF-8 becomes `�`.
+    """
+    fd = os.open(path, _READ_FLAGS)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(errno.EINVAL, "keine normale Datei", str(path))
+        if info.st_size > limit and not prefix:
+            raise FileTooLarge(f"{path.name} ist größer als {limit} Bytes")
+        chunks: list[bytes] = []
+        size = 0
+        while size <= limit:
+            chunk = os.read(fd, min(1 << 16, limit + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    if len(data) > limit:
+        if not prefix:
+            raise FileTooLarge(f"{path.name} ist größer als {limit} Bytes")
+        data = data[:limit]
+    return data.decode("utf-8", errors="replace")
+
+
 class _Cached[T]:
-    """A value read from one file, refreshed when the file's size or mtime changes."""
+    """A value read from one file, refreshed when the file's size or mtime changes.
+
+    The file itself is looked at without following a link (`lstat`); `read` should use
+    `read_regular`.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -272,7 +323,7 @@ class _Cached[T]:
 
     def get(self, read: Any) -> T | None:
         try:
-            st = self.path.stat()
+            st = os.lstat(self.path)
         except OSError:
             self.key, self.value = None, None
             return None
@@ -458,6 +509,8 @@ class RunRecord:
         self.meta: RunMeta | None = None
         self._meta_key: tuple[int, int] | None = None
         self.resolved: ResolvedRun | None = None
+        self.run_yaml_text: str | None = None
+        """The text `load_resolved` parsed (W4-01: `run.yaml` is read once)."""
         self._resolved_key: tuple[int, int] | None = None
         self._peek: _Cached[RunPeek] = _Cached(run_dir / "run.yaml")
         self._final_extras: tuple[BestResult | None, LastMessage | None] | None = None
@@ -485,8 +538,9 @@ class RunRecord:
 
     def refresh_meta(self) -> bool:
         """Reload `meta.json` if it changed; True when it did (or vanished)."""
+        path = self.run_dir / "meta.json"
         try:
-            st = (self.run_dir / "meta.json").stat()
+            st = os.lstat(path)
         except OSError:
             changed = self.meta is not None
             self.meta, self._meta_key = None, None
@@ -494,8 +548,8 @@ class RunRecord:
         key = (st.st_mtime_ns, st.st_size)
         if key == self._meta_key:
             return False
-        try:
-            self.meta = load_run_meta(self.run_dir)
+        try:  # no link, no FIFO (W4-01.1, G2)
+            self.meta = RunMeta.model_validate_json(read_regular(path, 100_000))
         except (OSError, ValueError):
             return False  # half written: keep the last good one, try again next time
         self._meta_key = key
@@ -566,18 +620,26 @@ class RunRecord:
             return None
 
     def load_resolved(self) -> ResolvedRun | None:
-        """`run.yaml` as `ResolvedRun` (read once; again if the file changes)."""
+        """`run.yaml` as `ResolvedRun` (read once; again if the file changes).
+
+        Read with `read_regular` (no link, no FIFO, at most `MAX_FILE_BYTES`); the text stays
+        in `run_yaml_text` for the inputs view, so it is never read a second time (W4-01).
+        """
         path = self.run_dir / "run.yaml"
         try:
-            st = path.stat()
+            st = os.lstat(path)
         except OSError:
             return self.resolved
         key = (st.st_mtime_ns, st.st_size)
         if key != self._resolved_key:
             try:
-                self.resolved = load_yaml_model(path, ResolvedRun)
+                text = read_regular(path)
+                data, lines = parse_yaml_text(text, str(path))
+                self.resolved = validate_model(ResolvedRun, data, source=str(path), lines=lines)
+                self.run_yaml_text = text
             except (OSError, ArrError, ValueError):
                 self.resolved = None
+                self.run_yaml_text = None
             self._resolved_key = key
         return self.resolved
 
@@ -594,7 +656,7 @@ class RunRecord:
                 budget_usd=limits.budget_usd,
                 pass_score=float(pass_score) if isinstance(pass_score, int | float) else None,
             )
-        peek = self._peek.get(lambda p: peek_run_yaml(p.read_text("utf-8")))
+        peek = self._peek.get(lambda p: peek_run_yaml(read_regular(p)))
         if peek is None and (self.run_dir / "run.yaml").is_file():
             resolved = self.load_resolved()  # a run.yaml arr did not write: full parse
             if resolved is not None:
@@ -603,15 +665,15 @@ class RunRecord:
 
     @property
     def usage(self) -> RunUsage | None:
-        return self._usage.get(lambda p: RunUsage.model_validate_json(p.read_text("utf-8")))
+        return self._usage.get(lambda p: RunUsage.model_validate_json(read_regular(p)))
 
     @property
     def summary_md(self) -> str | None:
-        return self._summary_md.get(lambda p: p.read_text("utf-8"))
+        return self._summary_md.get(read_regular)
 
     @property
     def task_md(self) -> str | None:
-        return self._task_md.get(lambda p: p.read_text("utf-8"))
+        return self._task_md.get(read_regular)
 
     @property
     def slimmed(self) -> bool:
@@ -827,7 +889,22 @@ def open_items(record: RunRecord) -> list[dict[str, Any]]:
 
 
 def _item_is_escalation(entry: Mapping[str, Any]) -> bool:
-    return entry.get("request") is None and entry.get("question") is None
+    return (
+        entry.get("request") is None
+        and entry.get("question") is None
+        and entry.get("run_start") is None  # a run start of Claude Code (W4-01)
+    )
+
+
+def _adjusted(record: RunRecord) -> list[ChangeInfo]:
+    """Your changes of „Anpassen“ of a run start of Claude Code (W4-01), if any."""
+    from arr.service.real_api.run_starts import change_infos, decision_of
+
+    decision = decision_of(item_entries(record))
+    if decision is None or decision.get("action") != "adjust":
+        return []
+    changes = decision.get("changes")
+    return change_infos(changes) if isinstance(changes, list) else []
 
 
 def item_question(entry: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -1073,6 +1150,7 @@ def run_summary(
     if meta.started is not None:
         duration = int(max(0.0, (meta.ended or now) - meta.started))
     best, last = final_extras(record, peek)
+    changes = _adjusted(record) if meta.starter is Starter.USER_AGENT else []
     return RunSummary(
         id=record.run_id,
         name=name,
@@ -1101,6 +1179,8 @@ def run_summary(
         last_message=last,
         error=run_error(record, base_url),
         info=" · ".join(info_parts) or None,
+        adjusted_by_user=bool(changes),
+        changes=changes,
         secret_scan=secret_scan(entries),
         gui_url=f"{base_url}/runs/{record.run_id}",
     )
@@ -1868,9 +1948,9 @@ def _result_body(record: RunRecord, body: str | None, path: str | None) -> str |
     if path:
         file = (record.run_dir / path) if not Path(path).is_absolute() else Path(path)
         try:
-            if file.is_file() and record.run_dir in file.resolve().parents:
-                return _excerpt(file.read_text("utf-8", errors="replace")[:4000])
-        except OSError:
+            if record.run_dir.resolve() in file.resolve().parents:
+                return _excerpt(read_regular(file, 16_000, prefix=True)[:4000])
+        except (OSError, ValueError):
             return None
     return None
 

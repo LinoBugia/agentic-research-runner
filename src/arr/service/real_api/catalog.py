@@ -145,16 +145,42 @@ def _project_title(claude_text: str, fallback: str) -> str:
 
 
 def _mcp_state(file: Path) -> tuple[bool, str]:
-    """Whether the `.mcp.json` of a project names the server `arr`, with the check's text."""
+    """Whether the `.mcp.json` of a project starts `arr mcp` of this installation (G10).
+
+    Green only for `command` = the `arr` of this installation and `args: ["mcp"]`; a server
+    `arr` that starts something else is named, and „Reparieren“ never overwrites it.
+    """
+    from arr.workfolder import _arr_server_stale, arr_command
+
     if not file.is_file():
         return False, ".mcp.json fehlt"
     try:
         servers = json.loads(file.read_text("utf-8")).get("mcpServers")
     except (OSError, ValueError, AttributeError):
         return False, ".mcp.json ist kein gültiges JSON"
-    if isinstance(servers, dict) and "arr" in servers:
-        return True, ".mcp.json vorhanden"
-    return False, ".mcp.json ohne Server „arr“"
+    if not isinstance(servers, dict) or "arr" not in servers:
+        return False, ".mcp.json ohne Server „arr“"
+    server = servers["arr"]
+    if (
+        isinstance(server, dict)
+        and server.get("command") == arr_command()
+        and server.get("args") == ["mcp"]
+    ):
+        extra = sorted(str(k) for k in server if k not in ("command", "args"))
+        if not extra:
+            return True, ".mcp.json vorhanden"
+        # `env` or anything else changes what the bridge loads or reads (N4, W4-01.2)
+        names = ", ".join(f"„{k}“" for k in extra)
+        return False, (
+            f".mcp.json: Der Server „arr“ trägt zusätzlich {names}. Das ändert, was die Bridge "
+            "lädt oder liest; arr überschreibt es nicht. Entferne es in der .mcp.json."
+        )
+    if _arr_server_stale(server):
+        return False, ".mcp.json: „arr“ zeigt nicht auf das arr dieser Installation"
+    return False, (
+        ".mcp.json: Der Server „arr“ startet nicht „arr mcp“ dieser Installation. arr "
+        "überschreibt ihn nicht; benenne ihn um oder entferne ihn, dann „Reparieren“."
+    )
 
 
 def _agents_count(spec: GroupSpec) -> int | None:

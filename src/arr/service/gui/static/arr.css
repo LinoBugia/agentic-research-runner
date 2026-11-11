@@ -419,3 +419,7 @@ section[id] { scroll-margin-top: calc(var(--top-h) + 16px); }
 .sk-file-list ul.plain a.sel { background: var(--surface); color: var(--text); box-shadow: inset 3px 0 0 var(--text); }
 @media (max-width: 1279px) { .sk-files { grid-template-columns: 1fr; } }
 [data-skill-editor] [data-dirty-flag][hidden] { display: none; }
+/* W4-01.1 G11: the agents table of a run-start card scrolls instead of being cut off */
+.appr .tbl-scroll { overflow-x: auto; max-width: 100%; }
+.appr .tbl-scroll table { min-width: max-content; }
+.appr .tbl-scroll:focus-visible { outline: 2px solid var(--focus, currentColor); outline-offset: 2px; }
