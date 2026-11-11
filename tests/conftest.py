@@ -1,11 +1,26 @@
 import logging
 import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 os.environ["ARR_NOTIFY"] = "off"  # no test shows a real notification, child processes inherit it
+
+MACOS_ONLY = "nur macOS"
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """The marker `macos` skips by itself on every other system (W4-01.3, User 11.11.).
+
+    `sys.platform` is read here, at collection time, so one place decides for every test.
+    """
+    if sys.platform == "darwin":
+        return
+    for item in items:
+        if item.get_closest_marker("macos") is not None:
+            item.add_marker(pytest.mark.skip(reason=MACOS_ONLY))
 
 
 @pytest.fixture
