@@ -77,6 +77,13 @@ These hold on every platform.
 - **Agent text to Claude Code:** Agent text that reaches Claude Code is marked as data and cleaned of control, invisible format and tag characters. Error messages never quote argument values.
 - **Helper scripts the user's agent may run:** Start skills marked for both audiences can also be run by Claude Code, outside every sandbox, possibly on text taken from an agent's result. `sympy-check` therefore checks every expression against an allowlist (numbers, names, operators, brackets, known SymPy functions) before SymPy parses it. Nothing else reaches the parser, and the allowlist is the only wall. The script also has a CPU limit of 10 s and rejects oversized numbers before computing. Memory is not limited on macOS, which refuses the limit: an expansion can take a few GB for those 10 s.
 - **Installing start skills:** "Add start skills", `arr init` and the project setup write only new files below `<workfolder>/skills/`, follow no link and leave nothing half written.
+- **Supervising agent (layer 4):** With the decider `gatekeeper_then_user` or `gatekeeper`, a model decides simple requests within the user's mandate. A fixed check runs first and does not trust the model. It lets through only network requests to the mandate's hosts (in v1 at most `pypi.org`, `files.pythonhosted.org`, `arxiv.org`) and single, plain `pip install` commands of PyPI names (checked against an allowlist following PEP 508/503, no files, paths, URLs or other indexes). Everything else goes to the user or is denied without a call.
+  - The model can only allow once. It never decides run starts, escalations, questions to the user or Codex commands with extra rights.
+  - The call runs the Claude CLI without tools, MCP servers, plugins or settings from agent-writable places. It gets a cleaned environment with no inherited login, address or session variables and the same outside hygiene as the other outside processes. The login comes only from the profile's start program.
+  - Every call counts in usage per profile and against the budget, with at most 50 per run.
+  - The kill switch knows the supervising agent's profile: blocking it stops the run and cancels a running call, whose answer then does not count.
+  - Withdrawing a decision takes effect at once, also for requests already being checked.
+  - The prompt shows only the asking agent's own history.
 - **Codex project config:** `arr` records the state of the work folder's `.codex/` at run start and starts no further thread once it has changed.
 - **Tests:** Escape tests run the real CLIs against a fake model server in a test `HOME` with random bait files, and check results by exit code only. A `security` stub keeps the real keychain out of every lab.
 
@@ -104,6 +111,8 @@ These hold on every platform.
 | 10 | Claude Code answers an agent's question to the user by messaging the agent, so the user never sees it | closed (W4-01.2, W4-03.1): such a message wakes the agent but answers nothing; tested through `arr mcp` with every form of address |
 | 11 | Claude Code changes the decider or the supervising agent's mandate in a run start without the card showing it | closed (W4-01.1): the mandate cannot be set from Claude Code; another decider is always shown as a deviation that widens rights |
 | 12 | An agent puts an expression into its result that runs as Python when the user's agent checks it with `sympy-check` outside the sandbox | closed (W4-05.1): allowlist before parsing; 99 attacks, none ran code |
+| 13 | The supervising agent's call inherited a login or API address from the `arr` process, so it could run on another login, or send the profile's secret elsewhere, while being counted on the profile | closed (W4-04.1): cleaned environment before every call; measured with the real CLI against a fake API |
+| 14 | Agents pass text to each other through the supervising agent's prompt history and its reasons, around chat and seals | closed (W4-04.1): the prompt shows only the asking agent's history |
 
 Closing the ways we found does not prove that there are no others. Every review so far has found new ones.
 
@@ -139,7 +148,7 @@ On servers the Hugging Face lesson applies directly. A single allowed network pa
 - Do not write permission rules by hand that point into another agent's folder (way 9) or that grant reading over an agent's own work folder: the latter makes it read-only for the Claude CLI.
 - Agents cannot commit to git inside a run, because `.git` is write-protected for them. That is the price of the wall.
 - Every change to sandbox, permissions or logins gets an escape test with a counter-test, and an independent review.
-- Never test against real logins: test `HOME`, bait files, exit codes only.
+- Never test against real logins: test `HOME`, bait files, exit codes only. Every test that starts a real CLI runs in a lab with a `security` stub and no network except localhost (W4-04.1).
 
 ## 8. Reporting
 
