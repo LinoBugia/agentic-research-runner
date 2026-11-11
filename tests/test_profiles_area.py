@@ -41,7 +41,7 @@ from arr.backends.codex_login import (
     own_login_folder,
     prepare_login_dir,
 )
-from arr.models import AuthKind, AuthProfile, ProfilesFile, Provider, RunStatus
+from arr.models import AuthKind, AuthProfile, Decider, ProfilesFile, Provider, RunStatus
 from arr.resolve import load_yaml_model
 from arr.service.api_models import (
     ApiException,
@@ -217,7 +217,10 @@ async def test_delete_is_refused_while_a_run_of_another_process_uses_it(
     record = SimpleNamespace(
         run_id="r1",
         status=RunStatus.RUNNING,
-        load_resolved=lambda: SimpleNamespace(agents=[SimpleNamespace(auth="max")]),
+        load_resolved=lambda: SimpleNamespace(
+            agents=[SimpleNamespace(auth="max")],
+            approvals=SimpleNamespace(decider=Decider.USER, gatekeeper=None),  # W4-04.1
+        ),
     )
     monkeypatch.setattr(api.state.store, "scan", lambda: [record])
     with pytest.raises(ApiException) as caught:
