@@ -317,7 +317,8 @@ class ClaudeGatekeeperModel:
 
     Like every process outside the sandbox (SECURITY.md §5.1, W4-04.1): before each call the
     process environment is cleaned as before an agent (`clean_process_env`: no inherited
-    `ANTHROPIC_*`, `CLAUDE_CODE_*`, `CLAUDE_CONFIG_DIR`, no variable of a parent session), the
+    `ANTHROPIC_*`, `CLAUDE_CODE_*`, `CLAUDE_CONFIG_DIR`) and of every other `CLAUDE*` variable of
+    a parent session; the
     CLI's `PATH` holds no write root and starts with the `git` stub, Node's compile cache is
     off, and `TMPDIR` is a folder of arr's own. `extra_env` is only for tests (the address of a
     stand-in API).
@@ -345,11 +346,11 @@ class ClaudeGatekeeperModel:
 
     def environment(self) -> dict[str, str]:
         """What the call sets on top of the cleaned process environment (outside hygiene)."""
-        from arr.auth import claude_env, clean_process_env
+        from arr.auth import claude_env
         from arr.backends.claude_options import NODE_CACHE_SWITCH
         from arr.backends.process_path import no_git_folder, outside_path
 
-        removed = clean_process_env()
+        removed = clean_environment()
         if removed:
             log.info("Umgebung bereinigt: %s", ", ".join(removed))
         inherited = os.environ.get("PATH", os.defpath).split(os.pathsep)
@@ -447,6 +448,20 @@ class ClaudeGatekeeperModel:
         if result.is_error:
             raise CallFailed("Die Claude-CLI meldet einen Fehler.", usage)
         return ModelReply("".join(texts), usage, self.model)
+
+
+def clean_environment() -> list[str]:
+    """Clean the process environment before a call, as before an agent (`clean_process_env`),
+    and drop every other `CLAUDE*` variable of a Claude session that started arr (e.g.
+    `CLAUDE_PREVIEW_*`): none belongs to the call (W4-04.1, found by the live test). Returns the
+    removed names, never values."""
+    from arr.auth import clean_process_env
+
+    removed = clean_process_env()
+    rest = [name for name in os.environ if name.startswith("CLAUDE")]
+    for name in rest:
+        del os.environ[name]
+    return sorted([*removed, *rest])
 
 
 DISALLOWED_TOOLS = (

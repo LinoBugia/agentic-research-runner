@@ -114,6 +114,7 @@ INHERITED = {
     "CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/eltern.sock",
     "CLAUDECODE": "1",
     "CLAUDE_AGENT_SDK_FREMD": "1",
+    "CLAUDE_PREVIEW_CLASSIFIER_FLOOR": "1",  # a session variable outside CLAUDE_CODE_*
 }
 
 
@@ -139,7 +140,7 @@ def call_env(
     monkeypatch.setenv("PATH", f"{work}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
     if not clean:
-        monkeypatch.setattr("arr.auth.clean_process_env", lambda environ=None: [])
+        monkeypatch.setattr(gatekeeper_module, "clean_environment", lambda: [])
     dump = tmp_path / "env.txt"
     model = ClaudeGatekeeperModel(
         model="claude-haiku-5-5",
