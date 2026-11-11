@@ -12,8 +12,10 @@ in `~/.arr` are the user's: they may be links (B3); the hardness below applies f
 
 **Source.** `usage.json` of a finished run. A run without one (`interrupted`, or one that is
 still active) is summed from its transcripts (only their `turn_end` lines, as `arr.usage`), so
-aborted runs and runs of `arr run` count too. Only the agents on this profile count in a mixed
-run; which those are says `run.yaml`, so a run without a finished turn shows too, with zero.
+aborted runs and runs of `arr run` count too. The calls of the supervising agent (W4-04) come
+from `gatekeeper.jsonl` of the run, each with the profile it ran on. Only the agents on this
+profile count in a mixed run; which those are says `run.yaml`, so a run without a finished turn
+shows too, with zero.
 A period takes a run by the moment it started.
 
 **Hostile folders.** Agents write into run folders, so everything below a workfolder's `runs/`
@@ -59,11 +61,13 @@ from arr.service.state import (
     workfolders_file,
 )
 from arr.usage import (
+    GATEKEEPER_LOG,
     USAGE_FILE,
     AgentUsage,
     RunUsage,
     UsageTotal,
     aggregate_usage,
+    gatekeeper_records,
     usage_records,
 )
 
@@ -191,6 +195,10 @@ def _parse_run_yaml(data: bytes) -> ResolvedRun:
 
 def _parse_usage(data: bytes) -> RunUsage:
     return RunUsage.model_validate_json(data)
+
+
+def _parse_gatekeeper(data: bytes) -> list[Any]:
+    return gatekeeper_records(data.decode("utf-8").splitlines())
 
 
 _PARSE_ERRORS = (ValueError, ValidationError, YAMLError, UnicodeDecodeError, TypeError)
@@ -356,6 +364,8 @@ class _Reader:
                     records += self._agent_records(agents_fd, agent_id, config)
             finally:
                 os.close(agents_fd)
+        _, calls = self.small(folder, GATEKEEPER_LOG, run_fd, _parse_gatekeeper)
+        records += calls or []
         usage = aggregate_usage(records, run_id=run_id, agents=sorted(agents))
         if meta.status.is_final:
             self._settled[folder] = (meta_key, usage)

@@ -432,3 +432,9 @@ class RealApi:
 
     async def create_start_skills(self) -> StartSkillsResult:
         return await self.catalog.create_start_skills()
+
+    # -- mandate of the supervising agent (W4-04) --------------------------------------------
+
+    async def check_mandate(self, name: str, update: MandateUpdate) -> MandateInfo:
+        """Check a mandate text without saving it (`POST /api/mandates/{name}/check`)."""
+        return await self.setup.check_mandate(name, update)

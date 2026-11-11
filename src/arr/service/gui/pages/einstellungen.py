@@ -35,6 +35,7 @@ from arr.service.api_models import (
 from arr.service.gui import format as fmt
 from arr.service.gui.app import get_api
 from arr.service.gui.components.badge import badge_html
+from arr.service.gui.components.banner import banner
 from arr.service.gui.components.base import button, esc, icon, raw
 from arr.service.gui.components.dialog import ConfirmDialog
 from arr.service.gui.components.form import Field, checkbox, radio
@@ -111,6 +112,26 @@ DAYS = re.compile(r"\s*(\d+)\s*(tage?n?|t|d)?\s*$", re.I)
 def parse_days(text: str) -> int | None:
     m = DAYS.match(text)
     return int(m.group(1)) if m and int(m.group(1)) > 0 else None
+
+
+def checked_html(mandate: MandateInfo) -> str:
+    """„Vollmacht (von arr geprüft)“: what arr itself checks before the supervising agent."""
+    checks = mandate.checked
+    domains = ", ".join(checks.domains) or "keine"
+    install = (
+        "pip install von PyPI in die Run-venv" if checks.install == "pypi" else "keine Installation"
+    )
+    rows = [
+        ("Netzwerk zu", domains),
+        ("Installation", install),
+        ("Lese-Ordner", "lassen sich über die Vollmacht nicht freigeben"),
+    ]
+    items = "".join(f"<dt>{esc(k)}</dt><dd>{esc(v)}</dd>" for k, v in rows)
+    return (
+        '<div class="mandate-checked"><div class="small"><b>Vollmacht (von arr geprüft)</b> '
+        '<span class="faint">· nur was hier steht, kann der Aufsichts-Agent erlauben, jeweils '
+        f'einmal</span></div><dl class="kv small">{items}</dl></div>'
+    )
 
 
 def section_card(anchor: str, title: str, sub: str = "") -> ui.element:
@@ -305,19 +326,38 @@ class EinstellungenPage:
             "vollmacht-text", "Deine Vollmacht", f'<span class="mono">{esc(mandate.path)}</span>'
         )
         with card:
+            if mandate.problem:
+                banner(
+                    "err",
+                    "Die gespeicherte Vollmacht ist ungültig.",
+                    f" {mandate.problem} Bis du sie korrigierst, erreicht keine Anfrage den "
+                    "Aufsichts-Agenten.",
+                    small=True,
+                )
+            elif not mandate.exists:
+                banner(
+                    "info",
+                    "Die Vollmacht ist noch nicht angelegt.",
+                    f" Unten steht die Vorlage. „Speichern“ legt {mandate.path} an.",
+                    small=True,
+                )
+            checked = ui.element("div").mark("mandate-checked")
+            with checked:
+                raw(checked_html(mandate))
             field = Field(
                 "Vollmacht",
                 name="mandate",
                 kind="textarea",
-                rows=9,
+                rows=18,
                 value=mandate.text,
-                help_text="Klartext. Was arr hart prüfen kann (Domains, Pfade), prüft arr selbst "
-                "(„Vollmacht (von arr geprüft)“). Über den Rest entscheidet der Aufsichts-Agent.",
+                help_text="Oben zwischen den Zeilen „---“ steht, was arr selbst prüft "
+                "(„Vollmacht (von arr geprüft)“): Domains und pip install von PyPI. Lese-Ordner "
+                "lassen sich nicht freigeben. Darunter der Klartext für den Aufsichts-Agenten.",
             )
             field.box.classes("mandate")
             raw(
-                '<p class="small muted">Versionen, die Anzeige der erkannten Angaben und ein '
-                "Vorher/Nachher-Vergleich kommen in einer späteren Version.</p>"
+                '<p class="small muted">Versionen und ein Vorher/Nachher-Vergleich kommen in '
+                "einer späteren Version.</p>"
             )
 
             def example() -> None:
@@ -325,16 +365,37 @@ class EinstellungenPage:
 
             def discard() -> None:
                 field.set_value(mandate.text)
+                field.set_error(None)
 
-            def save() -> None:
-                text = field.value.strip()
-                if not text:
+            async def checked_text() -> MandateInfo | None:
+                """The checked part of the text in the field, or None (error at the field)."""
+                if not field.value.strip():
                     field.set_error("Die Vollmacht darf nicht leer sein. Nimm das Beispiel.")
-                    return
-                if text == mandate.text.strip():
+                    return None
+                try:
+                    info = await self.api.check_mandate(
+                        mandate.name, MandateUpdate(text=field.value)
+                    )
+                except ApiException as exc:
+                    field.set_error(exc.error.message)
+                    return None
+                field.set_error(None)
+                checked.clear()
+                with checked:
+                    raw(checked_html(info))
+                return info
+
+            async def check() -> None:
+                if await checked_text() is not None:
+                    self.frame.toast("Geprüft: Die Vollmacht ist gültig.")
+
+            async def save() -> None:
+                if mandate.exists and field.value.strip() == mandate.text.strip():
+                    field.set_error(None)
                     self.frame.toast("Nichts geändert.")
                     return
-                field.set_error(None)
+                if await checked_text() is None:
+                    return
 
                 async def confirm(_value: str) -> None:
                     try:
@@ -342,9 +403,11 @@ class EinstellungenPage:
                             mandate.name, MandateUpdate(text=field.value)
                         )
                     except ApiException as exc:
+                        field.set_error(exc.error.message)
                         self.frame.toast(exc.error.message, error=True)
                         return
                     mandate.text = saved.text
+                    mandate.exists = True
                     self.frame.toast("Gespeichert: Vollmacht. Sie gilt ab jetzt.")
 
                 running = mandate.running_runs
@@ -358,7 +421,7 @@ class EinstellungenPage:
                     [
                         f"Die neue Vollmacht gilt sofort für alle neuen Anfragen, {where}.",
                         "Schon getroffene Entscheidungen bleiben, wie sie sind.",
-                        "Die alte Fassung steht im Verlauf von mandates/standard.md.",
+                        f"Die bisherige Fassung von {mandate.path} wird ersetzt.",
                     ],
                     "Vollmacht speichern",
                     confirm,
@@ -367,6 +430,7 @@ class EinstellungenPage:
 
             with ui.element("div").classes("save-row"):
                 button("Beispiel einfügen", example, classes="btn btn-sm")
+                button("Prüfen", check, classes="btn btn-sm").mark("check-mandate")
                 raw('<span class="spacer"></span>', tag="span")
                 button("Verwerfen", discard)
                 button("Speichern …", save, classes="btn primary", key_hint="⌘↩").props(

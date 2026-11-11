@@ -15,8 +15,14 @@ cost (`cost_unknown_turns`).
 
 Only finished turns count: a turn without `turn_end` (crash) adds nothing to `usage.json`,
 even if `usage` events with tokens were logged. Such usage is not made up afterwards.
+
+The supervising agent (W4-04) has no transcript: each of its calls is a line of
+`gatekeeper.jsonl` in the run folder with its own profile and model. Each line counts as one
+turn of `GATEKEEPER_ID` (`gatekeeper_records`), so it shows in `usage.json` per agent, model
+and profile and in the record per profile.
 """
 
+import json
 import logging
 import os
 from collections.abc import Iterable, Mapping
@@ -32,6 +38,10 @@ from arr.runs.eventlog import TRANSCRIPT_FILE, read_events
 log = logging.getLogger(__name__)
 
 USAGE_FILE = "usage.json"
+GATEKEEPER_LOG = "gatekeeper.jsonl"
+"""Calls of the supervising agent in the run folder (`arr.permissions.gatekeeper`)."""
+GATEKEEPER_ID = "aufsichts-agent"
+"""Key of the supervising agent in `by_agent`; no skill uses it as an agent ID."""
 UNKNOWN = "unknown"
 """Key in `by_model` / `by_profile` for turns whose model or profile is not known."""
 
@@ -141,6 +151,47 @@ def usage_records(
     return records
 
 
+def gatekeeper_records(lines: Iterable[str]) -> list[UsageRecord]:
+    """One `UsageRecord` per call of the supervising agent, from lines of `gatekeeper.jsonl`.
+
+    Damaged lines are skipped with a warning; a call without tokens still counts as a turn.
+    """
+    records: list[UsageRecord] = []
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+            tokens = data.get("usage") or {}
+            records.append(
+                UsageRecord(
+                    agent=GATEKEEPER_ID,
+                    turn=number,
+                    ts=float(data.get("ts", 0)),
+                    profile=data.get("profile") or None,
+                    provider="claude",
+                    model=data.get("model") or None,
+                    usage=Usage(
+                        **{name: tokens.get(name) for name in _TOKEN_FIELDS},
+                        cost_usd=data.get("cost_usd"),
+                        cost_kind=_cost_kind(data.get("cost_kind")),
+                    ),
+                )
+            )
+        except (ValidationError, AttributeError, TypeError, ValueError):
+            log.warning("gatekeeper.jsonl: Zeile %d übersprungen", number)
+    return records
+
+
+def read_gatekeeper_records(run_dir: Path) -> list[UsageRecord]:
+    """`gatekeeper_records` of a run folder (none without the file)."""
+    try:
+        text = (run_dir / GATEKEEPER_LOG).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    return gatekeeper_records(text.splitlines())
+
+
 def aggregate_usage(
     records: Iterable[UsageRecord],
     *,
@@ -184,6 +235,7 @@ def compute_run_usage(
     for agent_id in ids:
         events = read_events(agents_dir / agent_id / TRANSCRIPT_FILE)
         records += usage_records(events, by_id.get(agent_id), agent=agent_id)
+    records += read_gatekeeper_records(run_dir)
     return aggregate_usage(records, run_id=run_id or run_dir.name, agents=ids)
 
 

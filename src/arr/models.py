@@ -716,10 +716,15 @@ class GroupSpec(StrictModel):
 
 
 class GatekeeperSettings(StrictModel):
-    """Supervising agent that decides within the user's mandate (docs/07 §3 ④, §4)."""
+    """Supervising agent that decides within the user's mandate (docs/07 §3 ④, §4).
+
+    `auth` is the profile of its calls (W4-04); without it the Claude default of `arr.yaml`
+    (`defaults.claude.auth`) is used.
+    """
 
     model: str
     mandate: str = Field(description="Mandate file, relative to the workfolder")
+    auth: Slug | None = Field(default=None, description="Auth profile; default: Claude default")
 
 
 class ApprovalSettings(StrictModel):

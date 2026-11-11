@@ -423,3 +423,7 @@ section[id] { scroll-margin-top: calc(var(--top-h) + 16px); }
 .appr .tbl-scroll { overflow-x: auto; max-width: 100%; }
 .appr .tbl-scroll table { min-width: max-content; }
 .appr .tbl-scroll:focus-visible { outline: 2px solid var(--focus, currentColor); outline-offset: 2px; }
+
+/* W4-04: the part of the mandate arr checks itself („Vollmacht (von arr geprüft)“) */
+.mandate-checked { border: 1px solid var(--border); border-radius: var(--r2, 6px); padding: var(--s2, 8px) var(--s3, 12px); margin: 0 0 var(--s3, 12px); background: var(--surface-2, transparent); }
+.mandate-checked .kv { margin-top: 6px; grid-template-columns: 120px minmax(0, 1fr); }

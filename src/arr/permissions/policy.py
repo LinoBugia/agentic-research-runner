@@ -55,6 +55,7 @@ from arr.permissions.types import (
     Decision,
     DecisionAction,
     DecisionScope,
+    EscalatedBy,
     PermissionRequest,
     RequestCategory,
     Risk,
@@ -2057,7 +2058,11 @@ class LogEvent(StrEnum):
 
 
 class ApprovalLogEntry(Record):
-    """One line of `runs/<id>/approvals.jsonl` (docs/02 §4, docs/07 §4). Never a secret."""
+    """One line of `runs/<id>/approvals.jsonl` (docs/02 §4, docs/07 §4). Never a secret.
+
+    `escalated_by` (W4-04): in the line `open` of an item the mandate check or the supervising
+    agent passed on to the user, who did it and why.
+    """
 
     ts: float = Field(default_factory=time.time)
     event: LogEvent
@@ -2066,6 +2071,7 @@ class ApprovalLogEntry(Record):
     decision: Decision | None = None
     rule: AlwaysRule | None = None
     question: UserQuestion | None = None
+    escalated_by: EscalatedBy | None = None
     note: str | None = None
 
 

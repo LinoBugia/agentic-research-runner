@@ -50,6 +50,7 @@ from arr.models import (
     Starter,
     WorkfolderSettings,
 )
+from arr.permissions.gatekeeper import run_profiles
 from arr.permissions.inbox import ApprovalDecider
 from arr.resolve import load_group_spec, load_run_input, load_yaml_model, resolve_run
 from arr.runs.finalize import finalize_run, last_turn_error
@@ -352,7 +353,7 @@ def plan_run_input(
     )
     check_topology(resolved)
     known = profiles if profiles is not None else load_profiles()
-    refuse_disabled((a.auth for a in resolved.agents), known)
+    refuse_disabled(run_profiles(resolved, settings), known)  # with the supervising agent's
     return Launch(
         run_file=run_file,
         workfolder=root,
@@ -979,6 +980,12 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
     return f"{kind}" + (f": {extra}" if extra else "")
 
 
+_DECIDED_BY_WORDS = {
+    "gatekeeper": "vom Aufsichts-Agenten",
+    "mandate_rule": "durch die Vollmacht (von arr geprüft)",
+}
+
+
 def describe_approval(entry: Mapping[str, Any]) -> str | None:
     """One line for an entry of `approvals.jsonl` (open items and their outcome)."""
     event = entry.get("event")
@@ -989,11 +996,17 @@ def describe_approval(entry: Mapping[str, Any]) -> str | None:
     what = request.get("command") or ", ".join(request.get("hosts") or request.get("paths") or [])
     match event:
         case "open":
-            return f"❓ Freigabe-Anfrage {item} von {who}" + (f": {what}" if what else "")
+            line = f"❓ Freigabe-Anfrage {item} von {who}" + (f": {what}" if what else "")
+            passed = entry.get("escalated_by") or {}
+            return line + (f" · {passed['note']}" if passed.get("note") else "")
         case "decided":
             action = "erlaubt" if decision.get("action") == "allow" else "abgelehnt"
             scope = decision.get("scope")
-            return f"✔ Freigabe {item} {action}" + (f" ({scope})" if scope else "")
+            line = f"✔ Freigabe {item} {action}" + (f" ({scope})" if scope else "")
+            by = _DECIDED_BY_WORDS.get(str(decision.get("decided_by")))
+            if by:  # W4-04: decided before it reached the user
+                line += f" {by}: {decision.get('reason') or ''}".rstrip(": ")
+            return line
         case "expired":
             return f"⌛ Freigabe {item} abgelaufen: abgelehnt."
         case "obsolete":
@@ -1130,7 +1143,7 @@ async def run_launch(
     done = asyncio.Event()
     follower = asyncio.create_task(follow_run(manager, report, done, interval_s=interval_s))
     stopper = asyncio.create_task(watch_stop_request(manager, report, done, interval_s=stop_poll_s))
-    names = {a.auth for a in launch.resolved.agents}
+    names = run_profiles(launch.resolved, launch.settings)  # with the supervising agent's
     blocker = asyncio.create_task(
         watch_blocked_profiles(
             manager, names, launch.profiles, report, done, interval_s=block_poll_s
