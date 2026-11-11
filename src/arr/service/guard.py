@@ -56,6 +56,11 @@ READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 MCP_PATH = "/mcp"
 """Mount point of the MCP server for Claude Code (W4-01)."""
 BEARER = "bearer "
+CSP_HEADER = b"content-security-policy"
+CSP = b"img-src 'self' data:; media-src 'self'; object-src 'none'; frame-src 'none'"
+"""On every HTTP answer of the service (W4-06.1, review W4-06 finding 2): the browser loads
+images and media only from the service itself, never from a host an agent names, and no
+plugin or frame. Second wall behind `markdown_html`, which shows external images as text."""
 
 Scope = MutableMapping[str, Any]
 Receive = Callable[[], Awaitable[MutableMapping[str, Any]]]
@@ -101,6 +106,18 @@ def refusal_page() -> str:
         "<p>Läuft arr schon, schließe diesen Tab und nimm den Tab, den arr geöffnet hat.</p>"
         "</body></html>"
     )
+
+
+def _with_csp(send: Send) -> Send:
+    """`send` that puts `CSP` on the start of every HTTP answer (replacing any other one)."""
+
+    async def wrapped(message: MutableMapping[str, Any]) -> None:
+        if message.get("type") == "http.response.start":
+            headers = [h for h in message.get("headers", []) if bytes(h[0]).lower() != CSP_HEADER]
+            message = {**message, "headers": [*headers, (CSP_HEADER, CSP)]}
+        await send(message)
+
+    return wrapped
 
 
 def _header(scope: Scope, name: bytes) -> str | None:
@@ -174,6 +191,8 @@ class Guard:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         kind = scope.get("type")
+        if kind == "http":
+            send = _with_csp(send)
         if kind in ("http", "websocket") and self.is_mcp(scope):
             await self._mcp(scope, receive, send)
         elif kind == "websocket":

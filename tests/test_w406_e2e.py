@@ -38,7 +38,7 @@ SUMMARY = """## Übersicht
 
 
 def test_the_overview_table_and_the_list_of_open_objections_are_html() -> None:
-    out = markdown_html(SUMMARY)
+    out = markdown_html(SUMMARY, tables=True)  # only the summary gets tables (W4-06.1)
     assert "<table>" in out and "<th>Runde</th>" in out and "<td>v2</td>" in out
     assert "| Runde |" not in out, "no running text with pipes"
     assert "<ul>" in out and "<li>E2 (offen" in out, "the list right after a line is a list"

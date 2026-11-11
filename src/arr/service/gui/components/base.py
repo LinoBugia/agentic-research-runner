@@ -151,16 +151,64 @@ def _tex_to_text(tex: str) -> str:
     return re.sub(r"\s+", " ", out).strip()
 
 
-def markdown_html(source: str) -> str:
-    """Render Markdown safely (raw HTML escaped) with `$…$` shown as math text."""
+def _is_external(src: str) -> bool:
+    """True for an image address the browser would fetch from elsewhere: any scheme
+    (`https:`, `data:`, `javascript:` …) or a host (`//host`, `/\\host`). Whitespace and
+    control characters are dropped and backslashes read as slashes, as browsers do."""
+    url = re.sub(r"[\x00-\x20\x7f]", "", html.unescape(src)).replace("\\", "/").lower()
+    return url.startswith("//") or re.match(r"[a-z][a-z0-9+.\-]*:", url) is not None
+
+
+def _image_as_text(match: re.Match[str]) -> str:
+    """An image with an external address as text, never loaded (W4-06.1, review finding 2):
+    an agent without network would otherwise send data to any host through the user's
+    browser. Relative images stay for `run_links_html` (files of the run)."""
+    tag = match.group(0)
+    src = _ATTR_SRC.search(tag)
+    if src is not None and not _is_external(src.group(1)):
+        return tag
+    alt = _ATTR_ALT.search(tag)
+    label = alt.group(1) if alt is not None and alt.group(1) else "ohne Titel"
+    title = f' title="{src.group(1)}"' if src is not None else ""
+    return f'<span class="ext-img"{title}>Bild: {label} (externe Adresse, nicht geladen)</span>'
+
+
+_IMG_TAG = re.compile(r"<img\b[^>]*>", re.I)
+_ATTR_SRC = re.compile(r'\bsrc="([^"]*)"', re.I)
+_ATTR_ALT = re.compile(r'\balt="([^"]*)"', re.I)
+_TAG = re.compile(r"<[A-Za-z][^>]*>")
+TABLE_LINE_MAX = 2000
+"""Tables only when no line with `|` is longer (markdown2's table search is quadratic in the
+length of such a line, review W4-06 finding 1)."""
+
+
+def _table_safe(text: str) -> bool:
+    return all(len(line) <= TABLE_LINE_MAX for line in text.split("\n") if "|" in line)
+
+
+def markdown_html(source: str, *, tables: bool = False) -> str:
+    """Render Markdown safely (raw HTML escaped) with `$…$` shown as math text.
+
+    `tables` renders Markdown tables; only for text arr writes itself (`summary.md`), and only
+    while no line with `|` exceeds `TABLE_LINE_MAX` (W4-06.1). Images with an external
+    address become text (`_image_as_text`). A text markdown2 cannot render (e.g. 300 nested
+    quotes: RecursionError) is shown escaped as it is, so the page still loads.
+    """
+    try:
+        return _markdown_html(source, tables=tables and _table_safe(source))
+    except RecursionError:
+        return f'<pre class="md-raw">{esc(source)}</pre>'
+
+
+def _markdown_html(source: str, *, tables: bool) -> str:
     nonce = secrets.token_hex(6)
     pieces: dict[str, list[str]] = {"B": [], "C": [], "M": []}
-    raws: dict[str, list[str]] = {"B": [], "C": []}  # code source, for code in a formula
+    raws: dict[str, list[str]] = {"B": [], "C": [], "M": []}  # source, for code in a formula
+    # and for a placeholder inside an attribute (title, alt, href)
 
     def hold(kind: str, html_text: str, raw_text: str = "") -> str:
         pieces[kind].append(html_text)
-        if kind in raws:
-            raws[kind].append(raw_text)
+        raws[kind].append(raw_text)
         return f"{_PH_OPEN}{kind}{nonce}{len(pieces[kind]) - 1}{_PH_CLOSE}"
 
     def code(match: re.Match[str]) -> str:
@@ -204,6 +252,7 @@ def markdown_html(source: str) -> str:
             "M",
             f'<span class="{cls}" title="{esc(tex)}" data-tex="{esc(tex)}">'
             f"{esc(_tex_to_text(tex))}</span>",
+            unmask(match.group(0)),
         )
 
     def keep_inline(match: re.Match[str]) -> str:
@@ -215,20 +264,33 @@ def markdown_html(source: str) -> str:
     marked = _MATH_RE.sub(keep_inline, _CODE_RE.sub(code, source))
     marked = marked.replace("\\$", dollar)
     # `_` inside a word is no emphasis: run IDs and snake_case keep their underscores.
-    # Tables and lists right after a line, as `summary.md` writes them (W4-06).
-    extras = {
+    # Lists right after a line, as `summary.md` writes them (W4-06); tables only on request.
+    extras: dict[str, Any] = {
         "fenced-code-blocks": None,
         "middle-word-em": False,
-        "tables": None,
         "cuddled-lists": None,
     }
+    if tables:
+        extras["tables"] = None
     rendered = markdown2.markdown(marked, safe_mode="escape", extras=extras)
+    placeholder = re.compile(rf"{_PH_OPEN}([BCM]){nonce}(\d+){_PH_CLOSE}")
 
     def back(match: re.Match[str]) -> str:
         table = pieces[match.group(1)]
         index = int(match.group(2))
         return table[index] if index < len(table) else match.group(0)
 
+    def source_back(match: re.Match[str]) -> str:
+        table = raws[match.group(1)]
+        index = int(match.group(2))
+        return esc(table[index]) if index < len(table) else ""
+
+    def in_attributes(match: re.Match[str]) -> str:
+        """Inside a tag only the source of a formula or code, never its HTML (review W4-06
+        finding 4: a `<span>` in a link title broke out of the attribute)."""
+        return placeholder.sub(source_back, match.group(0))
+
     rendered = re.sub(rf"<p>({_PH_OPEN}B{nonce}\d+{_PH_CLOSE})</p>", r"\1", rendered)
-    rendered = re.sub(rf"{_PH_OPEN}([BCM]){nonce}(\d+){_PH_CLOSE}", back, rendered)
-    return rendered.replace(dollar, "$")
+    rendered = _TAG.sub(in_attributes, rendered).replace(dollar, "$")
+    rendered = _IMG_TAG.sub(_image_as_text, rendered)  # on the final address
+    return placeholder.sub(back, rendered)
