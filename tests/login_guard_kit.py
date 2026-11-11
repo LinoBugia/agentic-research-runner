@@ -634,9 +634,11 @@ async def _backend_turn(backend: Any, turns: int = 1) -> None:
 
 
 def run_file_tools(
-    lab: Lab, script: list[ToolCall], decider: Any = None, *, turns: int = 1
+    lab: Lab, script: list[ToolCall], decider: Any = None, *, turns: int = 1, screener: Any = None
 ) -> FakeMessagesApi:
-    """`script` through the real backend: real hooks and `PolicyEngine`, outside the sandbox."""
+    """`script` through the real backend: real hooks and `PolicyEngine`, outside the sandbox.
+
+    `screener`: the supervising agent's stage in front of the decider (W4-04)."""
     with FakeMessagesApi(script) as api:
         engine = PolicyEngine([lab.profile], log=ApprovalLog(lab.run.run_dir / "approvals.jsonl"))
 
@@ -651,7 +653,12 @@ def run_file_tools(
         backend = ClaudeBackend(
             lab.agent,
             run_id=lab.run.run_id,
-            inbox=ApprovalInbox(engine, decider=decider, timeout=5 if decider else 0.05),
+            inbox=ApprovalInbox(
+                engine,
+                decider=decider,
+                timeout=5 if decider or screener else 0.05,
+                screener=screener,
+            ),
             auth=lab.auth,
             secret_reader=lambda _service, _account: lab.token,
             client_factory=factory,

@@ -14,6 +14,11 @@ run's `RunManager`. The inbox wakes the waiting agent. `GuiDecider` only keeps t
 for that; without a decision it expires in the inbox (counts as denied). Runs of `arr run` are
 decided in their terminal, here they are read-only.
 
+With a supervising agent (W4-04) an item it decided, or the mandate check denied, has no line
+`open`: its line `decided` (with `decided_by` and the reason) is the whole item, so it shows
+only in the history, never as a card or a notification. An item it passed on to the user
+carries `escalated_by` in its line `open` („Warum bei dir“).
+
 Questions of agents to the user (`@user`, docs/09 L16) are items „Frage“: `decide_approval`
 with `answer` posts the text as the user's answer into the channel, with `reply_to` on the
 question and to the asking agent, so `wait_for_messages` hands it over and a finished agent is
@@ -64,6 +69,7 @@ from arr.service.api_models import (
     DecisionResponse,
     Deviation,
     ErrorCode,
+    EscalatedByInfo,
     EscalationOptionInfo,
     Estimate,
     LastRating,
@@ -163,6 +169,9 @@ def _item_lines(entries: Sequence[Mapping[str, Any]]) -> dict[str, _Lines]:
                     and not is_run_start(entry)
                 )
         elif item_id not in items:
+            if event == "decided" and isinstance(entry.get("request"), Mapping):
+                # decided before it reached the user: supervising agent or mandate (W4-04)
+                items[item_id] = _Lines(entry, closed=entry)
             continue
         elif event == "decision":
             items[item_id].count += 1
@@ -230,6 +239,20 @@ def _consequences(request: Mapping[str, Any], agent: str) -> Consequences:
         deny=f"{agent} erfährt die Ablehnung und arbeitet ohne diese Aktion weiter.",
         expire=EXPIRE_TEXT,
     )
+
+
+def _escalated_by(entry: Mapping[str, Any]) -> EscalatedByInfo | None:
+    """Who passed an item on to the user and why, from its line `open` (W4-04)."""
+    data = entry.get("escalated_by")
+    if entry.get("event") != "open" or not isinstance(data, Mapping):
+        return None
+    try:
+        decider = DecidedBy(data.get("decider"))
+    except ValueError:
+        return None
+    if decider not in (DecidedBy.MANDATE_RULE, DecidedBy.GATEKEEPER):
+        return None
+    return EscalatedByInfo(decider=decider, note=str(data.get("note") or ""))
 
 
 def _decision_info(entry: Mapping[str, Any] | None) -> DecisionInfo | None:
@@ -427,6 +450,9 @@ class ApprovalReader:
             common["deadline"] = common["created_at"] + self._timeout(record)
         urls = [*(request.get("urls") or []), *(request.get("hosts") or [])]
         reason = assessment.get("reason") or "Braucht eine Freigabe."
+        why = f"{reason} Feste Regeln entscheiden das nicht allein, darum fragt arr dich."
+        if lines.opened.get("event") != "open":
+            why = None  # decided before it reached the user
         rule = self._rule(record.run_id, common["id"])
         label, effects = _rule_text(rule) if rule is not None else (None, [])
         return ApprovalItem(
@@ -441,7 +467,8 @@ class ApprovalReader:
             reason=request.get("reason"),
             risk=RiskInfo.model_validate(risk) if isinstance(risk, Mapping) else _UNKNOWN_RISK,
             categories=categories,
-            why=f"{reason} Feste Regeln entscheiden das nicht allein, darum fragt arr dich.",
+            why=why,
+            escalated_by=_escalated_by(lines.opened),
             consequences=_consequences(request, agent.id),
             content_to=[agent.vendor] if RequestCategory.READ_OUTSIDE in categories else [],
             rule_label=label,
@@ -744,7 +771,8 @@ class ApprovalsArea:
         if not item.revocable or inbox is None:
             raise not_allowed(
                 "Diese Entscheidung lässt sich nicht zurückziehen. Zurückziehen geht bei "
-                "Entscheidungen mit Reichweite Agent oder Run, solange der Run läuft."
+                "Entscheidungen des Aufsichts-Agenten und bei deinen mit Reichweite Agent oder "
+                "Run, solange der Run läuft."
             )
         try:
             inbox.revoke(approval_id)

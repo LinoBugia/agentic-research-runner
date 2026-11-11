@@ -67,3 +67,29 @@ def restore_root_logger() -> Iterator[logging.Logger]:
             handler.close()
     root.handlers[:] = handlers
     root.setLevel(level)
+
+
+@pytest.fixture(autouse=True)
+def no_real_gatekeeper(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """No test without the marker `live` calls the real supervising agent (W4-04): a run with
+    `decider: gatekeeper…` gets a model that refuses, and the test fails afterwards."""
+    if request.node.get_closest_marker("live") is not None:
+        yield
+        return
+    asked: list[str] = []
+
+    def refuse(*_args: object) -> object:
+        class Refusing:
+            model = "refused"
+
+            async def ask(self, system: str, prompt: str) -> object:
+                asked.append(prompt)
+                raise RuntimeError("Der echte Aufsichts-Agent ist in Tests gesperrt.")
+
+        return Refusing()
+
+    monkeypatch.setattr("arr.runs.manager.default_gatekeeper_model", refuse)
+    yield
+    assert not asked, "Der echte Aufsichts-Agent wurde ohne live-Marker gerufen."

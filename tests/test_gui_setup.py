@@ -201,7 +201,8 @@ async def test_settings_page_saves_and_removes_a_rule(wf: Path) -> None:
     async with real_user(wf) as (user, api):
         await user.open("/einstellungen")
         html = await see(user, "pypi.org")
-        assert "Freigaben und Vollmacht" in html and "kommt mit Auftrag W4-04" in html
+        assert "Freigaben und Vollmacht" in html and "Deine Vollmacht" in html  # W4-04
+        assert "Die Vollmacht ist noch nicht angelegt." in html
         assert "Standards und Limits" in html and "Aufräumregeln" in html
         user.find(marker="save-approvals").click()
         await see(user, "Gespeichert: Freigaben")

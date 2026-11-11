@@ -65,6 +65,7 @@ Endpoints (REST under `/api`, docs/04 §3 and docs/08 §5; `ApiClient` method in
                                                  [get_/update_workfolder_settings]
     GET/PUT /api/mandates/{name}                 MandateInfo, PUT with MandateUpdate
                                                  [get_mandate, update_mandate]
+    POST /api/mandates/{name}/check              MandateUpdate → MandateInfo  [check_mandate]
     GET  /api/rules · DELETE /api/rules/{id}     list[FixedRule]
                                                  [list_fixed_rules, delete_fixed_rule]
     POST /api/toolchain/test                     ToolchainTestResult     [test_toolchain]
@@ -1900,11 +1901,16 @@ class WorkfolderSettingsInfo(ApiModel):
 
 
 class MandateChecks(ApiModel):
-    """Parts of the mandate that arr checks itself (docs/07 §4 „Vollmacht (von arr geprüft)“)."""
+    """Parts of the mandate that arr checks itself (docs/07 §4 „Vollmacht (von arr geprüft)“).
+
+    `install`: `pypi` for `pip install` from PyPI into the run venv (W4-04). Read folders
+    cannot be granted by a mandate in v1, so `read_dirs` stays empty with the real service.
+    """
 
     domains: list[str] = Field(default_factory=list)
     read_dirs: list[str] = Field(default_factory=list)
     packages: list[str] = Field(default_factory=list)
+    install: str | None = None
 
 
 class MandateInfo(ApiModel):
@@ -1917,6 +1923,10 @@ class MandateInfo(ApiModel):
     checked: MandateChecks = Field(default_factory=MandateChecks)
     running_runs: int = Field(default=0, ge=0)
     example: str | None = Field(default=None, description="For „Beispiel einfügen“")
+    exists: bool = Field(default=True, description="False: the file is missing, `text` = example")
+    problem: str | None = Field(
+        default=None, description="Why the saved mandate is not valid (then nothing passes it)"
+    )
 
 
 class MandateUpdate(ApiModel):

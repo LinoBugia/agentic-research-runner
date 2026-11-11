@@ -5,7 +5,9 @@
 
 - `preparing`: `prepare_run` (also into a reserved folder), `tmp/<id>/` per agent, the run
   venv (with `run_venv: overlay`), `groupchats/room.sqlite` with the channels, the
-  PolicyEngine with one profile per agent, the `ApprovalInbox` with the given decider, one
+  PolicyEngine with one profile per agent, the `ApprovalInbox` with the given decider (and,
+  with `decider: gatekeeper` or `gatekeeper_then_user`, the supervising agent's stage in front
+  of it, W4-04), one
   EventLogger and one backend per agent (from the backend factory, after the profiles are
   registered), `start()`.
 - `running` ⇄ `paused`: the topology runs with the `Orchestrator` as `RunContext`; limits,
@@ -32,9 +34,12 @@ from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequen
 from datetime import datetime
 from pathlib import Path
 
-from arr.backends.base import AgentBackend
+from arr.backends.base import AgentBackend, Usage
 from arr.errors import ArrError
 from arr.models import (
+    AuthProfile,
+    Decider,
+    GatekeeperSettings,
     ProfilesFile,
     ResolvedRun,
     RunInput,
@@ -42,6 +47,15 @@ from arr.models import (
     RunVenvMode,
     Starter,
     WorkfolderSettings,
+)
+from arr.permissions.gatekeeper import (
+    ClaudeGatekeeperModel,
+    GatekeeperLog,
+    GatekeeperModel,
+    GatekeeperStage,
+    gatekeeper_auth,
+    gatekeeper_profile,
+    run_profiles,
 )
 from arr.permissions.inbox import ApprovalDecider, ApprovalInbox
 from arr.permissions.policy import (
@@ -95,6 +109,16 @@ BackendFactory = Callable[[PreparedAgent], AgentBackend]
 """Builds the backend of one agent; W2-05 wires `ClaudeBackend`/`CodexBackend`."""
 Finalizer = Callable[[PreparedRun], Awaitable[None]]
 """Runs in `finalizing`, also after stop, limit or error (W2-04)."""
+GatekeeperModelFactory = Callable[[GatekeeperSettings, AuthProfile, list[Path]], GatekeeperModel]
+"""Builds the model of the supervising agent: settings, its profile, the run's write roots."""
+
+
+def default_gatekeeper_model(
+    settings: GatekeeperSettings, auth: AuthProfile, write_roots: list[Path]
+) -> GatekeeperModel:
+    """The real supervising agent: the Claude CLI without tools (W4-04)."""
+    return ClaudeGatekeeperModel(model=settings.model, profile=auth, write_roots=write_roots)
+
 
 INTERRUPTIBLE_STATUSES = frozenset(
     {RunStatus.PREPARING, RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.FINALIZING}
@@ -284,6 +308,7 @@ class RunManager:
         venv_with_pip: bool = True,
         gates: MutableMapping[str, ProfileGate] | None = None,
         lock: RunLock | None = None,
+        gatekeeper_model: GatekeeperModelFactory | None = None,
     ) -> None:
         self.workfolder = Path(workfolder).expanduser().absolute()
         self.run_input = run_input
@@ -298,6 +323,7 @@ class RunManager:
         self.stop_grace_s = stop_grace_s
         self.venv_with_pip = venv_with_pip
         self.gates = gates
+        self.gatekeeper_model = gatekeeper_model
         self._lock = lock
         self._own_lock = False
         self._prepare_args: Mapping[str, object] = {
@@ -368,7 +394,7 @@ class RunManager:
         """
         from arr.runs.launch import UNREADABLE, blocked_profiles  # launch imports this module
 
-        names = {agent.auth for agent in self.resolved.agents if agent.auth}
+        names = run_profiles(self.resolved, self.settings)  # with the supervising agent's
         known = self._prepare_args.get("profiles")
         if not isinstance(known, ProfilesFile):
             known = ProfilesFile()
@@ -536,9 +562,17 @@ class RunManager:
 
         rules = PermissionRules.from_settings(self.settings.permissions)
         engine = PolicyEngine([], rules=rules, log=ApprovalLog(run_dir / "approvals.jsonl"))
+        write_roots: list[Path] = []
         for agent in prepared.agents.values():
-            engine.add_profile(profile_for(agent.file.config, paths, rules))
-        self.inbox = ApprovalInbox(engine, decider=self.decider, timeout=resolved.approvals.timeout)
+            profile = profile_for(agent.file.config, paths, rules)
+            engine.add_profile(profile)
+            write_roots += [r for r in profile.write_roots if r not in write_roots]
+        self.inbox = ApprovalInbox(
+            engine,
+            decider=self.decider,
+            timeout=resolved.approvals.timeout,
+            screener=self._gatekeeper(run_dir, write_roots),
+        )
 
         for agent_id, agent in prepared.agents.items():
             self.loggers[agent_id] = EventLogger(agent.agent_dir)
@@ -558,6 +592,53 @@ class RunManager:
             log=self.log,
             on_pause=self._on_pause,
             gates=self.gates,
+        )
+
+    def _gatekeeper(self, run_dir: Path, write_roots: list[Path]) -> GatekeeperStage | None:
+        """The supervising agent's stage in front of the user (W4-04), None for `decider: user`.
+
+        Its profile is `approvals.gatekeeper.auth`, else the Claude default of `arr.yaml`; a
+        missing or non-Claude profile means no call (the user decides). Its cost is booked on
+        the run's budget, and a call needs budget left.
+        """
+        approvals = self.resolved.approvals
+        settings = approvals.gatekeeper
+        if approvals.decider is Decider.USER or settings is None:
+            return None
+        known = self._prepare_args.get("profiles")
+        if not isinstance(known, ProfilesFile):
+            known = ProfilesFile()
+        auth = gatekeeper_profile(gatekeeper_auth(self.resolved, self.settings), None, known)
+        factory = self.gatekeeper_model or default_gatekeeper_model
+        budget = self.resolved.limits.budget_usd
+
+        def budget_left() -> bool:
+            orch = self.orchestrator
+            return budget is None or orch is None or orch.cost_usd < budget
+
+        def charge(usage: Usage) -> None:
+            if self.orchestrator is not None:
+                self.orchestrator.add_cost(usage.cost_usd)
+
+        def is_blocked(name: str) -> bool | None:
+            from arr.runs.launch import UNREADABLE, blocked_profiles
+
+            try:
+                return bool(blocked_profiles([name], known))
+            except UNREADABLE:
+                return None
+
+        return GatekeeperStage(
+            to_user=approvals.decider is Decider.GATEKEEPER_THEN_USER,
+            workfolder=self.workfolder,
+            mandate=settings.mandate,
+            model=factory(settings, auth, write_roots) if auth is not None else None,
+            profile=auth.name if auth is not None else None,
+            log=GatekeeperLog(run_dir),
+            profiles=known,
+            budget_left=budget_left,
+            charge=charge,
+            is_blocked=is_blocked,
         )
 
     async def _run_topology(self) -> None:

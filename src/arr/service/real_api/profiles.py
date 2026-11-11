@@ -45,6 +45,7 @@ from arr.backends.codex_config import codex_home_for
 from arr.backends.codex_login import own_login_folder
 from arr.errors import ArrError
 from arr.models import AuthKind, AuthProfile, ProfilesFile, Provider
+from arr.permissions.gatekeeper import run_profiles
 from arr.resolve import dump_yaml_model
 from arr.runs.launch import PROFILES_FILE, load_profiles
 from arr.service.api_models import (
@@ -350,12 +351,13 @@ class ProfilesArea:
         return self._info(profile)
 
     def _run_ids(self, name: str) -> list[str]:
-        """Active runs of the workfolder on this profile; one that cannot say counts."""
+        """Active runs of the workfolder on this profile, also as the profile of their
+        supervising agent (W4-04.1, M4); one that cannot say counts."""
         ids = []
         for record in self.state.store.scan():
             if record.status.is_active:
                 resolved = record.load_resolved()
-                if resolved is None or any(a.auth == name for a in resolved.agents):
+                if resolved is None or name in run_profiles(resolved, self.state.settings):
                     ids.append(record.run_id)
         return ids
 

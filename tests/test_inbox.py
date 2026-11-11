@@ -516,7 +516,11 @@ async def test_b3_resolve_from_another_thread(engine: PolicyEngine) -> None:
     assert sorted(results) == ["closed"] * 4 + ["ok"]
 
 
-async def test_b3_revoke_gatekeeper_once_is_a_no_op(engine: PolicyEngine) -> None:
+async def test_b3_revoke_gatekeeper_once_sends_equal_requests_to_the_user(
+    engine: PolicyEngine,
+) -> None:
+    """W4-04: withdrawing a one-time decision of the supervising agent keeps no grant, and
+    equal requests of the run skip it from now on (docs/08 §5.2, `test_gatekeeper`)."""
     assert engine.log is not None
     inbox = ApprovalInbox(engine, timeout=5)
     waiting = asyncio.create_task(inbox.handle(install()))
@@ -528,7 +532,7 @@ async def test_b3_revoke_gatekeeper_once_is_a_no_op(engine: PolicyEngine) -> Non
     revoked = inbox.revoke(item.id)
     assert revoked.status is ApprovalStatus.REVOKED
     last = engine.log.entries()[-1]
-    assert last["event"] == "revoked" and "Einmalige" in last["note"]
+    assert last["event"] == "revoked" and "nicht mehr der Aufsichts-Agent" in last["note"]
     # the next identical request asks again (nothing was remembered)
     assert engine.evaluate(install()).action is DecisionAction.ASK
 
