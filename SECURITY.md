@@ -84,6 +84,7 @@ These hold on every platform.
   - The kill switch knows the supervising agent's profile: blocking it stops the run and cancels a running call, whose answer then does not count.
   - Withdrawing a decision takes effect at once, also for requests already being checked.
   - The prompt shows only the asking agent's own history.
+- **Agent text in the GUI:** The GUI holds the service token, so script in the page could click approvals for the user. All agent and skill text is rendered with every `<` escaped before Markdown. The HTML is then rebuilt from an allowlist of tags and attributes with no event handlers or styles; links may only be `http`, `https`, `mailto` or relative, and images only relative. Images from other addresses are shown as text and never loaded. A Content-Security-Policy on every response (`img-src 'self' data:`, `media-src 'self'`, `object-src 'none'`, `frame-src 'none'`, `script-src-attr 'none'`) is a second wall for images and event handlers. It does not stop `javascript:` links or inline scripts (NiceGUI writes inline scripts without a nonce), so for those the allowlist is the only wall.
 - **Codex project config:** `arr` records the state of the work folder's `.codex/` at run start and starts no further thread once it has changed.
 - **Tests:** Escape tests run the real CLIs against a fake model server in a test `HOME` with random bait files, and check results by exit code only. A `security` stub keeps the real keychain out of every lab.
 
@@ -113,6 +114,9 @@ These hold on every platform.
 | 12 | An agent puts an expression into its result that runs as Python when the user's agent checks it with `sympy-check` outside the sandbox | closed (W4-05.1): allowlist before parsing; 99 attacks, none ran code |
 | 13 | The supervising agent's call inherited a login or API address from the `arr` process, so it could run on another login, or send the profile's secret elsewhere, while being counted on the profile | closed (W4-04.1): cleaned environment before every call; measured with the real CLI against a fake API |
 | 14 | Agents pass text to each other through the supervising agent's prompt history and its reasons, around chat and seals | closed (W4-04.1): the prompt shows only the asking agent's history |
+| 15 | An agent writes a Markdown image with an outside address into chat or a transcript; the user's browser loads it and so sends data out without any approval | closed (W4-06.1): such images are shown as text; CSP `img-src 'self' data:` |
+| 16 | Agent text runs JavaScript in the GUI (the Markdown library's safe mode left `<` after a letter raw, so an element with an event handler fired without a click); script there acts as the user, for example on approvals | closed (W4-06.2), present since W1-06: escaping and tag allowlist, plus CSP `script-src-attr 'none'`; `javascript:` links are held by the allowlist alone |
+| 17 | Very large agent texts (transcripts, summaries) block the service for seconds while they are rendered | **open**, no code runs; follow-up planned (size limit or rendering off the event loop) |
 
 Closing the ways we found does not prove that there are no others. Every review so far has found new ones.
 
