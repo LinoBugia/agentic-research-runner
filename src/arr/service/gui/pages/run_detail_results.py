@@ -219,11 +219,13 @@ def results_html(results: RunResults, handoff: str, run_dir: str) -> str:
             if results.summary_path
             else ""
         )
+        # tables only here: arr writes this file, agent text in it is one short line (W4-06.1)
+        summary = markdown_html(results.summary_md, tables=True)
         parts.append(
             '<section class="card summary" aria-labelledby="h-summary"><div class="card-head">'
             f'<h2 id="h-summary">Zusammenfassung</h2>{path}</div>'
             f'<div class="prose">'
-            f"{run_links_html(markdown_html(results.summary_md), summary_file, results.items)}"
+            f"{run_links_html(summary, summary_file, results.items)}"
             "</div></section>"
         )
     parts.append(handoff_html(handoff, run_dir))

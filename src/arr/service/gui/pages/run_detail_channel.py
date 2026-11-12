@@ -339,7 +339,7 @@ class ChannelView:
         form = (
             ui.element("form")
             .classes("composer")
-            .props(f'aria-label="Nachricht in #{esc(info.name)} schreiben" onsubmit="return false"')
+            .props(f'aria-label="Nachricht in #{esc(info.name)} schreiben"')  # no submit: arr.js
         )
         with form:
             raw(

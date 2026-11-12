@@ -319,6 +319,14 @@ body:has(.appr .af) .toasts { bottom: 84px; }
 .att.live { color: var(--run); border-color: var(--run); background: var(--run-bg); }
 .prose p:last-child { margin-bottom: 0; }
 .prose ul { margin: 0 0 var(--s2); }
+/* W4-06: Markdown tables (summary.md overview) scroll sideways instead of widening the page */
+.prose table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 0 0 var(--s2); }
+.prose th, .prose td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; vertical-align: top; }
+.prose th { background: var(--surface-2); font-weight: 600; }
+/* W4-06.1: an image with an external address is text, never loaded; text markdown2 cannot
+   render is shown as it is */
+.prose .ext-img { color: var(--text-2); font-style: italic; }
+.prose pre.md-raw { white-space: pre-wrap; overflow-wrap: anywhere; }
 .prose details summary { cursor: pointer; color: var(--text-2); margin-top: 4px; }
 .math { font-family: "STIX Two Math", "Cambria Math", "Times New Roman", serif; font-style: italic; font-size: 15px; }
 .task { max-height: 220px; overflow: auto; }

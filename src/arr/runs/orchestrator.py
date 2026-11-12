@@ -91,6 +91,7 @@ __all__ = [
     "PLAN_STAGE",
     "LimitKind",
     "LongWait",
+    "OpenUserQuestion",
     "Orchestrator",
     "OrchestratorLog",
     "ProfileGate",
@@ -320,6 +321,17 @@ class _Listener(Protocol):
     def on_message(self, msg: Message) -> None: ...
     def on_turn_end(self, agent_id: str, undelivered: Sequence[Message]) -> None: ...
     def kick(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class OpenUserQuestion:
+    """A question of an agent to the user that is still open: message, inbox item, asker and
+    the time it was asked (Unix time)."""
+
+    msg_id: int
+    item_id: str
+    agent: str
+    asked: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -1386,6 +1398,23 @@ class Orchestrator(RunContext):
             item=item.id,
             state="open",
         )
+
+    def open_user_questions(self, channel: str) -> list[OpenUserQuestion]:
+        """Questions of agents to the user in `channel` that are still open (L16), oldest
+        first; for the end of a discussion phase (B3, W4-06.1)."""
+        out = []
+        for msg_id, item_id in list(self._questions.items()):
+            try:
+                msg = self.room.message(msg_id)
+            except ArrError:
+                continue
+            if msg.channel == channel:
+                out.append(OpenUserQuestion(msg_id, item_id, msg.sender, msg.ts))
+        return out
+
+    def user_question_open(self, msg_id: int) -> bool:
+        """True while the question `msg_id` to the user is neither answered nor closed."""
+        return msg_id in self._questions
 
     def _close_answered_questions(self, answer: Message) -> None:
         """The user wrote in the channel: the questions this message answers (`reply_to` on

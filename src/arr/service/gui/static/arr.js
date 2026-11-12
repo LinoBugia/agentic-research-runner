@@ -9,6 +9,14 @@
 (function () {
   "use strict";
   const arr = (window.arr = window.arr || {});
+  // No inline handlers (CSP `script-src-attr 'none'`, W4-06.2): the reconnect button and the
+  // chat form get their behaviour here.
+  document.addEventListener("click", (e) => {
+    if (e.target.closest && e.target.closest("[data-reload]")) location.reload();
+  });
+  document.addEventListener("submit", (e) => {
+    if (e.target.matches && e.target.matches("form.composer")) e.preventDefault();
+  }, true);
   const root = document.documentElement;
   const params = new URLSearchParams(location.search);
   const theme = params.get("theme");

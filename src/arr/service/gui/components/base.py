@@ -9,6 +9,7 @@ import html
 import re
 import secrets
 from collections.abc import Awaitable, Callable
+from html.parser import HTMLParser
 from typing import Any
 
 import markdown2
@@ -151,16 +152,64 @@ def _tex_to_text(tex: str) -> str:
     return re.sub(r"\s+", " ", out).strip()
 
 
-def markdown_html(source: str) -> str:
-    """Render Markdown safely (raw HTML escaped) with `$…$` shown as math text."""
+def _is_external(src: str) -> bool:
+    """True for an image address the browser would fetch from elsewhere: any scheme
+    (`https:`, `data:`, `javascript:` …) or a host (`//host`, `/\\host`). Whitespace and
+    control characters are dropped and backslashes read as slashes, as browsers do."""
+    url = re.sub(r"[\x00-\x20\x7f]", "", html.unescape(src)).replace("\\", "/").lower()
+    return url.startswith("//") or re.match(r"[a-z][a-z0-9+.\-]*:", url) is not None
+
+
+def _image_as_text(match: re.Match[str]) -> str:
+    """An image with an external address as text, never loaded (W4-06.1, review finding 2):
+    an agent without network would otherwise send data to any host through the user's
+    browser. Relative images stay for `run_links_html` (files of the run)."""
+    tag = match.group(0)
+    src = _ATTR_SRC.search(tag)
+    if src is not None and not _is_external(src.group(1)):
+        return tag
+    alt = _ATTR_ALT.search(tag)
+    label = alt.group(1) if alt is not None and alt.group(1) else "ohne Titel"
+    title = f' title="{src.group(1)}"' if src is not None else ""
+    return f'<span class="ext-img"{title}>Bild: {label} (externe Adresse, nicht geladen)</span>'
+
+
+_IMG_TAG = re.compile(r"<img\b[^>]*>", re.I)
+_ATTR_SRC = re.compile(r'\bsrc="([^"]*)"', re.I)
+_ATTR_ALT = re.compile(r'\balt="([^"]*)"', re.I)
+_TAG = re.compile(r"<[A-Za-z][^>]*>")
+TABLE_LINE_MAX = 500
+"""Tables only when no line with `|` is longer (markdown2's table search is quadratic in the
+length of such a line, review W4-06 finding 1)."""
+
+
+def _table_safe(text: str) -> bool:
+    return all(len(line) <= TABLE_LINE_MAX for line in text.split("\n") if "|" in line)
+
+
+def markdown_html(source: str, *, tables: bool = False) -> str:
+    """Render Markdown safely (raw HTML escaped) with `$…$` shown as math text.
+
+    `tables` renders Markdown tables; only for text arr writes itself (`summary.md`), and only
+    while no line with `|` exceeds `TABLE_LINE_MAX` (W4-06.1). Images with an external
+    address become text (`_image_as_text`). A text markdown2 cannot render (e.g. 300 nested
+    quotes: RecursionError) is shown escaped as it is, so the page still loads.
+    """
+    try:
+        return _markdown_html(source, tables=tables and _table_safe(source))
+    except RecursionError:
+        return f'<pre class="md-raw">{esc(source)}</pre>'
+
+
+def _markdown_html(source: str, *, tables: bool) -> str:
     nonce = secrets.token_hex(6)
     pieces: dict[str, list[str]] = {"B": [], "C": [], "M": []}
-    raws: dict[str, list[str]] = {"B": [], "C": []}  # code source, for code in a formula
+    raws: dict[str, list[str]] = {"B": [], "C": [], "M": []}  # source, for code in a formula
+    # and for a placeholder inside an attribute (title, alt, href)
 
     def hold(kind: str, html_text: str, raw_text: str = "") -> str:
         pieces[kind].append(html_text)
-        if kind in raws:
-            raws[kind].append(raw_text)
+        raws[kind].append(raw_text)
         return f"{_PH_OPEN}{kind}{nonce}{len(pieces[kind]) - 1}{_PH_CLOSE}"
 
     def code(match: re.Match[str]) -> str:
@@ -204,6 +253,7 @@ def markdown_html(source: str) -> str:
             "M",
             f'<span class="{cls}" title="{esc(tex)}" data-tex="{esc(tex)}">'
             f"{esc(_tex_to_text(tex))}</span>",
+            unmask(match.group(0)),
         )
 
     def keep_inline(match: re.Match[str]) -> str:
@@ -214,15 +264,148 @@ def markdown_html(source: str) -> str:
     dollar = f"{_PH_OPEN}D{nonce}{_PH_CLOSE}"
     marked = _MATH_RE.sub(keep_inline, _CODE_RE.sub(code, source))
     marked = marked.replace("\\$", dollar)
-    # `_` inside a word is no emphasis: run IDs and snake_case keep their underscores
-    extras = {"fenced-code-blocks": None, "middle-word-em": False}
+    # First wall against script (W4-06.2, N1): no `<` of the text reaches markdown2 as markup.
+    # Its safe mode escaped whole tags but left `<a` before another tag raw (`<a<b> on…=`).
+    # Code and formulas are placeholders here and escape their own text.
+    marked = marked.replace("<", "&lt;")
+    # `_` inside a word is no emphasis: run IDs and snake_case keep their underscores.
+    # Lists right after a line, as `summary.md` writes them (W4-06); tables only on request.
+    extras: dict[str, Any] = {
+        "fenced-code-blocks": None,
+        "middle-word-em": False,
+        "cuddled-lists": None,
+    }
+    if tables:
+        extras["tables"] = None
     rendered = markdown2.markdown(marked, safe_mode="escape", extras=extras)
+    placeholder = re.compile(rf"{_PH_OPEN}([BCM]){nonce}(\d+){_PH_CLOSE}")
 
     def back(match: re.Match[str]) -> str:
         table = pieces[match.group(1)]
         index = int(match.group(2))
         return table[index] if index < len(table) else match.group(0)
 
+    def source_back(match: re.Match[str]) -> str:
+        table = raws[match.group(1)]
+        index = int(match.group(2))
+        return esc(table[index]) if index < len(table) else ""
+
+    def in_attributes(match: re.Match[str]) -> str:
+        """Inside a tag only the source of a formula or code, never its HTML (review W4-06
+        finding 4: a `<span>` in a link title broke out of the attribute)."""
+        return placeholder.sub(source_back, match.group(0))
+
     rendered = re.sub(rf"<p>({_PH_OPEN}B{nonce}\d+{_PH_CLOSE})</p>", r"\1", rendered)
-    rendered = re.sub(rf"{_PH_OPEN}([BCM]){nonce}(\d+){_PH_CLOSE}", back, rendered)
-    return rendered.replace(dollar, "$")
+    rendered = _TAG.sub(in_attributes, rendered).replace(dollar, "$")
+    rendered = _IMG_TAG.sub(_image_as_text, rendered)  # on the final address
+    return clean_html(placeholder.sub(back, rendered))
+
+
+# --- Allowed HTML of rendered text (W4-06.2, N1) ---------------------------------------------
+# Second check of the first wall: the output of markdown2 plus arr's own code and formula
+# pieces is parsed again and rebuilt from a list of tags and attributes. Everything else (an
+# unknown tag, `on…`, `style` but table alignment, a comment, `<!`, `<?`) becomes text.
+
+_PLAIN_TAGS = frozenset(
+    {"p", "h1", "h2", "h3", "h4", "h5", "h6", "table", "thead", "tbody", "tr", "ul", "li"}
+    | {"em", "strong", "blockquote", "hr", "br", "del", "sup", "sub", "pre"}
+)
+_ALLOWED_ATTRS: dict[str, frozenset[str]] = {
+    "a": frozenset({"href", "title"}),
+    "img": frozenset({"src", "alt", "title"}),
+    "span": frozenset({"class", "title", "data-tex"}),
+    "code": frozenset({"class"}),
+    "th": frozenset({"style"}),
+    "td": frozenset({"style"}),
+    "ol": frozenset({"start"}),
+    **{tag: frozenset() for tag in _PLAIN_TAGS},
+}
+_SPAN_CLASSES = frozenset({"math", "math math-display", "ext-img"})
+_LINK_SCHEMES = frozenset({"http", "https", "mailto"})
+_SCHEME = re.compile(r"([a-z][a-z0-9+.\-]*):")
+
+
+def _scheme_of(url: str) -> str | None:
+    """Scheme of an address as a browser reads it (no whitespace or control characters,
+    `\\` as `/`), lower case; None for a relative address."""
+    clean = re.sub(r"[\x00-\x20\x7f]", "", url).replace("\\", "/").lower()
+    match = _SCHEME.match(clean)
+    return match.group(1) if match else None
+
+
+def _attr_ok(tag: str, name: str, value: str) -> bool:
+    if name not in _ALLOWED_ATTRS.get(tag, frozenset()):
+        return False
+    if name == "href":
+        scheme = _scheme_of(value)
+        return scheme is None or scheme in _LINK_SCHEMES
+    if name == "src":
+        return not _is_external(value)
+    if name == "class":
+        if tag == "span":
+            return value in _SPAN_CLASSES
+        return re.fullmatch(r"language-[\w+#.\-]{1,40}", value) is not None
+    if name == "style":
+        return re.fullmatch(r"text-align:\s*(left|right|center);?", value) is not None
+    if name == "start":
+        return value.isdigit() and len(value) < 10
+    return True
+
+
+class _Cleaner(HTMLParser):
+    """Rebuilds HTML from allowed tags and attributes; the rest is escaped text."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.out: list[str] = []
+
+    def _tag(self, tag: str, attrs: list[tuple[str, str | None]], end: str) -> None:
+        if tag not in _ALLOWED_ATTRS:
+            self.out.append(esc(self.get_starttag_text() or ""))
+            return
+        if tag == "img" and not any(n == "src" and _attr_ok(tag, n, v or "") for n, v in attrs):
+            return  # an image without an address of the run is no image
+        kept = "".join(
+            f' {name}="{esc(value or "")}"'
+            for name, value in attrs
+            if _attr_ok(tag, name, value or "")
+        )
+        self.out.append(f"<{tag}{kept}{end}>")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._tag(tag, attrs, "")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._tag(tag, attrs, " /")
+
+    def handle_endtag(self, tag: str) -> None:
+        self.out.append(f"</{tag}>" if tag in _ALLOWED_ATTRS else esc(f"</{tag}>"))
+
+    def handle_data(self, data: str) -> None:
+        self.out.append(html.escape(data, quote=False))
+
+    def handle_entityref(self, name: str) -> None:
+        self.out.append(f"&{name};" if name.isalnum() else esc(f"&{name};"))
+
+    def handle_charref(self, name: str) -> None:
+        self.out.append(f"&#{name};" if re.fullmatch(r"x?[0-9a-fA-F]+", name) else "")
+
+    def handle_comment(self, data: str) -> None:
+        self.out.append(esc(f"<!--{data}-->"))
+
+    def handle_decl(self, decl: str) -> None:
+        self.out.append(esc(f"<!{decl}>"))
+
+    def unknown_decl(self, data: str) -> None:
+        self.out.append(esc(f"<![{data}]>"))
+
+    def handle_pi(self, data: str) -> None:
+        self.out.append(esc(f"<?{data}>"))
+
+
+def clean_html(markup: str) -> str:
+    """`markup` with only the tags and attributes rendered Markdown needs (W4-06.2)."""
+    cleaner = _Cleaner()
+    cleaner.feed(markup)
+    cleaner.close()
+    return "".join(cleaner.out)
