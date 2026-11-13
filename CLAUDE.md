@@ -2,8 +2,10 @@
 
 `arr` (agentic research runner) ist eine lokale Bibliothek für Mathe-Projekte plus Agent-Harness mit Web-GUI. Aus einem Claude-Code-Chat heraus startet arr Research-Groups aus Claude- und ChatGPT-Agenten mit eigenen Arbeitsordnern, Rollen und Gruppenchats.
 
-- **Doku liegt nur lokal** im Haupt-Ordner des Repos, nicht im Git (`docs/`, `umsetzung/`; im Git nur [umsetzung/Codeplan_Ablauf.md](umsetzung/Codeplan_Ablauf.md)). In Worktrees und Klonen fehlt sie: Pfade daher immer im Haupt-Ordner lesen.
-- Planung und Entwurf: [docs/](docs/) – Einstieg [00 Projektauftrag](docs/00-projektauftrag.md), [01 Architektur](docs/01-architektur.md)
+- **Interne Doku liegt nur lokal** im Haupt-Ordner des Repos, nicht im Git (`research-docs/`, `umsetzung/`; im Git nur [umsetzung/Codeplan_Ablauf.md](umsetzung/Codeplan_Ablauf.md)). In Worktrees und Klonen fehlt sie: Pfade daher immer im Haupt-Ordner lesen.
+- **Öffentliche Doku** liegt in [docs/](docs/), auf Englisch und im Git. Einstieg: [Research groups](docs/research-groups.md).
+- In Kommentaren im Code meint `docs/NN` (z. B. `docs/09 §4`) das Entwurfsdokument `research-docs/NN-…`; bis 13.11.2026 hieß der Ordner `docs/`.
+- Planung und Entwurf: [research-docs/](research-docs/) – Einstieg [00 Projektauftrag](research-docs/00-projektauftrag.md), [01 Architektur](research-docs/01-architektur.md)
 - Umsetzung: [umsetzung/](umsetzung/) – [Codeplan](umsetzung/Codeplan.md), [Arbeitsweise](umsetzung/Arbeitsweise.md)
 
 ## Befehle
@@ -30,7 +32,7 @@ Vor jedem Commit: `uv run pytest && uv run ruff check && uv run ruff format --ch
 
 ## Struktur
 
-- `src/arr/` – Paket nach [01 §2](docs/01-architektur.md#2-paketstruktur-vorschlag); Einstieg CLI: `arr.cli:app` (Typer), neue Befehle als Unterbefehle anhängen. Logging: `arr.log.setup_logging()`.
+- `src/arr/` – Paket nach [01 §2](research-docs/01-architektur.md#2-paketstruktur-vorschlag); Einstieg CLI: `arr.cli:app` (Typer), neue Befehle als Unterbefehle anhängen. Logging: `arr.log.setup_logging()`.
 - `src/arr/templates/` – Vorlagen für Workfolder, Projekte, Vollmachten, Start-Skills (Paketdaten, gelesen über `importlib.resources`)
 - `tests/` – pytest, `asyncio_mode = "auto"`
 - `spikes/` – Wegwerf-Code, siehe [spikes/README.md](spikes/README.md); wird nie von `arr` importiert

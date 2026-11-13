@@ -33,6 +33,7 @@ htmlcov/
 
 # Working method and research docs stay local, never in git (workflow 01 v1.2).
 # Only CLAUDE.md, AGENTS.md and the plan diagram below are tracked.
-/docs/
+# `docs/` holds the public documentation (English) and is tracked.
+/research-docs/
 /umsetzung/*
 !/umsetzung/Codeplan_Ablauf.md
