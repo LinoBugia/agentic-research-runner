@@ -124,11 +124,11 @@ Closing the ways we found does not prove that there are no others. Every review 
 
 `KERN_PROCARGS2` is a kernel `sysctl` on macOS that returns the command line and the start environment of a process. `ps` uses it. For processes of the same user it needs no special rights. Apple's own system binaries do not expose their environment, but ordinary applications do.
 
-This matters because some applications keep credentials in their environment. Processes of the Claude desktop app, for example, carry `CLAUDE_CODE_OAUTH_TOKEN`. A few lines of Python inside the sandbox can read it.
+This matters because some applications keep credentials in their environment, and a process inside the sandbox can read them.
 
-Seatbelt cannot block this call. We tested seven rules, applied after process start: `deny sysctl-read` by name, prefix and regex, `deny process-info*` and `(deny default)`. The call succeeded under all of them, while counter-tests showed that the rules themselves were active. `arr` therefore keeps its own secrets out of every environment (principle 5), but it cannot protect secrets that other applications put there. The only fix we know of is layer 7. The call is open only for processes of the same user, but we have not yet measured that a separate account closes it.
+Seatbelt cannot block this call. We tested seven rules, applied after process start: `deny sysctl-read` by name, prefix and regex, `deny process-info*` and `(deny default)`. The call succeeded under all of them, while counter-tests showed that the rules themselves were active. `arr` therefore keeps its own secrets out of every environment (principle 6), but it cannot protect secrets that other applications put there. The only fix we know of is layer 7. The call is open only for processes of the same user, but we have not yet measured that a separate account closes it.
 
-**Until then:** this includes the Claude desktop app, from which `arr` is usually started. Real runs therefore stay supervised until layer 7 exists.
+**Until then:** this can include the application from which `arr` is started. Real runs therefore stay supervised until layer 7 exists.
 
 ## 6. Other platforms (template, not implemented)
 
@@ -156,4 +156,4 @@ On servers the Hugging Face lesson applies directly. A single allowed network pa
 
 ## 8. Reporting
 
-The repository is private. Report security findings to the maintainer directly, not in a public issue.
+Report security findings to the maintainer directly, not in a public issue.
