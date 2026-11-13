@@ -254,6 +254,24 @@ phases:
 
 `arr` checks a group file before every start and reports errors with the path, the reason and a suggestion, for example a route to a phase that does not exist or a loop without a limit.
 
+## The supervising agent
+
+The supervising agent is not part of any phase. It has no role, no action and no channel. For the whole run it decides the agents' permission requests within the mandate you wrote, for example a single `pip install` from PyPI. Everything else goes to you or is denied. You set it per work folder or per run, outside the phases:
+
+```yaml
+approvals:
+  decider: gatekeeper_then_user   # user | gatekeeper | gatekeeper_then_user
+  gatekeeper: { model: claude-haiku-5-5, mandate: mandates/standard.md }
+```
+
+Three things sound alike and are different:
+
+| Who | Decides | Where it is set |
+|---|---|---|
+| Supervising agent | whether an agent **may** do something, within your mandate | `approvals`, per work folder or run |
+| `judge` gate | whether a result is **good enough**, and where the run goes | the gate of a phase |
+| You | run starts, anything outside the mandate, agents' questions, the `user` gate | the inbox in the web interface |
+
 ## What does not change
 
 Phases change the order of work, not the walls around it. Each agent runs in its sandbox, cannot read other agents' folders, and exchanges work only through channels and submissions. Approvals, limits, the budget and the kill switch apply to the whole run. See [SECURITY.md](../SECURITY.md).
