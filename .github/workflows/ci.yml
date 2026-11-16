@@ -1,8 +1,27 @@
 name: CI
 
+# A push or pull request that changes only documentation starts no run: the code is the
+# same as in the run before. Anything not listed here (src, tests, spikes, pyproject.toml,
+# uv.lock, this file) starts one.
 on:
   push:
+    paths-ignore:
+      - "docs/**"
+      - "umsetzung/**"
+      - "README.md"
+      - "SECURITY.md"
+      - "CLAUDE.md"
+      - "AGENTS.md"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "umsetzung/**"
+      - "README.md"
+      - "SECURITY.md"
+      - "CLAUDE.md"
+      - "AGENTS.md"
+      - "LICENSE"
 
 permissions:
   contents: read
