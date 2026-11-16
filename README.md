@@ -33,7 +33,7 @@ Today a group picks one of five fixed workflows. The next wave rebuilds them fro
 
 - **Agents** have an engine, a model, rights and a role.
 - **Phases** run in order. Each has a topology (`solo`, `parallel`, `chat` or `moderated`) and says who takes part and which channels are open.
-- **Actions** are the tasks of the agents in a phase. Every action ends with a submission in a fixed format that `arr` can read.
+- **Actions** are what the agents do in a phase. An action is a task and a submission: what the agent is asked to do, and what it hands in at the end in a fixed format that `arr` can read.
 - **Gates** decide when a phase ends and where the run goes: when the work is done, by a signal from the agents, by judges, or by you.
 
 The five workflows become templates built from these parts. [docs/research-groups.md](docs/research-groups.md) explains the model and shows each template as a diagram.
