@@ -886,3 +886,37 @@ def test_w4_05_2_sympy_check_refuses_numbers_too_large(text: str) -> None:
     with pytest.raises(module.Refused, match="zu groß"):
         module.check_size(text, {})
     module.check_size("2^100 + factorial(20) + 10^4000", {})  # counter-check: small enough
+
+
+@pytest.mark.parametrize(
+    ("text", "refused"),
+    [
+        ("10^4000", False),  # 13 288 bits
+        ("2^13000", False),
+        ("2^15000", True),
+        ("(10^-300)^14000", True),  # a small base counts with its inverse (W4b-01.1)
+        ("((10^-300)^14000)^-14000", True),
+        ("(1/10^300)^-14000", True),
+        ("(3/2)^14000", True),  # numerator and denominator both count
+        ("(10^-3)^100", False),
+        ("0^5", False),
+        ("0^-5", False),
+        ("1^(10^9)", False),
+        ("(-1)^(10^9)", False),
+    ],
+)
+def test_w4b_01_1_sympy_check_bits_are_tight_and_count_small_bases(
+    text: str, refused: bool
+) -> None:
+    """The size estimate is an upper bound for numerator and denominator, not coarser than
+    needed: 10^4000 passes, 2^15000 does not; 0, 1 and -1 never break the estimate."""
+    try:
+        import sympy  # noqa: F401
+    except ImportError:
+        pytest.skip("SymPy fehlt in dieser Umgebung; die Run-venv hat es (Bericht).")
+    module = check_module()
+    if refused:
+        with pytest.raises(module.Refused, match="zu groß"):
+            module.check_size(text, {})
+    else:
+        module.check_size(text, {})

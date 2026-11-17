@@ -171,13 +171,28 @@ def _scope(text: str, declared: dict, notes: set[str], *, inert: bool) -> dict:
 
 
 def _bits(value) -> float:  # noqa: ANN001 - a SymPy number
-    """About how many bits the integer part of |value| has."""
+    """Bits per unit of exponent of a power of `value`: an upper bound for numerator and
+    denominator, not coarser than needed.
+
+    A base built from rational numbers only (all smaller powers already passed the check) is
+    computed exactly, p/q: log2 of the larger of |p| and |q|, so a small base counts with its
+    inverse. Any other number (pi, a float) counts with |log2 |value||. 0, 1 and -1 give 0.
+    """
     import sympy
 
+    if not value.atoms(sympy.Function) and all(
+        isinstance(atom, sympy.Rational) for atom in value.atoms()
+    ):
+        exact = value.doit()
+        if exact.is_Rational:
+            largest = max(abs(int(exact.p)), abs(int(exact.q)), 1)
+            return math.log2(largest)
     magnitude = abs(sympy.N(value, 15))
     if not magnitude.is_finite:
         return math.inf
-    return float(sympy.log(magnitude + 2, 2).evalf(15))
+    if magnitude == 0:
+        return 0.0
+    return abs(float(sympy.log(magnitude, 2).evalf(15)))
 
 
 def check_size(text: str, declared: dict) -> None:
@@ -199,7 +214,7 @@ def check_size(text: str, declared: dict) -> None:
     for node in sympy.postorder_traversal(expr):
         if node.is_Pow and node.base.is_number and node.exp.is_number:
             exponent = abs(sympy.N(node.exp, 15))
-            if not exponent.is_finite or float(exponent) * max(_bits(node.base), 1) > MAX_BITS:
+            if not exponent.is_finite or float(exponent) * _bits(node.base) > MAX_BITS:
                 raise Refused(
                     f"Die Potenz {node} wäre zu groß zum Ausrechnen (mehr als {MAX_BITS} Bit). "
                     "Rechne symbolisch, z. B. mit einer Variablen statt der Zahl."
