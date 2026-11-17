@@ -9,6 +9,7 @@ login guard (`login_guard_kit.py`), with a test `HOME`, a `security` stub and on
 import json
 import re
 import sys
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -99,17 +100,24 @@ text(JSON.stringify(answer));
 """
 """An `exec` cell as a model writes it: Codex offers MCP tools only inside `functions.exec`, as
 `tools.mcp__arr_room__<tool>` (W4b-00, prompt `codex.md`). A server that is not ready yet
-gives no function; then the cell says so and the next request sends it again."""
+gives no function; then the cell says so and the next request sends it again, after a pause,
+for at most `WAIT_S` (under the load of the whole suite the server needs some seconds)."""
+
+WAIT_S = 90.0
+PAUSE_S = 0.5
 
 
 class McpResponsesApi(FakeResponsesApi):
     """`FakeResponsesApi` whose steps call a room tool from an `exec` cell (`CELL`)."""
 
-    def __init__(self, steps: list[tuple[str, dict[str, Any]]], tries: int = 20) -> None:
+    def __init__(
+        self, steps: list[tuple[str, dict[str, Any]]], *, stop_when_room_seen: bool = False
+    ) -> None:
         super().__init__([])
         self.steps = steps
-        self.tries = tries
+        self.stop_when_room_seen = stop_when_room_seen
         self.offered: list[str] = []
+        self.started = time.monotonic()
 
     def answer(self, body: Mapping[str, Any]) -> bytes:
         outputs = [
@@ -126,8 +134,14 @@ class McpResponsesApi(FakeResponsesApi):
             if waiting:
                 self.offered = sorted(set(re.findall(r"mcp__arr_room__\w+", waiting[-1])))
             step = len(done)
+            again = bool(self.outputs) and NOT_READY in self.outputs[-1]
         response = f"resp_{self.requests}"
-        if step < len(self.steps) and len(waiting) < self.tries:
+        go_on = step < len(self.steps) and time.monotonic() - self.started < WAIT_S
+        if again and self.stop_when_room_seen and self.offered:
+            go_on = False  # the counter-check only needs the list of room tools
+        elif again and go_on:
+            time.sleep(PAUSE_S)  # the room server is still starting
+        if go_on:
             tool, arguments = self.steps[step]
             cell = CELL % {
                 "tool": tool,
@@ -183,7 +197,7 @@ def test_without_phases_the_app_server_offers_no_submit(monkeypatch: pytest.Monk
     """Counter-check with the real app-server (A10): in a `solo` run the `exec` cell finds no
     `tools.mcp__arr_room__submit`; the room tools it does find include `submit_result`."""
     with kit.open_lab("codex") as lab:
-        api = McpResponsesApi([("submit", SUBMIT)], tries=3)
+        api = McpResponsesApi([("submit", SUBMIT)], stop_when_room_seen=True)
         monkeypatch.setattr(kit, "FakeResponsesApi", lambda _script: api)
         kit.run_codex_backend(lab, [])
         print("Codex ohne phases, Room-Werkzeuge:", api.offered)
