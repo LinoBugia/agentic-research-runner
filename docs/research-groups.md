@@ -1,6 +1,6 @@
 # Research groups: agents, phases, actions and gates
 
-> **Status: design.** Today `arr` ships five fixed group types (`solo`, `roundtable`, `waterfall`, `review`, `exploration`). This document describes the model they are being rebuilt on, so that you can compose your own groups from the same parts. It records where the design is going, not what the code does today. The YAML shown here is a sketch; key names may still change.
+> **Status: design.** Today `arr` ships five fixed group types (`solo`, `roundtable`, `waterfall`, `review`, `exploration`). This document describes the model they are being rebuilt on, so that you can compose your own groups from the same parts. It records where the design is going, not what the code does today. The notation of the group file is settled for the first version; the code that reads it is being built.
 
 ## The idea
 
@@ -134,11 +134,11 @@ After the run, slimming deletes the work folders, retired folders and the copy o
 | Topology | What happens | Example |
 |---|---|---|
 | `solo` | One agent with one action. | A prover writes a proof. |
-| `parallel` | Several agents, each with its action, at the same time. With `isolated: true` they see each other's submissions only after the phase, and the channels they share are closed. With `over: <list>`, `arr` deals the entries of a list out to them, one action per entry. | Judges review independently. |
-| `chat` | The agents discuss in a channel, in rounds or event-driven. When the discussion ends (the rounds are used up, or the channel has fallen silent), each one submits. | Judges discuss their reviews. |
-| `moderated` | One lead has the action. The others are on standby. The lead hands out actions at run time: it writes the task and names the format of the submission. The submissions go back to the lead, and the phase ends with the lead's own submission. | A coordinator splits a problem into computations. |
+| `parallel` | Several agents, each with its action, at the same time. With `isolated: true` they see each other's submissions only after the phase, every channel they share with another agent is closed, and no agent can be on standby. With `over: <list>`, `arr` deals the entries of a list out to them, one action per entry. With `repeat: N` every action runs N times in a row, and the latest submission counts. | Judges review independently. |
+| `chat` | The agents discuss in a channel, in rounds or event-driven, and each one submits. An agent can submit again during the discussion; its newest submission counts. The discussion ends when all have submitted and no direct message is unread, when the rounds are used up, or when the channel has fallen silent. Whoever has not submitted by then is asked once. | Judges discuss their reviews. |
+| `moderated` | One lead has the action. The others are on standby. The lead hands out actions at run time: it writes the task and names the format of the submission. The submissions go back to the lead, and the phase ends with the lead's own submission. If the lead submits while actions it handed out are still running, `arr` first names them; a second submission cancels them and ends the phase. | A coordinator splits a problem into computations. |
 
-An agent works on one action at a time. If it has several in one phase, for example three entries of a list or five actions from a lead, it does them one after the other.
+An agent works on one action at a time. If it has several in one phase, for example three entries of a list or five actions from a lead, it does them one after the other, in the order of the list or in the order the lead handed them out.
 
 ### Who takes part
 
@@ -157,6 +157,8 @@ Inputs decide what `arr` puts in front of an agent. They are not a wall: every a
 ### Channels
 
 A group defines its channels once: a group chat with several members or a direct channel between two agents. Each phase names the channels that are open. A message in an open channel wakes a sleeper and reaches a working agent as a hint.
+
+Every agent also has a private channel to you. `arr` sets it up by itself, it is open in every phase, also in an isolated one, and no other agent is in it. Through it an agent can ask you a question, which appears in your inbox.
 
 ### Context
 
@@ -178,20 +180,24 @@ The **gate** of a phase decides when the phase ends and where the run goes next.
 |---|---|---|---|
 | `done` (default) | Nobody. The phase ends when every agent with an action has submitted. | `done` | a summary |
 | `signal` | The agents themselves, through a field of their submission. With several agents a rule applies (`all`, `any`, `majority`, `unanimous`). | the values of the field | A prover reports `not_solved`, and the run goes back to the strategy. |
-| `judge` | Agents that did not take part in the phase. After the work each of them gets a rating action for every submission of the phase. A rule turns their submissions into a result (`mean >= 7`, `majority`, `rank`). | `pass` or `fail` for a threshold, `ranked` for `rank`, the verdict for `majority` | Two raters score a proof sketch. |
+| `judge` | Agents that did not take part in the phase. After the work each of them gets one rating action and rates every submission of the phase in it, never its own. A rule turns the ratings into a result (`mean` with a pass score, `rank`, `majority`). | `pass` or `fail` for a pass score, `ranked` for `rank`, the verdict for `majority` | Two raters score a proof sketch. |
 | `user` | You. The run pauses and shows you the summaries. | the route you choose | You look at the strategy before the prover starts. |
 
-If a rule finds no majority, the stricter value counts: one judge says `accept` and one says `minor`, so the result is `minor`.
+If a rule finds no majority, the stricter value counts: one judge says `accept` and one says `minor`, so the result is `minor`. That works for verdicts, which have an order. For a field without an order, for example the `choice` of a `decision`, the gate must name a route `on_tie`; `arr` rejects the group otherwise.
 
 The names can mislead. In the `review` template the judges are ordinary agents of the phase, and a `signal` gate reads their verdicts. A `judge` gate brings in agents from outside the phase:
 
 ```yaml
 gate:
-  judge: [rater-*]
+  type: judge
+  raters: [rater-*]
   action: { task: tasks/rate.md, submission: { format: rating } }
-  rule: mean >= 7
+  rule: mean
+  pass_score: 7
   routes: { pass: next, fail: retry }
 ```
+
+The scale and the criteria of ratings are set once for the group (`rubric`). A gate sets its own pass score and can name its own criteria.
 
 Each result of a gate has a **route**:
 
@@ -204,6 +210,10 @@ Each result of a gate has a **route**:
 | `escalate` | you decide, as with the `user` gate, but only in this case |
 
 Every loop is bounded. A phase in a loop has a maximum number of visits (`max_visits`); the first visit and every retry count. If a route leads into a phase whose visits are used up, the run takes the route `on_exhausted` of that phase instead. `arr` rejects a group in which a loop has no limit.
+
+If the visits are used up after a `judge` gate with a pass score and the run goes on, the best-rated version counts, not the last one.
+
+There is one exception to the limit. When you yourself choose "one more attempt", at a `user` gate or after `escalate`, the phase gets exactly one more visit, also beyond `max_visits`. The limits and the budget of the run still apply.
 
 ## The five built-in groups
 
@@ -307,10 +317,12 @@ flowchart TD
 
 ## What a group file looks like
 
-The `review` template as a sketch:
+The `review` template in this notation:
 
 ```yaml
 kind: research-group
+version: 1
+topology: phases
 
 agents:
   - { id: author, role: roles/author.md, model: claude-opus-5-5 }
@@ -341,7 +353,8 @@ phases:
     actions:
       judge-*: { task: tasks/discuss.md, submission: { format: review } }
     gate:
-      signal: verdict
+      type: signal
+      field: verdict
       rule: majority
       routes:
         accept: { goto: summary }
@@ -355,7 +368,7 @@ phases:
     actions:
       author: { task: tasks/revise.md, submission: { format: artifact, name: proof } }
     on_exhausted: next             # third revision asked for: go on to the summary
-    gate: { routes: { done: { goto: review } } }
+    gate: { type: done, routes: { done: { goto: review } } }
 
   - name: summary
     topology: solo
@@ -376,6 +389,8 @@ approvals:
   decider: gatekeeper_then_user   # user | gatekeeper | gatekeeper_then_user
   gatekeeper: { model: claude-haiku-5-5, mandate: mandates/standard.md }
 ```
+
+A phase or a single agent can tighten this with `decider: user`: you then decide every request in that phase, or of that agent, yourself. This setting can only tighten, never loosen, and there is one mandate for the whole run.
 
 Three things sound alike and are different:
 
@@ -399,7 +414,8 @@ The model is small on purpose. It cannot express the following:
 | One model per agent | An agent keeps its engine and its model for the whole run. | Two agents. The second gets the submission of the first. |
 | Rights per run | Tools, web access and read folders are set per agent for the whole run, not per phase. | – |
 | No machine check as a gate | Gates read submissions. `arr` does not run a proof checker or a test itself. | An agent runs the check and reports the result in its submission. |
+| No resume after a restart | If `arr` stops or is restarted during a run, the run ends as interrupted. It does not continue from the last finished phase. | Start the run again. The results folder of the interrupted run stays. |
 
 ## What does not change
 
-Phases change the order of work, not the walls around it. Each agent runs in its sandbox and cannot read other agents' work folders. Work is exchanged only through channels, submissions and the shared folders the group names. Approvals, limits, the budget and the kill switch apply to the whole run. See [SECURITY.md](../SECURITY.md).
+Phases change the order of work, not the walls around it. Each agent runs in its sandbox and cannot read other agents' work folders. Work is exchanged only through channels, submissions and the shared folders the group names. Approvals, limits, the budget and the kill switch apply to the whole run. Usage is counted for the whole run and also shown per phase. See [SECURITY.md](../SECURITY.md).
