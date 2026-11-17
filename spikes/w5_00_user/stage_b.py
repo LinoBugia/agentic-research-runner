@@ -191,7 +191,7 @@ def prepare() -> None:
     other_group = grp.getgrnam("admin").gr_gid  # a group of the normal user, not of arr-agent
     homes = {
         "h-0755": (0o755, None, None),
-        "h-0750-staff": (0o750, None, None),
+        "h-0750-staff": (0o750, grp.getgrnam("staff").gr_gid, None),  # folders inherit wheel here
         "h-0750-other-group": (0o750, other_group, None),
         "h-0700": (0o700, None, None),
         "h-0755-acl-deny": (0o755, None, "list,search,readattr,readextattr,readsecurity"),
