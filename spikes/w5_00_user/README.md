@@ -10,7 +10,7 @@
 - `stage_b.py` – Stufe B, Runde 1: Test-Run-Ordner zwischen arr und `arr-agent` (ACL, Gruppe, Klone, Ablegen, Entziehen), Testordner für ein geschlossenes Home, `access`-Proben, Deskriptoren über `sudo`, Sitzung, Seatbelt, `kill(-1)`. `agent-dry` spielt die Agenten-Seite als normaler Benutzer durch, ohne Kill.
 - `stage_b2.py` – Stufe B, Runde 2: launchd-Dienst als `arr-agent` (Plist aus `prepare`), Sitzung, Schlüsselbund-Abfrage ohne Anmeldesitzung, Secret als Deskriptor über einen Unix-Socket mit Peer-Prüfung.
 
-Alle drei laufen mit dem System-Python der Command Line Tools (3.9, nur Standardbibliothek), weil `arr-agent` weder das Repo noch die venvs des Users lesen kann. `prepare` kopiert sie dafür nach `/Users/Shared/arr-w5-00/bin/`.
+Alle Skripte laufen mit dem System-Python der Command Line Tools (3.9, nur Standardbibliothek), weil `arr-agent` weder das Repo noch die venvs des Users lesen kann. `prepare` kopiert sie dafür nach `/Users/Shared/arr-w5-00/bin/`.
 
 ## Ausführung
 
