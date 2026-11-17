@@ -1007,3 +1007,120 @@ def test_m42_a_version_in_between_is_diffed_again(
         ("lead", 2),
         ("prover", 3),
     ]
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-01.2 N1: a release during the diff does not falsify it
+# --------------------------------------------------------------------------------------------
+
+
+RELEASE = (
+    "import sys;from pathlib import Path;from arr.room.store import RoomStore;"
+    "RoomStore(Path(sys.argv[1])).release('pruefung')"
+)
+
+
+@pytest.mark.parametrize("intervene", [False, True])
+def test_n1_a_release_during_the_diff_does_not_falsify_it(
+    store: RoomStore, monkeypatch: pytest.MonkeyPatch, intervene: bool
+) -> None:
+    """Another process releases the stage after the previous version was read and before the
+    diff reads its folder: the diff is made again and names v1, not `/dev/null`. Without the
+    intervention (counter-check) the same diff comes out at once."""
+    store.seal("pruefung", "judges")
+    expect(store, "judge-1", stage="pruefung", format="text", name="g")
+    room(store, "judge-1").submit("done", "v1", body="Zeile A\nZeile B\n")
+    real = store_module.version_diff
+    calls: list[int] = []
+
+    def release_first(*args: Any) -> str:
+        calls.append(1)
+        if intervene:
+            subprocess.run([sys.executable, "-c", RELEASE, str(store.run_dir)], check=True)
+        return real(*args)
+
+    monkeypatch.setattr(store_module, "version_diff", release_first)
+    expect(store, "judge-1", stage="pruefung", format="text", name="g")
+    sub = room(store, "judge-1").submit("done", "v2", body="Zeile A\nZeile C\n")
+    patch = (store.run_dir / store.submission(sub.id).path / "diff.patch").read_text()
+    assert "--- v1/body.md" in patch and "-Zeile B" in patch, patch
+    assert "/dev/null" not in patch
+    assert len(calls) == (2 if intervene else 1)
+    assert not store.submission(sub.id).sealed if intervene else store.submission(sub.id).sealed
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-01.2 N4: links, the later place of a sealed submission, `_same_file`
+# --------------------------------------------------------------------------------------------
+
+
+def test_n4_a_link_at_the_target_is_moved_not_followed(store: RoomStore, tmp_path: Path) -> None:
+    outside = tmp_path / "draussen"
+    outside.mkdir()
+    (outside / "wichtig.txt").write_text("bleibt")
+    (store.run_dir / "output/beweis").mkdir(parents=True)
+    (store.run_dir / "output/beweis/v1").symlink_to(outside, target_is_directory=True)
+    write(store, "prover", "beweis.md")
+    expect(store, "prover", format="artifact", name="beweis")
+    sub = room(store, "prover").submit("done", "v1", files=["beweis.md"])
+    assert (store.run_dir / sub.path).is_dir() and not (store.run_dir / sub.path).is_symlink()
+    assert sorted(p.name for p in outside.iterdir()) == ["wichtig.txt"], "outside untouched"
+    assert (outside / "wichtig.txt").read_text() == "bleibt"
+    [moved] = [
+        p
+        for p in (store.run_dir / store_module.STAGING_DIR).iterdir()
+        if p.name.startswith(".orphan-")
+    ]
+    assert moved.is_symlink() and moved.readlink() == outside
+
+
+def test_n4_a_rest_at_the_later_place_of_a_sealed_submission(store: RoomStore) -> None:
+    rest = store.run_dir / "output/submissions/001-pruefung-mitglied-a"
+    rest.mkdir(parents=True)
+    (rest / "submission.json").write_text('{"rest": true}')
+    store.seal("pruefung", "judges")
+    expect(store, "judge-1", stage="pruefung", format="text")
+    sub = room(store, "judge-1").submit("done", "versiegelt", body="x")
+    assert sub.sealed and sub.path == "groupchats/sealed/submission-001"
+    store.release("pruefung")
+    released = store.submission(sub.id)
+    assert released.path == "output/submissions/001-pruefung-mitglied-a" and not released.sealed
+    data = json.loads((store.run_dir / released.path / "submission.json").read_text())
+    assert data["summary"] == "versiegelt", "the place holds the submission, not the rest"
+    orphans = [
+        p
+        for p in (store.run_dir / store_module.STAGING_DIR).iterdir()
+        if p.name.startswith(".orphan-")
+    ]
+    assert len(orphans) == 1 and json.loads((orphans[0] / "submission.json").read_text()) == {
+        "rest": True
+    }
+    folders_have_rows(store)
+
+
+def test_n4_same_file_with_a_link_and_a_fifo(tmp_path: Path) -> None:
+    import threading
+
+    a = tmp_path / "a.txt"
+    a.write_text("gleich")
+    copy = tmp_path / "copy.txt"
+    copy.write_text("gleich")
+    link = tmp_path / "link.txt"
+    link.symlink_to(copy)
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    assert store_module._same_file(a, copy), "counter-check: equal files are equal"
+    results: dict[str, bool] = {}
+
+    def compare() -> None:
+        results["link"] = store_module._same_file(a, link)
+        results["fifo"] = store_module._same_file(a, fifo)
+
+    worker = threading.Thread(target=compare, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    if worker.is_alive():  # free a blocked open before failing
+        with open(fifo, "w"):
+            pass
+        worker.join(timeout=5)
+    assert results == {"link": False, "fifo": False}, "different, and no hang"

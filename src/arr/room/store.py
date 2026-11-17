@@ -107,8 +107,8 @@ MAX_DIFF_TOTAL_BYTES = 2 * 1024 * 1024
 SEED_SHOWN = "arr"
 """How a version arr made itself (`add_version`, for `seed`) shows its author."""
 PUBLISH_TRIES = 3
-"""How often `submit` tries again when another version of the same name came in between
-(versions of one name are serialized by a lock, `_lock_name`, so only a writer without it)."""
+"""How often `submit` tries again when the stage was sealed or released, the previous version
+moved, or another version of the same name came in between the diff and the commit."""
 LOCK_WAIT_S = 60.0
 """How long a submission waits for the lock of its name (`_lock_name`)."""
 LOCK_POLL_S = 0.05
@@ -1604,8 +1604,9 @@ class RoomStore:
         previous version, `submission.json`), then renamed in one step to its place: below
         `output/` or, in a sealed stage, below `SEALED_DIR`, in the same write transaction that
         numbers it. A failure leaves nothing below `output/` and no row. Versions of one name
-        are made one after the other (`_lock_name`); should another version still come in
-        between (a writer without the lock), the diff is made again (`PUBLISH_TRIES`).
+        are made one after the other (`_lock_name`); if the stage was sealed or released
+        meanwhile, the previous version moved or another version came in (a writer without the
+        lock), the diff is made again (`PUBLISH_TRIES`).
         `note_next` stays in the database, never in the folder or the diff (W4b-01.1 M3).
         """
         name = expectation.name
@@ -1664,10 +1665,19 @@ class RoomStore:
                             previous.id if previous else None
                         ):
                             raise _Stale
-                        # Sealed or released since `sealed_now` changes nothing that matters:
-                        # a diff against a sealed version is only made in its own sealed stage,
-                        # and that stage is released together with it (W4b-01.1, M41).
+                        # The diff above read the previous version where it lay then. If
+                        # another process released it while the diff ran, it moved, and the
+                        # diff may name `/dev/null` as the previous version: make it again
+                        # (W4b-01.2, N1). A release always moves the sealed version, and a change
+                        # of the seal alone, without that, does not change the diff, so comparing
+                        # the place of the previous version is enough.
                         sealed, channel = AgentRoom._sealed(con, stage) if seal else (False, None)
+                        if previous is not None:
+                            row = con.execute(
+                                "SELECT path FROM submission WHERE id=?", (previous.id,)
+                            ).fetchone()
+                            if row is None or row["path"] != previous.path:
+                                raise _Stale
                         if expectation.format == "rating" and expectation.spec is None:
                             self._rated(con, agent, checked)
                         who = shown(con, channel)
@@ -1743,9 +1753,9 @@ class RoomStore:
                             encoding="utf-8",
                         )
                         target = self.run_dir / where
+                        # The place at `final` of a sealed one is cleared by `release`, which
+                        # moves it there; nothing can appear there in between (W4b-01.2, N4).
                         self._clear_orphan(con, where)
-                        if sealed:
-                            self._clear_orphan(con, final)  # where it goes on release
                         target.parent.mkdir(parents=True, exist_ok=True)
                         moved = target  # free now, under the write lock
                         os.rename(staging, target)
