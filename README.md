@@ -29,7 +29,7 @@ Setups like [OpenProver](https://github.com/Kripner/openprover), where a planner
 
 ## Research groups
 
-Today a group picks one of five fixed workflows. The next wave rebuilds them from a few parts, so that you can compose a group to fit a problem:
+Today a group picks one of five fixed workflows. The current wave rebuilds them from a few parts, so that you can compose a group to fit a problem:
 
 - **Agents** have an engine, a model, rights and a role.
 - **Phases** run in order. Each has a topology (`solo`, `parallel`, `chat` or `moderated`) and says who takes part and which channels are open.
@@ -53,7 +53,7 @@ Agents in `arr` work on hard, sometimes unsolvable problems for hours, without c
 | 2 | Real agents: mixed runs from the CLI | ✅ done |
 | 3 | Service and UI with real data | ✅ done |
 | 4 | MCP server for Claude Code, ready-made group skills | ✅ built |
-| 4b | Composable research groups (phases, actions, gates), context compaction per agent | planned |
+| 4b | Composable research groups (phases, actions, gates), context compaction per agent | in progress |
 | 5 | Hardening (separate macOS user for agents), onboarding, polish | planned |
 
 The [plan diagram](umsetzung/Codeplan_Ablauf.md) (in German) shows how the work packages fit together. Documentation for users lives in [docs/](docs/). The user interface and CLI messages are in German for now.
