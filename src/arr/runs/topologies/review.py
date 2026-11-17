@@ -39,13 +39,8 @@ author and summarizer), `channel` (`judges`), `summarizer` (none).
 """
 
 import asyncio
-import contextlib
-import difflib
-import json
 import re
-import sys
 from collections import Counter
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
@@ -67,6 +62,8 @@ from arr.runs.topologies import (
     require_task,
     suggest,
 )
+from arr.submissions.diff import diff_elsewhere
+from arr.submissions.diff import unified_diff as unified_diff  # same name as before W4b-01
 from arr.workfolder import read_template
 
 PHASES = ("artefakt", "pruefung", "diskussion", "urteil", "revision", "zusammenfassung")
@@ -129,68 +126,6 @@ _REASON_TEXT = {
 # --------------------------------------------------------------------------------------------
 # Parsing what judges write (docs/09 principle 3)
 # --------------------------------------------------------------------------------------------
-
-
-def unified_diff(before: str, after: str, old_name: str, new_name: str) -> str:
-    """The unified diff of two texts, in this process (`DIFF_PROGRAM` does the same apart)."""
-    lines = difflib.unified_diff(
-        before.splitlines(keepends=True),
-        after.splitlines(keepends=True),
-        fromfile=old_name,
-        tofile=new_name,
-    )
-    return "".join(lines)
-
-
-DIFF_PROGRAM = (
-    "import difflib, json, sys\n"
-    "d = json.load(sys.stdin)\n"
-    "sys.stdout.write(''.join(difflib.unified_diff(d['a'].splitlines(True), "
-    "d['b'].splitlines(True), fromfile=d['n'][0], tofile=d['n'][1])))\n"
-)
-"""The diff as a program of its own: the texts come as data on stdin, nothing is run from
-them; `python -I` loads nothing from the current folder or the environment."""
-
-
-async def diff_elsewhere(
-    before: str,
-    after: str,
-    names: tuple[str, str],
-    *,
-    timeout_s: float,
-    stopped: Callable[[], bool],
-) -> str | None:
-    """The unified diff in a process of its own (H2): the event loop stays free, and arr ends
-    the process (by its handle) after `timeout_s` or as soon as `stopped()` is true; then None."""
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-I",
-        "-c",
-        DIFF_PROGRAM,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    data = json.dumps({"a": before, "b": after, "n": list(names)}).encode("utf-8")
-    talk = asyncio.ensure_future(process.communicate(data))
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    try:
-        while not talk.done():
-            left = deadline - loop.time()
-            if left <= 0 or stopped():
-                return None
-            await asyncio.wait({talk}, timeout=min(0.1, left))
-        out, _ = talk.result()
-        return out.decode("utf-8", errors="replace") if process.returncode == 0 else None
-    finally:
-        if process.returncode is None:
-            process.kill()
-            await process.wait()
-        if not talk.done():
-            talk.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await talk
 
 
 def _lines(text: str) -> list[str]:
