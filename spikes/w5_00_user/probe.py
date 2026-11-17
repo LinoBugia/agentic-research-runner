@@ -9,8 +9,8 @@
 uses. It reads only a PID named in a bait's state file, and only if the start time of that PID
 still matches the state file, so it never reads a process the spike did not start. `file` reads a
 bait file, `keychain` asks `security` for a bait item in a test keychain file (never the login
-keychain), `access` only asks the kernel whether a folder may be listed (`access(2)`, no entries
-are read).
+keychain), `access` only asks the kernel whether a path may be read, written or executed
+(`access(2)`, nothing is read).
 
 Every check prints one JSON line and exits with: 0 marker found, 1 read but marker not found,
 2 read refused, 3 guard or usage error, 4 timeout. Markers and secrets are compared by SHA-256
@@ -100,9 +100,13 @@ def check_keychain(keychain: str, service: str, expected: str) -> None:
 
 
 def check_access(path: str) -> None:
-    listable = os.access(path, os.R_OK | os.X_OK)
-    enterable = os.access(path, os.X_OK)
-    report("access", FOUND if listable else REFUSED, listable=listable, enterable=enterable)
+    flags = {
+        "exists": os.path.lexists(path),
+        "read": os.access(path, os.R_OK),
+        "write": os.access(path, os.W_OK),
+        "execute": os.access(path, os.X_OK),
+    }
+    report("access", FOUND if flags["read"] else REFUSED, **flags)
 
 
 def main() -> None:
