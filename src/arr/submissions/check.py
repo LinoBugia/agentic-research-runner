@@ -10,6 +10,7 @@ field and what is expected, never a long input.
 """
 
 import math
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -55,6 +56,13 @@ MAX_PROBLEMS = 8
 """Problems named in one answer; the rest is counted."""
 SHOWN_CHARS = 40
 """A value is quoted in a message with at most this many characters."""
+MAX_LISTED = 20
+"""Allowed values named in one message line; the rest is counted (W4b-01.1 G3)."""
+MAX_PROBLEM_CHARS = 500
+MAX_MESSAGE_CHARS = 4_500
+"""One problem line and the whole message are cut to these lengths (W4b-01.1 G3)."""
+MAX_INT = 10**15
+"""Integers beyond this are refused before any float arithmetic (W4b-01.1 G1)."""
 
 
 class SubmissionError(Exception):
@@ -62,11 +70,12 @@ class SubmissionError(Exception):
 
     def __init__(self, problems: list[str]) -> None:
         self.problems = problems
-        shown = problems[:MAX_PROBLEMS]
+        shown = [_cut(p, MAX_PROBLEM_CHARS) for p in problems[:MAX_PROBLEMS]]
         text = "Die Abgabe passt nicht:\n" + "\n".join(f"- {p}" for p in shown)
         if len(problems) > len(shown):
             text += f"\n- … und {len(problems) - len(shown)} weitere."
-        super().__init__(text + "\nBessere nach und gib noch einmal mit `submit` ab.")
+        end = "\nBessere nach und gib noch einmal mit `submit` ab."
+        super().__init__(_cut(text, MAX_MESSAGE_CHARS - len(end)) + end)
 
 
 @dataclass(frozen=True)
@@ -81,13 +90,33 @@ class Checked:
     fields: dict[str, Any] = field(default_factory=dict)
 
 
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _line(text: str) -> str:
+    """Agent text inside a message line: cleaned and on one line (W4b-01.1 G2)."""
+    return " ".join(clean_text(text).split())
+
+
+def _listing(values: Any) -> str:
+    """At most `MAX_LISTED` values, each on one line, then how many more (W4b-01.1 G3)."""
+    values = list(values)
+    text = ", ".join(_line(str(v))[: SHOWN_CHARS * 2] for v in values[:MAX_LISTED])
+    if len(values) > MAX_LISTED:
+        text += f" … und {len(values) - MAX_LISTED} weitere"
+    return text
+
+
 def _shown(value: Any) -> str:
-    """A value for a message: short, cleaned, never the whole input."""
+    """A value for a message: short, cleaned, on one line, never the whole input."""
     if isinstance(value, str):
-        text = clean_text(value[: SHOWN_CHARS * 2])
+        text = _line(value[: SHOWN_CHARS * 2])
         return f"„{text[:SHOWN_CHARS]}…“" if len(value) > SHOWN_CHARS else f"„{text}“"
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, int) and abs(value) > MAX_INT:
+        return f"eine Zahl mit {len(str(MAX_INT))} oder mehr Stellen"
     if isinstance(value, int | float):
         return f"{value:g}" if isinstance(value, float) else str(value)
     if value is None:
@@ -125,6 +154,9 @@ class _Checker:
                 return False
             if isinstance(value, str):
                 chars += len(value)
+            elif isinstance(value, dict | list) and nodes + len(stack) + len(value) > MAX_NODES:
+                self.add("fields", f"zu viele Einträge (mehr als {MAX_NODES}).")
+                return False  # counted before anything is put on the stack (W4b-01.1 G7)
             elif isinstance(value, dict):
                 for key, item in value.items():
                     if not isinstance(key, str):
@@ -195,9 +227,9 @@ class _Checker:
                     "zu ihm an, z. B. „notes/beweis.md“.",
                 )
                 continue
-            name = parts[-1]
+            name = unicodedata.normalize("NFC", parts[-1]).casefold()  # as APFS sees it (G4)
             if name in names:
-                self.add(where, f"heißt wie files[{names[name]}] ({_shown(name)}).")
+                self.add(where, f"heißt wie files[{names[name]}] ({_shown(parts[-1])}).")
                 continue
             names[name] = i
             paths.append(rel)
@@ -209,11 +241,11 @@ class _Checker:
         if not isinstance(value, dict):
             self.add(path, f"muss ein Objekt sein, bekommen {_what(value)}.")
             return {}
-        allowed = ", ".join(specs) or "keine"
+        allowed = _listing(specs) or "keine"
         out: dict[str, Any] = {}
         for key in value:
             if key not in specs:
-                name = clean_text(key[:MAX_KEY_CHARS])
+                name = _line(key[:MAX_KEY_CHARS])
                 self.add(f"{path}.{name}", f"unbekanntes Feld. Erlaubt: {allowed}.")
         for key, spec in specs.items():
             where = f"{path}.{key}"
@@ -231,7 +263,7 @@ class _Checker:
     def expected(spec: FieldSpec) -> str:
         """What a field expects, in one short German sentence."""
         if spec.type is FieldKind.CHOICE:
-            return f"Erwartet: einer von {', '.join(spec.choices or []) or '(keine Werte)'}."
+            return f"Erwartet: einer von {_listing(spec.choices or []) or '(keine Werte)'}."
         if spec.type is FieldKind.NUMBER:
             what = "eine ganze Zahl" if spec.integer else "eine Zahl"
             if spec.min is not None and spec.max is not None:
@@ -242,9 +274,9 @@ class _Checker:
         if spec.type is FieldKind.TEXT:
             return f"Erwartet: ein Text mit höchstens {spec.text_limit} Zeichen."
         if spec.type is FieldKind.SCORES:
-            names = ", ".join(spec.choices or [])
+            names = _listing(spec.choices or [])
             return f"Erwartet: ein Objekt Kriterium → Punkte, Kriterien: {names or 'keine'}."
-        inner = ", ".join(spec.fields or {}) if spec.fields else "je ein Wert"
+        inner = _listing(spec.fields or {}) if spec.fields else "je ein Wert"
         return f"Erwartet: eine Liste ({inner})."
 
     def value(self, path: str, value: Any, spec: FieldSpec) -> Any:
@@ -267,6 +299,9 @@ class _Checker:
     def number(self, path: str, value: Any, spec: FieldSpec) -> int | float | None:
         if isinstance(value, bool) or not isinstance(value, int | float):
             self.add(path, f"{self.expected(spec)} Bekommen: {_shown(value)}.")
+            return None
+        if isinstance(value, int) and abs(value) > MAX_INT:  # before any float (G1)
+            self.add(path, f"{_shown(value)} liegt außerhalb. {self.expected(spec)}")
             return None
         if not math.isfinite(value):
             self.add(path, f"muss eine endliche Zahl sein. {self.expected(spec)}")
@@ -298,8 +333,8 @@ class _Checker:
         for name, score in value.items():
             if name not in known:
                 self.add(
-                    f"{path}.{clean_text(name[:MAX_KEY_CHARS])}",
-                    f"unbekanntes Kriterium. Erlaubt: {', '.join(spec.choices or [])}.",
+                    f"{path}.{_line(name[:MAX_KEY_CHARS])}",
+                    f"unbekanntes Kriterium. Erlaubt: {_listing(spec.choices or [])}.",
                 )
                 continue
             checked = self.number(f"{path}.{name}", score, number)
@@ -364,12 +399,12 @@ def _rating_rules(checker: _Checker, fields: dict[str, Any], rate: list[int]) ->
         if ref in seen:
             checker.add(where, f"Die Abgabe #{ref} steht schon in ratings[{seen[ref]}].")
         elif ref not in wanted:
-            ids = ", ".join(f"#{r}" for r in rate)
+            ids = _listing(f"#{r}" for r in rate)
             checker.add(where, f"#{ref} ist nicht zu bewerten. Zu bewerten: {ids}.")
         seen.setdefault(ref, i)
     missing = [r for r in rate if r not in seen]
     if missing and "ratings" in fields:
-        ids = ", ".join(f"#{r}" for r in missing)
+        ids = _listing(f"#{r}" for r in missing)
         checker.add(
             "fields.ratings", f"Es fehlt eine Bewertung für {ids}. Bewerte jede genau einmal."
         )

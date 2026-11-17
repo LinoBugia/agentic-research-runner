@@ -107,8 +107,11 @@ MAX_DIFF_TOTAL_BYTES = 2 * 1024 * 1024
 SEED_SHOWN = "arr"
 """How a version arr made itself (`add_version`, for `seed`) shows its author."""
 PUBLISH_TRIES = 3
-"""How often `submit` tries again when the stage was sealed or another version of the same
-name came in between (versions of one name are serialized by a lock, `_lock_name`)."""
+"""How often `submit` tries again when another version of the same name came in between
+(versions of one name are serialized by a lock, `_lock_name`, so only a writer without it)."""
+LOCK_WAIT_S = 60.0
+"""How long a submission waits for the lock of its name (`_lock_name`)."""
+LOCK_POLL_S = 0.05
 ROOM_DB_FILES = (DB_NAME, f"{DB_NAME}-wal", f"{DB_NAME}-shm", f"{DB_NAME}-journal")
 """The database files below `groupchats/`: they hold every result body (W4-03 F4)."""
 ORCHESTRATOR = "orchestrator"
@@ -441,8 +444,20 @@ def _read_head(path: Path, limit: int) -> bytes | None:
         os.close(fd)
 
 
+HEAD_PART = "kopf.json"
+"""The part of `diff.patch` with head and fields of a version (W4b-01.1 M2)."""
+
+
+def head_text(format: str, status: str, summary: str, fields: Mapping[str, Any]) -> bytes:
+    """Head and fields of a version for the diff: fixed, indented JSON without `id`, `ts`,
+    `version`, `attempt` and never `note_next` (private, W4b-01.1 M3)."""
+    data = {"format": format, "status": status, "summary": summary, "fields": fields}
+    text = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    return text.encode("utf-8")
+
+
 def _version_parts(folder: Path) -> dict[str, Path]:
-    """The parts of a version that get a diff: `body.md` and `files/<name>` (regular files)."""
+    """The files of a version that get a diff: `body.md` and `files/<name>` (regular files)."""
     parts = {}
     if (folder / SUBMISSION_BODY).is_file():
         parts[SUBMISSION_BODY] = folder / SUBMISSION_BODY
@@ -456,6 +471,29 @@ def _version_parts(folder: Path) -> dict[str, Path]:
     return parts
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    """True if two regular files arr wrote are equal as a whole: size, then the content in
+    blocks, never all of it in memory; anything else (a link, unreadable) counts as changed."""
+    fds = []
+    try:
+        for path in (a, b):
+            fds.append(os.open(path, _FILE_FLAGS))
+        infos = [os.fstat(fd) for fd in fds]
+        if not all(stat.S_ISREG(i.st_mode) for i in infos) or infos[0].st_size != infos[1].st_size:
+            return False
+        while True:
+            left, right = os.read(fds[0], _COPY_CHUNK), os.read(fds[1], _COPY_CHUNK)
+            if left != right:
+                return False
+            if not left:
+                return True
+    except OSError:
+        return False
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
 def _as_text(data: bytes | None) -> str | None:
     """Text of a part for the diff, or None (binary, too large or too many lines)."""
     if data is None or len(data) > MAX_DIFF_BYTES or b"\0" in data:
@@ -467,19 +505,37 @@ def _as_text(data: bytes | None) -> str | None:
     return text if len(text.splitlines()) <= MAX_DIFF_LINES else None
 
 
-def version_diff(old: Path, old_v: int, new: Path, new_v: int) -> str:
+def version_diff(
+    old: Path, old_v: int, new: Path, new_v: int, old_head: bytes, new_head: bytes
+) -> str:
     """`diff.patch` from version `old_v` (folder `old`) to `new_v` (folder `new`).
 
-    Text parts up to `MAX_DIFF_BYTES` and `MAX_DIFF_LINES` get a unified diff, made in a
-    process of its own with `DIFF_TIMEOUT_S` (`diff_pairs`); other parts a note at the top.
+    The parts are head and fields (`HEAD_PART`, from `head_text`), `body.md` and every file
+    of `files/`. Whether a part changed is decided on the whole part (`_same_file`). A changed
+    text part up to `MAX_DIFF_BYTES` and `MAX_DIFF_LINES` gets a unified diff, made in a
+    process of its own with `DIFF_TIMEOUT_S` (`diff_pairs`); any other changed part a note at
+    the top. „Keine Änderung“ only when every part is the same.
     """
-    before, after = _version_parts(old), _version_parts(new)
+    before: dict[str, Path | bytes] = {HEAD_PART: old_head, **_version_parts(old)}
+    after: dict[str, Path | bytes] = {HEAD_PART: new_head, **_version_parts(new)}
+    names = [HEAD_PART, *sorted((set(before) | set(after)) - {HEAD_PART})]
     notes, pairs, total = [], [], 0
-    for part in sorted(set(before) | set(after)):
-        a = _read_head(before[part], MAX_DIFF_BYTES + 1) if part in before else b""
-        b = _read_head(after[part], MAX_DIFF_BYTES + 1) if part in after else b""
-        if a == b:
-            continue
+    for part in names:
+        a_src, b_src = before.get(part), after.get(part)
+        if a_src is not None and b_src is not None:
+            if isinstance(a_src, bytes) or isinstance(b_src, bytes):
+                same = a_src == b_src
+            else:
+                same = _same_file(a_src, b_src)
+            if same:
+                continue
+
+        def load(src: Path | bytes | None) -> bytes | None:
+            if src is None:
+                return b""
+            return src if isinstance(src, bytes) else _read_head(src, MAX_DIFF_BYTES + 1)
+
+        a, b = load(a_src), load(b_src)
         text_a, text_b = _as_text(a), _as_text(b)
         if text_a is None or text_b is None:
             notes.append(
@@ -491,8 +547,8 @@ def version_diff(old: Path, old_v: int, new: Path, new_v: int) -> str:
         if total > MAX_DIFF_TOTAL_BYTES:
             notes.append(f"# {part}: geändert, kein Text-Diff (Fassungen zusammen zu groß).")
             continue
-        old_name = f"v{old_v}/{part}" if part in before else "/dev/null"
-        new_name = f"v{new_v}/{part}" if part in after else "/dev/null"
+        old_name = f"v{old_v}/{part}" if a_src is not None else "/dev/null"
+        new_name = f"v{new_v}/{part}" if b_src is not None else "/dev/null"
         pairs.append((text_a, text_b, old_name, new_name))
     diff = diff_pairs(pairs, timeout_s=DIFF_TIMEOUT_S) if pairs else ""
     if diff is None:
@@ -735,7 +791,14 @@ class RoomStore:
                 if result.path:
                     source = self.run_dir / result.path
                     target = results_dir / source.name
-                    os.replace(source, target)
+                    if os.path.lexists(source):
+                        os.replace(source, target)
+                    elif not os.path.lexists(target):
+                        raise ArrError(
+                            f"Die versiegelte Datei „{result.path}“ von Ergebnis #{result_id} "
+                            "fehlt. Das ist ein Fehler in arr."
+                        )
+                    # else: moved by a release that was killed before its commit (W4b-01.1)
                     rel = target.relative_to(self.run_dir).as_posix()
                     con.execute("UPDATE result SET path=? WHERE id=?", (rel, result_id))
                     result = result.model_copy(update={"path": rel})
@@ -745,7 +808,11 @@ class RoomStore:
         return released
 
     def _release_submissions(self, con: sqlite3.Connection, stage: str) -> None:
-        """Move the sealed submissions of `stage` to their place below `output/` (W4b-01)."""
+        """Move the sealed submissions of `stage` to their place below `output/` (W4b-01).
+
+        A submission whose folder is already there and gone from `SEALED_DIR` was moved by a
+        `release` killed before its commit: only its row is brought up to date (W4b-01.1 M1).
+        """
         try:
             rows = con.execute(
                 "SELECT s.id, s.path, s.final_path FROM sealed_submission ss "
@@ -755,9 +822,18 @@ class RoomStore:
         except sqlite3.OperationalError:  # a room from before W4b-01
             return
         for row in rows:
-            target = self.run_dir / row["final_path"]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            os.rename(self.run_dir / row["path"], target)
+            source, target = self.run_dir / row["path"], self.run_dir / row["final_path"]
+            if not os.path.lexists(source):
+                if not os.path.lexists(target):
+                    raise ArrError(
+                        f"Die versiegelte Abgabe #{row['id']} fehlt in „{row['path']}“. Das ist "
+                        "ein Fehler in arr."
+                    )
+                # moved by a release that was killed before its commit (W4b-01.1 M1)
+            else:
+                self._clear_orphan(con, row["final_path"], own=row["id"])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(source, target)
             con.execute("UPDATE submission SET path=final_path WHERE id=?", (row["id"],))
             con.execute("DELETE FROM sealed_submission WHERE submission_id=?", (row["id"],))
 
@@ -1440,6 +1516,32 @@ class RoomStore:
                 f"„output/{name}“ ist schon belegt. Der Auftrag braucht einen anderen Namen."
             )
 
+    def _clear_orphan(self, con: sqlite3.Connection, rel: str, *, own: int | None = None) -> None:
+        """Make room at `rel` (a folder of a submission, relative to the run) under the write
+        lock (W4b-01.1 M1).
+
+        Something there that no row of `submission` points to (`path` or `final_path`; `own`
+        is the row being moved) is the rest of a call killed between rename and commit: it is
+        moved, without following a link, to `STAGING_DIR`, which no agent can read. Something
+        a row points to stays, and arr refuses."""
+        place = self.run_dir / rel
+        if not os.path.lexists(place):
+            return
+        row = con.execute(
+            "SELECT id FROM submission WHERE (path=? OR final_path=?) AND id IS NOT ?",
+            (rel, rel, own),
+        ).fetchone()
+        if row is not None:
+            log.error("submission folder %s belongs to submission #%s", rel, row["id"])
+            raise RoomError(
+                f"„{rel}“ gehört schon zu Abgabe #{row['id']}. Das ist ein Fehler in arr, nicht "
+                "bei dir: Beende den Turn mit einer kurzen Notiz."
+            )
+        orphan = self.run_dir / STAGING_DIR / f".orphan-{uuid.uuid4().hex}"
+        orphan.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(place, orphan)
+        log.warning("moved the orphaned folder %s to %s", rel, orphan.name)
+
     def _stage_submission(
         self, staging: Path, checked: Checked, copy: Callable[[str, Path], str] | None
     ) -> list[str]:
@@ -1502,8 +1604,9 @@ class RoomStore:
         previous version, `submission.json`), then renamed in one step to its place: below
         `output/` or, in a sealed stage, below `SEALED_DIR`, in the same write transaction that
         numbers it. A failure leaves nothing below `output/` and no row. Versions of one name
-        are made one after the other (`_lock_name`); if the stage was sealed or released
-        meanwhile, the diff is made again (`PUBLISH_TRIES`).
+        are made one after the other (`_lock_name`); should another version still come in
+        between (a writer without the lock), the diff is made again (`PUBLISH_TRIES`).
+        `note_next` stays in the database, never in the folder or the diff (W4b-01.1 M3).
         """
         name = expectation.name
         if name is not None:
@@ -1533,6 +1636,15 @@ class RoomStore:
                             previous.version,
                             staging,
                             previous.version + 1,
+                            head_text(
+                                previous.format, previous.status, previous.summary, previous.fields
+                            ),
+                            head_text(
+                                expectation.format,
+                                checked.status.value,
+                                checked.summary,
+                                checked.fields,
+                            ),
                         )
                     (staging / SUBMISSION_DIFF).write_text(text, encoding="utf-8")
                 try:
@@ -1552,9 +1664,10 @@ class RoomStore:
                             previous.id if previous else None
                         ):
                             raise _Stale
+                        # Sealed or released since `sealed_now` changes nothing that matters:
+                        # a diff against a sealed version is only made in its own sealed stage,
+                        # and that stage is released together with it (W4b-01.1, M41).
                         sealed, channel = AgentRoom._sealed(con, stage) if seal else (False, None)
-                        if sealed != sealed_now:
-                            raise _Stale
                         if expectation.format == "rating" and expectation.spec is None:
                             self._rated(con, agent, checked)
                         who = shown(con, channel)
@@ -1621,7 +1734,7 @@ class RoomStore:
                             sealed=sealed,
                         )
                         public = record.model_dump(
-                            mode="json", exclude={"agent", "path", "sealed", "body"}
+                            mode="json", exclude={"agent", "path", "sealed", "body", "note_next"}
                         )
                         public["agent"] = public.pop("shown_as")
                         public["body"] = SUBMISSION_BODY if checked.body is not None else None
@@ -1630,12 +1743,11 @@ class RoomStore:
                             encoding="utf-8",
                         )
                         target = self.run_dir / where
+                        self._clear_orphan(con, where)
+                        if sealed:
+                            self._clear_orphan(con, final)  # where it goes on release
                         target.parent.mkdir(parents=True, exist_ok=True)
-                        if os.path.lexists(target):
-                            raise ArrError(
-                                f"„{where}“ gibt es schon; arr legt die Abgabe nicht an."
-                            )
-                        moved = target  # checked free above, under the write lock
+                        moved = target  # free now, under the write lock
                         os.rename(staging, target)
                         con.execute(
                             "UPDATE submission SET path=?, final_path=? WHERE id=?",
@@ -1665,15 +1777,29 @@ class RoomStore:
         """Hold the versions of `name` for this process until the descriptor is closed
         (`flock`; the system releases it when a process dies): two submissions of the same
         name number and diff one after the other, without holding the database lock while the
-        diff runs. Returns the descriptor."""
+        diff runs. Waits at most `LOCK_WAIT_S` (W4b-01.1 G6), then `RoomError`. Returns the
+        descriptor."""
         path = self.run_dir / STAGING_DIR / f".version-{name}.lock"
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        deadline = time.monotonic() + LOCK_WAIT_S
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return fd
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(LOCK_POLL_S)
         except BaseException:
             os.close(fd)
             raise
-        return fd
+        os.close(fd)
+        log.warning("version lock of %s still held after %.0f s", name, LOCK_WAIT_S)
+        raise RoomError(
+            f"Gerade legt arr eine andere Fassung von „{name}“ an, und das dauert zu lange. "
+            "Gib noch einmal ab."
+        )
 
     # ----------------------------------------------------------------------------------------
     # Export

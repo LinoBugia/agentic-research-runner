@@ -180,8 +180,8 @@ def test_codex_app_server_calls_submit_with_nested_fields(monkeypatch: pytest.Mo
 
 
 def test_without_phases_the_app_server_offers_no_submit(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Counter-check with the real app-server: a `solo` run has no `submit` (A10), the same
-    cell reaches `submit_result` there."""
+    """Counter-check with the real app-server (A10): in a `solo` run the `exec` cell finds no
+    `tools.mcp__arr_room__submit`; the room tools it does find include `submit_result`."""
     with kit.open_lab("codex") as lab:
         api = McpResponsesApi([("submit", SUBMIT)], tries=3)
         monkeypatch.setattr(kit, "FakeResponsesApi", lambda _script: api)

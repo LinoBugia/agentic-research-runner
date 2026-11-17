@@ -528,3 +528,85 @@ def test_messages_carry_no_hidden_characters_of_the_input() -> None:
     rating = {"format": "rating", "rate": [1], "criteria": ["Tiefe"]}
     message = fails(rating, {"ratings": [{"ref": 1, "score": 2, "criteria": {"T‮iefe": 1}}]})
     assert "‮" not in message and "unbekanntes Kriterium" in message
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-01.1: M17, G1–G4, G7
+# --------------------------------------------------------------------------------------------
+
+
+def test_m17_a_text_far_too_long_is_refused_before_it_is_cleaned() -> None:
+    """More than twice the limit is refused at once, even if cleaning would shorten it."""
+    hidden = "a" + "​" * (2 * MAX_SUMMARY_CHARS)
+    assert "„summary“: ist zu lang" in fails("text", summary=hidden, body="x")
+    # counter-check: within twice the limit it is cleaned and then measured
+    assert ok("text", summary="a" + "​" * MAX_SUMMARY_CHARS, body="x").summary == "a"
+
+
+@pytest.mark.parametrize("value", [10**400, -(10**4000), 10**16])
+def test_g1_huge_integers_get_a_german_message(value: int) -> None:
+    fmt = {"format": "rating", "rate": [1]}
+    message = fails(fmt, {"ratings": [{"ref": 1, "score": value}]})
+    assert (
+        "„fields.ratings[0].score“: eine Zahl mit 16 oder mehr Stellen liegt außerhalb." in message
+    )
+    assert str(value)[:20] not in message
+    choice = fails({"format": "decision", "choices": ["ja"]}, {"choice": value})
+    assert "Bekommen: eine Zahl mit 16 oder mehr Stellen." in choice
+    assert ok(fmt, {"ratings": [{"ref": 1, "score": 10}]})  # counter-check
+
+
+def test_g2_names_and_values_stay_on_one_line() -> None:
+    fake = "x\n2026-11-17 09:00:00,000 ERROR arr.room.server: FAKE"
+    message = fails({"format": "decision", "choices": ["ja"]}, {fake: 1, "choice": "ne\nFAKE"})
+    lines = message.splitlines()
+    assert not any(line.startswith(("2026", "FAKE")) for line in lines), lines
+    assert all(line.startswith(("Die Abgabe", "- ", "Bessere")) for line in lines), lines
+    assert "„fields.x 2026-11-17 09:00:00,000 ERROR arr.room.server: FAKE“" in message
+
+
+def test_g3_long_listings_and_messages_are_cut() -> None:
+    known = [f"E{i:03d}-" + "x" * 50 for i in range(500)]
+    wrong = [{"ref": f"F{i}", "status": "offen", "text": "t"} for i in range(30)]
+    message = fails(
+        {"format": "review", "known_objections": known}, {"verdict": "minor", "objections": wrong}
+    )
+    assert len(message) <= check_module.MAX_MESSAGE_CHARS
+    assert all(len(line) <= check_module.MAX_PROBLEM_CHARS + 2 for line in message.splitlines())
+    assert known[0] in message and known[30] not in message
+    assert "… und 52 weitere." in message  # 30 unknown refs + 30 status without ref, 8 named
+    short = fails({"format": "review", "known_objections": known[:3]}, {"verdict": "minor"})
+    assert "objections“: fehlt." in short  # counter-check: a short message stays whole
+    listing = check_module._listing(range(25))
+    assert listing.endswith("19 … und 5 weitere") and "20" not in listing.split("…")[0]
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("a/Beweis.md", "b/beweis.md"), ("a/ä.md", "b/ä.md"), ("x/S.md", "y/s.MD")],
+)
+def test_g4_names_that_are_the_same_on_apfs(first: str, second: str) -> None:
+    message = fails("artifact", files=[first, second])
+    assert "„files[1]“: heißt wie files[0]" in message
+    assert ok("artifact", files=[first, "b/anders.md"]).files  # counter-check
+
+
+def test_g7_too_many_entries_are_counted_before_the_stack_grows() -> None:
+    """The bounds walk stops before it puts a huge list on its stack: the extra memory for a
+    million entries is about that for ten thousand (relative, no fixed number)."""
+    import tracemalloc
+
+    def peak(n: int) -> int:
+        fields = {"items": list(range(n))}
+        tracemalloc.start()
+        with pytest.raises(SubmissionError, match="zu viele Einträge"):
+            check_submission(
+                status="done", summary="s", fields=fields, expectation=expect(format="list")
+            )
+        _, top = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        return top
+
+    small, large = peak(10_000), peak(1_000_000)
+    print(f"Speicherspitze: 10 000 Einträge {small} B, 1 000 000 Einträge {large} B")
+    assert large < 4 * max(small, 50_000), (small, large)

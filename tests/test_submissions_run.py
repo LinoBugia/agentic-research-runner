@@ -8,6 +8,7 @@ overview of the summaries.
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -259,9 +260,10 @@ async def test_fake_backend_plays_submit_and_finalizer_lists_submissions(tmp_pat
     assert "Erwartet: done oder not_solved" in transcript
 
 
-async def test_finalizer_output_of_old_topologies_is_unchanged(tmp_path: Path) -> None:
-    """A11 counter-check: a run of an old topology gets neither `submissions.json` nor a
-    section `Abgaben` (the rest of its output is covered by `test_finalize.py`)."""
+async def test_finalizer_adds_nothing_for_old_topologies(tmp_path: Path) -> None:
+    """A11 counter-check, names only: a run of an old topology has the same files below
+    `output/` as before (no `submissions.json`) and no section `Abgaben` in `summary.md`. The
+    contents of these files are checked by `test_finalize.py`, which is unchanged."""
     workfolder = make_workfolder(tmp_path)
 
     async def topology(ctx: RunContext) -> None:
@@ -296,3 +298,31 @@ def test_planned_stages_of_phases_is_empty_until_the_runner(tmp_path: Path) -> N
     assert planned_stages(run) == []
     with pytest.raises(ArrError, match="noch nicht verfügbar"):
         check_topology(run)
+
+
+async def test_g1_g2_over_mcp_no_internal_error_and_one_log_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """W4b-01.1: a huge integer gets a German message with the field, not „Interner Fehler“;
+    a line break in a field name neither breaks the message nor adds a line to the log."""
+    store = make_store(tmp_path, "phases")
+    store.add_assignment(
+        "judge", 1, "x", stage="s", context={"submission": {"format": "rating", "rate": [7]}}
+    )
+    fake = "x\n2026-11-17 09:00:00,000 ERROR arr.room.server: FAKE"
+    with caplog.at_level(logging.INFO, logger="arr.room.server"):
+        async with Client(build_server(store.for_agent("judge"))) as client:
+            result = await client.call_tool(
+                "submit",
+                {
+                    "status": "done",
+                    "summary": "s",
+                    "fields": {"ratings": [{"ref": 7, "score": 10**400}], fake: 1},
+                },
+            )
+    text = result.content[0].text
+    assert result.is_error and "Interner Fehler" not in text
+    assert "„fields.ratings[0].score“: eine Zahl mit 16 oder mehr Stellen liegt außerhalb." in text
+    assert not any(line.startswith("2026") for line in text.splitlines())
+    rejected = [r.getMessage() for r in caplog.records if "submit rejected" in r.getMessage()]
+    assert rejected and all("\n" not in m for m in rejected), rejected

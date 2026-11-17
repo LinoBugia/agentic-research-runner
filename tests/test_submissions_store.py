@@ -8,6 +8,7 @@ stage it waits in `groupchats/sealed/` until `release`.
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -279,7 +280,6 @@ def test_folder_tree_versions_and_diff(store: RoomStore) -> None:
         "status": "done",
         "summary": "Erste Fassung.",
         "files": ["beweis.md"],
-        "note_next": "Lemma 2",
         "fields": {},
         "body": None,
     }
@@ -385,7 +385,7 @@ def test_diff_notes_for_binary_large_and_unchanged(store: RoomStore) -> None:
     diff = (store.run_dir / v2.path / "diff.patch").read_text()
     assert "# files/bild.bin: geändert, kein Text-Diff" in diff
     assert "# files/gross.txt: geändert, kein Text-Diff" in diff
-    v3 = prover.submit("done", "v3", files=["bild.bin", "gross.txt"])
+    v3 = prover.submit("done", "v2", files=["bild.bin", "gross.txt"])  # all as in v2
     assert (
         store.run_dir / v3.path / "diff.patch"
     ).read_text() == "# Keine Änderung von v2 zu v3.\n"
@@ -666,3 +666,344 @@ def test_processes_submit_at_the_same_time(store: RoomStore) -> None:
 
 def test_submission_model_has_no_room_types_inside() -> None:
     assert set(Submission.model_fields) >= {"id", "agent", "shown_as", "format", "path", "sealed"}
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-01.1 M1: a hard kill between rename and commit blocks nothing
+# --------------------------------------------------------------------------------------------
+
+
+KILL_AFTER = textwrap.dedent(
+    """
+    import os, sys, time
+    from pathlib import Path
+    from arr.room import store as m
+    run, marker, call, agent = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+    name = "replace" if call == "release-results" else "rename"
+    real = getattr(os, name)
+    def once(src, dst):
+        real(src, dst)
+        marker.write_text("x")
+        time.sleep(120)
+    setattr(m.os, name, once)
+    store = m.RoomStore(run)
+    if call.startswith("release"):
+        store.release("pruefung")
+    else:
+        store.for_agent(agent).submit("done", "x", files=["beweis.md"])
+    """
+)
+
+
+def kill_after_rename(store: RoomStore, call: str, agent: str = "prover") -> None:
+    """Run `call` in a real process and kill it (by its PID) right after its first rename,
+    before the commit."""
+    marker = store.run_dir.parent / f"marker-{call}"
+    child = subprocess.Popen(
+        [sys.executable, "-c", KILL_AFTER, str(store.run_dir), str(marker), call, agent],
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists(), "the child reached the moment after the rename"
+    finally:
+        os.kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=10)
+
+
+def folders_have_rows(store: RoomStore) -> None:
+    """Every submission folder at a place a row could point to has exactly that row."""
+    rows = {store.run_dir / s.path for s in store.submissions()}
+    on_disk = {p for p in (store.run_dir / "output").glob("*/*") if p.is_dir()}
+    on_disk |= {p for p in (store.run_dir / "groupchats/sealed").iterdir() if p.is_dir()}
+    assert on_disk == rows, (on_disk, rows)
+
+
+@pytest.mark.parametrize("kind", ["named", "unnamed", "sealed"])
+def test_m1_a_kill_after_the_rename_does_not_block_the_next_submission(
+    store: RoomStore, kind: str
+) -> None:
+    write(store, "prover", "beweis.md")
+    if kind == "sealed":
+        store.seal("beweis")
+    submission = {"name": "beweis"} if kind == "named" else {}
+    expect(store, "prover", format="artifact", **submission)
+    kill_after_rename(store, "submit")
+    assert store.submissions() == []
+    orphan_place = {
+        "named": "output/beweis/v1",
+        "unnamed": "output/submissions/001-beweis-prover",
+        "sealed": "groupchats/sealed/submission-001",
+    }[kind]
+    assert (store.run_dir / orphan_place / "submission.json").is_file(), "the kill left it"
+    expect(store, "prover", format="artifact", **submission)
+    sub = room(store, "prover").submit("done", "danach", files=["beweis.md"])
+    assert (sub.id, sub.path) == (1, orphan_place), "same number, same place, now with a row"
+    assert json.loads((store.run_dir / sub.path / "submission.json").read_text())["summary"] == (
+        "danach"
+    )
+    assert [
+        p.name[:8]
+        for p in (store.run_dir / store_module.STAGING_DIR).iterdir()
+        if p.name.startswith(".orphan-")
+    ] == [".orphan-"], "the rest went to staging"
+    folders_have_rows(store)
+    if kind == "named":  # the name is not blocked: v2 follows
+        assert room(store, "prover").submit("done", "v2", files=["beweis.md"]).version == 2
+    if kind == "sealed":
+        store.release("beweis")
+        assert store.submission(sub.id).path == "output/submissions/001-beweis-prover"
+    folders_have_rows(store)
+
+
+def test_m1_a_folder_a_row_points_to_is_never_moved(store: RoomStore) -> None:
+    """Counter-check: only a folder without a row is a rest; one with a row stays, and arr
+    says it is its own error."""
+    write(store, "prover", "beweis.md")
+    expect(store, "prover", format="artifact", name="beweis")
+    room(store, "prover").submit("done", "v1", files=["beweis.md"])
+    taken = store.run_dir / "output/beweis/v2"
+    taken.mkdir()
+    (taken / "marke").write_text("bleibt")
+    with store._write() as con:  # a row that owns the place where v2 would go
+        con.execute(
+            "INSERT INTO submission(ts, agent, shown_as, format, status, summary, data, path, "
+            "final_path) VALUES(0, 'lead', 'lead', 'text', 'done', 's', '{}', ?, ?)",
+            ("groupchats/sealed/submission-099", "output/beweis/v2"),
+        )
+    with pytest.raises(RoomError, match="gehört schon zu Abgabe #2. Das ist ein Fehler in arr"):
+        room(store, "prover").submit("done", "v2", files=["beweis.md"])
+    assert (taken / "marke").read_text() == "bleibt"
+    assert [s.version for s in store.submissions(name="beweis")] == [1]
+
+
+def test_m1_a_kill_in_the_middle_of_release(store: RoomStore) -> None:
+    store.seal("pruefung", "judges")
+    for agent in ("judge-1", "judge-2"):
+        expect(store, agent, stage="pruefung", format="text")
+        room(store, agent).submit("done", f"von {agent}", body="x")
+    kill_after_rename(store, "release")
+    assert all(s.sealed for s in store.submissions()), "the kill undid the transaction"
+    assert (store.run_dir / "output/submissions/001-pruefung-mitglied-a").is_dir()
+    store.release("pruefung")  # runs through: the first one counts as moved
+    subs = store.submissions()
+    assert [(s.path, s.sealed) for s in subs] == [
+        ("output/submissions/001-pruefung-mitglied-a", False),
+        ("output/submissions/002-pruefung-mitglied-b", False),
+    ]
+    folders_have_rows(store)
+    assert list((store.run_dir / "groupchats/sealed").iterdir()) == []
+
+
+def test_m1_a_kill_in_the_middle_of_release_of_result_files(store: RoomStore) -> None:
+    """The same for the result files of `submit_result` (W4-03)."""
+    store.seal("pruefung", "judges")
+    for agent in ("judge-1", "judge-2"):
+        store.add_assignment(agent, 1, "x", stage="pruefung")
+        write(store, agent, "gutachten.md", f"von {agent}\n")
+        room(store, agent).submit_result("review", "Gutachten", path="gutachten.md")
+    kill_after_rename(store, "release-results")
+    released = store.release("pruefung")
+    assert [r.path for r in released] == [
+        "output/results/001-mitglied-a-review.md",
+        "output/results/002-mitglied-b-review.md",
+    ]
+    assert all((store.run_dir / r.path).is_file() for r in released)
+    assert not any(store.is_sealed(r.id) for r in released)
+
+
+def test_m1_release_with_nothing_left_says_it_is_an_arr_error(store: RoomStore) -> None:
+    store.seal("pruefung")
+    expect(store, "judge-1", stage="pruefung", format="text")
+    sub = room(store, "judge-1").submit("done", "x", body="y")
+    shutil.rmtree(store.run_dir / sub.path)
+    with pytest.raises(ArrError, match="fehlt in „groupchats/sealed/submission-001“. Das ist ein"):
+        store.release("pruefung")
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-01.1 M2: the diff tells the truth
+# --------------------------------------------------------------------------------------------
+
+
+def named_versions(store: RoomStore, fmt: str, *versions: dict[str, Any], **extra: Any) -> str:
+    """Hand in the versions of `name` in turn; returns `diff.patch` of the last one."""
+    sub = None
+    for version in versions:
+        expect(store, "judge-1", stage="pruefung", format=fmt, name="gegenstand", **extra)
+        sub = room(store, "judge-1").submit(**{"status": "done", "summary": "s", **version})
+    assert sub is not None
+    return (store.run_dir / store.submission(sub.id).path / "diff.patch").read_text()
+
+
+def test_m2_head_and_fields_are_part_of_the_diff(store: RoomStore) -> None:
+    diff = named_versions(
+        store,
+        "review",
+        {"fields": {"verdict": "major", "objections": [{"text": "Lücke."}]}},
+        {"fields": {"verdict": "accept", "objections": []}},
+    )
+    assert "Keine Änderung" not in diff
+    assert "--- v1/kopf.json\n+++ v2/kopf.json\n" in diff
+    assert '-    "verdict": "major"' in diff and '+    "verdict": "accept"' in diff
+    assert '-        "text": "Lücke."' in diff
+    # counter-check: the same head and fields → no change
+    again = named_versions(store, "review", {"fields": {"verdict": "accept", "objections": []}})
+    assert again == "# Keine Änderung von v2 zu v3.\n"
+
+
+def test_m2_summary_and_status_count_note_next_never(store: RoomStore) -> None:
+    diff = named_versions(
+        store,
+        "text",
+        {"body": "x", "note_next": "GEHEIME NOTIZ 1"},
+        {"body": "x", "summary": "anders", "status": "not_solved", "note_next": "GEHEIME NOTIZ 2"},
+    )
+    assert '-  "summary": "s"' in diff and '+  "summary": "anders"' in diff
+    assert '+  "status": "not_solved"' in diff
+    assert "GEHEIME NOTIZ" not in diff and "note_next" not in diff
+
+
+@pytest.mark.parametrize("where", ["files", "body"])
+def test_m2_a_change_behind_200_kb_is_a_change(store: RoomStore, where: str) -> None:
+    big = "Zeile\n" * 50_000  # 300 KB
+    changed = big[:-6] + "ENDE!\n"
+    if where == "files":
+        write(store, "judge-1", "gross.txt", big)
+        expect(store, "judge-1", stage="pruefung", format="artifact", name="gross")
+        room(store, "judge-1").submit("done", "s", files=["gross.txt"])
+        write(store, "judge-1", "gross.txt", changed)
+        expect(store, "judge-1", stage="pruefung", format="artifact", name="gross")
+        v2 = room(store, "judge-1").submit("done", "s", files=["gross.txt"])
+        part = "files/gross.txt"
+    else:
+        umlauts = "ä" * 150_000  # 300 KB of UTF-8, within MAX_BODY_CHARS
+        expect(store, "judge-1", stage="pruefung", format="text", name="gross")
+        room(store, "judge-1").submit("done", "s", body=umlauts + "a")
+        expect(store, "judge-1", stage="pruefung", format="text", name="gross")
+        v2 = room(store, "judge-1").submit("done", "s", body=umlauts + "b")
+        part = "body.md"
+    diff = (store.run_dir / v2.path / "diff.patch").read_text()
+    assert diff.startswith(f"# {part}: geändert, kein Text-Diff"), diff[:200]
+    assert "Keine Änderung" not in diff
+
+
+def test_m2_kills_m45_large_text_files_get_no_line_diff(store: RoomStore) -> None:
+    write(store, "prover", "gross.txt", "a" * 300_000 + "\n")
+    expect(store, "prover", format="artifact", name="gross")
+    room(store, "prover").submit("done", "a", files=["gross.txt"])
+    write(store, "prover", "gross.txt", "b" * 300_000 + "\n")
+    expect(store, "prover", format="artifact", name="gross")
+    v2 = room(store, "prover").submit("done", "a", files=["gross.txt"])
+    diff = (store.run_dir / v2.path / "diff.patch").read_text()
+    assert diff.startswith("# files/gross.txt: geändert, kein Text-Diff"), diff[:200]
+    assert len(diff) < 1000
+
+
+def test_m2_kills_m29_no_diff_against_a_version_sealed_in_another_stage(store: RoomStore) -> None:
+    store.seal("x")
+    store.seal("y")
+    expect(store, "judge-1", stage="x", format="text", name="gutachten")
+    room(store, "judge-1").submit("done", "GEHEIM kurz", body="GEHEIM aus x\n")
+    expect(store, "judge-2", stage="y", format="text", name="gutachten")
+    v2 = room(store, "judge-2").submit("done", "offen", body="Text aus y\n")
+    store.release("y")  # y ends first: v2 becomes readable while x is still sealed
+    diff = (store.run_dir / store.submission(v2.id).path / "diff.patch").read_text()
+    assert diff == "# Kein Diff: Die vorige Fassung v1 ist noch versiegelt.\n"
+    # counter-check: in the same sealed stage the diff is made (it is released together)
+    expect(store, "judge-1", stage="x", format="text", name="gutachten")
+    v3 = room(store, "judge-1").submit("done", "weiter", body="Neu in x\n")
+    assert "--- v2/body.md" in (store.run_dir / v3.path / "diff.patch").read_text()
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-01.1 M3: note_next stays private
+# --------------------------------------------------------------------------------------------
+
+
+def test_m3_note_next_is_not_in_the_folder(store: RoomStore) -> None:
+    store.seal("pruefung")
+    expect(store, "judge-1", stage="pruefung", format="text", name="notiz")
+    sub = room(store, "judge-1").submit("done", "s", body="x", note_next="Nur für mich.")
+    for when in ("sealed", "released"):
+        data = (store.run_dir / store.submission(sub.id).path / "submission.json").read_text()
+        assert "note_next" not in data and "Nur für mich" not in data, when
+        store.release("pruefung")
+    assert store.submission(sub.id).note_next == "Nur für mich."  # counter-check: arr has it
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-01.1 G6: the lock of a name has a deadline
+# --------------------------------------------------------------------------------------------
+
+
+HOLD_LOCK = textwrap.dedent(
+    """
+    import fcntl, os, sys, time
+    fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    open(sys.argv[2], "w").write("x")
+    time.sleep(120)
+    """
+)
+
+
+def test_g6_a_held_lock_ends_with_a_message(
+    store: RoomStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module, "LOCK_WAIT_S", 0.5)
+    lock = store.run_dir / store_module.STAGING_DIR / ".version-notiz.lock"
+    marker = store.run_dir.parent / "holding"
+    holder = subprocess.Popen([sys.executable, "-c", HOLD_LOCK, str(lock), str(marker)])
+    try:
+        deadline = time.monotonic() + 30
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        expect(store, "prover", format="text", name="notiz")
+        started = time.monotonic()
+        with pytest.raises(RoomError, match="dauert zu lange. Gib noch einmal ab."):
+            room(store, "prover").submit("done", "s", body="x")
+        assert time.monotonic() - started < 10
+        assert store.submissions() == []
+    finally:
+        os.kill(holder.pid, signal.SIGKILL)
+        holder.wait(timeout=10)
+    assert room(store, "prover").submit("done", "s", body="x").version == 1  # no holder
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-01.1 G8: the tries (M42) and a version that came in without the lock
+# --------------------------------------------------------------------------------------------
+
+
+def test_m42_a_version_in_between_is_diffed_again(
+    store: RoomStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A writer without the lock hands in v2 while v2 of prover is being diffed: the publish
+    notices it and takes v3 with a diff against v2 (with one try only it would refuse)."""
+    expect(store, "prover", format="text", name="notiz")
+    room(store, "prover").submit("done", "s", body="eins\n")
+    real = store_module.version_diff
+    calls: list[int] = []
+
+    def diff_and_overtake(*args: Any) -> str:
+        calls.append(1)
+        if len(calls) == 1:
+            monkeypatch.setattr(RoomStore, "_lock_name", lambda self, name: None)
+            expect(store, "lead", format="text", name="notiz")
+            room(store, "lead").submit("done", "s", body="vom lead\n")
+        return real(*args)
+
+    monkeypatch.setattr(store_module, "version_diff", diff_and_overtake)
+    expect(store, "prover", format="text", name="notiz")
+    sub = room(store, "prover").submit("done", "s", body="drei\n")
+    assert (sub.version, len(calls)) == (3, 3)
+    diff = (store.run_dir / sub.path / "diff.patch").read_text()
+    assert "-vom lead\n+drei\n" in diff
+    assert [(s.agent, s.version) for s in store.submissions(name="notiz")] == [
+        ("prover", 1),
+        ("lead", 2),
+        ("prover", 3),
+    ]

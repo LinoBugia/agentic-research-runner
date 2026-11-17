@@ -167,7 +167,10 @@ def _respond(room: AgentRoom, tool: str, call: Callable[[], str]) -> str:
     try:
         text = call()
     except RoomError as exc:
-        log.info("agent %s: %s rejected: %s", room.agent_id, tool, exc)
+        # one log line, whatever the agent put into the message (W4b-01.1 G2)
+        log.info(
+            "agent %s: %s rejected: %s", room.agent_id, tool, " | ".join(str(exc).splitlines())
+        )
         raise ToolError(_with_footer(room, str(exc))) from None
     except Exception:
         log.exception("agent %s: %s failed", room.agent_id, tool)
