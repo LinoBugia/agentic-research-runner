@@ -1,6 +1,6 @@
 # Security model
 
-> Status: 2026-11-10 · Platform implemented: macOS · Maintained with every change to sandbox, permissions or logins, every security review and every update of macOS, Claude Code CLI or Codex.
+> Status: 2026-11-17 · Platform implemented: macOS · Maintained with every change to sandbox, permissions or logins, every security review and every update of macOS, Claude Code CLI or Codex.
 
 This document describes how `arr` keeps research agents from harming the machine they run on, which ways out we know of, and which of them are closed. It is written so that the general part can serve as a template for other operating systems and for servers. The platform part currently covers macOS only.
 
@@ -56,7 +56,7 @@ These hold on every platform.
 | 4 Decider | User, or a supervising agent within limits the user set | human / agent |
 | 5 Outside hygiene | Processes outside the sandbox start isolated, with clean `PATH` and `HOME`, never from agent-writable places | code |
 | 6 Watch and stop | Kill switch per profile, usage per profile, secret scan at the end of every run | user / code |
-| 7 Separate OS user | Agents run as another account (planned) | kernel |
+| 7 Separate OS user | Agents run as another account (planned; measured in a spike, see 5.3) | kernel |
 
 ## 5. macOS
 
@@ -93,7 +93,7 @@ These hold on every platform.
 | # | Way | Status |
 |---|---|---|
 | 1 | Read logins, keys or files outside the run directly | closed, fixed tests with counter-test |
-| 2 | Read the environment of other processes of the same user (`KERN_PROCARGS2`, see 5.3) | **open**, needs layer 7 |
+| 2 | Read the environment of other processes of the same user (`KERN_PROCARGS2`, see 5.3) | **open**, needs layer 7. Measured in a spike: a separate account closes it across accounts. Not built yet |
 | 3a | Plant code in a folder on the outside process's `PATH` or import path (run venv, `python -m` from the work folder) | closed (W3-06.3) |
 | 3b | Plant git settings in an outside process's `HOME` | closed (W3-06.3) |
 | 3c | Create `.git` with the Write tool, which runs outside the sandbox, so the CLI's own `git` runs an agent's filter | closed (W3-06.4) |
@@ -103,7 +103,7 @@ These hold on every platform.
 | 3g | Codex `apply_patch` with `Move to` writes outside the run and onto the deny list; the approval request named only the source, so `arr` approved it and Codex applied it outside the sandbox | closed (W3-06.5) |
 | 3h | Codex applies moves and patches inside the run without asking, also to protected names below the top level such as `sub/.git` or `sub/.codex` | not closable with the pinned Codex version; measured: no effect outside the sandbox, the same as `mv` in the shell |
 | 3i | `arr` answered an approval method it does not know with an empty result instead of an error | closed (W4-00): an unknown method gets the JSON-RPC error `-32601`, a request for a token `-32000`; a fixed test holds the methods and fields against the schema of the pinned Codex version and turns red on another version |
-| 4 | Processes an agent starts in the background (`&`, `nohup`, `disown`, or a process detached with its own session) keep running after the run ends and after the kill switch. They stay inside the sandbox but keep using CPU and writing to the run folder | **open**, measured in W3-07. Prompts allow only Claude's `run_in_background`, which the CLI ends with the run; Codex agents run long scripts in the foreground. A follow-up makes run end and kill switch end every process of the run; layer 7 closes it fully |
+| 4 | Processes an agent starts in the background (`&`, `nohup`, `disown`, or a process detached with its own session) keep running after the run ends and after the kill switch. They stay inside the sandbox but keep using CPU and writing to the run folder | **open**, measured in W3-07. Prompts allow only Claude's `run_in_background`, which the CLI ends with the run; Codex agents run long scripts in the foreground. A follow-up makes run end and kill switch end every process of the run; layer 7 closes it fully. Measured in a spike (5.3): under a separate account one call ends every process of the agents, detached ones included, and none of the user's |
 | 5 | Read other agents' work through the room database `room.sqlite` (all channels, sealed reviews) | closed (W4-03) |
 | 6 | Read another agent's drafts, transcript or work copy with an approval or an "always" rule for the run folder, or through the run's shared temp folder | closed (W4-03.1, W4-03.2): fixed read rule, temp folder per agent; measured on both backends with counter-tests |
 | 7 | Reach `arr`'s own service on this machine through an approved network host or a wildcard rule such as `*` | closed (W4-03.1, W4-03.2) |
@@ -126,7 +126,17 @@ Closing the ways we found does not prove that there are no others. Every review 
 
 This matters because some applications keep credentials in their environment, and a process inside the sandbox can read them.
 
-Seatbelt cannot block this call. We tested seven rules, applied after process start: `deny sysctl-read` by name, prefix and regex, `deny process-info*` and `(deny default)`. The call succeeded under all of them, while counter-tests showed that the rules themselves were active. `arr` therefore keeps its own secrets out of every environment (principle 6), but it cannot protect secrets that other applications put there. The only fix we know of is layer 7. The call is open only for processes of the same user, but we have not yet measured that a separate account closes it.
+Seatbelt cannot block this call. We tested seven rules, applied after process start: `deny sysctl-read` by name, prefix and regex, `deny process-info*` and `(deny default)`. The call succeeded under all of them, while counter-tests showed that the rules themselves were active. `arr` therefore keeps its own secrets out of every environment (principle 6), but it cannot protect secrets that other applications put there. The only fix we know of is layer 7.
+
+**Measured in a spike (November 2026), not built yet.** A test account for agents, an ordinary account without admin rights, was probed with bait processes and bait files only:
+
+- **The call is closed across accounts.** A process of the agent account cannot read the environment of a process of the user, and a process of the user cannot read that of the agent account. Counter-tests read their own bait in both accounts.
+- **Inside the agent account it stays open.** Agents that all run under one account can read the environment of each other and of their own CLI. Principle 6 stays necessary.
+- **The account does not protect files by itself.** Where the user's home folder is readable for other accounts, the agent account can read the files in it that have default permissions. The sandbox allowlist remains the first wall for files. The home folder has to be closed for the agent account before the account counts as a second one.
+- **How agents are started matters.** Started with `sudo -u` from the user's login session, a process of the agent account runs inside that session: a keychain request opened a password dialog on the user's screen, which an agent could use for phishing. Started by a launchd daemon, the process runs outside the login session, and the same request failed at once without a dialog. That rules out `sudo` as the start path.
+- **The agent account owns what it creates** and can lock `arr` out of those files. Reading, copying and deleting agents' files then needs a helper that runs under the agent account.
+- **Processes:** one call under the agent account ended all of its processes, detached ones included, and none of the user's (way 4). It ends all runs at once.
+- **Not measured:** the real agent CLIs and their sandbox under the agent account, and whether a process outside the login session can still show something on the user's screen through system-wide services.
 
 **Until then:** this can include the application from which `arr` is started. Real runs therefore stay supervised until layer 7 exists.
 
@@ -139,7 +149,7 @@ The principles and layers carry over. These are the parts that change. Nothing h
 | OS sandbox | Seatbelt, Codex sandbox | Landlock, seccomp, bubblewrap or namespaces; containers or micro-VMs on servers |
 | Credential store | Keychain | Secret Service (libsecret), files with strict permissions, a secret manager |
 | Other processes' environment | `KERN_PROCARGS2`, not blockable by Seatbelt | `/proc/<pid>/environ`; hide with a PID namespace, `hidepid` or a separate user |
-| Separate user | planned spike | separate UID per run or per tenant, or one VM per run |
+| Separate user | measured in a spike, not built | separate UID per run or per tenant, or one VM per run |
 | Network | sandbox rules of the CLIs | network namespace, egress firewall with an allowlist |
 
 On servers the Hugging Face lesson applies directly. A single allowed network path, such as a package proxy, is a target in its own right and needs the same adversarial testing as the sandbox.
