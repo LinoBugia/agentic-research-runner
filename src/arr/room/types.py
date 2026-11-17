@@ -171,6 +171,37 @@ class Rating(Record):
     comment: str = ""
 
 
+class Submission(Record):
+    """A submission with `submit` (docs/10 §4.3, §4.12; W4b-01), table `submission`.
+
+    `agent` is the real ID, `shown_as` how other agents see it (its alias in an anonymous
+    channel, as in folder names). `stage` and `attempt` come from the assignment it answers,
+    `action` from its expectation. A named submission is version `version` of `name`. `path`
+    is the folder below the run folder where it lies now: `output/submissions/…` or
+    `output/<name>/v<n>/`, while its stage is sealed `groupchats/sealed/…` (`sealed`).
+    `files` are the names of the copied files in `<path>/files/`.
+    """
+
+    id: int
+    ts: float
+    agent: str
+    shown_as: str
+    stage: str | None = None
+    attempt: int = Field(default=1, ge=1)
+    action: str | None = None
+    format: str
+    name: str | None = None
+    version: int | None = None
+    status: str
+    summary: str
+    body: str | None = None
+    files: list[str] = Field(default_factory=list)
+    note_next: str | None = None
+    fields: dict[str, Any] = Field(default_factory=dict)
+    path: str
+    sealed: bool = False
+
+
 class Vote(Record):
     """A vote on a proposal (docs/06 §7, table `vote` in docs/02 §5)."""
 
@@ -369,4 +400,26 @@ class RoomAPI(Protocol):
 
         `channel` may be omitted if the agent moderates exactly one channel.
         """
+        ...
+
+
+@runtime_checkable
+class SubmitAPI(Protocol):
+    """The room tool `submit` of the phase toolkit (docs/10 §4.3, W4b-01), bound to one agent.
+
+    Kept apart from `RoomAPI` while the old tools `submit_result` and `submit_rating` live
+    (until W4b-06): a run offers either `submit` or the old ones, never both.
+    """
+
+    def submit(
+        self,
+        status: str,
+        summary: str,
+        body: str | None = None,
+        files: list[str] | None = None,
+        note_next: str | None = None,
+        fields: dict[str, Any] | None = None,
+    ) -> Submission:
+        """Hand in the submission the newest assignment expects (`context["submission"]`);
+        `RoomError` with every problem in German if it does not fit."""
         ...

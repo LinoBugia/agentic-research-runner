@@ -15,12 +15,14 @@ does not stop the others):
    A link in `base/` to a file excluded by `copy_exclude` is broken and therefore missing in
    the copy; it is left out with a hint in `summary.md`.
 4. `output/results/NNN-<agent>-<kind>.md` per result (unless the submitted file has that
-   name), `output/results.json`, `output/ratings.json`.
+   name), `output/results.json`, `output/ratings.json`; for submissions of `submit` (W4b-01)
+   `output/submissions.json`, only when there are any or the topology is `phases`.
 5. `usage.json`, and an empty `approvals.jsonl` if there were no requests.
 6. `output/summary.md` (German): status and reason, duration, agents, stages with attempts and
    scores, the overview a topology built itself (`review`: verdict and rounds, `exploration`:
-   ranking; the latest checkpoint with `overview`, W4-03 F8/F9), results with links, a
-   summarizer's summary, usage sums, hints.
+   ranking; the latest checkpoint with `overview`, W4-03 F8/F9), results with links, the
+   submissions with their summaries (W4b-01, docs/10 §4.8, without a model), a summarizer's
+   summary, usage sums, hints.
 
 Running it again overwrites every file with the same content (idempotent).
 See docs/02-workfolder-und-runs.md §4, §7.
@@ -41,9 +43,9 @@ from statistics import fmean
 from typing import Any
 
 from arr.backends.base import EventKind, TurnStatus
-from arr.models import RunStatus, WorkspaceMode
+from arr.models import RunStatus, TopologyKind, WorkspaceMode
 from arr.room.store import RESULTS_DIR, ROOM_DIR, RoomStore
-from arr.room.types import Rating, Result
+from arr.room.types import Rating, Result, Submission
 from arr.runs.eventlog import TRANSCRIPT_FILE, read_events, write_transcript_md
 from arr.runs.orchestrator import ORCHESTRATOR_LOG, OrchestratorLog, stopped_text
 from arr.runs.prepare import AgentFile, PreparedRun, RunMeta, load_run_meta
@@ -58,6 +60,7 @@ APPROVALS_FILE = "approvals.jsonl"
 SUMMARY_FILE = "output/summary.md"
 RESULTS_JSON = "output/results.json"
 RATINGS_JSON = "output/ratings.json"
+SUBMISSIONS_JSON = "output/submissions.json"
 SUMMARY_KIND = "summary"
 MAX_DIFF_BYTES = 256 * 1024
 """Files larger than this are listed as changed without a line diff (difflib is slow)."""
@@ -374,6 +377,7 @@ class _Finalizer:
         self.room: RoomStore | None = None
         self.results: list[Result] = []
         self.ratings: list[Rating] = []
+        self.submissions: list[Submission] = []
         self.usage: RunUsage | None = None
 
     def run(self) -> None:
@@ -383,6 +387,7 @@ class _Finalizer:
             ("Transkripte", self._transcripts),
             ("changes.diff", self._diffs),
             ("Ergebnisse und Ratings", self._results),
+            ("Abgaben", self._submissions),
             ("usage.json", self._usage),
             ("approvals.jsonl", self._approvals),
         ]
@@ -427,6 +432,7 @@ class _Finalizer:
         self.room = RoomStore(self.run_dir)
         self.results = self.room.results()
         self.ratings = self.room.ratings()
+        self.submissions = self.room.submissions()
 
     def _exports(self) -> None:
         if self.room is not None:
@@ -490,6 +496,24 @@ class _Finalizer:
             },
         )
 
+    def _submissions(self) -> None:
+        """`output/submissions.json`: every submission with head, fields and folder (W4b-01).
+
+        Written only when there are submissions or the run uses `phases`, so the output of
+        the five old topologies stays as it was."""
+        if not self.submissions and self.prepared.resolved.topology.kind is not TopologyKind.PHASES:
+            return
+        entries = []
+        for sub in self.submissions:
+            entry = sub.model_dump(mode="json", exclude={"body"})
+            entry["body_file"] = f"{sub.path}/body.md" if sub.body is not None else None
+            entry["files"] = [f"{sub.path}/files/{name}" for name in sub.files]
+            entries.append(entry)
+        _write_json(
+            self.run_dir / SUBMISSIONS_JSON,
+            {"version": 1, "run": self.run_id, "submissions": entries},
+        )
+
     def _approvals(self) -> None:
         """An empty `approvals.jsonl` when nobody asked for anything (docs/02 §4)."""
         (self.run_dir / APPROVALS_FILE).touch(exist_ok=True)
@@ -522,6 +546,7 @@ class _Finalizer:
         lines += self._stages(entries)
         lines += self._overview(entries)
         lines += self._results_section(entries)
+        lines += self._submissions_section()
         lines += self._summarizer()
         lines += self._usage_section()
         lines += self._hints(entries)
@@ -630,6 +655,31 @@ class _Finalizer:
             if result.path and result.path != result_file(result):
                 text += f" · Datei: [{Path(result.path).name}](../{result.path})"
             lines.append(text)
+        return lines
+
+    def _submissions_section(self) -> list[str]:
+        """The overview of all submissions from their summaries, without a model (docs/10
+        §4.8); nothing for a run without submissions."""
+        if not self.submissions:
+            return []
+        lines = ["", "## Abgaben", ""]
+        for sub in self.submissions:
+            head = f"#{sub.id}"
+            if sub.name:
+                head += f" {one_line(sub.name)} v{sub.version}"
+            who = f"`{sub.agent}`"
+            if sub.shown_as != sub.agent:
+                who += f" ({one_line(sub.shown_as)})"
+            text = f"- **{head}** · {who} · {one_line(sub.format)} · {sub.status}"
+            if sub.stage:
+                text += f" · Phase {one_line(sub.stage)}, Durchlauf {sub.attempt}"
+            if sub.action:
+                text += f" · Action {one_line(sub.action)}"
+            if sub.sealed:
+                text += f" · versiegelt, Ordner `{one_line(sub.path)}`"
+            else:
+                text += f" · [Ordner]({Path(sub.path).relative_to('output').as_posix()}/)"
+            lines += [text, f"  {one_line(sub.summary, 800)}"]
         return lines
 
     def _summarizer(self) -> list[str]:
