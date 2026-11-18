@@ -1,0 +1,101 @@
+# The start skill `proof` (topology `waterfall`) as phases (docs/10 §5), test data for W4b-02a
+# (A15) and later. `max_attempts` replaces `max_rework` (attempts = 1 + reworks), `on_fail`
+# takes routes (`next` instead of `continue`): arr computes no expressions.
+kind: research-group
+version: 1
+description: Beweis in Stufen entwickeln, Strategie, Skizze, Beweis, mit Ratings und Nacharbeit
+topology: phases
+
+params:
+  pass_score:
+    default: 7
+    min: 1
+    max: 10
+    doc: "Mindest-Score (Mittel der Rater, Skala 1–10), ab dem eine Stufe angenommen ist"
+  max_attempts:
+    default: 2
+    min: 1
+    max: 2
+    doc: "Versuche je Stufe (1 + Nacharbeiten), solange der Score zu niedrig ist"
+  on_fail:
+    default: next
+    choices: [next, stop, escalate]
+    doc: "Stufe nicht bestanden: next nimmt den besten Versuch, stop beendet den Run, escalate fragt dich"
+  n_raters:
+    default: 2
+    min: 1
+    max: 4
+    doc: "Anzahl der Rater, abwechselnd Claude und ChatGPT"
+
+rubric:
+  scale: [1, 10]
+  criteria: [korrektheit, strenge, klarheit]
+
+limits:
+  wall_time: 1h
+  turns_per_agent: 12
+  budget_usd: 5
+
+defaults:
+  provider: claude
+  model: claude-sonnet-5-5
+  effort: high
+  workspace: { mode: copy }
+
+agents:
+  - id: strategist
+    role: roles/strategist.md
+  - id: prover
+    role: roles/prover.md
+    model: claude-opus-5-5
+    skills: [sympy-check, latex-writeup]
+  - id: rater
+    count: "{{ params.n_raters }}"
+    role: roles/rater.md
+    skills: [sympy-check]
+    mix:
+      - { provider: claude, model: claude-sonnet-5-5 }
+      - { provider: codex }
+
+phases:
+  - name: strategie
+    topology: solo
+    max_visits: "{{ params.max_attempts }}"
+    on_exhausted: "{{ params.on_fail }}"
+    actions:
+      strategist: { task: tasks/strategie.md, submission: { format: artifact, name: strategie } }
+    gate:
+      type: judge
+      raters: [rater-*]
+      action: { task: tasks/bewerten.md, submission: { format: rating } }
+      rule: mean
+      pass_score: "{{ params.pass_score }}"
+      routes: { pass: next, fail: retry }
+
+  - name: skizze
+    topology: solo
+    max_visits: "{{ params.max_attempts }}"
+    on_exhausted: "{{ params.on_fail }}"
+    actions:
+      prover: { task: tasks/skizze.md, submission: { format: artifact, name: skizze } }
+    gate:
+      type: judge
+      raters: [rater-*]
+      action: { task: tasks/bewerten.md, submission: { format: rating } }
+      rule: mean
+      pass_score: "{{ params.pass_score }}"
+      routes: { pass: next, fail: retry }
+
+  - name: beweis
+    topology: solo
+    max_visits: "{{ params.max_attempts }}"
+    on_exhausted: "{{ params.on_fail }}"
+    actions:
+      prover: { task: tasks/beweis.md, submission: { format: artifact, name: beweis } }
+    gate:
+      type: judge
+      raters: [rater-*]
+      action: { task: tasks/bewerten.md, submission: { format: rating } }
+      rule: mean
+      pass_score: "{{ params.pass_score }}"
+      routes: { pass: next, fail: retry }

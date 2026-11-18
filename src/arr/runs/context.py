@@ -7,6 +7,10 @@ See docs/01-architektur.md §3, §6 and docs/03-skills-und-research-groups.md §
 Since W4-03: a phase is a stage (`turn`/`turns`/`discuss` with `stage`); finished (`done`)
 counts per phase (F1). Topologies open and close channels (F3), seal the results of a phase
 until they are released (F4), start fresh sessions (F5) and keep files in `output/`.
+
+Since W4b-02a the end of `RunContext` holds the signatures the phase runner needs (entering a
+pass of a phase, reading and adding submissions, fresh folders, compacting a session); they
+are not abstract and raise `NotImplementedError` until W4b-02b, 05a and 05b implement them.
 """
 
 from abc import ABC, abstractmethod
@@ -19,7 +23,7 @@ from typing import Any
 from arr.backends.base import TurnOutcome
 from arr.models import AgentConfig, AgentStatus, ChannelMode, ResolvedRun
 from arr.permissions.types import EscalationOption
-from arr.room.types import MessageKind, Rating, Result
+from arr.room.types import MessageKind, Rating, Result, Submission
 
 
 @dataclass(slots=True)
@@ -272,3 +276,63 @@ class RunContext(ABC):
     def read_output(self, rel: str, max_bytes: int) -> str | None:
         """Text of a file arr wrote below the run folder (e.g. `output/artifacts/…`); None if
         it is missing, a link, not a regular file, larger than `max_bytes` or not UTF-8."""
+
+    # -- W4b-02a: signatures for the phase toolkit (implemented by W4b-02b, 05a, 05b) -------
+    #
+    # Not abstract: the default raises `NotImplementedError` naming the order that implements
+    # the method, so `Orchestrator` and the test contexts stay as they are until then.
+
+    async def enter_phase(self, stage: str, attempt: int, agents: Sequence[str]) -> None:
+        """Pass `attempt` of phase `stage` begins for `agents`: they count as not finished
+        again, also when the same phase repeats (Entscheidung 21). W4b-03 hangs the limit of
+        wake-ups per pass on it. Implemented and called by W4b-02b."""
+        raise NotImplementedError("RunContext.enter_phase setzt W4b-02b um.")
+
+    def submissions(
+        self,
+        *,
+        agent: str | None = None,
+        stage: str | None = None,
+        attempt: int | None = None,
+        name: str | None = None,
+        action: str | None = None,
+        format: str | None = None,
+        latest: bool = False,
+    ) -> list[Submission]:
+        """Submissions of the run, filtered like `RoomStore.submissions` (W4b-01): `latest`
+        keeps the newest per agent, stage, attempt and action. Implemented by W4b-02b."""
+        raise NotImplementedError("RunContext.submissions setzt W4b-02b um.")
+
+    def latest_version(self, name: str) -> Submission | None:
+        """The newest version of the named submission `name`, None if there is none.
+        Implemented by W4b-02b."""
+        raise NotImplementedError("RunContext.latest_version setzt W4b-02b um.")
+
+    def add_version(
+        self,
+        name: str,
+        *,
+        summary: str,
+        format: str = "artifact",
+        body: str | None = None,
+        files: Sequence[str] = (),
+        root: Path | None = None,
+        fields: Mapping[str, Any] | None = None,
+        stage: str | None = None,
+    ) -> Submission:
+        """arr itself adds a version of `name` (a `seed`), like `RoomStore.add_version`
+        (W4b-01): files relative to `root` (default `base/`), checked like a submission.
+        Implemented by W4b-02b."""
+        raise NotImplementedError("RunContext.add_version setzt W4b-02b um.")
+
+    async def fresh_folder(self, agent_id: str, *, stage: str, attempt: int) -> None:
+        """The agent gets a fresh working folder: the old one is filed away (readable for no
+        agent), the scratch folder emptied (docs/10 §4.12). Waits for a running turn of the
+        agent. Implemented by W4b-05a, called by W4b-02b."""
+        raise NotImplementedError("RunContext.fresh_folder setzt W4b-05a um.")
+
+    async def compact_session(self, agent_id: str, *, note: str | None = None) -> None:
+        """The agent's next turn starts a new session that arr rebuilds without a model, with
+        `note` as the agent's own note (`context: compact`, docs/10 §4.6). Implemented by
+        W4b-05b, called by W4b-02b."""
+        raise NotImplementedError("RunContext.compact_session setzt W4b-05b um.")

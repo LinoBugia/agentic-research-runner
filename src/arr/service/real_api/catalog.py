@@ -31,8 +31,10 @@ from arr.models import (
     ProviderDefaults,
     ResolvedRun,
     RunInput,
+    TopologyKind,
     WorkfolderSettings,
 )
+from arr.plan.check import check as check_plan
 from arr.resolve import (
     _count_param,
     check_group_spec,
@@ -264,24 +266,32 @@ class _Issues:
         self.items: list[SkillIssue] = []
         self._seen: set[tuple[str, str]] = set()
 
-    def add(self, path: str, message: str, line: int | None = None) -> None:
+    def add(
+        self,
+        path: str,
+        message: str,
+        line: int | None = None,
+        severity: Severity = Severity.ERROR,
+    ) -> None:
         if (path, message) in self._seen:
             return
         self._seen.add((path, message))
         if line is None and path:
             line = line_of_path(path, self.lines)
         self.items.append(
-            SkillIssue(file=self.file, line=line, message=message, field=path or None)
+            SkillIssue(
+                file=self.file, line=line, message=message, field=path or None, severity=severity
+            )
         )
 
-    def extend(self, issues: Iterable[ConfigIssue]) -> None:
+    def extend(self, issues: Iterable[ConfigIssue], severity: Severity = Severity.ERROR) -> None:
         for issue in issues:
             message = issue.message
             if message.startswith("Das Muster") and "Passe" not in message:
                 message += _PATTERN_HINT
             elif "Standardwert passt nicht" in message:
                 message += _DEFAULT_HINT
-            self.add(issue.path, message, issue.line)
+            self.add(issue.path, message, issue.line, severity)
 
 
 def _spec_index(spec: GroupSpec, base_id: str) -> int:
@@ -303,10 +313,37 @@ def _role_issue(folder: Path, role: str) -> str | None:
     return None
 
 
+def _check_tasks(resolved: ResolvedRun, folder: Path, out: _Issues) -> None:
+    """Every assignment file (`task` of an action or gate action) is a regular file in the
+    skill, by the rules of the roles (W4b-02a B7, A11)."""
+    done: set[str] = set()
+    for phase in resolved.phases:
+        tasks = [(f"phases[{phase.index}].actions.{a.key}.task", a.task) for a in phase.actions]
+        if phase.gate.action is not None:
+            tasks.append((f"phases[{phase.index}].gate.action.task", phase.gate.action.task))
+        for path, task in tasks:
+            if task in done:
+                continue
+            done.add(task)
+            try:
+                problem = _role_issue(folder, task)
+            except (OSError, ValueError):
+                problem = "ist kein gültiger Pfad. Nenne eine Datei im Skill"
+            shown = task if len(task) <= 60 else task[:59] + "…"
+            if problem == "nicht gefunden":
+                out.add(path, f"Auftrag {shown} nicht gefunden. Lege die Datei im Skill an.")
+            elif problem is not None:
+                out.add(path, f"Der Auftrag {shown} {problem.replace('die Rolle', 'ihn')}.")
+
+
 def _check_resolved(
     spec: GroupSpec, resolved: ResolvedRun, folder: Path, catalog: SkillCatalog, out: _Issues
 ) -> None:
-    """Roles in the skill, skills of the agents and the topology, for the resolved defaults."""
+    """Roles in the skill, skills of the agents and the topology, for the resolved defaults.
+
+    A group with `topology: phases` gets the messages of `arr.plan.check.check` (hints as
+    warnings) and the check of its assignment files instead of `check_topology` (W4b-02a).
+    """
     roles_done: set[str] = set()
     skills_done: set[str] = set()
     for agent in resolved.agents:
@@ -331,6 +368,12 @@ def _check_resolved(
         base = f"agents[{index}].skills" if own.skills is not None else "defaults.skills"
         _found, issues = check_research_skills(catalog, agent.skills, base)
         out.extend(issues)
+    if resolved.topology.kind is TopologyKind.PHASES:
+        result = check_plan(resolved)
+        out.extend(result.errors)
+        out.extend(result.warnings, Severity.WARNING)
+        _check_tasks(resolved, folder, out)
+        return
     try:
         check_topology(resolved)
     except ConfigError as exc:

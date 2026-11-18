@@ -1,0 +1,25 @@
+# The old topology `solo` as phases (docs/10 §5), test data for W4b-02a (A15), W4b-02b, W4b-06.
+kind: research-group
+version: 1
+description: Ein Agent bearbeitet die Aufgabe
+topology: phases
+
+params:
+  max_turns:
+    default: 3
+    min: 1
+    max: 20
+    doc: "Turns ohne Abgabe, bevor arr einmal nachfragt"
+
+agents:
+  - id: worker
+    role: roles/worker.md
+
+phases:
+  - name: arbeit
+    topology: solo
+    actions:
+      worker:
+        task: tasks/arbeit.md
+        submission: { format: text }
+        turns: "{{ params.max_turns }}"
