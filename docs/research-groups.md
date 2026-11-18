@@ -1,6 +1,6 @@
 # Research groups: agents, phases, actions and gates
 
-> **Status: design.** Today `arr` ships five fixed group types (`solo`, `roundtable`, `waterfall`, `review`, `exploration`). This document describes the model they are being rebuilt on, so that you can compose your own groups from the same parts. It records where the design is going, not what the code does today. The notation of the group file is settled for the first version; the code that reads it is being built.
+> **Status: design.** Today `arr` ships five fixed group types (`solo`, `roundtable`, `waterfall`, `review`, `exploration`). This document describes the model they are being rebuilt on, so that you can compose your own groups from the same parts. It records where the design is going, not what the code does today. The notation of the group file is settled for the first version; the code that reads it is being built. Built so far: the submission tool with its formats and checks, and the result folder with versions and diffs. No run can use them yet, because the phase runner is still missing.
 
 ## The idea
 
