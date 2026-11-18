@@ -30,7 +30,6 @@ from typing import Any
 from arr.errors import ArrError, ConfigError, ConfigIssue
 from arr.models import (
     AgentConfig,
-    ChannelMode,
     GroupChatConfig,
     ParamSpec,
     ProfilesFile,
@@ -40,10 +39,10 @@ from arr.models import (
     RunInput,
     RunStatus,
     Starter,
-    TopologyKind,
     WorkfolderSettings,
 )
 from arr.permissions.policy import REDACTED, _redact_data, redact
+from arr.plan.estimate import turn_range
 from arr.resolve import dump_yaml_model, load_group_spec, validate_model
 from arr.room.types import DeliveryStatus, MessageVia
 from arr.room.types import Message as RoomMessage
@@ -682,75 +681,18 @@ def request_data(
 # --------------------------------------------------------------------------------------------
 
 
-def _int(value: Any, default: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return default
-    return int(value)
-
-
-def _topology_turns(resolved: ResolvedRun) -> tuple[int, int | None, list[str]]:
-    """Fewest and most turns the topology itself gives (None: open), with German notes.
-
-    Follows the topologies (docs/03 §4): `solo` asks again up to `max_turns`; `roundtable`
-    has one turn per member and round (`event`: kick-off, at most `max_wakeups_per_agent`
-    wake-ups and `rounds` idle rounds) plus the summarizer; `waterfall` one attempt per stage
-    (author + raters, each asked once more at most), up to `1 + max_rework` attempts.
-    """
-    params = resolved.params
-    agents = len(resolved.agents)
-    kind = resolved.topology.kind
-    if kind is TopologyKind.SOLO:
-        most = max(1, _int(params.get("max_turns"), 3))
-        if params.get("require_result") is False:
-            most = 1
-        return 1, most, []
-    if kind is TopologyKind.ROUNDTABLE:
-        rounds = max(1, _int(params.get("rounds"), 3))
-        name = params.get("channel")
-        if name is None and len(resolved.groupchats) == 1:
-            name = resolved.groupchats[0].name
-        try:
-            channel = resolved.channel(str(name))
-        except KeyError:
-            return agents, None, []
-        members = len(channel.members)
-        extra = 1 if params.get("summarizer") else 0
-        if channel.mode is ChannelMode.ROUNDS:
-            return members + extra, members * rounds + extra, []
-        wakeups = channel.max_wakeups_per_agent
-        return (
-            members + extra,
-            members * (1 + wakeups + rounds) + extra,
-            ["Ereignisgesteuert: Wie oft Agenten geweckt werden, hängt von der Diskussion ab."],
-        )
-    if kind is TopologyKind.WATERFALL:
-        rework = max(0, _int(params.get("max_rework"), 2))
-        least = most = 0
-        for stage in resolved.stages:
-            raters = sum(1 for r in resolved.raters if r != stage.agent)
-            least += 1 + raters
-            most += (1 + rework) * (2 + 2 * raters)
-        notes = []
-        if str(params.get("on_fail") or "continue") == "escalate":
-            notes.append("Nach einer Eskalation kann es weitere Versuche geben.")
-            return least, None, notes
-        return least, most, notes
-    if kind in (TopologyKind.REVIEW, TopologyKind.EXPLORATION):
-        return _w4_03_turns(resolved)
-    return agents, None, []
-
-
 def estimate_run(resolved: ResolvedRun) -> Estimate:
     """Rough ranges for turns, cost and duration of a resolved run, without invented prices.
 
-    Turns come from the topology and are capped by `turns_per_agent` × agents. Costs: arr
+    Turns come from the topology (`arr.plan.estimate.turn_range`, since W4b-02a also for
+    `phases` with loops) and are capped by `turns_per_agent` × agents. Costs: arr
     knows no prices, so the only honest number is the budget as an upper bound, and only when
     every agent reports costs (Claude); with Codex agents or without budget the cost is
     unknown. The duration is at most `wall_time`.
     """
     limits = resolved.limits
     agents = resolved.agents
-    least, most, notes = _topology_turns(resolved)
+    least, most, notes = turn_range(resolved)
     cap = len(agents) * limits.turns_per_agent if limits.turns_per_agent else None
     if most is None or (cap is not None and cap < most):
         most = cap
@@ -1714,65 +1656,3 @@ class RunsArea:
             await asyncio.gather(*tasks, return_exceptions=True)
         for follower in list(self._followers):
             follower.cancel()
-
-
-# --------------------------------------------------------------------------------------------
-# W4-03: estimate of `review` and `exploration`
-# --------------------------------------------------------------------------------------------
-
-
-def _discussion_turns(resolved: ResolvedRun, name: Any, members: int, rounds: int) -> int:
-    """Most turns of one discussion phase of `members` agents (see `_topology_turns`)."""
-    try:
-        channel = resolved.channel(str(name))
-    except KeyError:
-        return members * rounds
-    if channel.mode is ChannelMode.ROUNDS:
-        return members * rounds
-    return members * (1 + channel.max_wakeups_per_agent + rounds)
-
-
-def _w4_03_turns(resolved: ResolvedRun) -> tuple[int, int | None, list[str]]:
-    """Fewest and most turns of `review` and `exploration` (docs/03 §4.3, §4.5, W4-03).
-
-    `review`: the author writes the artifact (unless `artifact`, 1 + 1 asking again), per
-    round every judge reviews (+ asking again) and, with two or more judges, discusses
-    `discussion_rounds`; the author revises up to `max_revisions` times; a summarizer adds
-    one. `exploration`: the ideator (unless `ideas`, 1 + 1), `turns_per_idea` per idea (+ one
-    asking again), every ranker once (+ once again), a summarizer one.
-    """
-    import fnmatch  # here: W4-03 changes only the end of this file
-
-    params = resolved.params
-    ids = [a.id for a in resolved.agents]
-    extra = 1 if params.get("summarizer") else 0
-    if resolved.topology.kind is TopologyKind.REVIEW:
-        name = params.get("channel") or "judges"
-        try:
-            members = list(resolved.channel(str(name)).members)
-        except KeyError:
-            members = []
-        author = params.get("author") or next(
-            (a.id for a in resolved.agents if "author" in (a.id, a.base_id)), None
-        )
-        judges = len([m for m in members if m not in (author, params.get("summarizer"))])
-        revisions = max(0, _int(params.get("max_revisions"), 2))
-        rounds = max(0, _int(params.get("discussion_rounds"), 1))
-        writes = 0 if params.get("artifact") else 1
-        talk = _discussion_turns(resolved, name, judges, rounds) if judges > 1 else 0
-        least = writes + judges + (judges * min(rounds, 1) if judges > 1 else 0) + extra
-        most = 2 * writes + (1 + revisions) * (2 * judges + talk) + 2 * revisions + extra
-        notes = ["Ein Review endet früher, wenn die Judges das Artefakt annehmen."]
-        return least, most, notes
-    ideas = params.get("ideas")
-    n_ideas = len(ideas) if isinstance(ideas, list) and ideas else _int(params.get("n_ideas"), 3)
-    per_idea = max(1, _int(params.get("turns_per_idea"), 1))
-    ideator = 0 if isinstance(ideas, list) and ideas else 1
-    rankers = params.get("rankers")
-    if isinstance(rankers, str):
-        rankers = [rankers]
-    patterns = rankers if isinstance(rankers, list) else ["ranker*"]
-    ranker_count = len([i for i in ids if any(fnmatch.fnmatchcase(i, p) for p in patterns)])
-    least = ideator + n_ideas * per_idea + ranker_count + extra
-    most = 2 * ideator + n_ideas * (per_idea + 1) + 2 * ranker_count + extra
-    return least, most, []

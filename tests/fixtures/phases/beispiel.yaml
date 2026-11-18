@@ -1,0 +1,93 @@
+# The example of docs/10 §4.9 (Entwurf 10), unchanged: test data for W4b-02a (A1) and later
+# orders (W4b-02b, W4b-06).
+kind: research-group
+version: 1
+topology: phases
+
+rubric:
+  scale: [1, 10]
+  criteria: [korrektheit, vollstaendigkeit, strenge]
+
+agents:
+  - { id: ideator,    role: roles/ideator.md }
+  - { id: explorer,   role: roles/explorer.md, count: 2,
+      mix: [{ provider: claude }, { provider: codex }] }
+  - { id: strategist, role: roles/strategist.md }
+  - { id: prover,     role: roles/prover.md, model: claude-opus-5-5, compact: { at: 60% } }
+  - { id: judge,      role: roles/judge.md, count: 2,
+      mix: [{ provider: claude }, { provider: codex }] }
+  - { id: writer,     role: roles/writer.md, model: claude-haiku-5-5 }
+
+channels:
+  - { name: rueckfrage, members: [prover, strategist] }     # Direktkanal
+  - { name: judges, members: [judge-*], mode: rounds, anonymous: true }
+
+phases:
+  - name: ideen
+    topology: solo
+    actions:
+      ideator: { task: tasks/ideen.md, submission: { format: list, name: ideen } }
+    gate: { type: user }               # du siehst die Ideen, bevor die Explorer starten
+
+  - name: exploration
+    topology: parallel
+    isolated: true
+    over: ideen                        # jede Idee wird eine Action, reihum verteilt
+    actions:
+      explorer-*: { task: tasks/ausarbeiten.md, submission: { format: text } }
+    gate:
+      type: judge
+      raters: [judge-*]
+      action: { task: tasks/bewerten.md, submission: { format: rating } }
+      rule: rank                       # keine Schwelle, nur ordnen
+      routes: { ranked: next }
+
+  - name: beweis
+    topology: solo
+    inputs:
+      - { from: exploration, pick: best }
+    actions:
+      prover: { task: tasks/beweis.md, submission: { format: artifact, name: beweis } }
+    standby: [strategist]              # Sleeper, über den Direktkanal erreichbar
+    channels: [rueckfrage]
+    decider: user                      # hier entscheidest du jede Berechtigungsanfrage selbst
+    gate:
+      type: signal
+      field: status
+      routes: { done: next, not_solved: stop }
+
+  - name: pruefung
+    topology: parallel
+    isolated: true
+    context: reset                     # neue Sitzung und frischer Arbeitsordner
+    actions:
+      judge-*: { task: tasks/pruefen.md, submission: { format: review } }
+
+  - name: urteil
+    topology: chat
+    channels: [judges]
+    rounds: 1
+    actions:
+      judge-*: { task: tasks/besprechen.md, submission: { format: review } }
+    gate:
+      type: signal
+      field: verdict
+      rule: majority
+      routes:
+        accept: { goto: zusammenfassung }
+        minor: { goto: revision }
+        major: { goto: revision }
+        reject: stop
+
+  - name: revision
+    topology: solo
+    max_visits: 2
+    on_exhausted: next                 # dritte Revision verlangt: weiter zur Zusammenfassung
+    actions:
+      prover: { task: tasks/ueberarbeiten.md, submission: { format: artifact, name: beweis } }
+    gate: { type: done, routes: { done: { goto: pruefung } } }
+
+  - name: zusammenfassung
+    topology: solo
+    actions:
+      writer: { task: tasks/zusammenfassen.md, submission: { format: text } }

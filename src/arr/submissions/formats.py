@@ -12,14 +12,20 @@ built-in format takes from the assignment (`choices` of a decision, the IDs to `
 `known_objections`, the scale and criteria of the rubric) are filled in by
 `format_for(expectation, rubric)`; `Expectation` is the key `submission` of the context of an
 assignment. W4b-02a builds the JSON schema of `formats:` from `FormatSpec`.
+
+Since W4b-02a the base types `StrictModel`, `Slug` and `Rubric` live here and `arr.models`
+imports them from this module: a group's `formats:` holds `FormatSpec`s, so `arr.models` needs
+this module, and this module must not need `arr.models` (no import cycle, no late import).
+`from arr.models import StrictModel, Slug, Rubric` works as before.
 """
 
+import difflib
+import re
 from enum import StrEnum
 from typing import Annotated, Any, Self
 
-from pydantic import Field, model_validator
-
-from arr.models import Rubric, Slug, StrictModel
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic_core import PydanticCustomError
 
 __all__ = [
     "BUILTIN",
@@ -36,9 +42,92 @@ __all__ = [
     "FieldSpec",
     "FormatName",
     "FormatSpec",
+    "Rubric",
+    "Slug",
+    "StrictModel",
     "SubmissionStatus",
     "format_for",
 ]
+
+
+# --------------------------------------------------------------------------------------------
+# Base types (in `arr.models` until W4b-02a; unchanged, re-exported there)
+# --------------------------------------------------------------------------------------------
+
+
+class StrictModel(BaseModel):
+    """Base for models read from user files: unknown fields are errors (docs/02 §3.3).
+
+    The check runs before field validation so the error carries the field name, the allowed
+    fields and a spelling suggestion; `arr.resolve` turns it into a German `ConfigIssue`.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_unknown_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        allowed: list[str] = []
+        for name, info in cls.model_fields.items():
+            allowed.append(info.alias or name)
+            if info.alias:
+                allowed.append(name)
+        for key in data:
+            if key not in allowed:
+                public = sorted({info.alias or name for name, info in cls.model_fields.items()})
+                suggestion = difflib.get_close_matches(str(key), public, n=1)
+                raise PydanticCustomError(
+                    "unknown_field",
+                    "unknown field {field}",
+                    {
+                        "field": str(key),
+                        "allowed": ", ".join(public),
+                        "suggestion": suggestion[0] if suggestion else "",
+                    },
+                )
+        return data
+
+
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _check_slug(value: Any, what: str, example: str) -> Any:
+    if isinstance(value, str) and not _SLUG_RE.fullmatch(value):
+        raise ValueError(
+            f"Ungültige {what} „{value}“. Erlaubt sind Kleinbuchstaben, Ziffern, „-“ und „_“ "
+            f"(höchstens 64 Zeichen), z. B. „{example}“."
+        )
+    return value
+
+
+Slug = Annotated[str, BeforeValidator(lambda v: _check_slug(v, "Bezeichnung", "main"))]
+"""Name of a channel, profile, shared folder, …: lowercase slug (docs/06 §2)."""
+
+
+class Rubric(StrictModel):
+    """Rating scale and criteria for `submit_rating` (docs/03 §3, docs/01 §5)."""
+
+    scale: tuple[float, float] = (1, 10)
+    pass_score: float | None = None
+    criteria: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _pass_score_in_scale(self) -> Self:
+        low, high = self.scale
+        if low >= high:
+            raise ValueError("„scale“ braucht zwei Werte [min, max] mit min < max.")
+        if self.pass_score is not None and not low <= self.pass_score <= high:
+            raise ValueError(
+                f"„pass_score“ {self.pass_score:g} liegt außerhalb der Skala [{low:g}, {high:g}]."
+            )
+        return self
+
+
+# --------------------------------------------------------------------------------------------
+# Formats
+# --------------------------------------------------------------------------------------------
 
 
 class SubmissionStatus(StrEnum):
