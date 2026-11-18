@@ -28,7 +28,6 @@ import logging
 import os
 import re
 import time
-import unicodedata
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -50,6 +49,7 @@ from arr.service.api_models import (
     validation_issues,
 )
 from arr.service.gui.texts import RUN_STATUS
+from arr.submissions.text import clean_text
 
 log = logging.getLogger("arr.service.user_api")
 
@@ -70,8 +70,6 @@ RESULTS_PAGE_MAX = 100
 MAX_RATINGS = 20
 WAIT_MAX_S = 600
 WAIT_POLL_S = 0.25
-_KEEP = {"\t", "\n"}
-_LINE_BREAKS = {"\r", "\u0085", "\u2028", "\u2029"}
 VIA = MessageVia.USER_AGENT
 """Origin of every message of `post_to_run`: Claude Code (the user agent), never the GUI."""
 QUESTION_HINT = "Deine Nachricht beantwortet die Frage nicht; nur der User beantwortet sie in arr."
@@ -81,28 +79,6 @@ INTERNAL = "Bei dieser Anfrage ist in arr ein interner Fehler aufgetreten. Versu
 
 class ToolProblem(Exception):
     """A German answer for Claude Code instead of a result (becomes an MCP tool error)."""
-
-
-def clean_text(value: Any) -> str:
-    """Text without invisible or controlling characters (G1, W4-01.1).
-
-    Removed: every C0 and C1 control character (category `Cc`) except tab and line break, and
-    every format character (`Cf`): bidi controls, zero-width characters, word joiner, BOM, soft
-    hyphen, the Unicode tag characters U+E0000–U+E007F and the supplementary variation
-    selectors up to U+E01EF, which can carry instructions that no reader sees. Line and
-    paragraph separators (and CR, NEL) become a plain line break.
-    """
-    out = []
-    for char in str(value or ""):
-        if char in _KEEP:
-            out.append(char)
-        elif char in _LINE_BREAKS:
-            out.append("\n")
-        elif unicodedata.category(char) in ("Cc", "Cf") or 0xE0000 <= ord(char) <= 0xE01EF:
-            continue
-        else:
-            out.append(char)
-    return "".join(out)
 
 
 def agent_text(value: Any, limit: int = MAX_TEXT) -> str:

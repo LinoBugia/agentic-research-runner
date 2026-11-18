@@ -22,6 +22,10 @@ Script format (YAML)::
             args: {channel: main, body: "Idee 1", kind: idea}
             save_as: posted         # later: reply_to: "${posted.id}"
           - {do: room, action: wait_for_messages, args: {seconds: 20}}   # blocks, see below
+          - do: room                # phase toolkit (W4b-01): needs an assignment that expects it
+            action: submit
+            args: {status: done, summary: "Kein Gegenbeispiel.", fields: {verdict: minor,
+                   objections: [{text: "Lemma 2 braucht n > 1."}]}}
           - {do: usage, input: 1200, output: 300, cost_usd: 0.02}
           - {do: delay, seconds: 0.5}      # interruptible wait
           - {do: hang, seconds: 2}         # wait that ignores interrupt()
@@ -78,7 +82,7 @@ from arr.errors import ArrError
 from arr.models import AgentConfig, AgentStatus, Provider, StrictModel
 from arr.resolve import load_yaml_model, validate_model
 from arr.room.store import AgentRoom
-from arr.room.types import MessageKind, RoomAPI, RoomError, VoteChoice, VoteRule
+from arr.room.types import MessageKind, RoomAPI, RoomError, SubmitAPI, VoteChoice, VoteRule
 from arr.room.waiting import WAIT_MAX_S, wait_for_messages
 
 ROOM_TOOL_PREFIX = "mcp__arr-room__"
@@ -136,6 +140,7 @@ class RoomAction(StrEnum):
     SET_STATUS = "set_status"
     SUBMIT_RESULT = "submit_result"
     SUBMIT_RATING = "submit_rating"
+    SUBMIT = "submit"  # W4b-01: `SubmitAPI`, the tool of the phase toolkit
     GET_ASSIGNMENT = "get_assignment"
     GIVE_FLOOR = "give_floor"
     CALL_VOTE = "call_vote"
@@ -632,9 +637,17 @@ class FakeBackend:
                 f"Das Skript ruft das Room auf („{step.action}“), aber dem FakeBackend von "
                 f"„{self.config.id}“ ist kein RoomAPI zugewiesen (Parameter room)."
             )
+        api: type = RoomAPI
+        if step.action is RoomAction.SUBMIT:
+            api = SubmitAPI
+            if not isinstance(self.room, SubmitAPI):
+                raise FakeScriptError(
+                    f"Das Skript ruft „submit“ auf, aber das Room von „{self.config.id}“ kennt "
+                    "es nicht (SubmitAPI)."
+                )
         method = getattr(self.room, step.action.value)
         try:
-            inspect.signature(getattr(RoomAPI, step.action.value)).bind(None, **args)
+            inspect.signature(getattr(api, step.action.value)).bind(None, **args)
         except TypeError as exc:
             raise FakeScriptError(
                 f"Room-Aktion „{step.action}“: ungültige Argumente ({exc})."

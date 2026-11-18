@@ -28,7 +28,7 @@ from arr.log import setup_logging
 from arr.models import Provider
 from arr.room.address import is_user_question
 from arr.room.store import USER, AgentRoom, RoomStore
-from arr.room.types import ChannelInfo, Inbox, Message, RoomError
+from arr.room.types import ChannelInfo, Inbox, Message, RoomError, Submission
 from arr.room.waiting import PROVIDER_ENV, STREAK_MAX_S, WaitEnd, WaitOutcome, wait_max_s
 from arr.room.waiting import wait_for_messages as wait_for_messages_
 
@@ -167,7 +167,10 @@ def _respond(room: AgentRoom, tool: str, call: Callable[[], str]) -> str:
     try:
         text = call()
     except RoomError as exc:
-        log.info("agent %s: %s rejected: %s", room.agent_id, tool, exc)
+        # one log line, whatever the agent put into the message (W4b-01.1 G2)
+        log.info(
+            "agent %s: %s rejected: %s", room.agent_id, tool, " | ".join(str(exc).splitlines())
+        )
         raise ToolError(_with_footer(room, str(exc))) from None
     except Exception:
         log.exception("agent %s: %s failed", room.agent_id, tool)
@@ -323,7 +326,9 @@ def build_server(room: AgentRoom) -> MCPServer:
     """MCP server with the room tools of docs/06 §9 bound to `room.agent_id`.
 
     Moderator tools are only registered if the agent moderates at least one channel; the
-    store checks the moderator for every call as well.
+    store checks the moderator for every call as well. A run with the topology `phases` gets
+    `submit` and not `submit_result`/`submit_rating`, the five old topologies the reverse
+    (W4b-01).
     """
     server = RoomServer(room)
 
@@ -413,32 +418,10 @@ def build_server(room: AgentRoom) -> MCPServer:
 
         return _respond(room, "set_status", call)
 
-    @server.tool(
-        description="Ergebnis der aktuellen Stufe abgeben, z. B. Idee, Lemma, Beweis oder "
-        "Gutachten. Inhalt in `body` oder als Datei `path` relativ zu deinem Arbeitsordner."
-    )
-    def submit_result(
-        kind: str, title: str, body: str | None = None, path: str | None = None
-    ) -> str:
-        def call() -> str:
-            r = room.submit_result(kind, title, body, path)
-            text = f"Ergebnis #{r.id} abgegeben (Stufe {r.stage or '–'}, Versuch {r.attempt})."
-            return text + (f" Datei: {r.path}" if r.path else "")
-
-        return _respond(room, "submit_result", call)
-
-    @server.tool(
-        description="Ein Ergebnis bewerten: `score` auf der Skala der Rubrik, `comment` als "
-        "Begründung, optional `criteria` mit Punkten pro Kriterium."
-    )
-    def submit_rating(
-        result_id: int, score: float, comment: str, criteria: dict[str, float] | None = None
-    ) -> str:
-        def call() -> str:
-            r = room.submit_rating(result_id, score, comment, criteria)
-            return f"Bewertung #{r.id} für Ergebnis #{r.result_id} gespeichert ({r.score:g})."
-
-        return _respond(room, "submit_rating", call)
+    if room.store.uses_phases():
+        _add_submit(server, room)
+    else:
+        _add_old_submit_tools(server, room)
 
     limit = wait_max_s()
 
@@ -515,6 +498,85 @@ def build_server(room: AgentRoom) -> MCPServer:
     if room.moderated_channels():
         _add_moderator_tools(server, room)
     return server
+
+
+SUBMIT_DESCRIPTION = (
+    "Deine Abgabe für den aktuellen Auftrag, im Format, das der Auftrag nennt "
+    "(`get_assignment`, Kontext `submission`). Kopf: `status` done oder not_solved (nicht "
+    "gelöst ist eine gültige Abgabe, dann ist `summary` die Begründung), `summary` (ein bis drei "
+    "Sätze), `body` (Text), `files` (Pfade relativ zu deinem Arbeitsordner), `note_next` "
+    "(Notiz an dich für die nächste Phase). `fields` hält die Felder des Formats: text und "
+    "artifact keine; review `verdict` (accept, minor, major, reject) und `objections` (je "
+    "`text`, bei einem bekannten Einwand dazu `ref` und `status` offen, behoben oder strittig); "
+    "rating `ratings` (je `ref` = Nummer der Abgabe, `score`, optional `criteria`, `comment`); "
+    "list `items` (je `title`, `text`); decision `choice`. arr prüft sofort und nennt, was "
+    "fehlt; dann bessere nach und gib noch einmal ab. Eine neue Abgabe ersetzt die alte nicht, "
+    "es zählt die neueste."
+)
+
+
+def render_submission(sub: Submission) -> str:
+    """The answer of `submit`: number, place and what counts."""
+    what = f"Abgabe #{sub.id} angenommen ({sub.format}, {sub.status}"
+    what += f", Phase {sub.stage}" if sub.stage else ""
+    what += f", Durchlauf {sub.attempt})."
+    if sub.name:
+        what += f" Fassung v{sub.version} von „{sub.name}“."
+    if sub.sealed:
+        what += " Sie bleibt bis zum Ende der Phase für die anderen verborgen."
+    else:
+        what += f" Ordner: {sub.path}."
+    return what + " Gibst du noch einmal ab, zählt die neueste."
+
+
+def _add_submit(server: MCPServer, room: AgentRoom) -> None:
+    """`submit` of the phase toolkit (W4b-01), instead of `submit_result`/`submit_rating`."""
+
+    @server.tool(description=SUBMIT_DESCRIPTION)
+    def submit(
+        status: str,
+        summary: str,
+        body: str | None = None,
+        files: list[str] | None = None,
+        note_next: str | None = None,
+        fields: dict[str, Any] | None = None,
+    ) -> str:
+        return _respond(
+            room,
+            "submit",
+            lambda: render_submission(room.submit(status, summary, body, files, note_next, fields)),
+        )
+
+
+def _add_old_submit_tools(server: MCPServer, room: AgentRoom) -> None:
+    """`submit_result` and `submit_rating` of the five old topologies (until W4b-06)."""
+
+    @server.tool(
+        description="Ergebnis der aktuellen Stufe abgeben, z. B. Idee, Lemma, Beweis oder "
+        "Gutachten. Inhalt in `body` oder als Datei `path` relativ zu deinem Arbeitsordner."
+    )
+    def submit_result(
+        kind: str, title: str, body: str | None = None, path: str | None = None
+    ) -> str:
+        def call() -> str:
+            r = room.submit_result(kind, title, body, path)
+            text = f"Ergebnis #{r.id} abgegeben (Stufe {r.stage or '–'}, Versuch {r.attempt})."
+            return text + (f" Datei: {r.path}" if r.path else "")
+
+        return _respond(room, "submit_result", call)
+
+    @server.tool(
+        description="Ein Ergebnis bewerten: `score` auf der Skala der Rubrik, `comment` als "
+        "Begründung, optional `criteria` mit Punkten pro Kriterium."
+    )
+    def submit_rating(
+        result_id: int, score: float, comment: str, criteria: dict[str, float] | None = None
+    ) -> str:
+        def call() -> str:
+            r = room.submit_rating(result_id, score, comment, criteria)
+            return f"Bewertung #{r.id} für Ergebnis #{r.result_id} gespeichert ({r.score:g})."
+
+        return _respond(room, "submit_rating", call)
 
 
 def _add_moderator_tools(server: MCPServer, room: AgentRoom) -> None:

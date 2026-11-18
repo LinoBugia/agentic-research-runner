@@ -170,14 +170,61 @@ def _scope(text: str, declared: dict, notes: set[str], *, inert: bool) -> dict:
     return scope
 
 
-def _bits(value) -> float:  # noqa: ANN001 - a SymPy number
-    """About how many bits the integer part of |value| has."""
+def _rational(value) -> bool:  # noqa: ANN001 - a SymPy expression
+    """True if `value` is built from rational numbers only (no constant, no function)."""
     import sympy
 
+    return not value.atoms(sympy.Function) and all(
+        isinstance(atom, sympy.Rational) for atom in value.atoms()
+    )
+
+
+def _part_bits(value) -> float:  # noqa: ANN001 - a SymPy number
+    """An upper bound for the bits of `value` and of every number inside it, summed over its
+    parts: a rational part exactly, log2(max(|p|, |q|) + 1); a power its base times the
+    exponent; a constant, `I` or a float log2(|x| + 1)."""
+    import sympy
+
+    if _rational(value):
+        exact = value.doit()
+        if exact.is_Rational:
+            return math.log2(max(abs(int(exact.p)), abs(int(exact.q))) + 1)
+    if value.is_Pow and value.exp.is_number:
+        exponent = abs(sympy.N(value.exp, 15))
+        if not exponent.is_finite:
+            return math.inf
+        return _part_bits(value.base) * float(exponent)
+    if value.args:
+        return sum(_part_bits(part) for part in value.args)
+    magnitude = abs(sympy.N(value, 15))
+    return math.log2(float(magnitude) + 1) if magnitude.is_finite else math.inf
+
+
+def _bits(value) -> float:  # noqa: ANN001 - a SymPy number
+    """Bits per unit of exponent of a power of `value`: an upper bound for numerator and
+    denominator, for every base.
+
+    A base built from rational numbers only (all smaller powers already passed the check) is
+    computed exactly, p/q: log2 of the larger of |p| and |q|, so a small base counts with its
+    inverse; 0, 1 and -1 give 0. A single constant (`pi`, `E`, `I`, a float) counts with
+    |log2 |x||. Any other base, e.g. `(3+4*I)/5` or `pi/3`, counts with the bits of its parts
+    (`_part_bits`), and at least 1 bit (W4b-01.2): its modulus may be 1 while numerator and
+    denominator grow with every power.
+    """
+    import sympy
+
+    if _rational(value):
+        exact = value.doit()
+        if exact.is_Rational:
+            largest = max(abs(int(exact.p)), abs(int(exact.q)), 1)
+            return math.log2(largest)
     magnitude = abs(sympy.N(value, 15))
     if not magnitude.is_finite:
         return math.inf
-    return float(sympy.log(magnitude + 2, 2).evalf(15))
+    own = 0.0 if magnitude == 0 else abs(float(sympy.log(magnitude, 2).evalf(15)))
+    if not value.args:
+        return own
+    return max(own, _part_bits(value), 1.0)
 
 
 def check_size(text: str, declared: dict) -> None:
@@ -199,7 +246,7 @@ def check_size(text: str, declared: dict) -> None:
     for node in sympy.postorder_traversal(expr):
         if node.is_Pow and node.base.is_number and node.exp.is_number:
             exponent = abs(sympy.N(node.exp, 15))
-            if not exponent.is_finite or float(exponent) * max(_bits(node.base), 1) > MAX_BITS:
+            if not exponent.is_finite or float(exponent) * _bits(node.base) > MAX_BITS:
                 raise Refused(
                     f"Die Potenz {node} wäre zu groß zum Ausrechnen (mehr als {MAX_BITS} Bit). "
                     "Rechne symbolisch, z. B. mit einer Variablen statt der Zahl."

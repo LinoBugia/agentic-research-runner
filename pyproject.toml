@@ -51,6 +51,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.17.2",
+    "sympy>=1.14.0",
 ]
 # Agent SDKs are runtime dependencies since Welle 2; the group stays so old spike commands work.
 spikes = []

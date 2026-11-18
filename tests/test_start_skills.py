@@ -886,3 +886,70 @@ def test_w4_05_2_sympy_check_refuses_numbers_too_large(text: str) -> None:
     with pytest.raises(module.Refused, match="zu groß"):
         module.check_size(text, {})
     module.check_size("2^100 + factorial(20) + 10^4000", {})  # counter-check: small enough
+
+
+@pytest.mark.parametrize(
+    ("text", "refused"),
+    [
+        ("10^4000", False),  # 13 288 bits
+        ("2^13000", False),
+        ("2^15000", True),
+        ("(10^-300)^14000", True),  # a small base counts with its inverse (W4b-01.1)
+        ("((10^-300)^14000)^-14000", True),
+        ("(1/10^300)^-14000", True),
+        ("(3/2)^14000", True),  # numerator and denominator both count
+        ("(10^-3)^100", False),
+        ("0^5", False),
+        ("0^-5", False),
+        ("1^(10^9)", False),
+        ("(-1)^(10^9)", False),
+    ],
+)
+def test_w4b_01_1_sympy_check_bits_are_tight_and_count_small_bases(
+    text: str, refused: bool
+) -> None:
+    """The size estimate is an upper bound for numerator and denominator, not coarser than
+    needed: 10^4000 passes, 2^15000 does not; 0, 1 and -1 never break the estimate."""
+    try:
+        import sympy  # noqa: F401
+    except ImportError:
+        pytest.skip("SymPy fehlt in dieser Umgebung; die Run-venv hat es (Bericht).")
+    module = check_module()
+    if refused:
+        with pytest.raises(module.Refused, match="zu groß"):
+            module.check_size(text, {})
+    else:
+        module.check_size(text, {})
+
+
+@pytest.mark.parametrize(
+    ("text", "refused"),
+    [
+        ("((3+4*I)/5)^20", False),  # counter-check: small
+        ("((3+4*I)/5)^13000", True),  # numerator (3+4i)^13000: about 30 000 bits
+        ("((3+4*I)/5)^(10^9)", True),
+        ("(pi/3)^13000", True),  # denominator 3^13000: about 20 600 bits
+        ("(pi/3)^-15000", True),
+        ("((5+12*I)/13)^(10^9/7)", True),
+        ("((3+4*I)/5)^(-10^9)", True),
+        ("(((3+4*I)/5)^13000)^(1/2)", True),
+        ("(0.3+0.4)^14000", False),  # parts 0.86 bits: here only the floor of 1 bit counts
+        ("(0.3+0.4)^15000", True),
+        ("pi^100", False),  # a single constant counts with its own size
+        ("I^(10^9)", False),
+    ],
+)
+def test_n2_bases_of_modulus_one_are_bounded_too(text: str, refused: bool) -> None:
+    """W4b-01.2: a base with `I` or a constant counts with the bits of its parts and at least
+    1 bit per exponent, so its numerator and denominator stay below `MAX_BITS`; rational
+    bases are unchanged (`test_w4b_01_1_…`)."""
+    try:
+        import sympy  # noqa: F401
+    except ImportError:
+        pytest.skip("SymPy fehlt in dieser Umgebung; die Run-venv hat es (Bericht).")
+    module = check_module()
+    if refused:
+        with pytest.raises(module.Refused, match="zu groß"):
+            module.check_size(text, {})
+    else:
+        module.check_size(text, {})

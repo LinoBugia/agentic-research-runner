@@ -13,6 +13,7 @@ See docs/01-architektur.md §5, docs/02-workfolder-und-runs.md §4-§5, docs/06-
 """
 
 import errno
+import fcntl
 import json
 import logging
 import math
@@ -24,13 +25,15 @@ import stat
 import string
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
+
+from pydantic import ValidationError
 
 from arr.errors import ArrError
 from arr.models import (
@@ -40,6 +43,7 @@ from arr.models import (
     GroupChatConfig,
     ResolvedRun,
     Rubric,
+    TopologyKind,
 )
 from arr.resolve import load_yaml_model
 from arr.room.address import USER_ADDRESS, address, is_user_question, mentions
@@ -58,6 +62,7 @@ from arr.room.types import (
     Rating,
     Result,
     RoomError,
+    Submission,
     Vote,
     VoteChoice,
     VoteRule,
@@ -66,6 +71,9 @@ from arr.room.types import (
     WaitState,
 )
 from arr.runs.prepare import load_agent_file
+from arr.submissions.check import Checked, SubmissionError, check_submission
+from arr.submissions.diff import diff_pairs
+from arr.submissions.formats import Expectation, SubmissionStatus
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +87,31 @@ read profile denies the run folder, the policy names it a hard block) until `rel
 STAGING_DIR = f"{ROOM_DIR}/staging"
 """Where `submit_result` copies a file first; readable for no agent, so a sealed result never
 passes through `output/` (W4-03 F4)."""
+SUBMISSIONS_DIR = "output/submissions"
+"""Unnamed submissions: `<nr>-<phase>-<agent or alias>/` (docs/10 §4.12, W4b-01)."""
+OUTPUT_DIR = "output"
+"""Named submissions: `output/<name>/v<n>/`, from v2 on with `diff.patch`."""
+SUBMISSION_JSON = "submission.json"
+SUBMISSION_BODY = "body.md"
+SUBMISSION_FILES = "files"
+SUBMISSION_DIFF = "diff.patch"
+MAX_SUBMISSION_BYTES = 100 * 1024 * 1024
+"""All files of one submission together (each at most `MAX_ATTACHMENT_BYTES`)."""
+DIFF_TIMEOUT_S = 10.0
+"""The diff of two versions runs at most this long in its own process (as in `review`)."""
+MAX_DIFF_BYTES = 200 * 1024
+MAX_DIFF_LINES = 2000
+"""A file of a version gets a line diff up to this size (as in `review`), else a note."""
+MAX_DIFF_TOTAL_BYTES = 2 * 1024 * 1024
+"""Text of all files of two versions that goes to the diff process together."""
+SEED_SHOWN = "arr"
+"""How a version arr made itself (`add_version`, for `seed`) shows its author."""
+PUBLISH_TRIES = 3
+"""How often `submit` tries again when the stage was sealed or released, the previous version
+moved, or another version of the same name came in between the diff and the commit."""
+LOCK_WAIT_S = 60.0
+"""How long a submission waits for the lock of its name (`_lock_name`)."""
+LOCK_POLL_S = 0.05
 ROOM_DB_FILES = (DB_NAME, f"{DB_NAME}-wal", f"{DB_NAME}-shm", f"{DB_NAME}-journal")
 """The database files below `groupchats/`: they hold every result body (W4-03 F4)."""
 ORCHESTRATOR = "orchestrator"
@@ -134,6 +167,11 @@ CREATE TABLE IF NOT EXISTS wait_guard(agent TEXT PRIMARY KEY, waited REAL NOT NU
     until_streak INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS sealed_stage(stage TEXT PRIMARY KEY, channel TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS sealed_result(result_id INTEGER PRIMARY KEY, stage TEXT);
+CREATE TABLE IF NOT EXISTS submission(id INTEGER PRIMARY KEY, ts REAL, agent TEXT,
+    shown_as TEXT, stage TEXT, attempt INTEGER, action TEXT, format TEXT, name TEXT,
+    version INTEGER, status TEXT, summary TEXT, data TEXT, path TEXT, final_path TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS submission_version ON submission(name, version);
+CREATE TABLE IF NOT EXISTS sealed_submission(submission_id INTEGER PRIMARY KEY, stage TEXT);
 """
 """Tables of docs/02 §5 plus `channel.state`, `msg.via`/`msg.delivery`, `poll`, `floor`,
 `agent_report` (the status an agent reported itself), `agent_wait` (one row per agent and
@@ -141,7 +179,10 @@ kind of wait, docs/09 §4.3) and `wait_guard` (the limits of waiting, L7, L10, L
 runs before W3-07 lack the last three, rooms before W3-09 the column `agent_wait.result_from`
 (L14); readers treat that as „no rows“ or „none“. Since W4-03: `sealed_stage` (stages whose
 results stay hidden until `release`) and `sealed_result` (results not released yet); rooms
-before W4-03 lack them, which means „nothing sealed“."""
+before W4-03 lack them, which means „nothing sealed“. Since W4b-01: `submission` (every
+submission of `submit`, head and fields as JSON in `data`; `path` where its folder lies now,
+`final_path` where it lies after `release`) and `sealed_submission`; rooms before W4b-01 lack
+them, which means „no submissions“."""
 
 WAIT_GUARD_FIELDS = frozenset(
     {"waited", "seen", "last_end", "yield_to", "end_turn", "until_streak"}
@@ -353,6 +394,180 @@ def _row_to_assignment(row: sqlite3.Row) -> Assignment:
     )
 
 
+_SUBMISSION_SELECT = (
+    "SELECT s.*, (ss.submission_id IS NOT NULL) AS sealed FROM submission s "
+    "LEFT JOIN sealed_submission ss ON ss.submission_id = s.id"
+)
+
+
+def _row_to_submission(row: sqlite3.Row) -> Submission:
+    data = json.loads(row["data"] or "{}")
+    return Submission(
+        id=row["id"],
+        ts=row["ts"],
+        agent=row["agent"],
+        shown_as=row["shown_as"],
+        stage=row["stage"],
+        attempt=row["attempt"],
+        action=row["action"],
+        format=row["format"],
+        name=row["name"],
+        version=row["version"],
+        status=row["status"],
+        summary=row["summary"],
+        body=data.get("body"),
+        files=data.get("files", []),
+        note_next=data.get("note_next"),
+        fields=data.get("fields", {}),
+        path=row["path"],
+        sealed=bool(row["sealed"]),
+    )
+
+
+def _folder_part(text: str | None, empty: str) -> str:
+    """A piece of a folder name: lowercase letters, digits, `-` and `_`, at most 40."""
+    part = "".join(c if c.isascii() and (c.isalnum() or c in "-_") else "-" for c in text or "")
+    return part.lower().strip("-")[:40] or empty
+
+
+def _read_head(path: Path, limit: int) -> bytes | None:
+    """At most `limit` bytes of a regular file arr wrote; None for anything else."""
+    try:
+        fd = os.open(path, _FILE_FLAGS)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return os.read(fd, limit)
+    finally:
+        os.close(fd)
+
+
+HEAD_PART = "kopf.json"
+"""The part of `diff.patch` with head and fields of a version (W4b-01.1 M2)."""
+
+
+def head_text(format: str, status: str, summary: str, fields: Mapping[str, Any]) -> bytes:
+    """Head and fields of a version for the diff: fixed, indented JSON without `id`, `ts`,
+    `version`, `attempt` and never `note_next` (private, W4b-01.1 M3)."""
+    data = {"format": format, "status": status, "summary": summary, "fields": fields}
+    text = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    return text.encode("utf-8")
+
+
+def _version_parts(folder: Path) -> dict[str, Path]:
+    """The files of a version that get a diff: `body.md` and `files/<name>` (regular files)."""
+    parts = {}
+    if (folder / SUBMISSION_BODY).is_file():
+        parts[SUBMISSION_BODY] = folder / SUBMISSION_BODY
+    try:
+        entries = sorted(os.scandir(folder / SUBMISSION_FILES), key=lambda e: e.name)
+    except OSError:
+        entries = []
+    for entry in entries:
+        if entry.is_file(follow_symlinks=False):
+            parts[f"{SUBMISSION_FILES}/{entry.name}"] = Path(entry.path)
+    return parts
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """True if two regular files arr wrote are equal as a whole: size, then the content in
+    blocks, never all of it in memory; anything else (a link, unreadable) counts as changed."""
+    fds = []
+    try:
+        for path in (a, b):
+            fds.append(os.open(path, _FILE_FLAGS))
+        infos = [os.fstat(fd) for fd in fds]
+        if not all(stat.S_ISREG(i.st_mode) for i in infos) or infos[0].st_size != infos[1].st_size:
+            return False
+        while True:
+            left, right = os.read(fds[0], _COPY_CHUNK), os.read(fds[1], _COPY_CHUNK)
+            if left != right:
+                return False
+            if not left:
+                return True
+    except OSError:
+        return False
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def _as_text(data: bytes | None) -> str | None:
+    """Text of a part for the diff, or None (binary, too large or too many lines)."""
+    if data is None or len(data) > MAX_DIFF_BYTES or b"\0" in data:
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return text if len(text.splitlines()) <= MAX_DIFF_LINES else None
+
+
+def version_diff(
+    old: Path, old_v: int, new: Path, new_v: int, old_head: bytes, new_head: bytes
+) -> str:
+    """`diff.patch` from version `old_v` (folder `old`) to `new_v` (folder `new`).
+
+    The parts are head and fields (`HEAD_PART`, from `head_text`), `body.md` and every file
+    of `files/`. Whether a part changed is decided on the whole part (`_same_file`). A changed
+    text part up to `MAX_DIFF_BYTES` and `MAX_DIFF_LINES` gets a unified diff, made in a
+    process of its own with `DIFF_TIMEOUT_S` (`diff_pairs`); any other changed part a note at
+    the top. „Keine Änderung“ only when every part is the same.
+    """
+    before: dict[str, Path | bytes] = {HEAD_PART: old_head, **_version_parts(old)}
+    after: dict[str, Path | bytes] = {HEAD_PART: new_head, **_version_parts(new)}
+    names = [HEAD_PART, *sorted((set(before) | set(after)) - {HEAD_PART})]
+    notes, pairs, total = [], [], 0
+    for part in names:
+        a_src, b_src = before.get(part), after.get(part)
+        if a_src is not None and b_src is not None:
+            if isinstance(a_src, bytes) or isinstance(b_src, bytes):
+                same = a_src == b_src
+            else:
+                same = _same_file(a_src, b_src)
+            if same:
+                continue
+
+        def load(src: Path | bytes | None) -> bytes | None:
+            if src is None:
+                return b""
+            return src if isinstance(src, bytes) else _read_head(src, MAX_DIFF_BYTES + 1)
+
+        a, b = load(a_src), load(b_src)
+        text_a, text_b = _as_text(a), _as_text(b)
+        if text_a is None or text_b is None:
+            notes.append(
+                f"# {part}: geändert, kein Text-Diff (keine Textdatei oder größer als "
+                f"{MAX_DIFF_BYTES // 1024} KB oder {MAX_DIFF_LINES} Zeilen)."
+            )
+            continue
+        total += len(a or b"") + len(b or b"")
+        if total > MAX_DIFF_TOTAL_BYTES:
+            notes.append(f"# {part}: geändert, kein Text-Diff (Fassungen zusammen zu groß).")
+            continue
+        old_name = f"v{old_v}/{part}" if a_src is not None else "/dev/null"
+        new_name = f"v{new_v}/{part}" if b_src is not None else "/dev/null"
+        pairs.append((text_a, text_b, old_name, new_name))
+    diff = diff_pairs(pairs, timeout_s=DIFF_TIMEOUT_S) if pairs else ""
+    if diff is None:
+        notes.append(f"# Kein Diff: Er dauerte länger als {DIFF_TIMEOUT_S:g} s.")
+        diff = ""
+    if not notes and not diff:
+        return f"# Keine Änderung von v{old_v} zu v{new_v}.\n"
+    head = "\n".join(notes) + "\n" if notes else ""
+    return head + diff
+
+
+_COPY_VIEW = "arr-copy"
+"""Agent ID of the view `add_version` copies files with; it writes nothing to the room."""
+
+
+class _Stale(Exception):
+    """Another version of the same name came in between: compute the diff again."""
+
+
 class RoomStore:
     """The group chat database of one run: `<run>/groupchats/room.sqlite` (docs/02 §4-§5).
 
@@ -555,8 +770,9 @@ class RoomStore:
 
     def release(self, stage: str) -> list[Result]:
         """Unseal `stage`: its hidden result files move to `output/results/` (their names
-        carry aliases, see `seal`); later results of the stage are no longer sealed. Returns
-        the released results, oldest first."""
+        carry aliases, see `seal`), its hidden submissions to their place below `output/`
+        (W4b-01); later results of the stage are no longer sealed. Returns the released
+        results, oldest first."""
         results_dir = self.run_dir / RESULTS_DIR
         results_dir.mkdir(parents=True, exist_ok=True)
         released = []
@@ -575,13 +791,51 @@ class RoomStore:
                 if result.path:
                     source = self.run_dir / result.path
                     target = results_dir / source.name
-                    os.replace(source, target)
+                    if os.path.lexists(source):
+                        os.replace(source, target)
+                    elif not os.path.lexists(target):
+                        raise ArrError(
+                            f"Die versiegelte Datei „{result.path}“ von Ergebnis #{result_id} "
+                            "fehlt. Das ist ein Fehler in arr."
+                        )
+                    # else: moved by a release that was killed before its commit (W4b-01.1)
                     rel = target.relative_to(self.run_dir).as_posix()
                     con.execute("UPDATE result SET path=? WHERE id=?", (rel, result_id))
                     result = result.model_copy(update={"path": rel})
                 con.execute("DELETE FROM sealed_result WHERE result_id=?", (result_id,))
                 released.append(result)
+            self._release_submissions(con, stage)
         return released
+
+    def _release_submissions(self, con: sqlite3.Connection, stage: str) -> None:
+        """Move the sealed submissions of `stage` to their place below `output/` (W4b-01).
+
+        A submission whose folder is already there and gone from `SEALED_DIR` was moved by a
+        `release` killed before its commit: only its row is brought up to date (W4b-01.1 M1).
+        """
+        try:
+            rows = con.execute(
+                "SELECT s.id, s.path, s.final_path FROM sealed_submission ss "
+                "JOIN submission s ON s.id = ss.submission_id WHERE ss.stage=? ORDER BY s.id",
+                (stage,),
+            ).fetchall()
+        except sqlite3.OperationalError:  # a room from before W4b-01
+            return
+        for row in rows:
+            source, target = self.run_dir / row["path"], self.run_dir / row["final_path"]
+            if not os.path.lexists(source):
+                if not os.path.lexists(target):
+                    raise ArrError(
+                        f"Die versiegelte Abgabe #{row['id']} fehlt in „{row['path']}“. Das ist "
+                        "ein Fehler in arr."
+                    )
+                # moved by a release that was killed before its commit (W4b-01.1 M1)
+            else:
+                self._clear_orphan(con, row["final_path"], own=row["id"])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(source, target)
+            con.execute("UPDATE submission SET path=final_path WHERE id=?", (row["id"],))
+            con.execute("DELETE FROM sealed_submission WHERE submission_id=?", (row["id"],))
 
     def result_text(self, result_id: int, max_bytes: int) -> str:
         """Body of a result and the start of its file (also a sealed one) as text, for arr's
@@ -610,6 +864,12 @@ class RoomStore:
             run_yaml = self.run_dir / "run.yaml"
             self._run = load_yaml_model(run_yaml, ResolvedRun) if run_yaml.is_file() else None
         return self._run
+
+    def uses_phases(self) -> bool:
+        """True if `run.yaml` names the topology `phases` (W4b-01): its agents get `submit`
+        instead of `submit_result` and `submit_rating`."""
+        run = self._resolved()
+        return run is not None and run.topology.kind is TopologyKind.PHASES
 
     def rubric(self) -> Rubric:
         """Rubric of the run from `run.yaml` (docs/03 §3); the default scale without one."""
@@ -1136,6 +1396,420 @@ class RoomStore:
             sql, args = sql + " WHERE result_id=?", (result_id,)
         with self._read() as con:
             return [_row_to_rating(r) for r in con.execute(sql + " ORDER BY id", args)]
+
+    # ----------------------------------------------------------------------------------------
+    # Submissions (docs/10 §4.3, §4.12; W4b-01)
+    # ----------------------------------------------------------------------------------------
+
+    def submissions(
+        self,
+        *,
+        agent: str | None = None,
+        stage: str | None = None,
+        attempt: int | None = None,
+        name: str | None = None,
+        action: str | None = None,
+        format: str | None = None,
+        latest: bool = False,
+    ) -> list[Submission]:
+        """Submissions in order, filtered by every argument given (sealed ones included).
+
+        `latest`: only the newest per agent, stage, attempt and action (Entscheidung 16: an
+        agent may hand in again, the newest counts). Empty for a room before W4b-01.
+        """
+        sql, args = _SUBMISSION_SELECT + " WHERE 1=1", []
+        filters = (
+            ("agent", agent),
+            ("stage", stage),
+            ("attempt", attempt),
+            ("name", name),
+            ("action", action),
+            ("format", format),
+        )
+        for column, value in filters:
+            if value is not None:
+                sql, args = sql + f" AND s.{column}=?", [*args, value]
+        try:
+            with self._read() as con:
+                found = [_row_to_submission(r) for r in con.execute(sql + " ORDER BY s.id", args)]
+        except sqlite3.OperationalError:  # a room from before W4b-01
+            return []
+        if latest:
+            newest = {(s.agent, s.stage, s.attempt, s.action): s for s in found}
+            found = sorted(newest.values(), key=lambda s: s.id)
+        return found
+
+    def submission(self, submission_id: int) -> Submission:
+        """One submission by its number."""
+        try:
+            with self._read() as con:
+                row = con.execute(_SUBMISSION_SELECT + " WHERE s.id=?", (submission_id,)).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        if row is None:
+            raise ArrError(f"Die Abgabe #{submission_id} gibt es nicht.")
+        return _row_to_submission(row)
+
+    def latest_version(self, name: str) -> Submission | None:
+        """The newest version of the named submission `name`, None without one."""
+        found = self.submissions(name=name)
+        return found[-1] if found else None
+
+    def add_version(
+        self,
+        name: str,
+        *,
+        summary: str,
+        format: str = "artifact",
+        body: str | None = None,
+        files: Sequence[str] = (),
+        root: Path | None = None,
+        fields: Mapping[str, Any] | None = None,
+        stage: str | None = None,
+    ) -> Submission:
+        """A version of `name` that arr makes itself, without the tool (for `seed`, W4b-02b).
+
+        `files` are paths relative to `root` (default `base/`, the project at the start),
+        copied by the same rules as files of agents (`AgentRoom.copy_file`). The format is
+        checked like a submission with status `done`; the author is `orchestrator`, shown as
+        `arr`. Never sealed. `ArrError` with a German message if anything does not fit.
+        """
+        try:
+            expectation = Expectation.model_validate({"format": format, "name": name})
+            checked = check_submission(
+                status=SubmissionStatus.DONE.value,
+                summary=summary,
+                body=body,
+                files=list(files),
+                fields=dict(fields or {}),
+                expectation=expectation,
+            )
+        except ValidationError as exc:
+            raise ArrError(f"Die Fassung „{name}“ lässt sich nicht anlegen: {exc}") from None
+        except SubmissionError as exc:
+            raise ArrError(str(exc)) from None
+        view = AgentRoom(self, _COPY_VIEW, root or self.run_dir / "base")
+        try:
+            return self._publish(
+                agent=ORCHESTRATOR,
+                expectation=expectation,
+                checked=checked,
+                stage=stage,
+                attempt=1,
+                copy=view.copy_file,
+                shown=lambda _con, _channel: SEED_SHOWN,
+                current=None,
+                seal=False,
+            )
+        except RoomError as exc:
+            raise ArrError(str(exc)) from None
+
+    def _check_name_place(self, name: str) -> None:
+        """`output/<name>` is free or a plain folder of versions (no link, no file)."""
+        place = self.run_dir / OUTPUT_DIR / name
+        try:
+            info = os.lstat(place)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(info.st_mode):
+            raise RoomError(
+                f"„output/{name}“ ist schon belegt. Der Auftrag braucht einen anderen Namen."
+            )
+
+    def _clear_orphan(self, con: sqlite3.Connection, rel: str, *, own: int | None = None) -> None:
+        """Make room at `rel` (a folder of a submission, relative to the run) under the write
+        lock (W4b-01.1 M1).
+
+        Something there that no row of `submission` points to (`path` or `final_path`; `own`
+        is the row being moved) is the rest of a call killed between rename and commit: it is
+        moved, without following a link, to `STAGING_DIR`, which no agent can read. Something
+        a row points to stays, and arr refuses."""
+        place = self.run_dir / rel
+        if not os.path.lexists(place):
+            return
+        row = con.execute(
+            "SELECT id FROM submission WHERE (path=? OR final_path=?) AND id IS NOT ?",
+            (rel, rel, own),
+        ).fetchone()
+        if row is not None:
+            log.error("submission folder %s belongs to submission #%s", rel, row["id"])
+            raise RoomError(
+                f"„{rel}“ gehört schon zu Abgabe #{row['id']}. Das ist ein Fehler in arr, nicht "
+                "bei dir: Beende den Turn mit einer kurzen Notiz."
+            )
+        orphan = self.run_dir / STAGING_DIR / f".orphan-{uuid.uuid4().hex}"
+        orphan.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(place, orphan)
+        log.warning("moved the orphaned folder %s to %s", rel, orphan.name)
+
+    def _stage_submission(
+        self, staging: Path, checked: Checked, copy: Callable[[str, Path], str] | None
+    ) -> list[str]:
+        """Body and files of a submission into `staging`; returns the names of the files."""
+        if checked.body is not None:
+            (staging / SUBMISSION_BODY).write_text(checked.body, encoding="utf-8")
+        if not checked.files:
+            return []
+        if copy is None:
+            raise RoomError("Diese Abgabe kann keine Dateien enthalten.")
+        folder = staging / SUBMISSION_FILES
+        folder.mkdir()
+        names, total = [], 0
+        for rel in checked.files:
+            name = [p for p in rel.split("/") if p not in ("", ".")][-1]
+            copy(rel, folder / name)
+            total += (folder / name).stat().st_size
+            if total > MAX_SUBMISSION_BYTES:
+                raise RoomError(
+                    f"Die Dateien der Abgabe sind zusammen zu groß (erlaubt "
+                    f"{MAX_SUBMISSION_BYTES // (1024 * 1024)} MB)."
+                )
+            names.append(name)
+        return names
+
+    def _stage_sealed(self, stage: str | None) -> bool:
+        with self._read() as con:
+            return AgentRoom._sealed(con, stage)[0]
+
+    @staticmethod
+    def _rated(con: sqlite3.Connection, agent: str, checked: Checked) -> None:
+        """Every rated submission exists and is not the rater's own (Entscheidung 7)."""
+        for i, entry in enumerate(checked.fields.get("ratings") or []):
+            ref = entry["ref"]
+            row = con.execute("SELECT agent FROM submission WHERE id=?", (ref,)).fetchone()
+            if row is None:
+                raise RoomError(f"„fields.ratings[{i}].ref“: Die Abgabe #{ref} gibt es nicht.")
+            if row["agent"] == agent:
+                raise RoomError(
+                    f"„fields.ratings[{i}].ref“: #{ref} ist deine eigene Abgabe. Eigene "
+                    "Abgaben bewertest du nie."
+                )
+
+    def _publish(
+        self,
+        *,
+        agent: str,
+        expectation: Expectation,
+        checked: Checked,
+        stage: str | None,
+        attempt: int,
+        copy: Callable[[str, Path], str] | None,
+        shown: Callable[[sqlite3.Connection, str | None], str],
+        current: Callable[[sqlite3.Connection], None] | None,
+        seal: bool = True,
+    ) -> Submission:
+        """File a checked submission exactly once (docs/10 §4.12).
+
+        Everything is prepared in `STAGING_DIR` (body, files, `diff.patch` against the
+        previous version, `submission.json`), then renamed in one step to its place: below
+        `output/` or, in a sealed stage, below `SEALED_DIR`, in the same write transaction that
+        numbers it. A failure leaves nothing below `output/` and no row. Versions of one name
+        are made one after the other (`_lock_name`); if the stage was sealed or released
+        meanwhile, the previous version moved or another version came in (a writer without the
+        lock), the diff is made again (`PUBLISH_TRIES`).
+        `note_next` stays in the database, never in the folder or the diff (W4b-01.1 M3).
+        """
+        name = expectation.name
+        if name is not None:
+            self._check_name_place(name)
+        staging = self.run_dir / STAGING_DIR / f".submission-{uuid.uuid4().hex}"
+        staging.mkdir(parents=True)
+        moved: Path | None = None
+        lock: int | None = None
+        try:
+            names = self._stage_submission(staging, checked, copy)
+            if name is not None:
+                lock = self._lock_name(name)
+            for _ in range(PUBLISH_TRIES):
+                previous = self.latest_version(name) if name is not None else None
+                sealed_now = seal and self._stage_sealed(stage)
+                (staging / SUBMISSION_DIFF).unlink(missing_ok=True)
+                if previous is not None:
+                    assert previous.version is not None
+                    if previous.sealed and not (sealed_now and previous.stage == stage):
+                        text = (
+                            f"# Kein Diff: Die vorige Fassung v{previous.version} ist noch "
+                            "versiegelt.\n"
+                        )
+                    else:
+                        text = version_diff(
+                            self.run_dir / previous.path,
+                            previous.version,
+                            staging,
+                            previous.version + 1,
+                            head_text(
+                                previous.format, previous.status, previous.summary, previous.fields
+                            ),
+                            head_text(
+                                expectation.format,
+                                checked.status.value,
+                                checked.summary,
+                                checked.fields,
+                            ),
+                        )
+                    (staging / SUBMISSION_DIFF).write_text(text, encoding="utf-8")
+                try:
+                    with self._write() as con:
+                        if current is not None:
+                            current(con)
+                        newest = (
+                            con.execute(
+                                "SELECT id FROM submission WHERE name=? "
+                                "ORDER BY version DESC LIMIT 1",
+                                (name,),
+                            ).fetchone()
+                            if name is not None
+                            else None
+                        )
+                        if (newest["id"] if newest else None) != (
+                            previous.id if previous else None
+                        ):
+                            raise _Stale
+                        # The diff above read the previous version where it lay then. If
+                        # another process released it while the diff ran, it moved, and the
+                        # diff may name `/dev/null` as the previous version: make it again
+                        # (W4b-01.2, N1). A release always moves the sealed version, and a change
+                        # of the seal alone, without that, does not change the diff, so comparing
+                        # the place of the previous version is enough.
+                        sealed, channel = AgentRoom._sealed(con, stage) if seal else (False, None)
+                        if previous is not None:
+                            row = con.execute(
+                                "SELECT path FROM submission WHERE id=?", (previous.id,)
+                            ).fetchone()
+                            if row is None or row["path"] != previous.path:
+                                raise _Stale
+                        if expectation.format == "rating" and expectation.spec is None:
+                            self._rated(con, agent, checked)
+                        who = shown(con, channel)
+                        version = (previous.version or 0) + 1 if previous else 1
+                        version = version if name is not None else None
+                        data = {
+                            "body": checked.body,
+                            "files": names,
+                            "sources": checked.files,
+                            "note_next": checked.note_next,
+                            "fields": checked.fields,
+                        }
+                        ts = _now()
+                        cur = con.execute(
+                            "INSERT INTO submission(ts, agent, shown_as, stage, attempt, action, "
+                            "format, name, version, status, summary, data, path, final_path) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                ts,
+                                agent,
+                                who,
+                                stage,
+                                attempt,
+                                expectation.action,
+                                expectation.format,
+                                name,
+                                version,
+                                checked.status.value,
+                                checked.summary,
+                                json.dumps(data, ensure_ascii=False),
+                                "",
+                                "",
+                            ),
+                        )
+                        number = cur.lastrowid
+                        assert number is not None
+                        if name is not None:
+                            final = f"{OUTPUT_DIR}/{name}/v{version}"
+                        else:
+                            phase = _folder_part(stage, "ohne-phase")
+                            final = (
+                                f"{SUBMISSIONS_DIR}/{number:03d}-{phase}-"
+                                f"{_folder_part(who, 'agent')}"
+                            )
+                        where = f"{SEALED_DIR}/submission-{number:03d}" if sealed else final
+                        record = Submission(
+                            id=number,
+                            ts=ts,
+                            agent=agent,
+                            shown_as=who,
+                            stage=stage,
+                            attempt=attempt,
+                            action=expectation.action,
+                            format=expectation.format,
+                            name=name,
+                            version=version,
+                            status=checked.status.value,
+                            summary=checked.summary,
+                            body=checked.body,
+                            files=names,
+                            note_next=checked.note_next,
+                            fields=checked.fields,
+                            path=where,
+                            sealed=sealed,
+                        )
+                        public = record.model_dump(
+                            mode="json", exclude={"agent", "path", "sealed", "body", "note_next"}
+                        )
+                        public["agent"] = public.pop("shown_as")
+                        public["body"] = SUBMISSION_BODY if checked.body is not None else None
+                        (staging / SUBMISSION_JSON).write_text(
+                            json.dumps(public, ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8",
+                        )
+                        target = self.run_dir / where
+                        # The place at `final` of a sealed one is cleared by `release`, which
+                        # moves it there; nothing can appear there in between (W4b-01.2, N4).
+                        self._clear_orphan(con, where)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        moved = target  # free now, under the write lock
+                        os.rename(staging, target)
+                        con.execute(
+                            "UPDATE submission SET path=?, final_path=? WHERE id=?",
+                            (where, final, number),
+                        )
+                        if sealed:
+                            con.execute(
+                                "INSERT INTO sealed_submission(submission_id, stage) VALUES(?,?)",
+                                (number, stage),
+                            )
+                    moved = None  # committed
+                    return record
+                except _Stale:
+                    continue
+            raise RoomError(
+                "Während deiner Abgabe hat sich der Stand der Phase geändert (versiegelt, "
+                "freigegeben oder eine neue Fassung). Gib noch einmal ab."
+            )
+        finally:
+            if lock is not None:
+                os.close(lock)  # releases the lock
+            if moved is not None:
+                shutil.rmtree(moved, ignore_errors=True)
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _lock_name(self, name: str) -> int:
+        """Hold the versions of `name` for this process until the descriptor is closed
+        (`flock`; the system releases it when a process dies): two submissions of the same
+        name number and diff one after the other, without holding the database lock while the
+        diff runs. Waits at most `LOCK_WAIT_S` (W4b-01.1 G6), then `RoomError`. Returns the
+        descriptor."""
+        path = self.run_dir / STAGING_DIR / f".version-{name}.lock"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        deadline = time.monotonic() + LOCK_WAIT_S
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return fd
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(LOCK_POLL_S)
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+        log.warning("version lock of %s still held after %.0f s", name, LOCK_WAIT_S)
+        raise RoomError(
+            f"Gerade legt arr eine andere Fassung von „{name}“ an, und das dauert zu lange. "
+            "Gib noch einmal ab."
+        )
 
     # ----------------------------------------------------------------------------------------
     # Export
@@ -2209,6 +2883,101 @@ class AgentRoom:
     def get_assignment(self) -> Assignment | None:
         """Current assignment with stage and context package."""
         return self.store.assignment(self.agent_id)
+
+    # ----------------------------------------------------------------------------------------
+    # Submissions (docs/10 §4.3, W4b-01)
+    # ----------------------------------------------------------------------------------------
+
+    def _shown_label(self, con: sqlite3.Connection, channel: str | None) -> str:
+        """How my submissions show me: my alias in `channel` or, without it, in my first
+        anonymous channel (also a closed one), else my ID (the rule of `_file_label`)."""
+        channels = self._my_channels(con)
+        if channel is not None:
+            channels = [ch for ch in channels if ch.name == channel] + channels
+        for ch in channels:
+            if ch.anonymous and ch.members.get(self.agent_id):
+                return str(ch.members[self.agent_id])
+        return self.agent_id
+
+    def _expectation(self, assignment: Assignment | None) -> Expectation:
+        """The submission my newest assignment expects (`context["submission"]`)."""
+        raw = assignment.context.get("submission") if assignment is not None else None
+        if raw is None:
+            raise RoomError(
+                "Dein aktueller Auftrag erwartet keine Abgabe mit `submit`. Lies ihn mit "
+                "`get_assignment`."
+            )
+        try:
+            return Expectation.model_validate(raw)
+        except ValidationError as exc:
+            log.warning(
+                "agent %s: invalid expectation in assignment (turn %s): %s",
+                self.agent_id,
+                assignment.turn if assignment else None,
+                exc,
+            )
+            raise RoomError(
+                "Dein Auftrag beschreibt die erwartete Abgabe nicht gültig. Das ist ein Fehler "
+                "in arr, nicht bei dir: Beende den Turn mit einer kurzen Notiz."
+            ) from None
+
+    def submit(
+        self,
+        status: str,
+        summary: str,
+        body: str | None = None,
+        files: list[str] | None = None,
+        note_next: str | None = None,
+        fields: dict[str, Any] | None = None,
+    ) -> Submission:
+        """Hand in the submission of my newest assignment (`context["submission"]`).
+
+        Head and `fields` are checked at once against the expected format (`check_submission`);
+        `RoomError` names every problem in German, and the agent can try again in the same
+        turn. Files are copied from my working folder by the rules of attachments
+        (`_copy_source`). Stage and attempt come from the assignment, as for `submit_result`.
+        Every accepted submission is filed once (`RoomStore._publish`); in a sealed stage it
+        stays in `SEALED_DIR` until `release`.
+        """
+        assignment = self.store.assignment(self.agent_id)
+        expectation = self._expectation(assignment)
+        assert assignment is not None
+        try:
+            checked = check_submission(
+                status=status,
+                summary=summary,
+                body=body,
+                files=files,
+                note_next=note_next,
+                fields=fields,
+                expectation=expectation,
+                rubric=self.rubric,
+            )
+        except SubmissionError as exc:
+            raise RoomError(str(exc)) from None
+        attempt = assignment.context.get("attempt")
+        attempt = (
+            max(1, attempt) if isinstance(attempt, int) and not isinstance(attempt, bool) else 1
+        )
+
+        def current(con: sqlite3.Connection) -> None:
+            latest = self.store._latest_assignment(con, self.agent_id)
+            if latest is None or (latest.turn, latest.ts) != (assignment.turn, assignment.ts):
+                raise RoomError(
+                    "Dein Auftrag hat sich während der Abgabe geändert. Lies ihn mit "
+                    "`get_assignment` und gib passend dazu ab."
+                )
+
+        return self.store._publish(
+            agent=self.agent_id,
+            expectation=expectation,
+            checked=checked,
+            stage=assignment.stage,
+            attempt=attempt,
+            copy=self._copy_source,
+            shown=self._shown_label,
+            current=current,
+        )
 
     # ----------------------------------------------------------------------------------------
     # Moderator tools (docs/06 §5.3)

@@ -222,6 +222,8 @@ class TopologyKind(StrEnum):
     EXPLORATION = "exploration"
     WATERFALL = "waterfall"
     REVIEW = "review"
+    PHASES = "phases"
+    """The phase toolkit (docs/10 §4.10); not startable until its runner exists (W4b-02b)."""
 
 
 class ChannelMode(StrEnum):
