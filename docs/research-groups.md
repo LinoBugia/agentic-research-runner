@@ -1,6 +1,6 @@
 # Research groups: agents, phases, actions and gates
 
-> **Status: design.** Today `arr` ships five fixed group types (`solo`, `roundtable`, `waterfall`, `review`, `exploration`). This document describes the model they are being rebuilt on, so that you can compose your own groups from the same parts. It records where the design is going, not what the code does today. The notation of the group file is settled for the first version; the code that reads it is being built. Built so far: the submission tool with its formats and checks, and the result folder with versions and diffs. No run can use them yet, because the phase runner is still missing.
+> **Status: design.** Today `arr` ships five fixed group types (`solo`, `roundtable`, `waterfall`, `review`, `exploration`). This document describes the model they are being rebuilt on, so that you can compose your own groups from the same parts. It records where the design is going, not what the code does today. The notation of the group file is settled for the first version; the code that reads it is being built. Built so far: the submission tool with its formats and checks, the result folder with versions and diffs, and the group file itself (its model, the checks and the estimate of turns). No run can use phases yet, because the phase runner is still missing.
 
 ## The idea
 
@@ -41,7 +41,7 @@ The task is for the agent. The submission is for everything that comes after it:
 
 The task is a text file in the group (`tasks/<name>.md`). It says what to do in this phase, while the role says who the agent is. `arr` adds the context: the research question of the run, the phase, the inputs from earlier phases and, on a retry, the feedback.
 
-An action can take several turns. If a turn ends without a submission, for example because the agent is waiting for a long computation, `arr` starts the next turn of the same action. The number of turns per action is limited.
+An action can take several turns. If a turn ends without a submission, for example because the agent is waiting for a long computation, `arr` starts the next turn of the same action. The number of turns per action is limited (`turns`, three unless the action says otherwise).
 
 ### Submission
 
@@ -179,7 +179,7 @@ The **gate** of a phase decides when the phase ends and where the run goes next.
 | Gate | Who decides | Results | Example |
 |---|---|---|---|
 | `done` (default) | Nobody. The phase ends when every agent with an action has submitted. | `done` | a summary |
-| `signal` | The agents themselves, through a field of their submission. With several agents a rule applies (`all`, `any`, `majority`, `unanimous`). | the values of the field | A prover reports `not_solved`, and the run goes back to the strategy. |
+| `signal` | The agents themselves, through a field of their submission. With several submissions a rule applies: `all` or `any` for `status`, `majority` or `unanimous` for any field with fixed values. | the values of the field | A prover reports `not_solved`, and the run goes back to the strategy. |
 | `judge` | Agents that did not take part in the phase. After the work each of them gets one rating action and rates every submission of the phase in it, never its own. A rule turns the ratings into a result (`mean` with a pass score, `rank`, `majority`). | `pass` or `fail` for a pass score, `ranked` for `rank`, the verdict for `majority` | Two raters score a proof sketch. |
 | `user` | You. The run pauses and shows you the summaries. | the route you choose | You look at the strategy before the prover starts. |
 
@@ -378,7 +378,17 @@ phases:
 
 Each entry under `actions` is one action: the agent, its task and its submission.
 
-`arr` checks a group file before every start and reports errors with the path, the reason and a suggestion, for example a route to a phase that does not exist or a loop without a limit.
+`arr` checks a group file and reports errors with the path, the reason and a suggestion, for example a route to a phase that does not exist or a loop without a limit. Today the check runs on the skills page; once the runner is there it also runs before every start.
+
+Some details of the notation:
+
+- A value can be a whole placeholder such as `rounds: "{{ params.rounds }}"`. That works for numbers, choices and names; keys cannot be placeholders.
+- `groupchats` is read as the older spelling of `channels`. A file that uses both is rejected.
+- Defaults: the gate `done` with the route `next`, `turns: 3`, `rounds: 3` in a `chat` phase, `context: keep`.
+- A phase is dropped when its `when` does not hold or none of its agents with an action is active. A route to a dropped phase goes to the next phase that exists.
+- `max_visits: 0` is allowed. The phase is never entered, and a route to it takes `on_exhausted` at once.
+- The format `rating` belongs to the rating action of a `judge` gate and cannot be used in an ordinary action.
+- An input from a channel is always the full text of the channel.
 
 ## The supervising agent
 
