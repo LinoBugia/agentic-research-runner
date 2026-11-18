@@ -9,13 +9,16 @@ that only runs through exhausted phases visits no bounded phase and never ends.
 Pure functions over the resolved run, used by `arr.plan.check` and `arr.plan.estimate`.
 """
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 
 from arr.models import GateType, Goto, ResolvedPhase, ResolvedRun, Route, RouteKeyword
 
 __all__ = [
     "END",
+    "entry",
+    "exhausted",
+    "on_exhausted",
     "USER",
     "Graph",
     "build",
@@ -69,7 +72,7 @@ class Graph:
         `escalate` among the redirects becomes what the user may choose there."""
         if target < 0:
             return {target}
-        out = set() if self.phases[target].max_visits == 0 else {target}
+        out = set() if exhausted(self.phases[target], 0) else {target}
         if self.bounded(target):
             out |= self.redirect[target]
             if with_user:
@@ -125,6 +128,34 @@ def target(phases: list[ResolvedPhase], node: int, route: Route) -> int:
     return END
 
 
+def exhausted(phase: ResolvedPhase, visits: int) -> bool:
+    """True if an attempt to enter `phase` after `visits` visits takes its `on_exhausted`
+    instead (docs/10 §4.7; with `max_visits: 0` already the first, Entscheidung 40)."""
+    return phase.max_visits is not None and visits >= phase.max_visits
+
+
+def on_exhausted(phases: list[ResolvedPhase], node: int) -> int:
+    """Where `on_exhausted` of the exhausted phase `node` leads: a phase, `END` or `USER`.
+    `next` is the successor of `node` itself, not of the phase whose route led there."""
+    route = phases[node].on_exhausted
+    return END if route is None else target(phases, node, route)
+
+
+def entry(phases: list[ResolvedPhase], node: int, visits: Sequence[int]) -> tuple[int, list[int]]:
+    """The one rule for exhausted phases (Entscheidung 45): an attempt to enter `node` with
+    these visits per phase leads to the phase that is really entered, `END` or `USER` (the
+    user decides at the last exhausted phase), following `on_exhausted` through every phase
+    whose visits are used up. Returns that and the exhausted phases passed, in order. A chain
+    that comes back ends the run (L3 rejects such a group)."""
+    passed: list[int] = []
+    while node >= 0 and exhausted(phases[node], visits[node]):
+        if node in passed:
+            return END, passed
+        passed.append(node)
+        node = on_exhausted(phases, node)
+    return node, passed
+
+
 def _routes(phase: ResolvedPhase) -> Iterator[Route]:
     yield from phase.gate.routes.values()
     if phase.gate.on_tie is not None:
@@ -161,7 +192,7 @@ def _redirects(phases: list[ResolvedPhase], node: int) -> tuple[list[int], set[i
         phase = phases[current]
         if phase.max_visits is None or phase.on_exhausted is None:
             continue
-        nxt = target(phases, current, phase.on_exhausted)
+        nxt = on_exhausted(phases, current)
         out.add(nxt)
         if nxt >= 0 and phases[nxt].max_visits is not None and nxt not in chain:
             chain.append(nxt)
@@ -178,7 +209,7 @@ def exhaust_cycle(phases: list[ResolvedPhase], node: int) -> list[int] | None:
         phase = phases[current]
         if phase.max_visits is None or phase.on_exhausted is None:
             return None
-        nxt = target(phases, current, phase.on_exhausted)
+        nxt = on_exhausted(phases, current)
         if nxt < 0:
             return None
         if nxt in path:

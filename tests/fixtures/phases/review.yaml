@@ -2,6 +2,7 @@
 # W4b-02a (A15) and later. Without a discussion the verdict of the reviews counts, so the review
 # phase comes twice, switched by `discussion_rounds`; a route to the one that is dropped leads
 # to the next one that stays (Entscheidung 37). `judge_memory` takes `reset`/`keep`.
+# One turn per action as today (`turns: 1`; the default is 3).
 kind: research-group
 version: 1
 description: Beweis von unabhängigen Judges prüfen lassen, mit Diskussion und Revision
@@ -74,7 +75,7 @@ phases:
     topology: solo
     when: { param: artifact, equals: null }
     actions:
-      author: { task: tasks/fassung.md, submission: { format: artifact, name: beweis } }
+      author: { task: tasks/fassung.md, submission: { format: artifact, name: beweis }, turns: 1 }
 
   - name: pruefung
     topology: parallel
@@ -84,7 +85,7 @@ phases:
     inputs:
       - { name: beweis, content: full }
     actions:
-      judge-*: { task: tasks/pruefen.md, submission: { format: review } }
+      judge-*: { task: tasks/pruefen.md, submission: { format: review }, turns: 1 }
 
   - name: pruefung-allein
     topology: parallel
@@ -94,7 +95,7 @@ phases:
     inputs:
       - { name: beweis, content: full }
     actions:
-      judge-*: { task: tasks/pruefen.md, submission: { format: review } }
+      judge-*: { task: tasks/pruefen.md, submission: { format: review }, turns: 1 }
     gate:
       type: signal
       field: verdict
@@ -111,7 +112,7 @@ phases:
     channels: [judges]
     rounds: "{{ params.discussion_rounds }}"
     actions:
-      judge-*: { task: tasks/besprechen.md, submission: { format: review } }
+      judge-*: { task: tasks/besprechen.md, submission: { format: review }, turns: 1 }
     gate:
       type: signal
       field: verdict
@@ -127,5 +128,5 @@ phases:
     max_visits: "{{ params.max_revisions }}"
     on_exhausted: stop
     actions:
-      author: { task: tasks/ueberarbeiten.md, submission: { format: artifact, name: beweis } }
+      author: { task: tasks/ueberarbeiten.md, submission: { format: artifact, name: beweis }, turns: 1 }
     gate: { type: done, routes: { done: { goto: pruefung } } }

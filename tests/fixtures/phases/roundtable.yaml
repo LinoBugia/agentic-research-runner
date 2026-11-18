@@ -1,4 +1,5 @@
 # The start skill `roundtable` as phases (docs/10 §5), test data for W4b-02a (A15) and later.
+# One turn per action as today (`turns: 1`; the default is 3).
 kind: research-group
 version: 1
 description: Offene Diskussion mehrerer Agenten zu einer Frage, mit Zusammenfassung
@@ -55,7 +56,7 @@ phases:
     channels: [runde]
     rounds: "{{ params.rounds }}"
     actions:
-      diskutant-*: { task: tasks/diskutieren.md, submission: { format: text } }
+      diskutant-*: { task: tasks/diskutieren.md, submission: { format: text }, turns: 1 }
 
   - name: zusammenfassung
     topology: solo
@@ -63,4 +64,4 @@ phases:
     inputs:
       - { channel: runde, content: full }
     actions:
-      summarizer: { task: tasks/zusammenfassen.md, submission: { format: text } }
+      summarizer: { task: tasks/zusammenfassen.md, submission: { format: text }, turns: 1 }

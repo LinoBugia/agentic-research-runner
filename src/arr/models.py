@@ -14,6 +14,7 @@ See docs/01-architektur.md §3, docs/02-workfolder-und-runs.md §1.1, §2.2, §3
 docs/03-skills-und-research-groups.md §3, docs/06-gruppenchats.md §2 and docs/10 §4.
 """
 
+import difflib
 import re
 from datetime import timedelta
 from enum import StrEnum
@@ -33,7 +34,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic.json_schema import JsonSchemaValue
-from pydantic_core import core_schema
+from pydantic_core import PydanticCustomError, core_schema
 
 from arr.submissions.formats import (
     _SLUG_RE,
@@ -523,6 +524,33 @@ OR_PARAM = _OrParam()
 """Marker for `Annotated[…, OR_PARAM]`: the value may be a whole placeholder in the input."""
 
 
+def _no_bool(value: Any) -> Any:
+    if isinstance(value, bool):
+        raise ValueError(
+            f"Falscher Typ: erwartet eine Zahl, gefunden {'true' if value else 'false'}. "
+            "Wahrheitswerte sind keine Zahlen."
+        )
+    return value
+
+
+def _only_bool(value: Any) -> Any:
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    if not isinstance(value, bool):
+        shown = value if isinstance(value, int | float) else type(value).__name__
+        if isinstance(value, str):
+            shown = f"„{value[:20]}“"
+        raise ValueError(f"Falscher Typ: erwartet true oder false, gefunden {shown}.")
+    return value
+
+
+NO_BOOL = BeforeValidator(_no_bool)
+"""Numbers of phases take no `true`/`false` (Entscheidung 44, like submissions); numbers as
+text (`"2"`) stay allowed, because parameters may arrive so."""
+ONLY_BOOL = BeforeValidator(_only_bool)
+"""Switches of phases take `true`/`false` (also as text), no `1` or `"yes"`."""
+
+
 class _RawIfTemplated:
     """Annotation for a section that may hold placeholders anywhere (an own format): with a
     placeholder inside, the section stays plain data until `arr.resolve` inserts the values
@@ -799,8 +827,9 @@ MAX_ASSIGNMENTS = 50
 """`max_assignments` of a phase `moderated`."""
 MAX_REF_CHARS = 200
 """Length of an agent entry, a route word or a path in a phase (names are slugs of 64)."""
-DEFAULT_TURNS = 1
-"""`turns` of an action without one: one turn, then arr asks once (like `ask_for_result`)."""
+DEFAULT_TURNS = 3
+"""`turns` of an action without one: arr continues a turn without a submission up to three
+times, as `solo` does today, then asks once (Entscheidung 46)."""
 DEFAULT_CHAT_ROUNDS = 3
 """`rounds` of a phase `chat` without one: the default of a discussion today."""
 
@@ -943,7 +972,7 @@ class ActionSpec(StrictModel):
 
     task: Annotated[str, Field(min_length=1, max_length=MAX_REF_CHARS), OR_PARAM]
     submission: SubmissionSpec
-    turns: Annotated[int, Field(ge=1, le=MAX_TURNS), OR_PARAM] | None = None
+    turns: Annotated[int, Field(ge=1, le=MAX_TURNS), NO_BOOL, OR_PARAM] | None = None
 
 
 class GateSpec(StrictModel):
@@ -961,7 +990,7 @@ class GateSpec(StrictModel):
     on_tie: RouteSpec | None = None
     raters: NameList | None = None
     action: ActionSpec | None = None
-    pass_score: Annotated[float, Field(allow_inf_nan=False), OR_PARAM] | None = None
+    pass_score: Annotated[float, Field(allow_inf_nan=False), NO_BOOL, OR_PARAM] | None = None
     criteria: (
         Annotated[
             list[Annotated[str, Field(min_length=1, max_length=MAX_CHOICE_CHARS)]],
@@ -1006,16 +1035,18 @@ class PhaseSpec(StrictModel):
     actions: dict[Ref, ActionSpec] = Field(min_length=1, max_length=MAX_ACTIONS)
     standby: NameList | None = None
     channels: NameList | None = None
-    rounds: Annotated[int, Field(ge=1, le=MAX_ROUNDS), OR_PARAM] | None = None
-    isolated: Annotated[bool, OR_PARAM] | None = None
+    rounds: Annotated[int, Field(ge=1, le=MAX_ROUNDS), NO_BOOL, OR_PARAM] | None = None
+    isolated: Annotated[bool, ONLY_BOOL, OR_PARAM] | None = None
     over: Annotated[str, Field(min_length=1, max_length=64), OR_PARAM] | None = None
-    repeat: Annotated[int, Field(ge=1, le=MAX_REPEAT), OR_PARAM] | None = None
+    repeat: Annotated[int, Field(ge=1, le=MAX_REPEAT), NO_BOOL, OR_PARAM] | None = None
     context: ContextSetting | None = None
     folder: FolderSetting | None = None
     inputs: list[InputSpec] | None = Field(default=None, max_length=MAX_INPUTS)
-    max_visits: Annotated[int, Field(ge=0, le=MAX_VISITS), OR_PARAM] | None = None
+    max_visits: Annotated[int, Field(ge=0, le=MAX_VISITS), NO_BOOL, OR_PARAM] | None = None
     on_exhausted: RouteSpec | None = None
-    max_assignments: Annotated[int, Field(ge=1, le=MAX_ASSIGNMENTS), OR_PARAM] | None = None
+    max_assignments: Annotated[int, Field(ge=1, le=MAX_ASSIGNMENTS), NO_BOOL, OR_PARAM] | None = (
+        None
+    )
     decider: Annotated[UserDecider, OR_PARAM] | None = None
     gate: GateSpec | None = None
 
@@ -1189,10 +1220,37 @@ class _PlanFields(StrictModel):
     @model_validator(mode="wrap")
     @classmethod
     def _channels_alias(cls, data: Any, handler: ModelWrapValidatorHandler[Self]) -> Self:
+        cls._unknown_with_channels(data)
         data, key = _rename_channels(data)
         model = handler(data)
         model._channels_key = key
         return model
+
+    @classmethod
+    def _unknown_with_channels(cls, data: Any) -> None:
+        """An unknown key is reported as by `StrictModel`, but the allowed keys name the new
+        spelling `channels` (a typo like `chanels` gets the suggestion `channels`)."""
+        if not isinstance(data, dict):
+            return
+        public = sorted(
+            {
+                "channels" if name == "groupchats" else info.alias or name
+                for name, info in cls.model_fields.items()
+            }
+        )
+        known = {*public, "groupchats", *cls.model_fields}
+        for key in data:
+            if key not in known:
+                suggestion = difflib.get_close_matches(str(key), public, n=1)
+                raise PydanticCustomError(
+                    "unknown_field",
+                    "unknown field {field}",
+                    {
+                        "field": str(key),
+                        "allowed": ", ".join(public),
+                        "suggestion": suggestion[0] if suggestion else "",
+                    },
+                )
 
     @property
     def channels_key(self) -> str:

@@ -12,10 +12,9 @@ from typing import Any
 
 from plan_kit import findings, load, resolve
 
-from arr.models import Goto, ResolvedRun, RouteKeyword
-from arr.plan.check import check
+from arr.models import Goto, ResolvedRun
 from arr.plan.estimate import phase_turns, turn_range
-from arr.plan.graph import END, target
+from arr.plan.graph import END
 from arr.service.real_api.runs import estimate_run
 
 
@@ -62,89 +61,212 @@ def test_a10_gate_user_leaves_the_upper_bound_open_and_the_service_caps_it() -> 
 
 
 # --------------------------------------------------------------------------------------------
-# Generated graphs: every possible run walked
+# Generated groups: every possible run walked, costs computed here from the input (W4b-02a.1)
 # --------------------------------------------------------------------------------------------
 
-ROUTES = ["next", "stop", "retry", "goto"]
+WAKE = 2
+"""`max_wakeups_per_agent` of the two channels of the generated groups."""
+CHANNELS = [
+    {"name": "rund", "members": ["a", "b", "s"], "mode": "rounds", "max_wakeups_per_agent": WAKE},
+    {"name": "los", "members": ["a", "b", "s"], "mode": "event", "max_wakeups_per_agent": WAKE},
+]
+LIST_MOST = 50
 
 
-def _route(rng: random.Random, names: list[str], bounded: bool) -> Any:
-    kind = rng.choice(ROUTES if bounded else ["next", "stop", "goto"])
+def _act(turns: int, fmt: str = "text", name: str | None = None) -> dict[str, Any]:
+    sub: dict[str, Any] = {"format": fmt}
+    if name:
+        sub["name"] = name
+    return {"task": "t.md", "submission": sub, "turns": turns}
+
+
+def _pick_route(rng: random.Random, names: list[str], retry: bool) -> Any:
+    kinds = ["next", "stop", "goto", "goto"] + (["retry"] if retry else [])
+    if rng.random() < 0.08:
+        kinds.append("escalate")
+    kind = rng.choice(kinds)
     return {"goto": rng.choice(names)} if kind == "goto" else kind
 
 
-def _graph(rng: random.Random) -> dict[str, Any]:
-    size = rng.randint(2, 5)
-    names = [f"p{i}" for i in range(size)]
-    phases = []
+def _make(rng: random.Random) -> tuple[dict[str, Any], list[tuple[int, int]]]:
+    """A group with all four topologies, `over`, `repeat`, sleepers, gates `done`, `signal`,
+    `judge`, `user`, `escalate` and `max_visits` 0–3, and the fewest and most turns of one
+    pass of every phase, computed here by W4b-02a §6.6."""
+    size = rng.randint(1, 5)
+    names = [f"p{i}" for i in range(1, size + 1)]
+    known = rng.choice([None, 2, 3])
+    phases: list[dict[str, Any]] = [
+        {"name": "p0", "topology": "solo", "actions": {"c": _act(1, "list", "liste")}}
+    ]
+    costs = [(1, 2)]
     for name in names:
-        visits = rng.choice([None, None, 0, 1, 2, 3])
-        bounded = visits is not None
-        entry: dict[str, Any] = {
-            "name": name,
-            "topology": "solo",
-            "actions": {
-                "a": {"task": "t.md", "submission": {"format": "text"}, "turns": rng.randint(1, 3)}
-            },
-        }
-        if bounded:
-            entry["max_visits"] = visits
-            entry["on_exhausted"] = _route(rng, names, False)
-        if rng.random() < 0.5:
-            entry["gate"] = {"type": "done", "routes": {"done": _route(rng, names, bounded)}}
+        topo = rng.choice(["solo", "parallel", "parallel", "chat", "moderated"])
+        entry: dict[str, Any] = {"name": name, "topology": topo}
+        if topo == "solo":
+            turns, rep = rng.randint(1, 3), rng.choice([1, 1, 2])
+            entry["actions"] = {"a": _act(turns)}
+            entry["repeat"] = rep
+            least, most = rep, rep * (turns + 1)
+        elif topo == "parallel":
+            turns = {x: rng.randint(1, 3) for x in ("a", "b")}
+            rep = rng.choice([1, 2])
+            entry["actions"] = {x: _act(t) for x, t in turns.items()}
+            entry["repeat"] = rep
+            if rng.random() < 0.35:
+                entry["over"] = "ideen" if known else "liste"
+                lo, hi = (known, known) if known else (1, LIST_MOST)
+                least, most = lo * rep, hi * rep * (max(turns.values()) + 1)
+            else:
+                least, most = 2 * rep, rep * sum(t + 1 for t in turns.values())
+        elif topo == "chat":
+            channel = rng.choice(["rund", "los"])
+            rounds = rng.choice([None, 1, 2])
+            entry["channels"] = [channel]
+            if rounds:
+                entry["rounds"] = rounds
+            entry["actions"] = {"a": _act(1), "b": _act(1)}
+            r = rounds or 3
+            talk = 2 * r if channel == "rund" else 2 * (1 + WAKE + r)
+            least, most = 2, talk + 2
         else:
+            turns, jobs = rng.randint(1, 3), rng.randint(1, 3)
+            entry["actions"] = {"a": _act(turns)}
+            entry["standby"] = ["b"]
+            entry["max_assignments"] = jobs
+            least, most = 1, turns + 1 + 2 * jobs
+        if topo != "chat" and rng.random() < 0.3:
+            entry["channels"] = [rng.choice(["rund", "los"])]
+            if topo != "moderated":
+                entry["standby"] = ["s"]
+            most += WAKE  # the sleeper is in the open channel
+        visits = rng.choice([None, None, None, 0, 1, 2, 3])
+        if visits is not None:
+            entry["max_visits"] = visits
+            entry["on_exhausted"] = _pick_route(rng, names, False)
+        bounded = visits is not None
+        kind = rng.random()
+        many = len(entry["actions"]) > 1 or "over" in entry
+        if kind < 0.3:
+            entry["gate"] = {"type": "done", "routes": {"done": _pick_route(rng, names, bounded)}}
+        elif kind < 0.55:
             entry["gate"] = {
                 "type": "signal",
                 "field": "status",
                 "routes": {
-                    "done": _route(rng, names, bounded),
-                    "not_solved": _route(rng, names, bounded),
+                    "done": _pick_route(rng, names, bounded),
+                    "not_solved": _pick_route(rng, names, bounded),
                 },
             }
+            if many:
+                entry["gate"]["rule"] = "all"
+        elif kind < 0.85 and topo in ("solo", "parallel"):
+            raters = rng.choice([["r1"], ["r1", "r2"]])
+            rt = rng.randint(1, 2)
+            gate: dict[str, Any] = {
+                "type": "judge",
+                "raters": raters,
+                "action": _act(rt, "rating"),
+            }
+            if not many and rng.random() < 0.5:
+                gate |= {"rule": "mean", "pass_score": 5}
+                gate["routes"] = {
+                    "pass": _pick_route(rng, names, bounded),
+                    "fail": _pick_route(rng, names, bounded),
+                }
+            else:
+                gate |= {"rule": "rank", "routes": {"ranked": _pick_route(rng, names, bounded)}}
+            entry["gate"] = gate
+            least += len(raters)
+            most += len(raters) * (rt + 1)
+        elif kind < 0.92:
+            entry["gate"] = {"type": "user"}
+        else:
+            entry["gate"] = {"type": "done", "routes": {"done": _pick_route(rng, names, bounded)}}
         phases.append(entry)
-    return {"topology": "phases", "agents": [{"id": "a"}], "phases": phases}
+        costs.append((least, most))
+    group = {
+        "topology": "phases",
+        "rubric": {"pass_score": 6},
+        "params": {"ideen": {"default": [f"i{k}" for k in range(known or 0)]}},
+        "seed": {"ideen": {"param": "ideen"}},
+        "agents": [{"id": x} for x in ("a", "b", "c", "s", "r1", "r2")],
+        "channels": CHANNELS,
+        "phases": phases,
+    }
+    return group, costs
 
 
-def _walk(resolved: ResolvedRun) -> tuple[int, int]:
-    """Fewest and most turns over every run the routes allow, visits counted as arr does."""
+def _runs(resolved: ResolvedRun, costs: list[tuple[int, int]]) -> tuple[int, int | None]:
+    """Fewest and most turns over every run the routes allow (None: the user may repeat),
+    with visits counted and exhausted phases followed by this test's own rule."""
     phases = resolved.phases
-    costs = [phase_turns(resolved, p)[:2] for p in phases]
+    index = {p.name: i for i, p in enumerate(phases)}
+    open_end = [False]
+
+    def to(i: int, route: Any) -> int:
+        if isinstance(route, Goto):
+            return index[route.goto]
+        word = route.value
+        if word == "next":
+            return i + 1 if i + 1 < len(phases) else END
+        return {"retry": i, "stop": END}.get(word, -2)
 
     @functools.cache
-    def enter(node: int, visits: tuple[int, ...], depth: int) -> tuple[int, int]:
-        assert depth < 500, "a run that never ends"
-        if node == END:
+    def enter(i: int, visits: tuple[int, ...], depth: int) -> tuple[int, int | None]:
+        assert depth < 300, "a run that never ends"
+        if i == END:
             return 0, 0
-        phase = phases[node]
-        if phase.max_visits is not None and visits[node] >= phase.max_visits:
+        if i == -2:
+            open_end[0] = True
+            return 0, None
+        phase = phases[i]
+        if phase.max_visits is not None and visits[i] >= phase.max_visits:
             assert phase.on_exhausted is not None
-            return enter(target(phases, node, phase.on_exhausted), visits, depth + 1)
-        after = visits[:node] + (visits[node] + 1,) + visits[node + 1 :]
-        routes = list(phase.gate.routes.values())
-        results = [enter(target(phases, node, r), after, depth + 1) for r in routes]
-        least, most = costs[node]
-        return least + min(r[0] for r in results), most + max(r[1] for r in results)
+            return enter(to(i, phase.on_exhausted), visits, depth + 1)
+        after = visits[:i] + (visits[i] + 1,) + visits[i + 1 :]
+        outs = [enter(to(i, r), after, depth + 1) for r in phase.gate.routes.values()]
+        if phase.gate.type.value == "user":
+            open_end[0] = True
+            outs.append((0, None))
+        least, most = costs[i]
+        tail = [o[1] for o in outs]
+        return (
+            least + min(o[0] for o in outs),
+            None if None in tail else most + max(t for t in tail if t is not None),
+        )
 
-    return enter(0, (0,) * len(phases), 0)
+    least, most = enter(0, (0,) * len(phases), 0)
+    return least, None if open_end[0] else most
 
 
-def test_a10_upper_bound_never_below_a_possible_run() -> None:
+def test_a10_bounds_hold_against_every_run_of_generated_groups() -> None:
     rng = random.Random(4202)
-    checked = loops = 0
-    for _ in range(600):
-        group = _graph(rng)
+    seen = {"valid": 0, "loops": 0, "open": 0, "over": 0, "chat": 0, "moderated": 0}
+    seen |= {"judge": 0, "max0": 0, "sleeper": 0, "escalate": 0}
+    for _ in range(1500):
+        group, costs = _make(rng)
         found = findings(group)
         if found.errors or found.resolved is None:
             continue
         resolved = found.resolved
-        assert check(resolved).ok
-        shortest, longest = _walk(resolved)
+        if [p.name for p in resolved.phases] != [p["name"] for p in group["phases"]]:
+            continue
+        shortest, longest = _runs(resolved, costs)
         least, most, _notes = turn_range(resolved)
-        assert most is not None
-        assert most >= longest, (group, most, longest)
         assert least <= shortest, (group, least, shortest)
-        checked += 1
-        routes = [r for p in resolved.phases for r in p.gate.routes.values()]
-        if any(r is RouteKeyword.RETRY or isinstance(r, Goto) for r in routes):
-            loops += 1
-    assert checked >= 100 and loops >= 50, (checked, loops)
+        if longest is None:
+            assert most is None, (group, most)
+        elif most is not None:
+            assert most >= longest, (group, most, longest)
+        phases = group["phases"]
+        seen["valid"] += 1
+        seen["loops"] += any("max_visits" in p for p in phases)
+        seen["open"] += longest is None
+        seen["over"] += any("over" in p for p in phases)
+        seen["chat"] += any(p["topology"] == "chat" for p in phases)
+        seen["moderated"] += any(p["topology"] == "moderated" for p in phases)
+        seen["judge"] += any(p.get("gate", {}).get("type") == "judge" for p in phases)
+        seen["max0"] += any(p.get("max_visits") == 0 for p in phases)
+        seen["sleeper"] += any("s" in p.get("standby", []) for p in phases)
+        seen["escalate"] += "escalate" in str(phases)
+    assert seen["valid"] >= 150 and all(v >= 10 for v in seen.values()), seen

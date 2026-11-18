@@ -350,7 +350,7 @@ def test_a5_agents_defaults_and_written_out_values() -> None:
     assert [a.agent for a in exploration.actions] == ["explorer-1", "explorer-2"]
     assert {a.key for a in exploration.actions} == {"explorer-*"}
     assert exploration.gate.raters == ["judge-1", "judge-2"]
-    assert exploration.gate.action is not None and exploration.gate.action.turns == 1
+    assert exploration.gate.action is not None and exploration.gate.action.turns == 3
     pruefung = resolved.phase("pruefung")
     assert pruefung.context == {"judge-1": ContextMode.RESET, "judge-2": ContextMode.RESET}
     assert pruefung.folder == {"judge-1": FolderMode.FRESH, "judge-2": FolderMode.FRESH}

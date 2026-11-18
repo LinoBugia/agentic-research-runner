@@ -27,7 +27,6 @@ from arr.models import (
     PhaseTopology,
     ResolvedPhase,
     ResolvedRun,
-    RouteKeyword,
     TopologyKind,
 )
 from arr.plan import graph as graphs
@@ -296,23 +295,17 @@ def _cheapest(graph: graphs.Graph, least: list[int]) -> int:
 
 
 def _attempt(
-    graph: graphs.Graph, node: int, visits: tuple[int, ...], seen: frozenset[int] = frozenset()
+    graph: graphs.Graph, node: int, visits: tuple[int, ...]
 ) -> list[tuple[int, tuple[int, ...]]]:
-    """Where an attempt to enter `node` leads with these visits: `(phase, visits after)` for a
-    visit, `(END, visits)` for the end; exhausted phases follow their `on_exhausted`."""
+    """Where an attempt to enter `node` leads with these visits (`graph.entry`, the same rule
+    as the runner's): `(phase, visits after)` for a visit, `(END, visits)` for the end or where
+    the user may stop after `escalate`."""
     if node < 0:
         return [(graphs.END, visits)]
-    phase = graph.phases[node]
-    if phase.max_visits is None:
-        return [(node, visits)]
-    if visits[node] < phase.max_visits:
-        return [(node, visits[:node] + (visits[node] + 1,) + visits[node + 1 :])]
-    if node in seen or phase.on_exhausted is None:
-        return []
-    if phase.on_exhausted is RouteKeyword.ESCALATE:
-        return [(graphs.END, visits)]  # the user may stop
-    nxt = graphs.target(graph.phases, node, phase.on_exhausted)
-    return _attempt(graph, nxt, visits, seen | {node})
+    entered, _passed = graphs.entry(graph.phases, node, visits)
+    if entered < 0:
+        return [(graphs.END, visits)]  # the end, or the user may stop
+    return [(entered, visits[:entered] + (visits[entered] + 1,) + visits[entered + 1 :])]
 
 
 def _exact(graph: graphs.Graph, least: list[int]) -> int | None:

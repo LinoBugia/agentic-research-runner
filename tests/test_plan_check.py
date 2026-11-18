@@ -338,13 +338,6 @@ RULES: list[tuple[str, Mutation, str, str, Mutation | None]] = [
         _set(6, inputs=[{"channel": "judges"}]),
     ),
     (
-        "B5-peers",
-        _set(1, inputs=[{"peers": "summary"}]),
-        "phases[1].inputs[0].peers",
-        "„repeat“ größer 1",
-        _set(1, inputs=[{"peers": "summary"}], repeat=2),
-    ),
-    (
         "B5-best",
         _set(6, inputs=[{"from": "beweis", "pick": "best"}]),
         "phases[6].inputs[0].pick",

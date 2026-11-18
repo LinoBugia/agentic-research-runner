@@ -30,6 +30,7 @@ from arr.models import (
     GateRule,
     GateType,
     Goto,
+    InputContent,
     PhaseTopology,
     Pick,
     ResolvedAction,
@@ -83,10 +84,28 @@ class PlanCheck:
         return not self.errors
 
 
+def _clean(value: Any, limit: int = 40) -> str:
+    """A text of the file for a message or a path: one line, no control characters, cut
+    after `limit` characters (W4b-02a.1, G8)."""
+    text = " ".join("".join(c if c.isprintable() else " " for c in str(value)).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _q(value: Any, limit: int = 40) -> str:
     """A value of the file for a message: „…“, on one line, cut after `limit` characters."""
-    text = " ".join(str(value).split())
-    return "„" + (text if len(text) <= limit else text[: limit - 1] + "…") + "“"
+    return "„" + _clean(value, limit) + "“"
+
+
+MAX_LISTED = 10
+"""Names a message lists at most; the rest is counted (W4b-02a.1, M2)."""
+
+
+def _listing(names: Any) -> str:
+    """Names for a message: at most `MAX_LISTED`, each cut short, then „… und N weitere“."""
+    items = [_clean(n) for n in names]
+    shown = ", ".join(items[:MAX_LISTED])
+    rest = len(items) - MAX_LISTED
+    return f"{shown} … und {rest} weitere" if rest > 0 else shown
 
 
 def _suggest(value: str, known: list[str]) -> str:
@@ -123,7 +142,7 @@ class _Checker:
     def at(phase: ResolvedPhase, *parts: str | int) -> str:
         path = f"phases[{phase.index}]"
         for part in parts:
-            path += f"[{part}]" if isinstance(part, int) else f".{part}"
+            path += f"[{part}]" if isinstance(part, int) else f".{_clean(part, 60)}"
         return path
 
     def action_path(self, phase: ResolvedPhase, action: ResolvedAction, *parts: str) -> str:
@@ -227,6 +246,7 @@ class _Checker:
         """S5: every entry names an agent, nobody twice, the right number of agents."""
         known = list(self.agents)
         holders: dict[str, str] = {}
+        pairs: set[tuple[str, str]] = set()  # one message per pair of entries (G5)
         for action in phase.actions:
             path = self.action_path(phase, action)
             if action.agent not in self.agents:
@@ -234,12 +254,14 @@ class _Checker:
                     path,
                     f"Unbekannter Agent {_q(action.agent)}.{_suggest(action.agent, known)}",
                 )
-            if action.agent in holders and holders[action.agent] != action.key:
+            first = holders.get(action.agent)
+            if first is not None and first != action.key and (first, action.key) not in pairs:
+                pairs.add((first, action.key))
                 self.error(
                     path,
                     f"Der Agent {_q(action.agent)} hat in der Phase {_q(phase.name)} schon eine "
-                    f"Action (über {_q(holders[action.agent])}). Ein Agent steht in einer Phase "
-                    "nur einmal; ändere eins der Muster.",
+                    f"Action (über {_q(first)}). Ein Agent steht in einer Phase nur einmal; "
+                    "ändere eins der Muster.",
                 )
             holders.setdefault(action.agent, action.key)
         for index, agent in enumerate(phase.standby):
@@ -252,8 +274,6 @@ class _Checker:
                     f"Der Agent {_q(agent)} hat in der Phase {_q(phase.name)} eine Action und "
                     "kann nicht zugleich auf Abruf sein. Entferne ihn aus „standby“.",
                 )
-        if phase.standby and len(set(phase.standby)) != len(phase.standby):
-            self.error(self.at(phase, "standby"), "„standby“ nennt einen Agenten doppelt.")
         agents = phase.agents
         if phase.topology is PhaseTopology.SOLO and len(agents) != 1:
             self.error(
@@ -297,7 +317,7 @@ class _Checker:
                     self.error(
                         self.at(phase, "channels", 0),
                         f"Im Diskussionskanal {_q(phase.channels[0])} fehlen "
-                        f"{', '.join(missing)}. Jeder Agent mit Action muss Mitglied des ersten "
+                        f"{_listing(missing)}. Jeder Agent mit Action muss Mitglied des ersten "
                         "Kanals sein (Entscheidung 39).",
                     )
         if phase.isolated:
@@ -354,6 +374,14 @@ class _Checker:
                         f"{path}.submission.format",
                         f"Das Format {_q(fmt)} gibt es nicht.{_suggest(fmt, known)} Eingebaut: "
                         f"{', '.join(BUILTIN)}; eigene stehen unter „formats“.",
+                    )
+                    continue
+                if agent is not None and fmt == "rating":
+                    self.error(
+                        f"{path}.submission.format",
+                        "Ein „rating“ gibt es nur als Bewertungs-Action eines Gates „judge“: dort "
+                        "bewerten die Rater die Abgaben der Phase. Nimm ein Gate „judge“ mit "
+                        "„action“ oder ein anderes Format (Entscheidung 45).",
                     )
                     continue
                 self.submission_name(task, path, names)
@@ -507,10 +535,23 @@ class _Checker:
                 f"{_suggest(entry.channel, list(self.channels))}",
             )
         if entry.peers is not None and phase.repeat <= 1:
-            self.error(
+            self.warn(
                 f"{path}.peers",
                 "„peers: summary“ zeigt die Kurzfassungen der anderen aus der vorigen "
-                "Wiederholung und braucht „repeat“ größer 1.",
+                "Wiederholung; ohne „repeat“ größer 1 gibt es keine, die Eingabe bleibt leer "
+                "(Entscheidung 43).",
+            )
+        if entry.pick is not None and (entry.channel is not None or entry.peers is not None):
+            self.error(
+                f"{path}.pick",
+                "„pick“ gibt es nur mit „from“ oder „name“; ein Kanal und „peers“ haben keine "
+                "Fassungen zur Auswahl. Entferne „pick“.",
+            )
+        if entry.channel is not None and entry.content is not InputContent.FULL:
+            self.error(
+                f"{path}.content",
+                "Eine Eingabe aus einem Kanal ist sein Verlauf und hat keine Kurzfassung: nur "
+                "„content: full“ (der Standard). Entferne „content“ (Entscheidung 45).",
             )
         if entry.pick is Pick.BEST:
             source = next((p for p in self.run.phases if p.name == entry.from_), None)
@@ -621,14 +662,15 @@ class _Checker:
         if missing:
             self.error(
                 self.at(phase, "gate", "routes"),
-                f"Es fehlt eine Route für {', '.join(missing)}. Das Gate „{phase.gate.type.value}“ "
-                f"der Phase {_q(phase.name)} hat die Ergebnisse {', '.join(expected)}.",
+                f"Es fehlt eine Route für {_listing(missing)}. Das Gate "
+                f"„{phase.gate.type.value}“ der Phase {_q(phase.name)} hat die Ergebnisse "
+                f"{_listing(expected)}.",
             )
         for outcome in foreign:
             self.error(
                 self.at(phase, "gate", "routes", outcome),
                 f"Das Gate „{phase.gate.type.value}“ hat kein Ergebnis {_q(outcome)}."
-                f"{_suggest(outcome, expected)} Ergebnisse: {', '.join(expected)}.",
+                f"{_suggest(outcome, expected)} Ergebnisse: {_listing(expected)}.",
             )
 
     def field_values(self, task: ResolvedTask, name: str) -> list[str] | None:
@@ -677,13 +719,20 @@ class _Checker:
         if values is None:
             return
         self.outcomes(phase, values)
-        agents = len(phase.agents)
+        # the rules count submissions per pass, not agents: with `over` one agent hands in one
+        # submission per entry (W4b-02a.1, M3)
+        many = len(phase.agents) >= 2 or phase.over is not None
         rule = gate.rule
-        if rule is None and agents >= 2:
+        if rule is None and many:
+            why = (
+                f"hat {len(phase.agents)} Agenten mit Action"
+                if phase.over is None
+                else f"gibt mit „over: {_clean(phase.over)}“ je Eintrag eine Abgabe ab"
+            )
             self.error(
                 self.at(phase, "gate", "rule"),
-                f"Die Phase {_q(phase.name)} hat {agents} Agenten mit Action; das Gate braucht "
-                "„rule“ (all, any, majority oder unanimous).",
+                f"Die Phase {_q(phase.name)} {why}; das Gate braucht „rule“ (all, any, "
+                "majority oder unanimous).",
             )
             return
         if rule in (GateRule.MEAN, GateRule.RANK):
@@ -701,7 +750,7 @@ class _Checker:
             )
             return
         needs_tie = gate.field != "verdict" and (
-            rule is GateRule.UNANIMOUS or (rule is GateRule.MAJORITY and agents >= 2)
+            rule is GateRule.UNANIMOUS or (rule is GateRule.MAJORITY and many)
         )
         if needs_tie and gate.on_tie is None:
             self.error(
@@ -783,6 +832,12 @@ class _Checker:
                     f"„pass_score“ {gate.pass_score:g} liegt außerhalb der Skala "
                     f"[{low:g}, {high:g}].",
                 )
+        elif gate.pass_score is not None:
+            self.warn(
+                self.at(phase, "gate", "pass_score"),
+                f"„pass_score“ gilt nur bei „rule: mean“; bei „{rule.value}“ wird es nie "
+                "genommen. Du kannst es entfernen.",
+            )
         expected = {
             GateRule.MEAN: ["pass", "fail"],
             GateRule.RANK: ["ranked"],
@@ -889,7 +944,7 @@ class _Checker:
                     if len(shared) > 1:
                         self.error(
                             self.at(phase, "isolated"),
-                            f"{', '.join(shared)} teilen den Arbeitsordner {_q(folder)}. In der "
+                            f"{_listing(shared)} teilen den Arbeitsordner {_q(folder)}. In der "
                             f"isolierten Phase {_q(phase.name)} braucht jeder einen eigenen "
                             "(„workspace“).",
                         )

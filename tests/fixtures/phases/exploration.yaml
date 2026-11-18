@@ -1,5 +1,6 @@
 # The start skill `exploration` as phases (docs/10 §5), test data for W4b-02a (A15) and later.
 # `exchange` switches between three variants of the phase `exploration`.
+# One turn per action as today (`turns: 1`; the default is 3).
 kind: research-group
 version: 1
 description: Ansätze zu einer Frage breit erkunden und bewerten
@@ -87,7 +88,7 @@ phases:
     topology: solo
     when: { param: ideas, equals: [] }
     actions:
-      ideator: { task: tasks/ideen.md, submission: { format: list, name: ideen } }
+      ideator: { task: tasks/ideen.md, submission: { format: list, name: ideen }, turns: 1 }
 
   - name: exploration
     topology: parallel
@@ -96,11 +97,11 @@ phases:
     over: ideen
     repeat: "{{ params.turns_per_idea }}"
     actions:
-      explorer-*: { task: tasks/ausarbeiten.md, submission: { format: text } }
+      explorer-*: { task: tasks/ausarbeiten.md, submission: { format: text }, turns: 1 }
     gate:
       type: judge
       raters: [ranker-*]
-      action: { task: tasks/ranking.md, submission: { format: rating } }
+      action: { task: tasks/ranking.md, submission: { format: rating }, turns: 1 }
       rule: rank
       routes: { ranked: next }
 
@@ -113,11 +114,11 @@ phases:
     inputs:
       - { peers: summary }
     actions:
-      explorer-*: { task: tasks/ausarbeiten.md, submission: { format: text } }
+      explorer-*: { task: tasks/ausarbeiten.md, submission: { format: text }, turns: 1 }
     gate:
       type: judge
       raters: [ranker-*]
-      action: { task: tasks/ranking.md, submission: { format: rating } }
+      action: { task: tasks/ranking.md, submission: { format: rating }, turns: 1 }
       rule: rank
       routes: { ranked: next }
 
@@ -128,11 +129,11 @@ phases:
     repeat: "{{ params.turns_per_idea }}"
     channels: [werkstatt]
     actions:
-      explorer-*: { task: tasks/ausarbeiten.md, submission: { format: text } }
+      explorer-*: { task: tasks/ausarbeiten.md, submission: { format: text }, turns: 1 }
     gate:
       type: judge
       raters: [ranker-*]
-      action: { task: tasks/ranking.md, submission: { format: rating } }
+      action: { task: tasks/ranking.md, submission: { format: rating }, turns: 1 }
       rule: rank
       routes: { ranked: next }
 
@@ -140,4 +141,4 @@ phases:
     topology: solo
     when: { param: summarizer, equals: summarizer }
     actions:
-      summarizer: { task: tasks/zusammenfassen.md, submission: { format: text } }
+      summarizer: { task: tasks/zusammenfassen.md, submission: { format: text }, turns: 1 }

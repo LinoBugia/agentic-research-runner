@@ -1,6 +1,7 @@
 # The start skill `proof` (topology `waterfall`) as phases (docs/10 §5), test data for W4b-02a
-# (A15) and later. `max_attempts` replaces `max_rework` (attempts = 1 + reworks), `on_fail`
-# takes routes (`next` instead of `continue`): arr computes no expressions.
+# (A15) and later. One turn per action as today (`turns: 1`, the default is 3). `max_attempts`
+# replaces `max_rework` (attempts = 1 + reworks), `on_fail` takes routes (`next` instead of
+# `continue`): arr computes no expressions.
 kind: research-group
 version: 1
 description: Beweis in Stufen entwickeln, Strategie, Skizze, Beweis, mit Ratings und Nacharbeit
@@ -63,11 +64,11 @@ phases:
     max_visits: "{{ params.max_attempts }}"
     on_exhausted: "{{ params.on_fail }}"
     actions:
-      strategist: { task: tasks/strategie.md, submission: { format: artifact, name: strategie } }
+      strategist: { task: tasks/strategie.md, submission: { format: artifact, name: strategie }, turns: 1 }
     gate:
       type: judge
       raters: [rater-*]
-      action: { task: tasks/bewerten.md, submission: { format: rating } }
+      action: { task: tasks/bewerten.md, submission: { format: rating }, turns: 1 }
       rule: mean
       pass_score: "{{ params.pass_score }}"
       routes: { pass: next, fail: retry }
@@ -77,11 +78,11 @@ phases:
     max_visits: "{{ params.max_attempts }}"
     on_exhausted: "{{ params.on_fail }}"
     actions:
-      prover: { task: tasks/skizze.md, submission: { format: artifact, name: skizze } }
+      prover: { task: tasks/skizze.md, submission: { format: artifact, name: skizze }, turns: 1 }
     gate:
       type: judge
       raters: [rater-*]
-      action: { task: tasks/bewerten.md, submission: { format: rating } }
+      action: { task: tasks/bewerten.md, submission: { format: rating }, turns: 1 }
       rule: mean
       pass_score: "{{ params.pass_score }}"
       routes: { pass: next, fail: retry }
@@ -91,11 +92,11 @@ phases:
     max_visits: "{{ params.max_attempts }}"
     on_exhausted: "{{ params.on_fail }}"
     actions:
-      prover: { task: tasks/beweis.md, submission: { format: artifact, name: beweis } }
+      prover: { task: tasks/beweis.md, submission: { format: artifact, name: beweis }, turns: 1 }
     gate:
       type: judge
       raters: [rater-*]
-      action: { task: tasks/bewerten.md, submission: { format: rating } }
+      action: { task: tasks/bewerten.md, submission: { format: rating }, turns: 1 }
       rule: mean
       pass_score: "{{ params.pass_score }}"
       routes: { pass: next, fail: retry }

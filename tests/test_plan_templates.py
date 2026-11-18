@@ -2,9 +2,9 @@
 
 The test data in `tests/fixtures/phases/` use the parameters of today's start skills (`solo`
 those of its topology). Each passes the check with its defaults; each limit of a parameter has
-a test. Two limits cannot be expressed and are asserted as such (the report lists them):
-`n_rankers: 0` in `exploration` (a gate `judge` without raters) and `exchange: digest` with
-`turns_per_idea: 1` (`peers: summary` needs `repeat` > 1). No model, no run.
+a test. One limit cannot be expressed and is asserted as such: `n_rankers: 0` in `exploration`
+(a gate `judge` without raters; the value goes away in W4b-06, Entscheidung 42). `exchange:
+digest` with `turns_per_idea: 1` passes with a hint (Entscheidung 43). No model, no run.
 """
 
 import pytest
@@ -88,5 +88,9 @@ def test_a15_waterfall_limits_in_detail() -> None:
 def test_a15_what_cannot_be_expressed() -> None:
     no_rankers = findings(load("exploration"), {"n_rankers": 0})
     assert "phases[1].gate.raters" in no_rankers.paths
+
+
+def test_a15_digest_with_one_pass_is_a_hint() -> None:
     digest = findings(load("exploration"), {"exchange": "digest", "turns_per_idea": 1})
-    assert "phases[2].inputs[0].peers" in digest.paths
+    assert digest.errors == []
+    assert [w.path for w in digest.warnings] == ["phases[2].inputs[0].peers"]

@@ -33,11 +33,14 @@ from arr.models import (
     RunInput,
     TopologyKind,
     WorkfolderSettings,
+    is_placeholder,
 )
 from arr.plan.check import check as check_plan
 from arr.resolve import (
     _count_param,
+    _short,
     check_group_spec,
+    format_loc,
     line_of_path,
     parse_yaml_text,
     resolve_run,
@@ -313,23 +316,29 @@ def _role_issue(folder: Path, role: str) -> str | None:
     return None
 
 
-def _check_tasks(resolved: ResolvedRun, folder: Path, out: _Issues) -> None:
-    """Every assignment file (`task` of an action or gate action) is a regular file in the
-    skill, by the rules of the roles (W4b-02a B7, A11)."""
+def _check_tasks(spec: GroupSpec, folder: Path, out: _Issues) -> None:
+    """Every assignment file (`task` of an action or gate action) of every phase in the
+    `group.yaml`, also of phases the standard values drop, is a regular file in the skill, by
+    the rules of the roles (W4b-02a B7, A11; W4b-02a.1 G6). A task given as a placeholder is
+    known only at the start (W4b-02b). Paths and names in messages are cleaned and cut (G8)."""
     done: set[str] = set()
-    for phase in resolved.phases:
-        tasks = [(f"phases[{phase.index}].actions.{a.key}.task", a.task) for a in phase.actions]
-        if phase.gate.action is not None:
-            tasks.append((f"phases[{phase.index}].gate.action.task", phase.gate.action.task))
-        for path, task in tasks:
-            if task in done:
+    for index, phase in enumerate(spec.phases):
+        tasks = [
+            (("phases", index, "actions", key, "task"), action.task)
+            for key, action in phase.actions.items()
+        ]
+        if phase.gate is not None and phase.gate.action is not None:
+            tasks.append((("phases", index, "gate", "action", "task"), phase.gate.action.task))
+        for loc, task in tasks:
+            if task in done or is_placeholder(task):
                 continue
             done.add(task)
             try:
                 problem = _role_issue(folder, task)
             except (OSError, ValueError):
                 problem = "ist kein gültiger Pfad. Nenne eine Datei im Skill"
-            shown = task if len(task) <= 60 else task[:59] + "…"
+            shown = _short(task, 60)
+            path = format_loc(loc)
             if problem == "nicht gefunden":
                 out.add(path, f"Auftrag {shown} nicht gefunden. Lege die Datei im Skill an.")
             elif problem is not None:
@@ -372,7 +381,7 @@ def _check_resolved(
         result = check_plan(resolved)
         out.extend(result.errors)
         out.extend(result.warnings, Severity.WARNING)
-        _check_tasks(resolved, folder, out)
+        _check_tasks(spec, folder, out)
         return
     try:
         check_topology(resolved)

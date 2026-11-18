@@ -17,7 +17,7 @@ import contextlib
 import difflib
 import io
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -261,7 +261,16 @@ def validate_model[M: BaseModel](
     try:
         return model.model_validate(data)
     except ValidationError as exc:
-        raise ConfigError(validation_issues(exc, lines=lines), source=source) from None
+        issues = validation_issues(exc, lines=lines, channels=_channels_spelling(data))
+        raise ConfigError(issues, source=source) from None
+
+
+def _channels_spelling(data: Any) -> str:
+    """`channels` if the input names its channels so (and not also `groupchats`): an error in
+    that section then names the key that is in the file (W4b-02a.1, M1)."""
+    if isinstance(data, dict) and "channels" in data and "groupchats" not in data:
+        return "channels"
+    return "groupchats"
 
 
 def load_yaml_model[M: BaseModel](
@@ -321,13 +330,19 @@ def _is_type_tag(segment: str | int) -> bool:
 
 
 def format_loc(loc: Sequence[str | int]) -> str:
-    """Format a location tuple as a path: `("agents", 1, "model")` → `agents[1].model`."""
+    """Format a location tuple as a path: `("agents", 1, "model")` → `agents[1].model`.
+
+    A key from a file is written without control characters and line breaks and cut after 60
+    characters (W4b-02a.1, G8); keys of arr's own files are short and stay as they are."""
     out = ""
     for segment in loc:
         if isinstance(segment, int):
             out += f"[{segment}]"
         elif not _is_type_tag(segment):
-            out += f".{segment}" if out else str(segment)
+            text = str(segment)
+            if len(text) > 60 or not text.isprintable():
+                text = _short(text, 60)
+            out += f".{text}" if out else text
     return out
 
 
@@ -360,7 +375,7 @@ def _message(error: Mapping[str, Any]) -> str:
     ctx = error.get("ctx") or {}
     value = error.get("input")
     if kind == "unknown_field":
-        text = f"Unbekanntes Feld „{ctx['field']}“."
+        text = f"Unbekanntes Feld „{_short(ctx['field'], 60)}“."
         if ctx.get("suggestion"):
             text += f" Meintest du „{ctx['suggestion']}“?"
         return text + f" Erlaubt sind: {ctx['allowed']}."
@@ -417,16 +432,20 @@ def validation_issues(
     *,
     prefix: Loc = (),
     lines: Mapping[Loc, int] | None = None,
+    channels: str = "groupchats",
 ) -> list[ConfigIssue]:
     """Translate a pydantic `ValidationError` into German `ConfigIssue`s with paths.
 
     `prefix` is prepended to every location (e.g. `("agents", 1)` when a single entry was
     validated). `lines` maps locations to YAML line numbers. Duplicates per path are dropped.
+    `channels` is the spelling of the channel list in the input (`groupchats` in the model).
     """
     issues: list[ConfigIssue] = []
     seen: set[str] = set()
     for error in exc.errors():
         loc = _clean_loc((*prefix, *error["loc"]))
+        if channels != "groupchats" and loc[:1] == ("groupchats",):
+            loc = (channels, *loc[1:])
         if error["type"] == "unknown_field":
             loc = (*loc, error["ctx"]["field"])
         path = format_loc(loc)
@@ -541,7 +560,7 @@ def _substitute(
             )
             return value
         if name not in params:
-            known = ", ".join(sorted(params)) or "keine"
+            known = _listing(sorted(params))
             issues.append(
                 ConfigIssue(
                     format_loc(loc),
@@ -568,7 +587,7 @@ def _check_when(
 ) -> ConfigIssue | None:
     if spec.when is None or spec.when.param in params:
         return None
-    known = ", ".join(sorted(params)) or "keine"
+    known = _listing(sorted(params))
     who = spec.id if isinstance(spec, AgentSpec) else spec.name
     return ConfigIssue(
         format_loc((*loc, "when", "param")),
@@ -623,7 +642,7 @@ def _resolve_params(
         return {**run_params, **overrides}
     declared = group_spec.params
     values = {name: decl.default for name, decl in declared.items()}
-    known = ", ".join(sorted(declared)) or "keine"
+    known = _listing(sorted(declared))
     layers = (
         (("topology", "params"), run_params, RUN_SOURCE),
         (("params",), overrides, OVERRIDES_SOURCE),
@@ -665,9 +684,24 @@ def _plain(value: BaseModel | dict[str, Any]) -> dict[str, Any]:
 
 
 def _short(value: Any, limit: int = 40) -> str:
-    """A text from a file for a message: on one line and at most `limit` characters."""
-    text = " ".join(str(value).split())
+    """A text from a file for a message: on one line, without control characters and at most
+    `limit` characters."""
+    text = " ".join("".join(c if c.isprintable() else " " for c in str(value)).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+MAX_LISTED = 10
+"""Names a message lists at most; the rest is counted (W4b-02a.1, M2)."""
+
+
+def _listing(names: Iterable[Any], empty: str = "keine") -> str:
+    """Names for a message: at most `MAX_LISTED`, each cut short, then „… und N weitere“."""
+    items = [_short(n) for n in names]
+    if not items:
+        return empty
+    shown = ", ".join(items[:MAX_LISTED])
+    rest = len(items) - MAX_LISTED
+    return f"{shown} … und {rest} weitere" if rest > 0 else shown
 
 
 def _apply(target: dict[str, Any], layer: Mapping[str, Any]) -> None:
@@ -938,7 +972,7 @@ def _match_entry(
 ) -> list[str]:
     """The active agents one ID or pattern names (see `_match_agents`), issue at `loc`."""
     path = format_loc(loc)
-    available = ", ".join(active)
+    available = _listing(active)
     if _is_pattern(entry):
         hits = [a for a in active if fnmatchcase(a, entry)]
         if not hits and not disabled.matches(entry):
@@ -956,11 +990,11 @@ def _match_entry(
         return []
     hint = ""
     if any(a.startswith(f"{entry}-") for a in active):
-        hint = f" Meintest du „{entry}-*“ (Replikate aus „count“)?"
+        hint = f" Meintest du „{_short(entry)}-*“ (Replikate aus „count“)?"
     else:
         close = difflib.get_close_matches(entry, active, n=1)
         if close:
-            hint = f" Meintest du „{close[0]}“?"
+            hint = f" Meintest du „{_short(close[0])}“?"
     issues.append(
         ConfigIssue(
             path,
@@ -1121,16 +1155,24 @@ def _validate_inserted[M: BaseModel](
         return model.model_validate(data)
     except ValidationError as exc:
         for issue in validation_issues(exc, prefix=loc):
-            original = _raw_at(raw, issue.path, len(loc))
-            if is_placeholder(original):
-                issue = ConfigIssue(
-                    issue.path,
-                    f"{issue.message} Der Wert kommt aus „{_short(original)}“; ändere den "
-                    "Parameter oder den Eintrag.",
-                    issue.line,
-                )
-            issues.append(issue)
+            issues.append(_with_hint(issue, raw, len(loc)))
         return None
+
+
+def _with_hint(issue: ConfigIssue, raw: Any, skip: int) -> ConfigIssue:
+    """The issue, and if the value at its path came from a placeholder, which one (W4b-02a
+    §6.2): the user knows which parameter to change."""
+    original = _raw_at(raw, issue.path, skip)
+    if isinstance(original, dict) and set(original) == {"goto"}:
+        original = original["goto"]  # `{ goto: {{ params.x }} }`
+    if not is_placeholder(original) or "Der Wert kommt aus" in issue.message:
+        return issue
+    return ConfigIssue(
+        issue.path,
+        f"{issue.message} Der Wert kommt aus „{_short(original)}“; ändere den Parameter oder "
+        "den Eintrag.",
+        issue.line,
+    )
 
 
 @dataclass
@@ -1154,7 +1196,7 @@ class _Names:
 
 def _suggestion(value: str, known: Sequence[str]) -> str:
     close = difflib.get_close_matches(value, list(known), n=1, cutoff=0.5)
-    return f" Meintest du „{close[0]}“?" if close else ""
+    return f" Meintest du „{_short(close[0])}“?" if close else ""
 
 
 def _route(value: Any, loc: Loc, names: _Names, issues: list[ConfigIssue]) -> Route | None:
@@ -1168,7 +1210,7 @@ def _route(value: Any, loc: Loc, names: _Names, issues: list[ConfigIssue]) -> Ro
                 ConfigIssue(
                     path,
                     f"Die Phase „{_short(target)}“ gibt es nicht."
-                    f"{_suggestion(target, names.phases)} Phasen: {', '.join(names.phases)}.",
+                    f"{_suggestion(target, names.phases)} Phasen: {_listing(names.phases)}.",
                 )
             )
             return None
@@ -1188,7 +1230,7 @@ def _route(value: Any, loc: Loc, names: _Names, issues: list[ConfigIssue]) -> Ro
         hint = _suggestion(word, _ROUTE_WORDS)
         if not hint and names.phases:
             close = difflib.get_close_matches(word, names.phases, n=1, cutoff=0.5)
-            hint = f" Meintest du „{{ goto: {close[0]} }}“?" if close else ""
+            hint = f" Meintest du „{{ goto: {_short(close[0])} }}“?" if close else ""
         text = f"Unbekannte Route „{_short(word)}“.{hint} {ROUTE_HELP}"
     issues.append(ConfigIssue(path, text))
     return None
@@ -1226,11 +1268,13 @@ def _modes(
 def _phase_inputs(
     spec: PhaseSpec, loc: Loc, names: _Names, issues: list[ConfigIssue]
 ) -> list[dict[str, Any]] | None:
-    """Inputs with `pick` and `content` written out; an input from a dropped phase, a dropped
-    channel or a name nothing produces any more is left out (W4b-02a §6.3)."""
+    """Inputs with `pick` and `content` written out (`content: full` for a channel, else
+    `summary`; `pick: latest` for `from` and `name`). An input from a dropped phase, a dropped
+    channel or a name nothing produces any more is left out; if no source is left, the phase
+    gets the standard inputs (None, Entscheidung 45)."""
     if spec.inputs is None:
         return None
-    out = []
+    out: list[dict[str, Any]] = []
     for index, entry in enumerate(spec.inputs):
         here = (*loc, "inputs", index)
         source = entry.from_
@@ -1241,7 +1285,7 @@ def _phase_inputs(
                         format_loc((*here, "from")),
                         f"Die Phase „{_short(source)}“ gibt es nicht."
                         f"{_suggestion(source, names.phases)} Phasen: "
-                        f"{', '.join(names.phases)}.",
+                        f"{_listing(names.phases)}.",
                     )
                 )
                 continue
@@ -1249,7 +1293,7 @@ def _phase_inputs(
                 continue
         if entry.name is not None:
             if entry.name not in names.names:
-                known = ", ".join(sorted(names.names)) or "keine"
+                known = _listing(sorted(names.names))
                 issues.append(
                     ConfigIssue(
                         format_loc((*here, "name")),
@@ -1262,7 +1306,7 @@ def _phase_inputs(
                 continue
         if entry.channel is not None:
             if entry.channel not in names.channels:
-                known = ", ".join(sorted(names.channels)) or "keine"
+                known = _listing(sorted(names.channels))
                 issues.append(
                     ConfigIssue(
                         format_loc((*here, "channel")),
@@ -1276,8 +1320,11 @@ def _phase_inputs(
         data = _dump(entry)
         named = source is not None or entry.name is not None
         data["pick"] = entry.pick or (Pick.LATEST if named else None)
-        data["content"] = entry.content or InputContent.SUMMARY
+        talk = InputContent.FULL if entry.channel is not None else InputContent.SUMMARY
+        data["content"] = entry.content or talk
         out.append(data)
+    if spec.inputs and not out:
+        return None  # every source dropped: the standard inputs (Entscheidung 45)
     return out
 
 
@@ -1287,7 +1334,7 @@ def _phase_channels(
     out = []
     for index, name in enumerate(spec.channels or []):
         if name not in names.channels:
-            known = ", ".join(sorted(names.channels)) or "keine"
+            known = _listing(sorted(names.channels))
             issues.append(
                 ConfigIssue(
                     format_loc((*loc, "channels", index)),
@@ -1344,6 +1391,7 @@ class _Pass1:
     index: int
     spec: PhaseSpec
     actions: list[dict[str, Any]]
+    raw: dict[str, Any]
 
 
 def _insert_phase(
@@ -1381,7 +1429,7 @@ def _insert_phase(
     if when is not None and not when.matches(params[when.param]):
         for key in original.actions:
             _match_entry(key, (*loc, "actions", key), active, disabled, issues)
-        return _Pass1(index, original, []), False
+        return _Pass1(index, original, [], raw), False
     spec = _validate_inserted(PhaseSpec, data, raw, loc, issues)
     if spec is None:
         return None, True
@@ -1389,7 +1437,7 @@ def _insert_phase(
     for key, action in spec.actions.items():
         for agent in _match_entry(key, (*loc, "actions", key), active, disabled, issues):
             actions.append({**_task(action), "agent": agent, "key": key})
-    return _Pass1(index, spec, actions), bool(actions)
+    return _Pass1(index, spec, actions, raw), bool(actions)
 
 
 def _submission_names(spec: PhaseSpec) -> set[str]:
@@ -1427,7 +1475,7 @@ def _finish_phase(
     if rounds is None and spec.topology is PhaseTopology.CHAT:
         rounds = DEFAULT_CHAT_ROUNDS
     if spec.over is not None and spec.over not in names.names:
-        known = ", ".join(sorted(names.names)) or "keine"
+        known = _listing(sorted(names.names))
         issues.append(
             ConfigIssue(
                 format_loc((*loc, "over")),
@@ -1458,6 +1506,7 @@ def _finish_phase(
     if spec.on_exhausted is not None:
         data["on_exhausted"] = _route(spec.on_exhausted, (*loc, "on_exhausted"), names, issues)
     if len(issues) > before:
+        issues[before:] = [_with_hint(i, first.raw, len(loc)) for i in issues[before:]]
         return None
     try:
         return ResolvedPhase.model_validate(data)
@@ -1467,9 +1516,8 @@ def _finish_phase(
 
 
 def _resolve_formats(
-    formats: Mapping[str, Any], params: Mapping[str, Any], source: str
+    formats: Mapping[str, Any], params: Mapping[str, Any], issues: list[ConfigIssue]
 ) -> dict[str, FormatSpec]:
-    issues: list[ConfigIssue] = []
     out: dict[str, FormatSpec] = {}
     for name, value in formats.items():
         loc: Loc = ("formats", name)
@@ -1481,18 +1529,15 @@ def _resolve_formats(
         spec = _validate_inserted(FormatSpec, data, raw, loc, issues)
         if spec is not None:
             out[name] = spec
-    if issues:
-        raise ConfigError(issues, source=source)
     return out
 
 
 def _resolve_seed(
-    seed: Mapping[str, SeedSpec], params: Mapping[str, Any], source: str
+    seed: Mapping[str, SeedSpec], params: Mapping[str, Any], issues: list[ConfigIssue]
 ) -> dict[str, ResolvedSeed]:
     """Seeds with the path or the list of their parameter; an empty value creates nothing."""
-    issues: list[ConfigIssue] = []
     out: dict[str, ResolvedSeed] = {}
-    known = ", ".join(sorted(params)) or "keine"
+    known = _listing(sorted(params))
     for name, entry in seed.items():
         loc: Loc = ("seed", name)
         if entry.param is not None:
@@ -1517,22 +1562,19 @@ def _resolve_seed(
         if len(issues) > before or file is None or (isinstance(file, str) and not file.strip()):
             continue
         if not isinstance(file, str):
-            issues.append(
-                ConfigIssue(
-                    format_loc((*loc, "file")),
-                    f"„file“ ist ein Pfad im Projekt, gefunden {_describe(file)}.",
-                )
+            issue = ConfigIssue(
+                format_loc((*loc, "file")),
+                f"„file“ ist ein Pfad im Projekt, gefunden {_describe(file)}.",
             )
+            issues.append(_with_hint(issue, {"file": entry.file}, 2))
             continue
         out[name] = ResolvedSeed(file=file)
-    if issues:
-        raise ConfigError(issues, source=source)
     return out
 
 
 def _resolve_phases(
     specs: Sequence[PhaseSpec],
-    source: str,
+    issues: list[ConfigIssue],
     params: Mapping[str, Any],
     active: Sequence[str],
     disabled: _Disabled,
@@ -1544,9 +1586,8 @@ def _resolve_phases(
     shared: set[str],
 ) -> list[ResolvedPhase]:
     """Resolve the phases (W4b-02a §6.3): insert parameters, apply `when`, resolve agents,
-    write out defaults, drop phases and rewrite routes and inputs to them. Every problem of
-    every phase is reported at once."""
-    issues: list[ConfigIssue] = []
+    write out defaults, drop phases and rewrite routes and inputs to them. Problems go to
+    `issues`, those of every phase at once; after a problem the result is incomplete."""
     seen: dict[str, int] = {}
     for index, spec in enumerate(specs):
         if spec.name in seen:
@@ -1574,7 +1615,7 @@ def _resolve_phases(
             kept.append(first.spec.name)
             kept_names |= produced
     if issues:
-        raise ConfigError(issues, source=source)
+        return []
     table = _Names(
         phases=[s.name for s in specs],
         kept=kept,
@@ -1588,8 +1629,6 @@ def _resolve_phases(
         phase = _finish_phase(first, table, active, disabled, rubric, shared, issues)
         if phase is not None:
             resolved.append(phase)
-    if issues:
-        raise ConfigError(issues, source=source)
     return resolved
 
 
@@ -1757,11 +1796,15 @@ def resolve_run(
         ],
     )
     rubric = run_input.rubric or (group_spec.rubric if group_spec else None)
-    formats = _resolve_formats(format_specs, params, formats_source)
-    seeds = _resolve_seed(seed_specs, params, seed_source)
+    # formats, seed and phases report together (W4b-02a.1, G4); the file of the first problem
+    # names the source (they come from the same file unless a run replaces only some of them)
+    plan_issues: list[tuple[list[ConfigIssue], str]] = [([], formats_source), ([], seed_source)]
+    formats = _resolve_formats(format_specs, params, plan_issues[0][0])
+    seeds = _resolve_seed(seed_specs, params, plan_issues[1][0])
+    plan_issues.append(([], phases_source))
     phases = _resolve_phases(
         phase_specs,
-        phases_source,
+        plan_issues[2][0],
         params,
         active,
         disabled,
@@ -1772,6 +1815,10 @@ def resolve_run(
         rubric,
         {a.id for a in agents if a.workspace.mode is WorkspaceMode.SHARED},
     )
+    found = [issue for found, _source in plan_issues for issue in found]
+    if found:
+        source = next(src for found, src in plan_issues if found)
+        raise ConfigError(found, source=source)
 
     agents = [
         agent.model_copy(update={"channels": [c.name for c in channels if agent.id in c.members]})
