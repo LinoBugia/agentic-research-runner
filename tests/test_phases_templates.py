@@ -199,8 +199,11 @@ async def test_review_without_discussion(
             calls.append(("reset", agent_id))
             await reset(self, agent_id)
 
+        fresh = Orchestrator.fresh_folder
+
         async def fresh_folder(self: Any, agent_id: str, *, stage: str, attempt: int) -> None:
             calls.append(("fresh", agent_id, stage, str(attempt)))
+            await fresh(self, agent_id, stage=stage, attempt=attempt)  # the real one (W4b-05a)
 
         monkeypatch.setattr(Orchestrator, "reset_session", reset_session)
         monkeypatch.setattr(Orchestrator, "fresh_folder", fresh_folder)
@@ -231,12 +234,13 @@ async def test_review_without_discussion(
     assert [o["id"] for o in revision.context["objections"]] == ["E1", "E2"]
     # the author sees the reviews of the isolated check (W4b-02b.1, H1): verdict, summary, path
     reviews = [i for i in revision.context["inputs"] if i["source"] == "phase:pruefung-allein"]
+    # under their aliases only, as today's `review._alias` (W4b-02b.1 Teil 2, N-M1)
     assert sorted((i["from"], i["verdict"]) for i in reviews) == [
-        ("judge-1", "minor"),
-        ("judge-2", "major"),
+        ("Mitglied A", "minor"),
+        ("Mitglied B", "major"),
     ]
     assert all(i["path"] and "/output/" in i["path"] and i["summary"] for i in reviews)
-    assert "judge-1 in pruefung-allein" in revision.prompt, "in the text the author reads"
+    assert "Mitglied A" in revision.prompt, "in the text the author reads"
     second = [v for v in log.of("judge-1") if v.attempt == 2][0]
     assert second.expected["known_objections"] == ["E1", "E2"]
     beweis = [i for i in second.context["inputs"] if i["source"] == "name:beweis"]
@@ -274,13 +278,6 @@ async def test_review_without_discussion(
             "phases[2].standby",
             "Agenten auf Abruf („standby“, Phase „beweis“) sind in dieser Version noch nicht "
             "verfügbar.",
-        ),
-        (
-            "review",
-            {"discussion_rounds": 0},
-            "phases[2].folder",
-            "Ein frischer Arbeitsordner („folder: fresh“, Phase „pruefung-allein“) ist in dieser "
-            "Version noch nicht verfügbar.",
         ),
     ],
 )

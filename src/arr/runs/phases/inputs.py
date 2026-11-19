@@ -8,8 +8,9 @@ An input item is a submission as the receiving agent may see it:
 
 `source` is `phase:<name>` (standard inputs and `from`), `name:<name>` or `channel:<name>`
 (then `messages` instead of a submission). `from` is the author as the receiver sees it
-(`ctx.shown_name`, never the real ID behind an alias; `arr` for a seed). `path` is the
-absolute folder of the submission below `output/`. `text` only with `content: full`.
+(`shown`: an agent with an alias is shown to every other agent only under that alias, also
+outside its anonymous channel; `arr` for a seed). `path` is the absolute folder of the
+submission below `output/`. `text` only with `content: full`.
 
 Isolation: a submission another agent handed in that is still sealed is never an input; only
 `peers: summary` shows summaries of the running pass. Everything an agent wrote is cleaned and
@@ -19,7 +20,7 @@ limited (`arr.runs.phases.text`).
 import os
 import stat
 from collections.abc import Iterable, Sequence
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from arr.models import GateRule, GateType, InputContent, Pick, ResolvedInput, ResolvedPhase
@@ -73,13 +74,24 @@ def visible(s: Submission, viewer: str) -> bool:
 
 
 def shown(ctx: "RunContext", viewer: str, agent: str, fallback: str | None = None) -> str:
-    """The name of `agent` as `viewer` sees it; `arr` for arr's own versions (seeds)."""
+    """The name of `agent` as `viewer` sees it; `arr` for arr's own versions (seeds).
+
+    An agent with an alias (in an anonymous channel) is shown to every other agent under
+    that alias only, also to one outside the channel (W4b-02b.1 Teil 2, N-M1; as today's
+    `review._alias`): `shown_name(viewer, agent)` if it is the alias, else the name the agent
+    has for itself (`shown_name(agent, agent)`), the alias it carries in folder names and
+    `Submission.shown_as`. `fallback` is the `shown_as` of a submission."""
     if agent == ORCHESTRATOR:
         return line(fallback or "arr", MAX_NAME_CHARS)
     try:
-        return line(ctx.shown_name(viewer, agent), MAX_NAME_CHARS)
+        name = ctx.shown_name(viewer, agent)
+        if name == agent and viewer != agent:
+            name = ctx.shown_name(agent, agent)
     except Exception:  # an agent the view does not know: its ID is no secret then
-        return line(agent, MAX_NAME_CHARS)
+        name = agent
+    if name == agent and viewer != agent and fallback:
+        name = fallback  # the alias the submission was filed under
+    return line(name, MAX_NAME_CHARS)
 
 
 def newest_per_action(subs: Iterable[Submission]) -> list[Submission]:
@@ -101,16 +113,40 @@ def _entry_number(s: Submission) -> int | None:
     return None
 
 
+def _open_below(root: Path, rel: str) -> int | None:
+    """Open the file `rel` below `root` for reading without following a link at any part of
+    `rel` (W4b-02b.1 Teil 2, N-G3): every folder is opened relative to the one before with
+    `O_NOFOLLOW | O_DIRECTORY`, the file with `O_NOFOLLOW | O_NONBLOCK` (a FIFO never blocks).
+    `root` itself is arr's run folder and may lie below a link (e.g. `/tmp`). None if a part
+    is missing, a link or no folder, or `rel` is absolute or has `..`."""
+    path = PurePosixPath(rel)
+    parts = path.parts
+    if path.is_absolute() or not parts or any(p in ("", ".", "..") for p in parts):
+        return None
+    folder_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return None
+    try:
+        for part in parts[:-1]:
+            inner = os.open(part, folder_flags, dir_fd=fd)
+            os.close(fd)
+            fd = inner
+        return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
 def _file_head(ctx: "RunContext", rel: str, limit: int) -> tuple[str | None, bool]:
     """The start of a file arr filed below the run folder, as text: at most `limit` bytes,
-    no link followed, only a regular file; (None, False) if it is no UTF-8 text. The second
-    value says whether the file is longer (W4b-02b.1, G7)."""
-    path = PurePosixPath(rel)
-    if path.is_absolute() or ".." in path.parts:
-        return None, False
-    try:
-        fd = os.open(ctx.run_folder / rel, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
+    no link followed at any part of the path (`_open_below`), only a regular file; (None,
+    False) if it is no UTF-8 text. The second value says whether the file is longer
+    (W4b-02b.1, G7)."""
+    fd = _open_below(Path(ctx.run_folder), rel)
+    if fd is None:
         return None, False
     try:
         info = os.fstat(fd)
@@ -136,9 +172,10 @@ def _full_text(ctx: "RunContext", s: Submission) -> str:
         parts.append(s.body)
     for name in s.files:
         title = line(name, MAX_NAME_CHARS)
-        if "/" in name or name in ("", ".", ".."):
-            continue
-        text, cut = _file_head(ctx, f"{s.path}/files/{name}", MAX_FULL_CHARS * 4)
+        if "/" in name or name in ("", ".", ".."):  # never a path of its own (N-G5)
+            text, cut = None, False
+        else:
+            text, cut = _file_head(ctx, f"{s.path}/files/{name}", MAX_FULL_CHARS * 4)
         if text is None:
             parts.append(f"[Datei „{title}“: kein lesbarer Text]")
         elif cut:
@@ -180,6 +217,8 @@ def item(
     if s.sealed and s.agent == viewer:  # read just now: only an own one can be sealed here
         out["path"] = None
         out["note"] = "Deine Abgabe ist noch versiegelt; sie liegt nach der Phase unter output/."
+    elif s.sealed:  # a second wall (N-G6): every caller filters with `visible` before
+        out["path"] = None
     else:
         out["path"] = str(ctx.run_folder / s.path)
     if s.format == "review" and isinstance(s.fields.get("verdict"), str):
@@ -188,7 +227,7 @@ def item(
         out["files"] = [line(f, MAX_NAME_CHARS) for f in s.files[:MAX_FILES_LISTED]]
     if score is not None:
         out["score"] = round(score, 2)
-    if content is InputContent.FULL:
+    if content is InputContent.FULL and (not s.sealed or s.agent == viewer):
         out["text"] = _full_text(ctx, s)
     return out
 

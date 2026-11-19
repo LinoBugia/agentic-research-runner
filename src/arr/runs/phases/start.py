@@ -6,9 +6,11 @@ version of the runner cannot run yet, each with its path and a German sentence:
 
 - phases with `topology: chat` or `moderated` (`NOT_YET`; W4b-03, W4b-04),
 - phases with `standby` (W4b-03),
-- `folder: fresh` while the context class does not implement `fresh_folder` (W4b-05a), and
-  `context: compact` while it does not implement `compact_session` (W4b-05b). This is checked on
-  the class, not by a list: once an order implements the method, the refusal is gone.
+- `folder: fresh` and `context: compact` only with a context class that does not implement
+  `fresh_folder` or `compact_session` (a test context). The `Orchestrator` implements both
+  (W4b-05a, W4b-05b), so a real run is never refused for them (W4b-02b.1 Teil 2). The check
+  stays as a wall against a context that would raise `NotImplementedError` in the middle of
+  a run.
 
 `check_topology` calls it with the `Orchestrator` before anything is created; the runner calls
 it again at its start with the class of its context (`ensure_valid`), in case the check was

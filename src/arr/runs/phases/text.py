@@ -103,9 +103,9 @@ FEEDBACK_CORE = ("attempt", "gate", "result", "score", "user_hint")
 
 
 def fit_package(package: dict[str, Any], limit: int = MAX_PACKAGE_CHARS) -> dict[str, Any]:
-    """Make a package fit `limit` (W4b-02b.1, M2; Entscheidung 58). No part goes as a whole
-    while another can still be cut inside. In this order, each step only while the package is
-    too large:
+    """Make a package fit `limit` (W4b-02b.1, M2; Entscheidung 58). The parts are cut in a
+    fixed order, each from its end, before the next part is touched, and each step only while
+    the package is too large (so a later part may still be whole when an earlier one is gone):
 
     1. the full texts of inputs (longest first, each with a note to read it under `path`),
     2. inside the feedback: the comments of the raters (from the end), then the ratings, then

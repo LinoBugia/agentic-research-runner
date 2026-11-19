@@ -29,6 +29,7 @@ from arr.models import AgentStatus, RunInput, RunStatus, TopologyKind
 from arr.resolve import resolve_run, validate_model
 from arr.room.server import build_server
 from arr.room.store import RoomStore
+from arr.runs.context import RunContext
 from arr.runs.launch import plan_launch
 from arr.runs.orchestrator import Orchestrator
 from arr.runs.phases import start
@@ -183,22 +184,6 @@ NOT_YET = {
         "phases[0].standby",
         "Agenten auf Abruf („standby“, Phase „s“) sind in dieser Version noch nicht verfügbar.",
     ),
-    "fresh": (
-        {"phases": [{**solo("f", "a"), "folder": "fresh"}]},
-        "phases[0].folder",
-        "Ein frischer Arbeitsordner („folder: fresh“, Phase „f“) ist in dieser Version noch "
-        "nicht verfügbar.",
-    ),
-    "reset": (
-        {"phases": [{**solo("r", "a"), "context": "reset"}]},
-        "phases[0].folder",
-        "Ein frischer Arbeitsordner („folder: fresh“, Phase „r“)",
-    ),
-    "compact": (
-        {"phases": [{**solo("c", "a"), "context": "compact"}]},
-        "phases[0].context",
-        "„context: compact“ (Phase „c“) ist in dieser Version noch nicht verfügbar.",
-    ),
 }
 
 
@@ -218,24 +203,38 @@ def test_a2_reset_with_folder_keep_runs_today() -> None:
     check_topology(resolved_of(group))
 
 
-@pytest.mark.parametrize("case", ["fresh", "reset", "compact"])
-def test_a2_with_a_context_that_implements_it_the_refusal_is_gone(
-    case: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    group, _path, _text = NOT_YET[case]
-    resolved = resolved_of({**TWO, **group})
-    with pytest.raises(ConfigError):
-        check_topology(resolved)
+NOW_READY = {
+    "fresh": {"phases": [{**solo("f", "a"), "folder": "fresh"}]},
+    "reset": {"phases": [{**solo("r", "a"), "context": "reset"}]},  # fresh folder by default
+    "compact": {"phases": [{**solo("c", "a"), "context": "compact"}]},
+}
 
-    async def fresh_folder(self: Any, agent_id: str, *, stage: str, attempt: int) -> None:
-        return None
 
-    async def compact_session(self: Any, agent_id: str, *, note: str | None = None) -> None:
-        return None
+@pytest.mark.parametrize("case", list(NOW_READY))
+def test_a2_fresh_and_compact_start_with_the_orchestrator(case: str) -> None:
+    """W4b-02b.1 Teil 2: the `Orchestrator` implements `fresh_folder` and `compact_session`
+    (W4b-05a, W4b-05b), so nothing refuses them any more."""
+    check_topology(resolved_of({**TWO, **NOW_READY[case]}))
+    assert start.start_issues(resolved_of({**TWO, **NOW_READY[case]}), Orchestrator) == []
 
-    monkeypatch.setattr(Orchestrator, "fresh_folder", fresh_folder)
-    monkeypatch.setattr(Orchestrator, "compact_session", compact_session)
-    check_topology(resolved)
+
+@pytest.mark.parametrize(
+    ("case", "path"),
+    [
+        ("fresh", "phases[0].folder"),
+        ("reset", "phases[0].folder"),
+        ("compact", "phases[0].context"),
+    ],
+)
+def test_a2_a_context_without_the_methods_is_still_refused(case: str, path: str) -> None:
+    """The wall stays for a context class that would raise `NotImplementedError` mid-run."""
+
+    class Bare(RunContext):  # type: ignore[misc]
+        pass
+
+    issues = start.start_issues(resolved_of({**TWO, **NOW_READY[case]}), Bare)
+    assert [i.path for i in issues] == [path]
+    assert "noch nicht verfügbar" in issues[0].message
 
 
 def test_a2_plan_launch_creates_nothing_for_a_refused_run(
