@@ -53,7 +53,7 @@ from arr.models import (
 from arr.permissions.gatekeeper import run_profiles
 from arr.permissions.inbox import ApprovalDecider
 from arr.resolve import load_group_spec, load_run_input, load_yaml_model, resolve_run
-from arr.runs.finalize import finalize_run, last_turn_error
+from arr.runs.finalize import clean_up_after_scan, finalize_run, last_turn_error
 from arr.runs.inspect import (
     LOCKS_AVAILABLE,
     RUN_LOCK,
@@ -1181,6 +1181,7 @@ async def run_launch(
             result.scan = await asyncio.to_thread(scan_run_dir, run_dir, secrets)
             record_scan(run_dir, result.scan)
             report(format_report(result.scan))
+        await asyncio.to_thread(clean_up_after_scan, run_dir)  # W4b-05a.1, Entscheidung 54
         return result
     finally:
         remove()

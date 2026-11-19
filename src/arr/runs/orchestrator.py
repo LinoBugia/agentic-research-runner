@@ -1200,33 +1200,42 @@ class Orchestrator(RunContext):
         """The agent gets a fresh working folder in place after its running turn; the old
         content goes to `retired/`, the scratch folder is emptied (`arr.runs.folders`, W4b-05a).
         With a new session too, call `reset_session` first (Entscheidung 48). `ArrError` for
-        an agent in a shared folder or when something old would stay; the folder is then not
-        fresh and the run must not go on."""
+        an agent in a shared folder or when something old or foreign would stay; the folder is
+        then not fresh and the run must not go on. Cancelled meanwhile (a stop), it waits for
+        the file operations to end, writes the log entry and then passes the cancellation on,
+        so the finalizer never runs beside them (W4b-05a.1)."""
         self._handle(agent_id)
         started = time.monotonic()
         async with self._locks[agent_id]:
-            try:
-                done = await asyncio.to_thread(
-                    folders.fresh_folder, self.prepared.agents[agent_id], stage=stage
-                )
-            except ArrError as exc:
-                self.log.write(
-                    "folder_fresh_failed",
-                    agent=agent_id,
-                    stage=stage,
-                    attempt=attempt,
-                    message=exc.message,
-                    duration_s=round(time.monotonic() - started, 3),
-                )
-                raise
-        self.log.write(
-            "folder_fresh",
-            agent=agent_id,
-            stage=stage,
-            attempt=attempt,
-            duration_s=round(time.monotonic() - started, 3),
-            **done.log_data(),
-        )
+            work = asyncio.ensure_future(
+                asyncio.to_thread(folders.fresh_folder, self.prepared.agents[agent_id], stage=stage)
+            )
+            cancelled = False
+            while not work.done():
+                try:
+                    await asyncio.shield(work)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break
+            error = work.exception()
+            entry: dict[str, Any] = {
+                "agent": agent_id,
+                "stage": stage,
+                "attempt": attempt,
+                "duration_s": round(time.monotonic() - started, 3),
+            }
+            if cancelled:
+                entry["cancelled"] = True
+            if error is not None:
+                message = error.message if isinstance(error, ArrError) else str(error)
+                self.log.write("folder_fresh_failed", message=message, **entry)
+            else:
+                self.log.write("folder_fresh", **entry, **work.result().log_data())
+        if cancelled:
+            raise asyncio.CancelledError
+        if error is not None:
+            raise error
 
     def seal_results(self, stage: str, channel: str | None = None) -> None:
         """Hide the results of `stage` until `release_results` (F4)."""

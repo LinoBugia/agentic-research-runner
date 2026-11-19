@@ -1192,7 +1192,12 @@ def claude_options(profile: SandboxProfile) -> ClaudeOptions:
                 for p in (*profile.read_deny, *profile.sensitive)
                 if p not in profile.private_roots
             ],
-            "allowRead": [str(p) for p in profile.read_allow if not opens_private(p)],
+            # a rule written by hand never opens what is a ban for the agent (way 9, W4b-05a.1)
+            "allowRead": [
+                str(p)
+                for p in profile.read_allow
+                if not opens_private(p) and not profile.is_sensitive(p)
+            ],
         },
     }
     return ClaudeOptions(

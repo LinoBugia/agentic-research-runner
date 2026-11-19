@@ -390,13 +390,8 @@ class CopyStats:
         return "copy" if self.copied else "clone"
 
 
-def copy_tree(
-    src: Path, dst: Path, excludes: ExcludeSet | None = None, *, into_empty: bool = False
-) -> CopyStats:
+def copy_tree(src: Path, dst: Path, excludes: ExcludeSet | None = None) -> CopyStats:
     """Copy a folder tree file by file as APFS clones; `dst` must not exist.
-
-    `into_empty`: `dst` is an existing empty folder that keeps its identity (a fresh working
-    folder in place, W4b-05a); it gets the mode and times of `src` as a new one would.
 
     Every regular file is cloned with `clonefile(2)` (never a whole folder, which the man page
     discourages, and never `cp -c`, which silently copies for real). On `EXDEV`/`ENOTSUP` the
@@ -429,7 +424,7 @@ def copy_tree(
         stats.bytes_copied += target.stat().st_size
 
     def walk(source_dir: Path, target_dir: Path, rel: str) -> None:
-        target_dir.mkdir(parents=not rel, exist_ok=into_empty and not rel)
+        target_dir.mkdir(parents=not rel)
         with os.scandir(source_dir) as scan:
             entries = sorted(scan, key=lambda e: e.name)
         for entry in entries:
@@ -697,16 +692,6 @@ def make_private_dir(path: Path) -> Path:
     return path
 
 
-def _new_folder_mode(parent: Path) -> int:
-    """The mode `mkdir` gives a new folder here (umask), read from a probe folder of arr."""
-    probe = parent / f".arr-mode-{secrets.token_hex(6)}"
-    os.mkdir(probe)
-    try:
-        return os.lstat(probe).st_mode & 0o7777
-    finally:
-        os.rmdir(probe)
-
-
 def fill_work_dir(
     work_dir: Path,
     *,
@@ -716,25 +701,24 @@ def fill_work_dir(
     context: str,
     claude_md: bool,
     codex_skills: Sequence[str] = (),
-    into_empty: bool = False,
 ) -> tuple[list[str], CopyStats | None]:
     """Fill an agent's own working folder (`copy` or `empty`): the one place that decides what
     a working folder holds at the start of a run and after a fresh one (W4b-05a).
 
     `copy`: a clone of `base/`; `empty`: an empty folder. Then the context files with `context`
     (`AGENTS.md`, and `CLAUDE.md` with `claude_md`) and, for Codex, its skills from the
-    snapshot `skills_dir` in `.agents/skills`. `into_empty`: `work_dir` exists and is empty.
-    Returns the generated paths (`AgentFile.generated_paths`) and the copy statistics.
+    snapshot `skills_dir` in `.agents/skills`. `work_dir` must not exist: at the start it is
+    the new working folder, for a fresh one a folder below `retired/` that no agent reaches
+    (`arr.runs.folders` moves the finished content into the working folder). Returns the
+    generated paths (`AgentFile.generated_paths`) and the copy statistics.
     """
     if mode is WorkspaceMode.SHARED:
         raise ValueError("a shared folder is filled by _finish_shared")
     stats: CopyStats | None = None
     if mode is WorkspaceMode.COPY:
-        stats = copy_tree(base_dir, work_dir, into_empty=into_empty)
+        stats = copy_tree(base_dir, work_dir)
     else:
-        work_dir.mkdir(exist_ok=into_empty)
-        if into_empty:  # the mode a new folder gets, as at the start (rights the agent took)
-            os.chmod(work_dir, _new_folder_mode(work_dir.parent), follow_symlinks=False)
+        work_dir.mkdir()
     generated = _write_context(work_dir, context, claude_md=claude_md)
     if codex_skills:
         install_codex_skills(work_dir, skills_dir, list(codex_skills))
@@ -742,8 +726,9 @@ def fill_work_dir(
     return generated, stats
 
 
-def refill_work_dir(agent: "PreparedAgent") -> list[str]:
-    """Fill the agent's emptied working folder in place as at the start of the run (W4b-05a).
+def refill_work_dir(agent: "PreparedAgent", build: Path) -> list[str]:
+    """Build the content of a fresh working folder in the new folder `build` as the working
+    folder was at the start of the run (W4b-05a): `build` lies where no agent reaches it.
 
     Only from the run folder, never from the project as it is now or from the old folder:
     `base/`, the skill snapshot `skills/`, the agent's `context.md` (the same text as the
@@ -755,14 +740,13 @@ def refill_work_dir(agent: "PreparedAgent") -> list[str]:
     context = (agent.run_dir / file.context_file).read_text(encoding="utf-8")
     codex = file.config.provider is Provider.CODEX and ".agents/skills" in file.generated_paths
     generated, _ = fill_work_dir(
-        agent.work_dir,
+        build,
         mode=mode,
         base_dir=agent.run_dir / "base",
         skills_dir=agent.run_dir / "skills",
         context=context,
         claude_md="CLAUDE.md" in file.generated_paths,
         codex_skills=file.skill_ids if codex else (),
-        into_empty=True,
     )
     return generated
 

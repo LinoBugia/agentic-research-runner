@@ -326,3 +326,35 @@ def test_a7_the_codex_profile_stays_within_its_limits_with_many_agents_and_chann
         sizes.append((len(entries) - len(old), size - len(codex_config.toml_value(old).encode())))
     assert sizes[0][0] == sizes[1][0] == 2 + 1 + len(policy.CODEX_READ_ONLY_NAMES)
     assert all(extra < 2000 for _, extra in sizes), sizes
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-05a.1, Entscheidung 55: way 9 closed in the Claude sandbox lists
+# --------------------------------------------------------------------------------------------
+
+
+def test_e55_a_rule_by_hand_puts_no_ban_into_allow_read(setup: Setup) -> None:
+    """A read rule written by hand for a folder that is a ban for the agent never reaches
+    `allowRead` of the Claude sandbox; one for a harmless folder outside still does."""
+    run = setup.run
+    for other in ("a2", "judge-x"):
+        (run / "tmp" / other).mkdir(parents=True, exist_ok=True)
+    banned = {
+        "own_agent_dir": run / "agents" / "a1",
+        "own_transcript": run / "agents" / "a1" / "transcript.jsonl",
+        "retired_id": run / "retired" / "a1",
+        "retired_folder": run / "retired" / "a1" / "001-p",
+        "other_scratch": run / "scratch" / "a2",
+        "other_agent": run / "agents" / "a2",
+        "other_work": run / "agents" / "a2" / "work",
+        "other_tmp": run / "tmp" / "a2",
+    }
+    harmless = setup.home / "Literatur"
+    profile = setup.profile(rules=rules_for(*banned.values(), harmless))
+    allow = claude_options(profile).sandbox["filesystem"]["allowRead"]
+    own = {str(profile.work_dir), str(run / "agents" / "a1" / "plugin")}  # from the profile
+    for name, path in banned.items():
+        opened = [p for p in allow if p == str(path) or p.startswith(f"{path}/")]
+        assert not set(opened) - own, name
+    assert str(harmless) in allow
+    assert str(profile.work_dir) in allow and str(profile.scratch_dir) in allow

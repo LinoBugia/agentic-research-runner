@@ -6,12 +6,15 @@ in `test_folders_policy.py`.
 """
 
 import asyncio
+import contextlib
 import errno
 import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -241,14 +244,22 @@ async def test_a3_a_process_writing_into_an_open_file_does_not_stop_the_fresh_fo
 
 
 async def test_a3_a_process_adding_files_all_the_time_gives_fresh_or_arr_error_with_the_path(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A writer that never stops: after the call the folder is either fresh (nothing from
-    before it) or `fresh_folder` names a path in an `ArrError` instead of going on in a half
-    old folder. The error comes at least once in three tries (the writer is much faster than
-    five rounds); without the writer the same call makes the folder fresh."""
+    """A writer that never stops: after the call the folder is either fresh – nothing from
+    before it and no new file that existed when arr compared the folder (`_verify`) – or
+    `fresh_folder` names a path in an `ArrError`. The error comes at least once in three
+    tries; without the writer the same call makes the folder fresh."""
     wf = folder_workfolder(tmp_path)
-    seen: dict[str, Any] = {"errors": [], "old_left": []}
+    seen: dict[str, Any] = {"errors": [], "old_left": [], "unseen": []}
+    checked: list[float] = []
+    verify = folders._verify
+
+    def timed(work_fd: int, placed: dict[str, int], label: Path) -> None:
+        checked.append(time.time())
+        verify(work_fd, placed, label)
+
+    monkeypatch.setattr(folders, "_verify", timed)
 
     async def topology(ctx: RunContext) -> None:
         folder = work(ctx, "c-copy")
@@ -263,6 +274,7 @@ async def test_a3_a_process_adding_files_all_the_time_gives_fresh_or_arr_error_w
                     seen["errors"].append(exc.message)
                 else:
                     seen["old_left"].append(before & inodes(folder))
+                    seen["unseen"] += _born_before(folder, checked[-2])
         await ctx.fresh_folder("c-copy", stage="p", attempt=4)
         seen["names"] = sorted(os.listdir(folder))
 
@@ -270,12 +282,22 @@ async def test_a3_a_process_adding_files_all_the_time_gives_fresh_or_arr_error_w
     run_dir = await run_done(mgr)
     assert seen["errors"], "the writer never kept the folder from becoming fresh"
     for message in seen["errors"]:
-        assert "agents/c-copy/work/" in message and "nicht ablegen" in message
-    assert not any(seen["old_left"])
+        assert "agents/c-copy/work/" in message
+        assert "nicht ablegen" in message or "nicht frisch" in message
+    assert not any(seen["old_left"]) and seen["unseen"] == []
     assert not any(n.startswith(("neu-", "vorher-")) for n in seen["names"])
     failed = log_entries(run_dir, "folder_fresh_failed")
     assert len(failed) == len(seen["errors"])
-    assert all("nicht ablegen" in f["data"]["message"] for f in failed)
+
+
+def _born_before(folder: Path, moment: float) -> list[str]:
+    """Writer files in `folder` that already existed at `moment` (macOS: birth time)."""
+    found = []
+    for path in folder.glob("neu-*"):
+        born = getattr(os.lstat(path), "st_birthtime", None)
+        if born is not None and born < moment:
+            found.append(path.name)
+    return found
 
 
 async def test_a3_an_entry_arr_cannot_move_gives_arr_error_with_the_path(
@@ -283,16 +305,16 @@ async def test_a3_an_entry_arr_cannot_move_gives_arr_error_with_the_path(
 ) -> None:
     wf = folder_workfolder(tmp_path)
     seen: dict[str, Any] = {}
-    rename = os.rename
+    rename = folders._rename_excl
 
-    def stuck(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
-        if str(src).endswith("klemmt.txt"):
-            raise OSError(errno.EBUSY, os.strerror(errno.EBUSY), str(src))
-        rename(src, dst, *args, **kwargs)
+    def stuck(src_fd: int, name: str, dst_fd: int, new: str | None = None) -> None:
+        if name == "klemmt.txt":
+            raise OSError(errno.EBUSY, os.strerror(errno.EBUSY), name)
+        rename(src_fd, name, dst_fd, new)
 
     async def topology(ctx: RunContext) -> None:
         (work(ctx, "c-copy") / "klemmt.txt").write_text("x")
-        monkeypatch.setattr(folders.os, "rename", stuck)
+        monkeypatch.setattr(folders, "_rename_excl", stuck)
         with pytest.raises(ArrError) as caught:
             await ctx.fresh_folder("c-copy", stage="p", attempt=1)
         seen["message"] = caught.value.message
@@ -332,7 +354,9 @@ async def test_a5_the_scratch_folder_is_emptied_without_rest_and_without_diff(
     assert seen["own"] == [] and seen["mode"] == 0o700
     assert seen["other"] == ["fremd.txt"], "another agent's scratch stays"
     assert outside.read_text() == "bleibt\n"
-    assert os.listdir(run_dir / "retired" / ".trash") == []
+    # the emptied content is gone; what lies there is the end of the run (finalizer, parked)
+    [parked] = os.listdir(run_dir / "retired" / ".trash")
+    assert os.listdir(run_dir / "retired" / ".trash" / parked) == ["scratch"]
     diffs = [p.name for p in (run_dir / "agents" / "c-copy").glob("*.diff")]
     assert sorted(diffs) == ["changes.diff", "retired-001-p.diff"]
     assert "teil.bin" not in (run_dir / "agents" / "c-copy" / "retired-001-p.diff").read_text()
@@ -386,7 +410,7 @@ async def test_a14_a_shared_folder_never_becomes_fresh(tmp_path: Path) -> None:
 
     run_dir = await run_done(manager(wf, topology, agents))
     assert "gemeinsamen Ordner" in seen["message"] and seen["still"]
-    assert not (run_dir / "retired").exists()
+    assert not (run_dir / "retired" / "a").exists()
 
 
 async def test_a14_two_calls_in_a_row_file_away_twice(tmp_path: Path) -> None:
@@ -623,26 +647,27 @@ async def test_a10_known_submission_folders_stay(tmp_path: Path) -> None:
 async def test_a12_a_file_arr_cannot_delete_is_a_message_and_the_run_ends_clean(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    wf = folder_workfolder(tmp_path)
-    rmtree = shutil.rmtree
+    from arr.runs.finalize import clean_up_after_scan
 
-    def refusing(path: Any, *args: Any, **kwargs: Any) -> None:
-        if "scratch" in str(path):
-            onexc = kwargs.get("onexc")
-            if onexc is None:
-                raise PermissionError(errno.EACCES, "Permission denied", str(path))
-            onexc(os.unlink, str(Path(path) / "c-copy" / "fest.bin"), PermissionError())
-            return
-        rmtree(path, *args, **kwargs)
+    wf = folder_workfolder(tmp_path)
+    unlink = folders._unlink_at
+
+    def refusing(dir_fd: int, name: str, *, folder: bool) -> None:
+        if name == "fest.bin":
+            raise PermissionError(errno.EACCES, "Permission denied", name)
+        unlink(dir_fd, name, folder=folder)
 
     async def topology(ctx: RunContext) -> None:
         (scratch(ctx, "c-copy") / "fest.bin").write_bytes(b"x")
-        monkeypatch.setattr(folders.shutil, "rmtree", refusing)
 
-    mgr = manager(wf, topology, [FOUR_AGENTS[0]])
-    run_dir = await run_done(mgr)
-    [cleanup] = log_entries(run_dir, "cleanup")
-    assert cleanup["data"]["failed"] == ["scratch/c-copy/fest.bin"]
+    run_dir = await run_done(manager(wf, topology, [FOUR_AGENTS[0]]))
+    monkeypatch.setattr(folders, "_unlink_at", refusing)
+    clean_up_after_scan(run_dir)
+    [parked, purged] = log_entries(run_dir, "cleanup")
+    assert parked["data"]["removed"] == ["scratch"] and parked["data"]["where"] == "finalizer"
+    [failed] = purged["data"]["failed"]
+    assert failed.startswith("retired/.trash/") and failed.endswith("/scratch/c-copy/fest.bin")
+    assert purged["data"]["where"] == "after_scan"
     assert not log_entries(run_dir, "error")
     assert json.loads((run_dir / "meta.json").read_text())["status"] == "done"
 
@@ -659,69 +684,6 @@ async def test_a12_an_error_of_fresh_folder_ends_the_run_with_its_message(tmp_pa
     assert await mgr.run() is RunStatus.FAILED
     assert isinstance(mgr.error, ArrError)
     assert (mgr.run_dir / "output" / "summary.md").is_file()
-
-
-# --------------------------------------------------------------------------------------------
-# A13: a run without fresh_folder
-# --------------------------------------------------------------------------------------------
-
-
-async def test_a13_a_run_without_fresh_folder_has_the_run_folder_of_before(
-    tmp_path: Path,
-) -> None:
-    """Besides `scratch/` (made at the start, deleted by the finalizer, one log entry
-    `cleanup`) nothing is new: no `retired/`, no new diff, no other new log entry."""
-    wf = folder_workfolder(tmp_path)
-    seen: dict[str, Any] = {}
-
-    async def topology(ctx: RunContext) -> None:
-        seen["during"] = sorted(os.listdir(ctx.prepared.run_dir))
-        for agent_id in ctx.prepared.agents:
-            await ctx.turn(agent_id, "x")
-
-    run_dir = await run_done(manager(wf, topology))
-    assert "scratch" in seen["during"] and "retired" not in seen["during"]
-    top = sorted(os.listdir(run_dir))
-    assert "scratch" not in top and "retired" not in top
-    assert top == sorted(
-        [
-            "agents",
-            "approvals.jsonl",
-            "base",
-            "gatekeeper.jsonl",
-            "groupchats",
-            "meta.json",
-            "orchestrator.jsonl",
-            "output",
-            "run.input.yaml",
-            "run.yaml",
-            "skills",
-            "task.md",
-            "tmp",
-            "usage.json",
-        ]
-    ) or set(top) - {"gatekeeper.jsonl"} == {
-        "agents",
-        "approvals.jsonl",
-        "base",
-        "groupchats",
-        "meta.json",
-        "orchestrator.jsonl",
-        "output",
-        "run.input.yaml",
-        "run.yaml",
-        "skills",
-        "task.md",
-        "tmp",
-        "usage.json",
-    }
-    for agent_id in ("c-copy", "x-copy", "c-empty", "x-empty"):
-        names = os.listdir(run_dir / "agents" / agent_id)
-        assert not [n for n in names if n.startswith("retired-")], names
-    kinds = {e["kind"] for e in log_entries(run_dir)}
-    assert not kinds & {"folder_fresh", "folder_fresh_failed"}
-    [cleanup] = log_entries(run_dir, "cleanup")
-    assert cleanup["data"] == {"removed": ["scratch"], "failed": [], "where": "finalizer"}
 
 
 # --------------------------------------------------------------------------------------------
@@ -796,3 +758,253 @@ async def test_a12_any_error_of_the_file_system_in_fresh_folder_is_an_arr_error(
     await run_done(manager(wf, topology, [FOUR_AGENTS[0]]))
     assert "keinen frischen Arbeitsordner" in seen["message"]
     assert "No space left on device" in seen["message"]
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-05a.1: mutations that survived the review (M04, M06, M28, M33), M1, G3, G6
+# --------------------------------------------------------------------------------------------
+
+
+async def test_m04_a_late_entry_is_filed_away_in_a_further_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file appears while arr moves the first round: it goes to `001-p~2` (one round only
+    would leave it and end in `ArrError`)."""
+    wf = folder_workfolder(tmp_path)
+    seen: dict[str, Any] = {}
+    move = folders._move_one
+
+    async def topology(ctx: RunContext) -> None:
+        folder = work(ctx, "c-copy")
+
+        def late(src_fd: int, dst_fd: int, name: str) -> bool:
+            if name == "notes.md" and not (folder / "spaet.txt").exists():
+                (folder / "spaet.txt").write_text("spät")
+            return move(src_fd, dst_fd, name)
+
+        monkeypatch.setattr(folders, "_move_one", late)
+        await ctx.fresh_folder("c-copy", stage="p", attempt=1)
+        seen["names"] = sorted(os.listdir(folder))
+
+    run_dir = await run_done(manager(wf, topology, [FOUR_AGENTS[0]]))
+    assert "spaet.txt" not in seen["names"]
+    assert (run_dir / "retired" / "c-copy" / "001-p~2" / "spaet.txt").is_file()
+    entry = log_entries(run_dir, "folder_fresh")[0]["data"]
+    assert entry["rounds"] == 2 and entry["extra"] == ["retired/c-copy/001-p~2"]
+
+
+@pytest.mark.parametrize("which", ["work", "scratch"])
+async def test_m06_a_folder_that_is_a_link_is_refused_and_its_target_untouched(
+    tmp_path: Path, which: str
+) -> None:
+    wf = folder_workfolder(tmp_path)
+    outside = tmp_path / "draussen"
+    outside.mkdir()
+    (outside / "bleibt.txt").write_text("bleibt")
+    seen: dict[str, Any] = {}
+
+    async def topology(ctx: RunContext) -> None:
+        entry = work(ctx, "c-copy") if which == "work" else scratch(ctx, "c-copy")
+        os.rename(entry, f"{entry}.echt")
+        entry.symlink_to(outside)
+        with pytest.raises(ArrError) as caught:
+            await ctx.fresh_folder("c-copy", stage="p", attempt=1)
+        seen["message"] = caught.value.message
+        entry.unlink()
+        os.rename(f"{entry}.echt", entry)
+
+    await run_done(manager(wf, topology, [FOUR_AGENTS[0]]))
+    assert "kein Ordner" in seen["message"]
+    assert sorted(os.listdir(outside)) == ["bleibt.txt"]
+    assert (outside / "bleibt.txt").read_text() == "bleibt"
+
+
+@pytest.mark.parametrize("agent", ["c-copy", "c-empty"])
+async def test_m28_the_rights_the_agent_took_on_its_folder_are_those_of_the_start(
+    tmp_path: Path, agent: str
+) -> None:
+    wf = folder_workfolder(tmp_path)
+    seen: dict[str, Any] = {}
+
+    async def topology(ctx: RunContext) -> None:
+        folder = work(ctx, agent)
+        seen["start"] = stat.S_IMODE(os.lstat(folder).st_mode)
+        os.chmod(folder, 0o500)
+        await ctx.fresh_folder(agent, stage="p", attempt=1)
+        seen["after"] = stat.S_IMODE(os.lstat(folder).st_mode)
+
+    spec = next(a for a in FOUR_AGENTS if a["id"] == agent)
+    await run_done(manager(wf, topology, [spec]))
+    assert seen["after"] == seen["start"] != 0o500
+
+
+async def test_m33_an_empty_working_folder_still_gets_its_filed_away_folder_and_diff(
+    tmp_path: Path,
+) -> None:
+    wf = folder_workfolder(tmp_path)
+
+    async def topology(ctx: RunContext) -> None:
+        folder = work(ctx, "c-copy")
+        for entry in list(folder.iterdir()):
+            shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+        await ctx.fresh_folder("c-copy", stage="p", attempt=1)
+
+    run_dir = await run_done(manager(wf, topology, [FOUR_AGENTS[0]]))
+    old = run_dir / "retired" / "c-copy" / "001-p"
+    assert old.is_dir() and os.listdir(old) == []
+    diff = (run_dir / "agents" / "c-copy" / "retired-001-p.diff").read_text()
+    assert "--- a/check.py\n+++ /dev/null" in diff
+
+
+def _tool(*command: str) -> None:
+    subprocess.run(command, check=True)
+
+
+def _xattrs(path: Path) -> list[str]:
+    done = subprocess.run(["/usr/bin/xattr", str(path)], capture_output=True, text=True)
+    return [n for n in done.stdout.split() if n != "com.apple.provenance"]
+
+
+def _acl(path: Path) -> str:
+    listing = subprocess.run(["/bin/ls", "-led", str(path)], capture_output=True, text=True)
+    return "\n".join(listing.stdout.splitlines()[1:])
+
+
+@macos_only
+async def test_m1_extended_attributes_and_acls_of_both_folders_themselves_are_removed(
+    tmp_path: Path,
+) -> None:
+    """Review rv11: an attribute at the working or scratch folder itself carried notes into
+    the fresh folder. Counter-check: the attribute at a file moves with it to `retired/`."""
+    wf = folder_workfolder(tmp_path)
+    seen: dict[str, Any] = {}
+
+    async def topology(ctx: RunContext) -> None:
+        folder, own = work(ctx, "c-copy"), scratch(ctx, "c-copy")
+        for path, text in ((folder, "ALT-AM-ORDNER"), (own, "ALT-AM-SCRATCH")):
+            _tool("/usr/bin/xattr", "-w", "user.notiz", text, str(path))
+            _tool("/bin/chmod", "+a", "everyone deny delete_child", str(path))
+        (folder / "datei.txt").write_text("x")
+        _tool("/usr/bin/xattr", "-w", "user.notiz", "AN-DER-DATEI", str(folder / "datei.txt"))
+        seen["before"] = (_xattrs(folder), bool(_acl(folder)), _xattrs(own), bool(_acl(own)))
+        await ctx.fresh_folder("c-copy", stage="p", attempt=1)
+        seen["after"] = (_xattrs(folder), _acl(folder), _xattrs(own), _acl(own))
+        moved = ctx.prepared.run_dir / "retired" / "c-copy" / "001-p" / "datei.txt"
+        seen["file"] = _xattrs(moved)
+
+    await run_done(manager(wf, topology, [FOUR_AGENTS[0]]))
+    assert seen["before"] == (["user.notiz"], True, ["user.notiz"], True)
+    assert seen["after"] == ([], "", [], ""), seen["after"]
+    assert seen["file"] == ["user.notiz"]
+
+
+async def test_g3_a_stop_during_fresh_folder_waits_for_the_file_operations(
+    tmp_path: Path,
+) -> None:
+    """Review rv12: the topology is cancelled after a grace of 10 ms while arr files away
+    60 000 entries. `fresh_folder` waits for its thread, writes the log entry and passes the
+    cancellation on; nothing changes after the run returned."""
+    wf = folder_workfolder(tmp_path)
+    holder: dict[str, Any] = {}
+
+    async def topology(ctx: RunContext) -> None:
+        folder = work(ctx, "c-copy")
+        for n in range(600):
+            sub = folder / f"d{n:03d}"
+            sub.mkdir()
+            for m in range(100):
+                (sub / f"f{m}").write_text("x")
+
+        holder["start"] = _count(folder)
+
+        async def later() -> None:
+            await asyncio.sleep(0.03)
+            holder["mgr"].stop()
+
+        task = asyncio.create_task(later())
+        holder["task"] = task
+        await ctx.fresh_folder("c-copy", stage="p", attempt=1)
+
+    mgr = manager(wf, topology, [FOUR_AGENTS[0]])
+    holder["mgr"] = mgr
+    mgr.stop_grace_s = 0.01
+    status = await mgr.run()
+    run_dir = mgr.run_dir
+    retired = run_dir / "retired" / "c-copy" / "001-p"
+    first = _count(retired), _count(run_dir / "agents" / "c-copy" / "work")
+    await asyncio.sleep(1)
+    assert (_count(retired), _count(run_dir / "agents" / "c-copy" / "work")) == first
+    assert status.value == "stopped"
+    [entry] = [e for e in log_entries(run_dir) if e["kind"].startswith("folder_fresh")]
+    assert entry["kind"] == "folder_fresh" and entry["data"]["cancelled"] is True
+    assert first[0] == holder["start"]  # everything filed away before the finalizer ran
+    diff = (run_dir / "agents" / "c-copy" / "retired-001-p.diff").read_text()
+    assert diff.count("+++ b/d") == 600 * 100
+
+
+def _count(folder: Path) -> int:
+    return sum(len(ds) + len(fs) for _, ds, fs in os.walk(folder)) if folder.exists() else -1
+
+
+@macos_only
+async def test_g6_an_acl_the_agent_set_does_not_keep_the_run_from_being_slimmed(
+    tmp_path: Path,
+) -> None:
+    from arr.runs.slim import slim_run
+
+    wf = folder_workfolder(tmp_path)
+
+    async def topology(ctx: RunContext) -> None:
+        file = work(ctx, "c-copy") / "gesperrt.txt"
+        file.write_text("x")
+        _tool("/bin/chmod", "+a", "everyone deny delete", str(file))
+        tmp = ctx.prepared.run_dir / "tmp" / "c-copy" / "auch.txt"
+        tmp.write_text("x")
+        _tool("/bin/chmod", "+a", "everyone deny delete", str(tmp))
+
+    run_dir = await run_done(manager(wf, topology, [FOUR_AGENTS[0]]))
+    slim_run(run_dir)
+    assert not (run_dir / "agents" / "c-copy" / "work").exists()
+    assert not (run_dir / "tmp").exists()
+
+
+@pytest.mark.parametrize("helper", ["chmod", "flags", "acl", "clear"])
+def test_h2_the_primitives_change_a_link_never_its_target(tmp_path: Path, helper: str) -> None:
+    """Rights, flags and ACLs change only at the entry itself: a link at the name keeps its
+    target as it was (a swap between `stat` and the change would otherwise reach it)."""
+    bait = tmp_path / "koeder"
+    bait.mkdir()
+    (bait / "f.txt").write_text("x")
+    if sys.platform == "darwin":
+        _tool("/bin/chmod", "+a", "everyone deny delete", str(bait / "f.txt"))
+        os.chflags(bait / "f.txt", stat.UF_IMMUTABLE)
+    os.chmod(bait, 0o500)
+    folder = tmp_path / "ordner"
+    folder.mkdir()
+    (folder / "x").symlink_to(bait)
+    (folder / "y").symlink_to(bait / "f.txt")
+    before = [
+        (os.lstat(p).st_mode, getattr(os.lstat(p), "st_flags", 0)) for p in (bait, bait / "f.txt")
+    ]
+    acl = _acl(bait / "f.txt") if sys.platform == "darwin" else ""
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in ("x", "y"):
+            with contextlib.suppress(OSError):
+                if helper == "chmod":
+                    folders._chmod_at(fd, name, 0o777)
+                elif helper == "flags":
+                    folders._set_flags_at(fd, name, 0)
+                elif helper == "acl":
+                    folders._drop_acl_at(fd, name)
+                else:
+                    folders._clear_at(fd, name)
+    finally:
+        os.close(fd)
+    after = [
+        (os.lstat(p).st_mode, getattr(os.lstat(p), "st_flags", 0)) for p in (bait, bait / "f.txt")
+    ]
+    assert after == before
+    if sys.platform == "darwin":
+        assert _acl(bait / "f.txt") == acl != ""
+    clear_flags(bait)

@@ -487,3 +487,237 @@ def test_a8_what_outlives_the_filing_away_and_what_it_still_reaches(
             assert seen["retired_path"] == "denied: PermissionError", (tag, seen)
             assert seen["retired_list"] == "denied: PermissionError", (tag, seen)
             assert "ALT gelesen" not in str(seen.get("work_list")), (tag, seen)
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-05a.1, H1 and M1 from the sandbox: a detached planter of the agent while arr refills
+# --------------------------------------------------------------------------------------------
+
+LAB_PLANTER = r"""
+import json, os, sys, time
+plan = json.load(open(sys.argv[1]))
+work, mode, bait_dir, bait_file, tmp, tag = (
+    plan[k] for k in ("work", "mode", "bait_dir", "bait_file", "tmp", "tag"))
+if os.fork():
+    os._exit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+open(os.path.join(tmp, "planter-%s.pid" % tag), "w").write(str(os.getpid()))
+stop = os.path.join(tmp, "stop-" + tag)
+marker = os.path.join(work, "project.yaml")
+end = time.time() + 120
+done = []
+while time.time() < end and os.path.lexists(marker):  # until arr filed the old content away
+    time.sleep(0.001)
+while time.time() < end and not os.path.lexists(marker) and not os.path.exists(stop):
+    if mode == "agentsmd":
+        try:
+            os.symlink(bait_file, os.path.join(work, "AGENTS.md")); done.append("AGENTS.md")
+        except OSError:
+            pass
+try:
+    open(os.path.join(work, "fremd.txt"), "x").write("fremd"); done.append("fremd.txt")
+except OSError as exc:
+    done.append("fremd: " + type(exc).__name__)
+while time.time() < end and not os.path.exists(stop):
+    if mode == "sub":
+        sub = os.path.join(work, "sub")
+        try:
+            os.rename(sub, sub + ".alt"); os.symlink(bait_dir, sub); done.append("sub"); break
+        except OSError:
+            pass
+    elif mode == "agentsmd":
+        path = os.path.join(work, "AGENTS.md")
+        try:
+            if not os.path.islink(path):
+                os.unlink(path)
+            os.symlink(bait_file, path); done.append("AGENTS.md")
+        except OSError:
+            pass
+    else:
+        break
+open(os.path.join(tmp, "planter-%s.json" % tag), "w").write(json.dumps(done[:20]))
+"""
+
+
+def _bait_state(bait: Path) -> list[tuple[str, int, str]]:
+    out = []
+    for top, dirs, files in os.walk(bait):
+        for name in sorted(dirs + files):
+            path = Path(top) / name
+            text = path.read_text() if path.is_file() and not path.is_symlink() else "dir"
+            out.append((str(path.relative_to(bait)), os.lstat(path).st_mode, text))
+    return sorted(out)
+
+
+def _end_planters(tmp: Path) -> None:
+    for pid_file in tmp.glob("planter-*.pid"):
+        pid = int(pid_file.read_text())
+        command = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True
+        ).stdout
+        if "planter.py" in command and _alive(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
+LAB_ATTEMPTS = 3
+
+
+@pytest.mark.parametrize("mode", ["sub", "agentsmd", "foreign"])
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_w4b05a1_a_planter_in_the_sandbox_never_makes_arr_write_outside(
+    provider: str, mode: str
+) -> None:
+    """After review rv02: a project with 1500 files in `sub/`, a detached planter of the agent
+    (started in a turn, lives on) plants while arr refills. Baits in the lab, outside the run
+    folder. Every attempt: baits unchanged, and the folder fresh or `ArrError`."""
+    import login_guard_kit as kit
+    from folders_kit import lab_orchestrator
+
+    from arr.errors import ArrError
+
+    with kit.open_lab(provider) as lab:
+        run_dir, agent_id = lab.run.run_dir, lab.agent.id
+        work, tmp = lab.agent.work_dir, lab.profile.tmp_dir
+        (run_dir / "base" / "sub").mkdir()
+        for n in range(1500):
+            (run_dir / "base" / "sub" / f"t{n:04d}.txt").write_text("x\n")
+        bait = lab.base / "koeder"
+        bait.mkdir()
+        (bait / "inhalt.txt").write_text("KOEDER\n")
+        (bait / "datei.txt").write_text("KOEDER-DATEI\n")
+        before = _bait_state(bait)
+        rows: list[dict[str, Any]] = []
+        turns = [
+            [step(provider, f"python3 planter.py plan-{n}.json"), step(provider, "sleep 1")]
+            for n in range(LAB_ATTEMPTS)
+        ]
+        api = api_for(provider, turns)
+        try:
+            with api:
+
+                async def go() -> None:
+                    async with lab_orchestrator(lab, api) as orchestrator:
+                        for n in range(LAB_ATTEMPTS):
+                            (work / "project.yaml").touch()
+                            (work / "planter.py").write_text(LAB_PLANTER)
+                            plan = {
+                                "work": str(work),
+                                "mode": mode,
+                                "bait_dir": str(bait),
+                                "bait_file": str(bait / "datei.txt"),
+                                "tmp": str(tmp),
+                                "tag": str(n),
+                            }
+                            (work / f"plan-{n}.json").write_text(json.dumps(plan))
+                            await orchestrator.turn(agent_id, f"Runde {n}")
+                            row: dict[str, Any] = {"n": n}
+                            try:
+                                await orchestrator.fresh_folder(agent_id, stage="p", attempt=n)
+                                row["error"] = None
+                            except ArrError as exc:
+                                row["error"] = exc.message[:90]
+                            (tmp / f"stop-{n}").write_text("")
+                            for _ in range(100):
+                                if (tmp / f"planter-{n}.json").exists():
+                                    break
+                                await asyncio.sleep(0.1)
+                            row["planted"] = (
+                                json.loads((tmp / f"planter-{n}.json").read_text())
+                                if (tmp / f"planter-{n}.json").exists()
+                                else None
+                            )
+                            row["bait_changed"] = _bait_state(bait) != before
+                            rows.append(row)
+
+                asyncio.run(asyncio.wait_for(go(), 600))
+        finally:
+            _end_planters(tmp)
+        print("LAB-H1", provider, mode, json.dumps(rows, ensure_ascii=False))
+        assert len(rows) == LAB_ATTEMPTS
+        assert not any(r["bait_changed"] for r in rows), rows
+        for row in rows:
+            planted = [p for p in row["planted"] or [] if ":" not in p]
+            if row["error"] is None:  # fresh: nothing planted before the check stayed
+                assert not (set(planted) & {"sub", "AGENTS.md"}), row
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-05a.1, Entscheidung 55: a read rule written by hand opens no ban to the Claude shell
+# --------------------------------------------------------------------------------------------
+
+WAY9_READER = r"""
+import json, sys
+targets = json.load(open("way9_targets.json"))
+out = {}
+for name, path in targets.items():
+    try:
+        out[name] = open(path).read().strip()
+    except OSError as exc:
+        out[name] = "denied: " + type(exc).__name__
+open(sys.argv[1], "w").write(json.dumps(out))
+"""
+
+
+def _way9_targets(lab: Any, bait: str) -> dict[str, tuple[Path, Path]]:
+    """name → (file with the bait, folder a rule by hand names)."""
+    run, agent = lab.run.run_dir, lab.agent.id
+    targets = {
+        "own_agent_dir": (lab.agent.agent_dir / "transcript.jsonl", lab.agent.agent_dir),
+        "retired": (run / "retired" / agent / "001-p" / "n.md", run / "retired" / agent),
+        "other_scratch": (run / "scratch" / OTHER / "d.txt", run / "scratch" / OTHER),
+        "other_agent": (run / "agents" / OTHER / "transcript.jsonl", run / "agents" / OTHER),
+        "other_tmp": (run / "tmp" / OTHER / "entwurf.md", run / "tmp" / OTHER),
+        # counter-check: a folder in the blocked test HOME, opened only by its own rule
+        "harmless": (lab.home / "Literatur" / "frei.txt", lab.home / "Literatur"),
+    }
+    for path, _ in targets.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{bait}\n")
+    return targets
+
+
+def _way9_shell(kit: Any, lab: Any, provider: str, targets: dict[str, Path], allow_in: Any) -> dict:
+    work = lab.agent.work_dir
+    (work / "way9_reader.py").write_text(WAY9_READER)
+    (work / "way9_targets.json").write_text(json.dumps({k: str(v) for k, v in targets.items()}))
+    answer = work / f"way9-{secrets.token_hex(3)}.json"
+    command = f"python3 way9_reader.py {answer.name}"
+    if provider == "claude":
+        from fake_messages_api import FakeMessagesApi
+
+        with FakeMessagesApi([kit.bash(command)], credential=lab.token) as api:
+            asyncio.run(asyncio.wait_for(kit._claude_turn(lab, api, allow_in=allow_in), 240))
+    else:
+        real, env, cwd = kit.codex_entries(lab)
+        assert kit.in_codex_sandbox(lab, real, env, cwd, command).returncode == 0
+    return json.loads(answer.read_text())
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_e55_a_rule_by_hand_opens_no_ban_to_the_shell(provider: str) -> None:
+    import login_guard_kit as kit
+
+    from arr.permissions.policy import AlwaysRule, PermissionRules, profile_for
+
+    with kit.open_lab(provider) as lab:
+        bait = f"WEG9-{secrets.token_hex(6)}"
+        targets = _way9_targets(lab, bait)
+        files = {name: path for name, (path, _) in targets.items()}
+        for name, (_, folder) in targets.items():
+            rule = AlwaysRule(action="allow", tools=["Read"], paths=[str(folder)])
+            profile = profile_for(
+                lab.agent.file.config, lab.run_paths, PermissionRules(always=[rule]), home=lab.home
+            )
+            seen = _way9_shell(kit, replace(lab, profile=profile), provider, files, None)
+            print("WAY9", provider, name, json.dumps({k: bait in v for k, v in seen.items()}))
+            if name == "harmless":
+                assert bait in seen["harmless"], seen
+            else:
+                assert seen[name] == "denied: PermissionError", (name, seen[name][:60])
+                assert seen["harmless"] == "denied: PermissionError", "blocked without its rule"
+                assert seen["harmless"] == "denied: PermissionError", "blocked without its rule"
+        if provider == "claude":  # counter-check: the folder in `allowRead` opens it
+            opened = {"path": str(targets["retired"][1])}
+            assert bait in _way9_shell(kit, lab, provider, files, opened)["retired"]

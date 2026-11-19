@@ -20,9 +20,12 @@ does not stop the others):
    name), `output/results.json`, `output/ratings.json`; for submissions of `submit` (W4b-01)
    `output/submissions.json`, only when there are any or the topology is `phases`.
 5. `usage.json`, and an empty `approvals.jsonl` if there were no requests.
-6. Cleaning up (W4b-05a, `arr.runs.folders.clean_up_run`): `scratch/`, the rests of submissions
-   in `groupchats/staging/` and folders in `output/submissions/` without a database row; never
-   below `groupchats/sealed/`. What cannot be deleted is an entry `cleanup` in the log.
+6. Cleaning up (W4b-05a, `arr.runs.folders.park_end_of_run`): `scratch/`, the rests of
+   submissions in `groupchats/staging/` and folders in `output/submissions/` without a database
+   row go to one folder below `retired/.trash/`, out of every agent's reach; never anything
+   below `groupchats/sealed/`. An entry `cleanup` in the log names them. The secret scan of
+   `arr run` still sees them; `clean_up_after_scan` deletes them after it (Entscheidung 54),
+   otherwise slimming does.
 7. `output/summary.md` (German): status and reason, duration, agents, stages with attempts and
    scores, the overview a topology built itself (`review`: verdict and rounds, `exploration`:
    ranking; the latest checkpoint with `overview`, W4-03 F8/F9), results with links, the
@@ -52,12 +55,18 @@ from arr.models import RunStatus, TopologyKind, WorkspaceMode
 from arr.room.store import RESULTS_DIR, ROOM_DIR, RoomStore
 from arr.room.types import Rating, Result, Submission
 from arr.runs.eventlog import TRANSCRIPT_FILE, read_events, write_transcript_md
-from arr.runs.folders import clean_up_run, retired_diff_name, retired_folders
+from arr.runs.folders import park_end_of_run, purge_trash, retired_diff_name, retired_folders
 from arr.runs.orchestrator import ORCHESTRATOR_LOG, OrchestratorLog, stopped_text
 from arr.runs.prepare import AgentFile, PreparedRun, RunMeta, load_run_meta
 from arr.usage import RunUsage, UsageTotal, compute_run_usage, write_usage_json
 
-__all__ = ["DiffResult", "changes_diff", "finalize_run", "last_turn_error"]
+__all__ = [
+    "DiffResult",
+    "changes_diff",
+    "clean_up_after_scan",
+    "finalize_run",
+    "last_turn_error",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +106,20 @@ _OUTCOME_TEXT = {
     "stage_failed": "nicht bestanden, Run beendet",
 }
 _REASON_TEXT = {"no_result": "kein Ergebnis", "no_rating": "kein Rating"}
+
+
+def clean_up_after_scan(run_dir: Path) -> None:
+    """Delete what the finalizer parked in `retired/.trash/` (`scratch/`, rests of
+    submissions), after the secret scan of `arr run` saw it (Entscheidung 54). Never raises;
+    an entry `cleanup` in the log names what went and what could not."""
+    try:
+        done = purge_trash(run_dir)
+        if done.removed or done.failed:
+            OrchestratorLog(run_dir).write(
+                "cleanup", removed=done.removed, failed=done.failed, where="after_scan"
+            )
+    except Exception:
+        logger.exception("Aufräumen nach dem Secret-Scan von %s fehlgeschlagen", run_dir.name)
 
 
 async def finalize_run(prepared: PreparedRun) -> None:
@@ -477,12 +500,17 @@ class _Finalizer:
         return result
 
     def _clean_up(self) -> None:
-        """Scratch folders and rests of submissions (W4b-05a); a failure is a message only."""
+        """Scratch folders and rests of submissions out of reach (W4b-05a); deleted only after
+        the secret scan (`clean_up_after_scan`). A failure is a message only."""
         submissions = self.room.submissions() if self.room is not None else None
-        done = clean_up_run(self.run_dir, submissions)
+        done = park_end_of_run(self.run_dir, submissions)
         if done.removed or done.failed:
             OrchestratorLog(self.run_dir).write(
-                "cleanup", removed=done.removed, failed=done.failed, where="finalizer"
+                "cleanup",
+                removed=done.removed,
+                failed=done.failed,
+                parked=done.parked,
+                where="finalizer",
             )
 
     def _results(self) -> None:

@@ -116,8 +116,9 @@ def clear_flags(root: Path) -> None:
     """Remove user flags and give the owner its rights below `root` (so pytest can delete)."""
     if not os.path.lexists(root):
         return
-    with contextlib.suppress(OSError):
-        os.chflags(root, 0, follow_symlinks=False)
+    if hasattr(os, "chflags"):  # macOS: user flags; Linux has none
+        with contextlib.suppress(OSError):
+            os.chflags(root, 0, follow_symlinks=False)
     if root.is_symlink() or not root.is_dir():
         return
     os.chmod(root, 0o700)
