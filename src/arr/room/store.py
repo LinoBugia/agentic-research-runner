@@ -193,6 +193,12 @@ NOTE_TURN_REFUSED = (
 """Refusal of a room tool during the note turn of auto-compact (W4b-05b.1, Entscheidung 53)."""
 _NOTE_TURN_TABLE = "CREATE TABLE IF NOT EXISTS note_turn(agent TEXT PRIMARY KEY, since REAL)"
 
+
+def _no_table(exc: sqlite3.OperationalError) -> bool:
+    """The error says the table `note_turn` is missing (a room from before W4b-05b.1)."""
+    return "no such table" in str(exc)
+
+
 WAIT_GUARD_FIELDS = frozenset(
     {"waited", "seen", "last_end", "yield_to", "end_turn", "until_streak"}
 )
@@ -1337,20 +1343,25 @@ class RoomStore:
             )
 
     def end_note_turn(self, agent: str) -> None:
-        """The note turn of `agent` is over (in any case: success, error, stop)."""
+        """The note turn of `agent` is over (in any case: success, error, stop). Only a missing
+        table („nobody was in a note turn“) is passed over; any other error is raised, so the
+        caller can log it and try again (W4b-05b.2)."""
         try:
             with self._write() as con:
                 con.execute("DELETE FROM note_turn WHERE agent=?", (agent,))
-        except sqlite3.OperationalError:  # no table: nobody was in a note turn
-            pass
+        except sqlite3.OperationalError as exc:
+            if not _no_table(exc):
+                raise
 
     def in_note_turn(self, agent: str) -> bool:
-        """True while the note turn of `agent` runs."""
+        """True while the note turn of `agent` runs. A room without the table (before
+        W4b-05b.1) means nobody; when the flag cannot be read (e.g. the database is locked),
+        the answer is True: in doubt the tools refuse (W4b-05b.2)."""
         try:
             with self._read() as con:
                 row = con.execute("SELECT 1 FROM note_turn WHERE agent=?", (agent,)).fetchone()
-        except sqlite3.OperationalError:  # a room from before W4b-05b.1
-            return False
+        except sqlite3.OperationalError as exc:
+            return not _no_table(exc)
         return row is not None
 
     def reset_wait_guard(self, agent: str) -> None:
@@ -1983,9 +1994,10 @@ class AgentRoom:
     # Helpers
     # ----------------------------------------------------------------------------------------
 
-    def _not_in_note_turn(self) -> None:
+    def not_in_note_turn(self) -> None:
         """Refuse a tool that writes, waits or moves the read position while the agent writes
-        its handover note (W4b-05b.1, Entscheidung 53); reading tools stay."""
+        its handover note (W4b-05b.1, Entscheidung 53); reading tools stay. Raises `RoomError`
+        with `NOTE_TURN_REFUSED`; also used by `arr.room.waiting.wait_for_messages`."""
         if self.store.in_note_turn(self.agent_id):
             raise RoomError(NOTE_TURN_REFUSED)
 
@@ -2329,7 +2341,7 @@ class AgentRoom:
         `only_new=False` the latest `limit` messages are returned. `thread` returns the
         strand of a message (root and all replies) and leaves the cursor alone.
         """
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         if not 1 <= limit <= MAX_READ_LIMIT:
             raise RoomError(f"„limit“ muss zwischen 1 und {MAX_READ_LIMIT} liegen.")
         if thread is not None:
@@ -2418,7 +2430,7 @@ class AgentRoom:
         Attachments are kept per channel, so each agent can be given read access to exactly
         the attachments of its own channels (E19).
         """
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         kind = _enum(MessageKind, kind, "Nachrichtenart")
         if kind is MessageKind.VOTE:
             raise RoomError("Stimmen gibst du mit dem Tool „vote“ ab, nicht als Nachricht.")
@@ -2538,7 +2550,7 @@ class AgentRoom:
 
     def vote(self, proposal_id: int, choice: VoteChoice, reason: str = "") -> Vote:
         """Vote on a `proposal`; a second vote replaces the first. Also posts a `vote` message."""
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         choice = _enum(VoteChoice, choice, "Stimme")
         with self.store._write() as con:
             row, ch = self._message_in_my_channel(con, proposal_id, write=True)
@@ -2567,7 +2579,7 @@ class AgentRoom:
 
     def set_status(self, status: AgentStatus, note: str = "") -> None:
         """Report `working` or `done` (with a short summary)."""
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         status = _enum(AgentStatus, status, "Status")
         if status not in AGENT_STATUSES:
             allowed = ", ".join(s.value for s in AGENT_STATUSES)
@@ -2636,7 +2648,7 @@ class AgentRoom:
     ) -> WaitState:
         """Record that this agent waits from now for `seconds` (and maybe `until_file` or the
         next result of the agent `result_from`, a real ID)."""
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         until_file = self._check_until_file(until_file)
         now = _now()
         state = WaitState(
@@ -2674,7 +2686,7 @@ class AgentRoom:
         Refused after `WAIT_UNTIL_REPEAT` of them in a row ended by their deadline (L10), for
         an unknown agent, for oneself and for an agent that is done already.
         """
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         if not isinstance(minutes, int | float) or not math.isfinite(minutes) or minutes <= 0:
             raise RoomError("„minutes“ muss eine Zahl größer als 0 sein, z. B. 10.")
         result_from = self._check_result_from(until_result_from)
@@ -2820,7 +2832,7 @@ class AgentRoom:
         is made in `STAGING_DIR` first; in a sealed stage (`RoomStore.seal`) the file stays in
         `SEALED_DIR` until the stage is released, so no other agent can read it before.
         """
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         if not kind.strip() or not title.strip():
             raise RoomError("„kind“ und „title“ dürfen nicht leer sein.")
         if not (body and body.strip()) and not path:
@@ -2891,7 +2903,7 @@ class AgentRoom:
         `score` and the values in `criteria` must lie on the scale of the rubric; with
         criteria in the rubric only those names are allowed.
         """
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         criteria = dict(criteria or {})
         self._check_score("score", score)
         known = self.rubric.criteria
@@ -2990,7 +3002,7 @@ class AgentRoom:
         Every accepted submission is filed once (`RoomStore._publish`); in a sealed stage it
         stays in `SEALED_DIR` until `release`.
         """
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         assignment = self.store.assignment(self.agent_id)
         expectation = self._expectation(assignment)
         assert assignment is not None
@@ -3037,7 +3049,7 @@ class AgentRoom:
 
     def give_floor(self, agent: str, prompt: str, channel: str | None = None) -> None:
         """Give a member the floor; posts a note to them and queues a turn for the orchestrator."""
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         if not prompt.strip():
             raise RoomError("Gib eine konkrete Frage oder Aufgabe in „prompt“ an.")
         with self.store._write() as con:
@@ -3055,7 +3067,7 @@ class AgentRoom:
 
     def call_vote(self, proposal_id: int, rule: VoteRule = VoteRule.MAJORITY) -> None:
         """Start a vote on a proposal in a channel I moderate."""
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         rule = _enum(VoteRule, rule, "Regel")
         with self.store._write() as con:
             row, ch = self._message_in_my_channel(con, proposal_id, write=True)
@@ -3077,7 +3089,7 @@ class AgentRoom:
 
     def pin(self, msg_id: int) -> None:
         """Pin a message in a channel I moderate."""
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         with self.store._write() as con:
             _, ch = self._message_in_my_channel(con, msg_id, write=True)
             self._moderated_channel(con, ch.name, "pin")
@@ -3085,7 +3097,7 @@ class AgentRoom:
 
     def close_discussion(self, decision: str, channel: str | None = None) -> Message:
         """Post the `decision` and close the channel for further agent messages."""
-        self._not_in_note_turn()
+        self.not_in_note_turn()
         if not decision.strip():
             raise RoomError("Die Entscheidung („decision“) darf nicht leer sein.")
         with self.store._write() as con:

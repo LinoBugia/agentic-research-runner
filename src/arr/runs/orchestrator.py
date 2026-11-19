@@ -204,7 +204,8 @@ class OrchestratorLog:
     `stage`, `tokens`, `window`, `threshold`, `note_chars`, `ok`, on a failure `failures`),
     `compact_no_window` and `compact_no_fill` (once per agent: a share without a known window,
     a turn with requests without a fill level), and `purpose: compact` at `turn`/`turn_end`
-    of a note turn.
+    of a note turn. Since W4b-05b.2: `note_turn_flag` (`agent`, `action` begin/end, `error`):
+    the flag of a note turn could not be set or cleared in the room.
     """
 
     def __init__(self, run_dir: Path) -> None:
@@ -292,6 +293,15 @@ class ProfileGate:
             return False
         capacity = self._capacity(now)
         return capacity is None or self.active < capacity
+
+    def admits_held(self) -> bool:
+        """True if a turn that already holds one slot may begin now: no rate-limit pause, and
+        the held slots fit the capacity, also a throttled one (W4b-05b.2)."""
+        now = self._clock()
+        if now < self.paused_until:
+            return False
+        capacity = self._capacity(now)
+        return capacity is None or self.active <= capacity
 
     def contended(self) -> bool:
         """True while a turn waits for a slot that a running turn could free (L12); not
@@ -579,29 +589,13 @@ class Orchestrator(RunContext):
             await self._runnable.wait()
             if (refused := self._refuse(handle)) is not None:
                 return refused
-            gate = self._gates[handle.config.auth]
-            if not gate.has_slot():  # docs/09 §4.5: waiting for a free place is visible
-                self._capacity.add(agent_id)
-                self.log.write(
-                    "waiting",
-                    agent=agent_id,
-                    reason="capacity",
-                    profile=gate.name,
-                    until=gate.blocked_until(),
-                )
-            try:
-                acquired = await gate.acquire(lambda: self.stop_requested)
+            slot = _Slot(self._gates[handle.config.auth])
+            try:  # the slot is given back only if it is held, in every exit (W4b-05b.2)
+                if (not_ready := await self._until_ready(handle, slot)) is not None:
+                    return not_ready
+                return await self._run_turn(handle, slot, prompt, stage, context)
             finally:
-                self._capacity.discard(agent_id)
-            if not acquired:
-                return self._not_run(handle)
-            try:
-                await self._runnable.wait()
-                if (refused := self._refuse(handle)) is not None:
-                    return refused
-                return await self._run_turn(handle, gate, prompt, stage, context)
-            finally:
-                gate.release()
+                slot.release()
 
     async def turns(
         self, jobs: Sequence[TurnJob | tuple[str, str]], *, stage: str | None = None
@@ -669,19 +663,22 @@ class Orchestrator(RunContext):
     async def _run_turn(
         self,
         handle: AgentHandle,
-        gate: ProfileGate,
+        slot: "_Slot",
         prompt: str,
         stage: str | None,
         context: Mapping[str, Any] | None,
     ) -> TurnOutcome:
         agent_id = handle.id
         backend = self.backends[agent_id]
-        if await self._auto_compact(handle, gate, stage):  # a note turn ran (W4b-05b)
-            if not await self._profile_again(handle, gate):
-                return self._not_run(handle)
-            await self._runnable.wait()
-            if (refused := self._refuse(handle)) is not None:
-                return refused
+        gate = slot.gate
+        if self._context_of(agent_id).flag_left:  # a note-turn flag that did not go (W4b-05b.2)
+            self._end_note_flag(agent_id)
+        # after a note turn (W4b-05b) the same rule as before any turn: run and profile ready
+        if (
+            await self._auto_compact(handle, gate, stage)
+            and (not_ready := await self._until_ready(handle, slot)) is not None
+        ):
+            return not_ready
         handle.turns_used += 1
         number = handle.turns_used
         self._turn_marks[agent_id] = self.last_message_id()
@@ -1815,15 +1812,27 @@ class Orchestrator(RunContext):
         )
         return True
 
-    async def _profile_again(self, handle: AgentHandle, gate: ProfileGate) -> bool:
-        """After a note turn: did it bring a rate limit (pause or throttle of the profile), the
-        working turn does not start in the slot already taken; it gives the slot back and
-        waits for the profile like any new turn (M1, login protection). False if the run
-        stopped meanwhile (no slot is held then)."""
-        if gate.blocked_until() is None:
-            return True
-        gate.release()
-        if not gate.has_slot():  # docs/09 §4.5: waiting for a free place is visible
+    async def _until_ready(self, handle: AgentHandle, slot: "_Slot") -> TurnOutcome | None:
+        """Wait until the turn may begin, holding a slot of its profile (W4b-05b.2, Entscheidung
+        59): the run is not paused, no limit forbids the turn, and the profile admits a turn
+        with this slot (no rate-limit pause, within a throttle). After a user pause or a note
+        turn the profile may have been paused meanwhile: then the slot goes back and the turn
+        waits for the profile like a new one. Returns an outcome if the turn does not run."""
+        while True:
+            if not slot.held and not await self._take_slot(handle, slot):
+                return self._not_run(handle)
+            await self._runnable.wait()
+            if (refused := self._refuse(handle)) is not None:
+                return refused
+            if slot.gate.admits_held():
+                return None
+            slot.release()
+
+    async def _take_slot(self, handle: AgentHandle, slot: "_Slot") -> bool:
+        """Wait for a free slot of the profile; the wait is visible (docs/09 §4.5). False if the
+        run stops first."""
+        gate = slot.gate
+        if not gate.has_slot():
             self._capacity.add(handle.id)
             self.log.write(
                 "waiting",
@@ -1833,12 +1842,9 @@ class Orchestrator(RunContext):
                 until=gate.blocked_until(),
             )
         try:
-            acquired = await gate.acquire(lambda: self.stop_requested)
+            return await slot.acquire(lambda: self.stop_requested)
         finally:
             self._capacity.discard(handle.id)
-        if not acquired:
-            gate.active += 1  # `turn` gives back the slot it took; this keeps the count right
-        return acquired
 
     async def _note_turn(
         self, handle: AgentHandle, gate: ProfileGate, stage: str | None
@@ -1849,6 +1855,13 @@ class Orchestrator(RunContext):
         `turns_per_agent`. Returns the cleaned note, None if the turn failed or said nothing."""
         agent_id = handle.id
         backend = self.backends[agent_id]
+        try:  # first the flag: its room tools refuse (Entscheidung 53)
+            self.room.begin_note_turn(agent_id)
+        except Exception as exc:  # no flag, no note turn: it counts as failed (W4b-05b.2)
+            logger.exception("Merker des Notiz-Turns für %s nicht gesetzt", agent_id)
+            self.log.write("note_turn_flag", agent=agent_id, action="begin", error=str(exc))
+            self._end_note_flag(agent_id)
+            return None
         handle.turns_used += 1
         number = handle.turns_used
         previous = handle.status
@@ -1867,11 +1880,10 @@ class Orchestrator(RunContext):
         self.log.write("turn", agent=agent_id, turn=number, stage=stage, purpose=PURPOSE)
         record = _TurnRecord()
         prompt = read_template("prompts", "compact_note.md").strip()
-        self.room.begin_note_turn(agent_id)  # its room tools refuse (Entscheidung 53)
         try:
             await self._consume(handle, gate, active, record, prompt, stage, purpose=PURPOSE)
         finally:
-            self.room.end_note_turn(agent_id)
+            self._end_note_flag(agent_id)
             self._active.pop(agent_id, None)
             self.room.clear_wait(agent_id, WaitKind.MESSAGES)
             self._waits.pop(agent_id, None)
@@ -1895,6 +1907,23 @@ class Orchestrator(RunContext):
             purpose=PURPOSE,
         )
         return note_from_text(record.text) if status is TurnStatus.OK else None
+
+    def _end_note_flag(self, agent_id: str, attempts: int = 2) -> bool:
+        """Clear the note-turn flag of the agent (W4b-05b.2): tried `attempts` times; if it
+        stays, the reason is logged (`note_turn_flag`) and the next turn tries again."""
+        ctx = self._context_of(agent_id)
+        for attempt in range(attempts):
+            try:
+                self.room.end_note_turn(agent_id)
+            except Exception as exc:
+                if attempt + 1 < attempts:
+                    continue
+                logger.exception("Merker des Notiz-Turns für %s nicht gelöscht", agent_id)
+                self.log.write("note_turn_flag", agent=agent_id, action="end", error=str(exc))
+                ctx.flag_left = True
+                return False
+        ctx.flag_left = False
+        return True
 
     async def _consume(
         self,
@@ -2044,3 +2073,24 @@ class Orchestrator(RunContext):
             ok=ok,
             **extra,
         )
+
+
+class _Slot:
+    """A slot of an auth profile that one turn may hold (W4b-05b.2): `held` says whether it
+    holds one, so every exit gives back exactly what it took, also on a cancel while waiting."""
+
+    def __init__(self, gate: ProfileGate) -> None:
+        self.gate = gate
+        self.held = False
+
+    async def acquire(self, abort: Callable[[], bool]) -> bool:
+        """Take a slot (see `ProfileGate.acquire`); `held` changes only together with it."""
+        if not self.held:
+            self.held = await self.gate.acquire(abort)
+        return self.held
+
+    def release(self) -> None:
+        """Give the slot back if one is held."""
+        if self.held:
+            self.held = False
+            self.gate.release()

@@ -211,7 +211,7 @@ class ClaudeEvents:
         """Fill level of the session (see module docstring), None while unknown."""
         self.context_window: int | None = None
         self.reported_model: str | None = None
-        """The API's name of the agent's model, from its main-session requests."""
+        """The API's name of the agent's model: fixed by the first main request that fits."""
         """Window of the agent's model; stays across sessions (a property of the model)."""
         self.turn = 0
         self._seen: set[str] = set()
@@ -268,6 +268,18 @@ class ClaudeEvents:
                 self.session_id = msg.data.get("session_id") or self.session_id
         return []
 
+    def _own_model(self, reported: str | None) -> bool:
+        """True for a request of the agent's model. The first main request whose model fits
+        the config (`same_model`) fixes the model; after that only that exact model counts,
+        so a short name decides only about the first one (W4b-05b.2, Entscheidung 59)."""
+        if reported is None:
+            return True
+        if self.reported_model is None:
+            if not same_model(self.model, reported):
+                return False
+            self.reported_model = reported
+        return reported == self.reported_model
+
     def _assistant(self, msg: AssistantMessage) -> list[AgentEvent]:
         events: list[AgentEvent] = []
         raw = _raw(msg)
@@ -295,9 +307,8 @@ class ClaudeEvents:
             self._seen.add(msg.message_id)
             data = message_usage(msg.usage, msg.model or self.model)
             main = msg.parent_tool_use_id is None  # not a subagent's request
-            if main and (msg.model is None or same_model(self.model, msg.model)):
+            if main and self._own_model(msg.model):
                 self.context_tokens = context_tokens(data)
-                self.reported_model = msg.model or self.reported_model
             events.append(self.event(EventKind.USAGE, data, raw))
         return _raw_once(events)
 

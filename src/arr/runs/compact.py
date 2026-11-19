@@ -203,6 +203,8 @@ class AgentContext:
     action: str | None = None
     pending: Pending | None = None
     sending: Pending | None = None
+    flag_left: bool = False
+    """The room flag of its last note turn could not be cleared; the next turn tries again."""
     """The package in the prompt of the running turn; spent at its `turn_start` (G4)."""
 
     def measured(self, tokens: Any, window: Any) -> None:
