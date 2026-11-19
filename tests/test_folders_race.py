@@ -24,7 +24,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from folders_kit import FOUR_AGENTS, clear_flags, folder_workfolder, manager, run_done
+from folders_kit import (
+    FOUR_AGENTS,
+    clear_flags,
+    folder_workfolder,
+    manager,
+    owner_gets_it_back,
+    run_done,
+)
 
 from arr.errors import ArrError
 from arr.runs import folders
@@ -114,8 +121,8 @@ def link(target, name):
     except OSError:
         pass
 while not os.path.exists(stop):
-    if mode == "agents_link" and os.path.lexists(os.path.join(work, "check.py")):
-        link(bait_dir, ".agents")  # the folder of the Codex skills, once the refill is on
+    if mode == "agents_link" and not os.listdir(work):  # filed away, not yet refilled
+        link(bait_dir, ".agents")  # the folder of the Codex skills, before arr moves it in
     elif mode == "md_loop" and os.path.lexists(os.path.join(work, ".codex")):
         link(bait_file, "AGENTS.md")  # again and again, once the refill is on
     elif mode == "foreign" and os.path.lexists(os.path.join(work, "check.py")):
@@ -164,6 +171,7 @@ async def test_h1_a_planter_never_makes_arr_write_outside_and_never_stays_unseen
         "unseen": [],
         "changed": 0,
         "left_after_ok": 0,
+        "planted": 0,
     }
 
     async def topology(ctx: RunContext) -> None:
@@ -189,6 +197,7 @@ async def test_h1_a_planter_never_makes_arr_write_outside_and_never_stays_unseen
                 planted = _planted(stop)
             if bait_state(bait) != before:
                 seen["changed"] += 1
+            seen["planted"] += len(planted)
             here = [(n, at) for n, at, inode in planted if _inode(folder / n) == inode]
             if not failed and verified:  # planted before arr compared, still there
                 seen["unseen"] += [n for n, at in here if at < verified[-1]]
@@ -204,6 +213,7 @@ async def test_h1_a_planter_never_makes_arr_write_outside_and_never_stays_unseen
 
     await run_done(manager(workfolder, topology, [FOUR_AGENTS[1]]))
     print("RACE-H1", json.dumps(seen))
+    assert seen["planted"] > 0, "the planter never planted: the run proves nothing"
     assert seen["changed"] == 0, seen
     assert seen["unseen"] == [], seen
 
@@ -351,6 +361,7 @@ def _put_back(entry: Path) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _no_lingering(tmp_path: Path) -> Iterator[None]:
-    yield
-    clear_flags(tmp_path)
+def _owner_gets_it_back(tmp_path: Path) -> Iterator[None]:
+    """Flags, ACLs and rights a test lays in its `tmp_path` go at the end, also on failure."""
+    with owner_gets_it_back(tmp_path):
+        yield

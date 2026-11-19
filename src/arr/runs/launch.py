@@ -1175,13 +1175,15 @@ async def run_launch(
             report(f"Zusammenfassung: {result.summary_file}")
         else:
             report("Keine Zusammenfassung: output/summary.md fehlt (siehe orchestrator.jsonl).")
-        if scan:
-            profiles = launch.used_profiles()
-            secrets = await asyncio.to_thread(profile_secrets, profiles, secret_reader)
-            result.scan = await asyncio.to_thread(scan_run_dir, run_dir, secrets)
-            record_scan(run_dir, result.scan)
-            report(format_report(result.scan))
-        await asyncio.to_thread(clean_up_after_scan, run_dir)  # W4b-05a.1, Entscheidung 54
+        try:
+            if scan:
+                profiles = launch.used_profiles()
+                secrets = await asyncio.to_thread(profile_secrets, profiles, secret_reader)
+                result.scan = await asyncio.to_thread(scan_run_dir, run_dir, secrets)
+                record_scan(run_dir, result.scan)
+                report(format_report(result.scan))
+        finally:  # W4b-05a.1/.2, Entscheidung 54: also when the scan fails
+            await asyncio.to_thread(clean_up_after_scan, run_dir)
         return result
     finally:
         remove()

@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from folders_kit import (
     folder_workfolder,
     inodes,
     manager,
+    owner_gets_it_back,
     run_done,
     tree,
     writer,
@@ -321,7 +323,7 @@ async def test_a3_an_entry_arr_cannot_move_gives_arr_error_with_the_path(
 
     await run_done(manager(wf, topology, [FOUR_AGENTS[0]]))
     assert "agents/c-copy/work/klemmt.txt" in seen["message"]
-    assert "Resource busy" in seen["message"]
+    assert os.strerror(errno.EBUSY) in seen["message"]
 
 
 # --------------------------------------------------------------------------------------------
@@ -899,30 +901,42 @@ async def test_m1_extended_attributes_and_acls_of_both_folders_themselves_are_re
 
 
 async def test_g3_a_stop_during_fresh_folder_waits_for_the_file_operations(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Review rv12: the topology is cancelled after a grace of 10 ms while arr files away
-    60 000 entries. `fresh_folder` waits for its thread, writes the log entry and passes the
-    cancellation on; nothing changes after the run returned."""
+    """Review rv12, deterministic: the thread of `fresh_folder` holds in the refill until the
+    manager has cancelled the topology (grace 10 ms). `fresh_folder` waits for its thread,
+    writes the log entry and passes the cancellation on; the finalizer runs after it, and
+    nothing changes after the run returned."""
+    import threading
+
     wf = folder_workfolder(tmp_path)
     holder: dict[str, Any] = {}
+    entered, go = threading.Event(), threading.Event()
+    refill = folders.refill_work_dir
+
+    def holding(agent: Any, build: Path) -> list[str]:
+        entered.set()
+        assert go.wait(30), "the topology was not cancelled"
+        return refill(agent, build)
+
+    monkeypatch.setattr(folders, "refill_work_dir", holding)
 
     async def topology(ctx: RunContext) -> None:
         folder = work(ctx, "c-copy")
-        for n in range(600):
+        for n in range(50):
             sub = folder / f"d{n:03d}"
             sub.mkdir()
-            for m in range(100):
+            for m in range(20):
                 (sub / f"f{m}").write_text("x")
-
         holder["start"] = _count(folder)
 
-        async def later() -> None:
-            await asyncio.sleep(0.03)
+        async def stop_while_it_works() -> None:
+            await asyncio.to_thread(entered.wait, 30)
             holder["mgr"].stop()
+            await asyncio.to_thread(_wait_until_cancelled, ctx.prepared.run_dir)
+            go.set()
 
-        task = asyncio.create_task(later())
-        holder["task"] = task
+        holder["task"] = asyncio.create_task(stop_while_it_works())
         await ctx.fresh_folder("c-copy", stage="p", attempt=1)
 
     mgr = manager(wf, topology, [FOUR_AGENTS[0]])
@@ -932,14 +946,26 @@ async def test_g3_a_stop_during_fresh_folder_waits_for_the_file_operations(
     run_dir = mgr.run_dir
     retired = run_dir / "retired" / "c-copy" / "001-p"
     first = _count(retired), _count(run_dir / "agents" / "c-copy" / "work")
-    await asyncio.sleep(1)
+    await asyncio.sleep(0.5)
     assert (_count(retired), _count(run_dir / "agents" / "c-copy" / "work")) == first
-    assert status.value == "stopped"
+    assert status.value == "stopped" and go.is_set()
     [entry] = [e for e in log_entries(run_dir) if e["kind"].startswith("folder_fresh")]
     assert entry["kind"] == "folder_fresh" and entry["data"]["cancelled"] is True
     assert first[0] == holder["start"]  # everything filed away before the finalizer ran
+    assert first[1] > 0  # the refill ended before the finalizer ran
     diff = (run_dir / "agents" / "c-copy" / "retired-001-p.diff").read_text()
-    assert diff.count("+++ b/d") == 600 * 100
+    assert diff.count("+++ b/d") == 50 * 20
+
+
+def _wait_until_cancelled(run_dir: Path) -> None:
+    """Until the manager wrote its entry that it cancels the topology (right before
+    `cancel()`)."""
+    for _ in range(3000):
+        entries = log_entries(run_dir, "error")
+        if any(e["data"].get("where") == "topology" for e in entries):
+            return
+        time.sleep(0.01)
+    raise AssertionError("the manager never cancelled the topology")
 
 
 def _count(folder: Path) -> int:
@@ -1008,3 +1034,10 @@ def test_h2_the_primitives_change_a_link_never_its_target(tmp_path: Path, helper
     if sys.platform == "darwin":
         assert _acl(bait / "f.txt") == acl != ""
     clear_flags(bait)
+
+
+@pytest.fixture(autouse=True)
+def _owner_gets_it_back(tmp_path: Path) -> Iterator[None]:
+    """Flags, ACLs and rights a test lays in its `tmp_path` go at the end, also on failure."""
+    with owner_gets_it_back(tmp_path):
+        yield

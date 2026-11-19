@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import threading
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
@@ -113,17 +114,36 @@ def inodes(root: Path) -> set[int]:
 
 
 def clear_flags(root: Path) -> None:
-    """Remove user flags and give the owner its rights below `root` (so pytest can delete)."""
+    """Give everything below `root` back to the owner, so pytest can delete it: user flags
+    off, folders 0o700, ACLs removed (macOS). Never follows a link; never raises."""
     if not os.path.lexists(root):
         return
+    _open_up(root)
+    if sys.platform == "darwin" and not root.is_symlink():  # ACLs only after the flags
+        subprocess.run(["/bin/chmod", "-R", "-N", str(root)], capture_output=True, check=False)
+
+
+def _open_up(path: Path) -> None:
     if hasattr(os, "chflags"):  # macOS: user flags; Linux has none
         with contextlib.suppress(OSError):
-            os.chflags(root, 0, follow_symlinks=False)
-    if root.is_symlink() or not root.is_dir():
+            os.chflags(path, 0, follow_symlinks=False)
+    if path.is_symlink() or not path.is_dir():
         return
-    os.chmod(root, 0o700)
-    for name in os.listdir(root):
-        clear_flags(root / name)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o700)
+    with contextlib.suppress(OSError):
+        for name in os.listdir(path):
+            _open_up(path / name)
+
+
+@contextlib.contextmanager
+def owner_gets_it_back(root: Path) -> Iterator[None]:
+    """Around a test: whatever flags, ACLs or rights it laid in `root`, they go at the end,
+    also when the test fails (no undeletable `garbage-*` folders of pytest)."""
+    try:
+        yield
+    finally:
+        clear_flags(root)
 
 
 class OpenAudit:
