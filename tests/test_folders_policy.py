@@ -304,31 +304,51 @@ def test_a7_options_are_unchanged_but_for_the_new_folders(setup: Setup) -> None:
 
 
 def test_a7_the_codex_profile_stays_within_its_limits_with_many_agents_and_channels(
-    setup: Setup,
+    arr_home: Path,
 ) -> None:
-    """The new entries are a fixed number per agent (no entry per other agent), so the size
-    does not grow with the agents. 150 agents with a long ID and 60 channels of the run, each
-    in the deny list; the new entries add 9 entries, each as long as its path (review G4)."""
+    """The new entries are a fixed number per agent: no entry per other agent, so the profile
+    does not grow with the agents (review NP2B-G3). A run with 2 and one with 150 agent
+    folders on disk (long IDs) give the same number of entries; with 60 channels of the run,
+    each in the deny list, it stays within the bounds, and the new folders add 9 entries,
+    each as long as its path (review G4). The run lies below a short fixed folder, so the
+    result does not depend on where pytest keeps its temp folders (review NP2-G2)."""
+    import shutil
+    import tempfile
+
     from arr.backends import codex_config
 
     long_id = "explorer-" + "x" * 50
     channels = [f"kanal-{n:03d}-{'y' * 30}" for n in range(60)]
-    agents = [setup.agent(f"{long_id}-{n}", "codex") for n in range(150)]
-    sizes = []
-    for agent in (agents[0], agents[-1]):
-        profile = profile_for(agent, setup.run_paths, rules_for(setup.run), home=setup.home)
-        entries = filesystem_entries(profile, setup.run_paths, ["main"], run_channels=channels)
-        old = filesystem_entries(
-            _old_profile(profile, setup.run), setup.run_paths, ["main"], run_channels=channels
-        )
-        size = len(codex_config.toml_value(entries).encode())
-        assert len(entries) < codex_config.ENTRIES_WARN and size < codex_config.PROFILE_MAX_BYTES
-        sizes.append((len(entries) - len(old), size - len(codex_config.toml_value(old).encode())))
-    assert sizes[0][0] == sizes[1][0] == 2 + 1 + len(policy.CODEX_READ_ONLY_NAMES)
-    # each new entry carries the full path (review G4, accepted, Entscheidung 56): the growth
-    # is bounded by the length of the run path, not by a fixed number of bytes
-    per_entry = len(str(setup.run / "scratch" / long_id)) + len(".gitattributes") + 30
-    assert all(extra < 9 * per_entry for _, extra in sizes), (sizes, per_entry)
+    root = Path(tempfile.mkdtemp(prefix="a7-", dir="/tmp"))
+    try:
+        counts: dict[int, int] = {}
+        checks: list[tuple[int, int, int, int]] = []  # entries, size, new entries, new bytes
+        for many in (2, 150):
+            setup = Setup(root / f"n{many:03d}")
+            ids = [f"{long_id}-{n}" for n in range(many)]
+            for agent_id in ids:
+                (setup.run / "agents" / agent_id / "work").mkdir(parents=True)
+                (setup.run / "scratch" / agent_id).mkdir(parents=True)
+            agent = setup.agent(ids[0], "codex")
+            profile = profile_for(agent, setup.run_paths, rules_for(setup.run), home=setup.home)
+            entries = filesystem_entries(profile, setup.run_paths, ["main"], run_channels=channels)
+            old = filesystem_entries(
+                _old_profile(profile, setup.run), setup.run_paths, ["main"], run_channels=channels
+            )
+            size = len(codex_config.toml_value(entries).encode())
+            counts[many] = len(entries)
+            extra = size - len(codex_config.toml_value(old).encode())
+            checks.append((len(entries), size, len(entries) - len(old), extra))
+        assert counts[2] == counts[150], counts  # no entry per other agent
+        per_entry = len(str(setup.run / "scratch" / ids[0])) + len(".gitattributes") + 30
+        for entries_n, size, new_entries, extra in checks:
+            assert entries_n < codex_config.ENTRIES_WARN
+            assert size < codex_config.PROFILE_MAX_BYTES
+            assert new_entries == 2 + 1 + len(policy.CODEX_READ_ONLY_NAMES)
+            # each new entry carries the full path (review G4, accepted, Entscheidung 56)
+            assert extra < 9 * per_entry, (extra, per_entry)
+    finally:
+        shutil.rmtree(root)
 
 
 # --------------------------------------------------------------------------------------------
