@@ -21,6 +21,8 @@ class EventKind(StrEnum):
     """Kind of a normalized agent event (docs/02-workfolder-und-runs.md §6).
 
     `hint` records a chat hint delivered during a running turn (docs/06-gruppenchats.md §4).
+    `compaction`: the engine compacted the session itself (W4b-05b, docs/10 §4.6); the fill
+    level is unknown until the next request.
     """
 
     TURN_START = "turn_start"
@@ -33,6 +35,7 @@ class EventKind(StrEnum):
     ERROR = "error"
     TURN_END = "turn_end"
     HINT = "hint"
+    COMPACTION = "compaction"
 
 
 class TurnStatus(StrEnum):
@@ -103,7 +106,11 @@ class ToolResultData(TypedDict):
 
 
 class UsageData(TypedDict):
-    """`data` of `usage`: token counts of one model request (docs/02 §6, §8)."""
+    """`data` of `usage`: token counts of one model request (docs/02 §6, §8).
+
+    `context_window`: size of the model's context window in tokens, only where the engine
+    reports it with the request (Codex; W4b-05b).
+    """
 
     input: int | None
     output: int | None
@@ -111,6 +118,7 @@ class UsageData(TypedDict):
     cache_write: int | None
     reasoning: int | None
     model: NotRequired[str]
+    context_window: NotRequired[int]
 
 
 class RateLimitData(TypedDict):
@@ -134,6 +142,12 @@ class TurnEndData(TypedDict):
 
     `cost_kind` (`billed` | `estimated` | None = unknown) lets the index be rebuilt from the
     run folder (docs/02 §8).
+
+    Fill level of the session (W4b-05b, docs/10 §4.6): `context_tokens` are the input tokens
+    of the last request of the agent's own model in the running session (Claude: `input +
+    cache_read + cache_write`, Codex: `last.inputTokens`), None while unknown (a new session
+    or an engine compaction without a request since). `context_window` is the size of the
+    window as far as the engine reported it.
     """
 
     status: str
@@ -142,6 +156,19 @@ class TurnEndData(TypedDict):
     cost_kind: NotRequired[str | None]
     session: str | None
     num_turns: int | None
+    context_tokens: NotRequired[int | None]
+    context_window: NotRequired[int | None]
+
+
+class CompactionData(TypedDict):
+    """`data` of `compaction`: the engine compacted the session (W4b-05b, docs/10 §4.6).
+
+    `trigger` as the engine names it (`auto`, `manual`), `tokens_before` the fill level the
+    engine reports for the time before, both None if unknown.
+    """
+
+    trigger: str | None
+    tokens_before: int | None
 
 
 class HintData(TypedDict):

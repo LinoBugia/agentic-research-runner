@@ -1,8 +1,11 @@
 """Slimming a finished run (docs/02 §9, UX task E10).
 
 Removes what can be rebuilt or is not needed to read a run: the working copies
-(`agents/*/work/`), `shared/`, `base/` and the run venv. Transcripts, raw events, diffs, group
-chats, output and usage stay. This is the one place of W3-02 that deletes data, so:
+(`agents/*/work/`), `shared/`, `base/`, the filed-away working folders `retired/`, the scratch
+folders `scratch/` (if the finalizer left them), the Run-tmp `tmp/` (W4b-05a) and the run
+venv. Transcripts, raw events, diffs (also those of the filed-away folders), group chats,
+output and usage stay. Deleting goes through `arr.runs.folders.remove_path`, the one place
+that deletes agents' folders. This is the one place of W3-02 that deletes data, so:
 
 - What goes comes from the fixed relative paths below, never from input or `meta.json`.
 - The run venv goes only if `run_venv_location` names `<root>/runs/<run-id>` of this run or the
@@ -21,13 +24,13 @@ import errno
 import json
 import logging
 import os
-import shutil
-import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from arr.errors import ArrError
+from arr.permissions.policy import RETIRED_DIR, SCRATCH_DIR
+from arr.runs.folders import RETIRED_DIFF_PREFIX, remove_path, retired_diff_name
 from arr.runs.inspect import RUN_LOCK, RunLock, run_lock_held
 from arr.runs.prepare import load_run_meta, run_venv_location
 from arr.venvs import run_venv_dir
@@ -37,7 +40,7 @@ __all__ = ["SLIM_MARKER", "SlimPlan", "check_slimmable", "plan_slim", "slim_run"
 log = logging.getLogger("arr.runs.slim")
 
 SLIM_MARKER = "slimmed.json"
-_RUN_DIRS = ("base", "shared")
+_RUN_DIRS = ("base", "shared", RETIRED_DIR, SCRATCH_DIR, "tmp")
 _AGENTS = "agents"
 _WORK = "work"
 _LEGACY_VENV = ".venv"
@@ -46,6 +49,7 @@ _KEPT = (
     ("Transkripte", "agents/*/transcript.jsonl"),
     ("Roh-Events", "agents/*/raw.jsonl"),
     ("Diffs", f"agents/*/{_DIFF}"),
+    ("Diffs abgelegter Ordner", f"agents/*/{RETIRED_DIFF_PREFIX}*.diff"),
     ("Gruppenchats", "groupchats/room.sqlite"),
     ("Output", "output/**/*"),
     ("Usage", "usage.json"),
@@ -149,9 +153,17 @@ def _unreadable(folder: Path, exc: OSError) -> ArrError:
 
 
 def _unsaved(folder: Path, targets: list[Path]) -> bool:
-    """True if work goes that no `changes.diff` holds; members of a shared folder share it."""
+    """True if work goes that no `changes.diff` holds; members of a shared folder share it.
+    A filed-away working folder needs its own diff (W4b-05a)."""
     if any(p.name == _WORK and not (p.parent / _DIFF).is_file() for p in targets):
         return True
+    retired = folder / RETIRED_DIR
+    if _real_dir(retired):
+        for owner in (p for p in retired.iterdir() if _real_dir(p) and p.name[:1] != "."):
+            diffs = folder / _AGENTS / owner.name
+            for old in (p for p in owner.iterdir() if _real_dir(p)):
+                if not (diffs / retired_diff_name(old)).is_file():
+                    return True
     shared = folder / "shared"
     if not _real_dir(shared) or not any(shared.iterdir()):
         return False
@@ -186,25 +198,9 @@ def plan_slim(run_dir: str | Path) -> SlimPlan:
     return SlimPlan(tuple(targets), venv, size, kept, unsaved)
 
 
-def _open_up(root: Path) -> None:
-    """Make the folders below `root` writable: `rmtree` fails on read-only ones (caches)."""
-    stack = [root]
-    while stack:
-        folder = stack.pop()
-        try:
-            os.chmod(folder, stat.S_IMODE(os.lstat(folder).st_mode) | stat.S_IRWXU)
-            with os.scandir(folder) as entries:
-                stack += [Path(e.path) for e in entries if e.is_dir(follow_symlinks=False)]
-        except OSError:
-            continue
-
-
 def _remove(path: Path) -> None:
-    if path.is_symlink():
-        path.unlink()
-        return
-    _open_up(path)
-    shutil.rmtree(path)
+    """A link as itself, a folder with its tree, never following a link (`arr.runs.folders`)."""
+    remove_path(path)
 
 
 def _write_marker(folder: Path, marker: dict[str, object]) -> None:

@@ -155,6 +155,7 @@ def test_run_folder_structure(run: PreparedRun, workfolder: Path) -> None:
         "output",
         "run.input.yaml",
         "run.yaml",
+        "scratch",  # W4b-05a: scratch/<id>/ per agent
         "skills",
         "task.md",
     ]

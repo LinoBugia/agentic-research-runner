@@ -53,7 +53,7 @@ from arr.models import (
 from arr.permissions.gatekeeper import run_profiles
 from arr.permissions.inbox import ApprovalDecider
 from arr.resolve import load_group_spec, load_run_input, load_yaml_model, resolve_run
-from arr.runs.finalize import finalize_run, last_turn_error
+from arr.runs.finalize import clean_up_after_scan, finalize_run, last_turn_error
 from arr.runs.inspect import (
     LOCKS_AVAILABLE,
     RUN_LOCK,
@@ -1175,12 +1175,15 @@ async def run_launch(
             report(f"Zusammenfassung: {result.summary_file}")
         else:
             report("Keine Zusammenfassung: output/summary.md fehlt (siehe orchestrator.jsonl).")
-        if scan:
-            profiles = launch.used_profiles()
-            secrets = await asyncio.to_thread(profile_secrets, profiles, secret_reader)
-            result.scan = await asyncio.to_thread(scan_run_dir, run_dir, secrets)
-            record_scan(run_dir, result.scan)
-            report(format_report(result.scan))
+        try:
+            if scan:
+                profiles = launch.used_profiles()
+                secrets = await asyncio.to_thread(profile_secrets, profiles, secret_reader)
+                result.scan = await asyncio.to_thread(scan_run_dir, run_dir, secrets)
+                record_scan(run_dir, result.scan)
+                report(format_report(result.scan))
+        finally:  # W4b-05a.1/.2, Entscheidung 54: also when the scan fails
+            await asyncio.to_thread(clean_up_after_scan, run_dir)
         return result
     finally:
         remove()

@@ -79,6 +79,7 @@ def test_backend_types() -> None:
         "error",
         "turn_end",
         "hint",
+        "compaction",
     ]
     assert {"input", "output", "cache_read", "cache_write", "reasoning", "cost_usd"} <= fields(
         Usage

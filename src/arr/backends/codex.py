@@ -154,6 +154,8 @@ class CodexBackend:
         self._turn = 0
         self._thread_id: str | None = None
         self._rollout: str | None = None
+        self._context_tokens: int | None = None  # fill level of the thread (W4b-05b)
+        self._context_window: int | None = None
         self._codex: Any = None
         self._bridge: ApprovalBridge | None = None
         self._handle: Any = None
@@ -198,6 +200,7 @@ class CodexBackend:
             raise RuntimeError("Reset während eines Turns")
         self._thread_id = None
         self._rollout = None
+        self._context_tokens = None
         logger.info("Codex-Agent %s: neuer Thread ab dem nächsten Turn", self.agent.id)
 
     def session_ref(self) -> dict[str, str]:
@@ -484,6 +487,9 @@ class CodexBackend:
 
     def _turn_end(self, events: TurnEvents) -> AgentEvent:
         usage = events.usage()
+        if events.measured:  # a turn without a request leaves the fill level as it was
+            self._context_tokens = events.context_tokens
+        self._context_window = events.context_window or self._context_window
         data = TurnEndData(
             status=(events.status or TurnStatus.ERROR).value,
             usage=UsageData(**usage.tokens(), model=self.config.model),
@@ -491,5 +497,7 @@ class CodexBackend:
             cost_kind=None,
             session=self._thread_id,
             num_turns=events.requests or None,
+            context_tokens=self._context_tokens,
+            context_window=self._context_window,
         )
         return self._event(EventKind.TURN_END, dict(data))

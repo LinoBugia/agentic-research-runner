@@ -48,7 +48,7 @@ from typing import Any
 from arr.backends.process_path import no_git_folder, outside_path, within
 from arr.errors import ArrError
 from arr.models import AuthKind, AuthProfile, Provider, RunVenvMode
-from arr.permissions.policy import CODEX_READ_ONLY_NAMES, RunPaths, SandboxProfile
+from arr.permissions.policy import CODEX_READ_ONLY_NAMES, SCRATCH_ENV, RunPaths, SandboxProfile
 from arr.room.waiting import PROVIDER_ENV, WAIT_MAX_ENV, WAIT_MAX_S
 from arr.runs.prepare import PreparedAgent
 from arr.settings import app_dir
@@ -529,6 +529,8 @@ def build_launch(
     shell_env["PATH"] = os.pathsep.join(path)
     shell_env["LANG"] = environ.get("LANG") or "C.UTF-8"
     shell_env["UV_NO_CONFIG"] = "1"
+    if profile.scratch_dir is not None:  # W4b-05a: the agent's scratch folder
+        shell_env[SCRATCH_ENV] = str(profile.scratch_dir)
     if overlay:
         shell_env["VIRTUAL_ENV"] = str(run_paths.venv_dir)
     room = {

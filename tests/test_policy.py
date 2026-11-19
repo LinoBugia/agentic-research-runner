@@ -737,7 +737,8 @@ def test_claude_translation_is_complete(views: Views, env: Env) -> None:
     claude = views.claude
     assert claude.cwd == str(env.work)
     own_tmp = env.run / "tmp" / "explorer-1"
-    assert claude.add_dirs == [str(own_tmp), str(env.run_venv)]
+    scratch = env.run / "scratch" / "explorer-1"  # W4b-05a
+    assert claude.add_dirs == [str(own_tmp), str(scratch), str(env.run_venv)]
     assert claude.permission_mode == "acceptEdits"
     assert claude.env == {"TMPDIR": str(own_tmp)}
     assert claude.allowed_tools[0] == "mcp__arr-room__*"
@@ -758,11 +759,12 @@ def test_claude_translation_is_complete(views: Views, env: Env) -> None:
     assert sandbox["failIfUnavailable"] is True
     assert sandbox["network"] == {"allowedDomains": []}
     fs = sandbox["filesystem"]
-    assert fs["allowWrite"] == [str(env.work), str(own_tmp), str(env.run_venv)]
+    assert fs["allowWrite"] == [str(env.work), str(own_tmp), str(scratch), str(env.run_venv)]
     assert {str(env.home), "/Volumes", str(env.workfolder)} <= set(fs["denyRead"])
     # W4-03.2: Codex gets `agents/`, `shared/`, `tmp/` as deny; the Claude CLI not (it would
     # also deny the own folders below them; its shell keeps the others out, probe N1/N2)
     private = {str(env.run / "agents"), str(env.run / "shared"), str(env.run / "tmp")}
+    private |= {str(env.run / "scratch"), str(env.run / "retired")}  # W4b-05a
     assert not private & set(fs["denyRead"])
     assert str(env.home / ".ssh") in fs["denyRead"]
     assert str(env.literature) in fs["allowRead"]
@@ -774,7 +776,11 @@ def test_codex_translation_is_complete(views: Views, env: Env) -> None:
     assert codex.sandbox == "workspace_write"
     assert codex.approvals_reviewer == "user"
     assert codex.sandbox_workspace_write == {
-        "writable_roots": [str(env.run / "tmp" / "explorer-1"), str(env.run_venv)],
+        "writable_roots": [
+            str(env.run / "tmp" / "explorer-1"),
+            str(env.run / "scratch" / "explorer-1"),  # W4b-05a
+            str(env.run_venv),
+        ],
         "network_access": False,
         "exclude_slash_tmp": True,
         "exclude_tmpdir_env_var": True,
@@ -785,9 +791,10 @@ def test_codex_translation_is_complete(views: Views, env: Env) -> None:
     assert access[str(env.literature)] == "read"
     assert access[str(env.home)] == "deny"
     assert access[str(env.home / ".ssh")] == "deny"
-    for private in ("agents", "shared", "tmp"):  # W4-03.2 N1, N2
+    for private in ("agents", "shared", "tmp", "scratch", "retired"):  # W4-03.2, W4b-05a
         assert access[str(env.run / private)] == "deny", private
     assert access[str(env.run / "tmp" / "explorer-1")] == "write"
+    assert access[str(env.run / "scratch" / "explorer-1")] == "write"
     assert codex.permission_profile["name"] == "arr-explorer-1"
 
 
@@ -1894,7 +1901,8 @@ def test_w3_00_a10_claude_sandbox_and_file_tools_follow(venv_env) -> None:
         [str(env.run_venv), str(root / "venvs" / "mathe"), str(root / "venvs" / "tools" / "bin")]
     )
     own_tmp = env.run / "tmp" / "explorer-1"
-    assert fs["allowWrite"] == [str(env.work), str(own_tmp), str(env.run_venv)]
+    scratch = env.run / "scratch" / "explorer-1"  # W4b-05a
+    assert fs["allowWrite"] == [str(env.work), str(own_tmp), str(scratch), str(env.run_venv)]
     other = root / "runs" / "20261029-1200_other_custom_beef" / "c.txt"
     assert not claude_sandbox_reads(claude, str(other))
     assert claude_sandbox_reads(claude, str(env.run_venv / "bin" / "python"))
@@ -2166,7 +2174,8 @@ def test_w4_03_1_other_agents_folders_are_closed_even_with_always_rules(env: Env
     assert engine.evaluate(read(env.work / "notes.md")).action is ALLOW
     assert engine.evaluate(read(env.run / "shared" / "other" / "x.tex")).action is ALLOW
     own = env.run / "agents" / "explorer-1" / "transcript.jsonl"
-    assert engine.evaluate(read(own)).action is ASK  # not foreign: the usual question
+    # W4b-05a (P16 b): the own transcript is a ban without a question, no longer `ASK`
+    assert engine.evaluate(read(own)).action is DENY
     assert engine.evaluate(write(other / "work" / "x.py")).reason.startswith("Schreiben außerhalb")
 
 

@@ -110,6 +110,7 @@ async def wait_for_messages(
     across calls (L7, L12) are in the module docstring; `streak_max_s` defaults to
     `STREAK_MAX_S`.
     """
+    await asyncio.to_thread(room.not_in_note_turn)  # refused in the note turn (W4b-05b.2)
     if not isinstance(seconds, int | float) or not math.isfinite(seconds) or seconds <= 0:
         raise RoomError(f"„seconds“ muss eine Zahl größer als 0 sein, höchstens {max_s:g}.")
     streak = STREAK_MAX_S if streak_max_s is None else streak_max_s
