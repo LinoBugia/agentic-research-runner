@@ -30,7 +30,7 @@ from arr.backends.claude_start import start_program
 from arr.backends.process_path import no_git_folder, outside_path, within
 from arr.errors import ArrError
 from arr.models import Effort, Provider
-from arr.permissions.policy import ROOM_TOOL_PREFIX, SandboxProfile, claude_options
+from arr.permissions.policy import ROOM_TOOL_PREFIX, SCRATCH_ENV, SandboxProfile, claude_options
 from arr.room.server import AGENT_ID_ENV, RUN_DIR_ENV
 from arr.room.waiting import PROVIDER_ENV, WAIT_MAX_ENV, WAIT_MAX_S
 from arr.runs.prepare import PreparedAgent
@@ -131,8 +131,9 @@ def shell_env_file(agent: PreparedAgent, profile: SandboxProfile, bash_path: str
 
     The CLI reads it itself and puts it in front of every Bash command, so the run venv
     reaches the commands inside the sandbox without being on the CLI's own `PATH`
-    (measured with the real CLI). The folder is no write root: an agent cannot change what
-    the next command runs with. Raises `ArrError` if it is one.
+    (measured with the real CLI). It also names the scratch folder (`ARR_SCRATCH`, W4b-05a).
+    The folder is no write root: an agent cannot change what the next command runs with.
+    Raises `ArrError` if it is one.
     """
     folder = agent.agent_dir
     path = folder / SHELL_ENV_FILE
@@ -143,6 +144,8 @@ def shell_env_file(agent: PreparedAgent, profile: SandboxProfile, bash_path: str
         )
     venv = python_env(profile.venv_dir)["VIRTUAL_ENV"]
     text = f"export PATH={shlex.quote(bash_path)}\nexport VIRTUAL_ENV={shlex.quote(venv)}\n"
+    if profile.scratch_dir is not None:  # W4b-05a: the agent's scratch folder
+        text += f"export {SCRATCH_ENV}={shlex.quote(str(profile.scratch_dir))}\n"
     folder.mkdir(parents=True, exist_ok=True)
     handle, temp = tempfile.mkstemp(dir=folder, prefix=f".{SHELL_ENV_FILE}.")
     with os.fdopen(handle, "w", encoding="utf-8") as file:
