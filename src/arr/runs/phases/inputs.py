@@ -4,7 +4,7 @@
 An input item is a submission as the receiving agent may see it:
 
     {"source", "id", "phase", "attempt", "from", "format", "status", "summary", "path",
-     "name"?, "version"?, "entry"?, "files"?, "score"?, "text"?, "note"?}
+     "name"?, "version"?, "entry"?, "verdict"?, "files"?, "score"?, "text"?, "note"?}
 
 `source` is `phase:<name>` (standard inputs and `from`), `name:<name>` or `channel:<name>`
 (then `messages` instead of a submission). `from` is the author as the receiver sees it
@@ -16,7 +16,10 @@ Isolation: a submission another agent handed in that is still sealed is never an
 limited (`arr.runs.phases.text`).
 """
 
+import os
+import stat
 from collections.abc import Iterable, Sequence
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from arr.models import GateRule, GateType, InputContent, Pick, ResolvedInput, ResolvedPhase
@@ -98,15 +101,50 @@ def _entry_number(s: Submission) -> int | None:
     return None
 
 
+def _file_head(ctx: "RunContext", rel: str, limit: int) -> tuple[str | None, bool]:
+    """The start of a file arr filed below the run folder, as text: at most `limit` bytes,
+    no link followed, only a regular file; (None, False) if it is no UTF-8 text. The second
+    value says whether the file is longer (W4b-02b.1, G7)."""
+    path = PurePosixPath(rel)
+    if path.is_absolute() or ".." in path.parts:
+        return None, False
+    try:
+        fd = os.open(ctx.run_folder / rel, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None, False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None, False
+        data = os.read(fd, limit)
+    except OSError:
+        return None, False
+    finally:
+        os.close(fd)
+    cut = info.st_size > len(data)
+    try:
+        return data.decode("utf-8"), cut
+    except UnicodeDecodeError as exc:
+        if cut and exc.start >= len(data) - 3:  # a character cut at the end of the start
+            return data[: exc.start].decode("utf-8", errors="strict"), cut
+        return None, False
+
+
 def _full_text(ctx: "RunContext", s: Submission) -> str:
     parts: list[str] = []
     if s.body:
         parts.append(s.body)
     for name in s.files:
-        text = ctx.read_output(f"{s.path}/files/{name}", MAX_FULL_CHARS * 4)
         title = line(name, MAX_NAME_CHARS)
+        if "/" in name or name in ("", ".", ".."):
+            continue
+        text, cut = _file_head(ctx, f"{s.path}/files/{name}", MAX_FULL_CHARS * 4)
         if text is None:
-            parts.append(f"[Datei „{title}“: kein lesbarer Text oder zu groß]")
+            parts.append(f"[Datei „{title}“: kein lesbarer Text]")
+        elif cut:
+            parts.append(
+                f"[Datei „{title}“, nur der Anfang; die ganze Datei liegt unter „path“]\n{text}"
+            )
         else:
             parts.append(f"[Datei „{title}“]\n{text}")
         if sum(len(p) for p in parts) > MAX_FULL_CHARS:
@@ -139,11 +177,13 @@ def item(
     entry = _entry_number(s)
     if entry is not None:
         out["entry"] = entry
-    if s.sealed:
+    if s.sealed and s.agent == viewer:  # read just now: only an own one can be sealed here
         out["path"] = None
         out["note"] = "Deine Abgabe ist noch versiegelt; sie liegt nach der Phase unter output/."
     else:
         out["path"] = str(ctx.run_folder / s.path)
+    if s.format == "review" and isinstance(s.fields.get("verdict"), str):
+        out["verdict"] = line(s.fields["verdict"], 20)
     if s.files:
         out["files"] = [line(f, MAX_NAME_CHARS) for f in s.files[:MAX_FILES_LISTED]]
     if score is not None:

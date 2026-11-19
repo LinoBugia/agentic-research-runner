@@ -162,6 +162,15 @@ def load_tasks(run_folder: Path, run: ResolvedRun, params: Mapping[str, Any]) ->
             issues += [ConfigIssue(path_text, f"{where}: {i.message}") for i in local]
             continue
         assert isinstance(inserted, str)
+        if len(inserted[1:].encode("utf-8")) > MAX_TASK_BYTES:  # the limit holds after inserting
+            issues.append(
+                ConfigIssue(
+                    path_text,
+                    f"{where} ist nach dem Einsetzen der Platzhalter größer als "
+                    f"{MAX_TASK_BYTES // 1024} KB.",
+                )
+            )
+            continue
         found.append((phase, kind, key, agents, task.task, label, path_text, inserted[1:]))
     if issues:
         raise ConfigError(issues, source="run.yaml")

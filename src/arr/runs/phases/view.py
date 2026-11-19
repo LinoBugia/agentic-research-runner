@@ -15,7 +15,8 @@ contract for W4b-03, 04 and 07:
   previous repetition), `objections` (the run's list of objections), `feedback` (only in a
   repeated pass: the last pass, the result of the gate, scores and comments, objections and the
   user's hint),
-- `inputs_cut`, `objections_cut`, `peers_cut` (true when the package had to be cut).
+- `inputs_cut`, `objections_cut`, `peers_cut`, `feedback_cut` (true when the package had to be
+  cut, `arr.runs.phases.text.fit_package`).
 
 Values that come from agents are data: they stay inside the JSON block of the text, cleaned
 and limited by `arr.runs.phases.text`; the fence of the block is longer than any run of
@@ -150,7 +151,8 @@ def render_assignment(context: Mapping[str, Any]) -> str:
         "mehrmals ab, zählt die neueste. `get_assignment` zeigt dir diesen Auftrag noch einmal.",
         "",
     ]
-    data = {key: context[key] for key in (*DATA_KEYS, "inputs_cut") if context.get(key)}
+    cuts = ("inputs_cut", "peers_cut", "objections_cut", "feedback_cut")
+    data = {key: context[key] for key in (*DATA_KEYS, *cuts) if context.get(key)}
     if data:
         text = json.dumps(data, ensure_ascii=False, indent=1)
         fence = _fence(text)

@@ -32,6 +32,7 @@ __all__ = [
     "MAX_PACKAGE_CHARS",
     "MAX_SUMMARY_CHARS",
     "MAX_TASK_BYTES",
+    "FEEDBACK_CORE",
     "MAX_TITLE_CHARS",
     "TRUNCATED",
     "block",
@@ -97,31 +98,72 @@ def package_size(package: Any) -> int:
     return len(json.dumps(package, ensure_ascii=False))
 
 
+FEEDBACK_CORE = ("attempt", "gate", "result", "score", "user_hint")
+"""What stays of the feedback when everything else had to go: the result of the gate."""
+
+
 def fit_package(package: dict[str, Any], limit: int = MAX_PACKAGE_CHARS) -> dict[str, Any]:
-    """Make a package fit `limit`: first the full texts of inputs go (longest first, each with
-    a note), then the inputs from the end, then the objections and the feedback are cut. The
-    task, the research question and the expected submission always stay."""
+    """Make a package fit `limit` (W4b-02b.1, M2; Entscheidung 58). No part goes as a whole
+    while another can still be cut inside. In this order, each step only while the package is
+    too large:
+
+    1. the full texts of inputs (longest first, each with a note to read it under `path`),
+    2. inside the feedback: the comments of the raters (from the end), then the ratings, then
+       the objections of the reviews, then the reviews, then the summaries of the submissions,
+    3. the inputs from the end, 4. the peers from the end,
+    5. the feedback down to its core (`FEEDBACK_CORE`: pass, gate, result, score, the user's
+       hint), 6. the objections from the end.
+
+    Task, research question and the expected submission always stay. Every list that was cut
+    gets `<key>_cut: true` (`feedback_cut` for the feedback)."""
     if package_size(package) <= limit:
         return package
     inputs = [i for i in package.get("inputs") or [] if isinstance(i, dict)]
     for item in sorted(inputs, key=lambda i: -len(str(i.get("text", "")))):
-        if "text" not in item:
+        if not item.get("text"):
             continue
         item["text"] = None
         item["note"] = "Der Text ist für das Kontextpaket zu lang; lies ihn unter „path“."
         if package_size(package) <= limit:
             return package
-    steps: list[tuple[str, Callable[[Any], bool]]] = [
-        ("inputs", _drop_last),
-        ("objections", _drop_last),
-        ("peers", _drop_last),
+    feedback = package.get("feedback")
+    feedback = feedback if isinstance(feedback, dict) else {}
+    ratings = feedback.get("ratings") if isinstance(feedback.get("ratings"), list) else []
+    reviews = feedback.get("reviews") if isinstance(feedback.get("reviews"), list) else []
+    steps: list[tuple[str, Callable[[], bool]]] = [
+        ("feedback", lambda: _drop_last_key(ratings, "comment")),
+        ("feedback", lambda: _drop_last(ratings)),
+        ("feedback", lambda: _drop_last_key(reviews, "objections")),
+        ("feedback", lambda: _drop_last(reviews)),
+        ("feedback", lambda: _drop_last(feedback.get("submissions"))),
+        ("inputs", lambda: _drop_last(package.get("inputs"))),
+        ("peers", lambda: _drop_last(package.get("peers"))),
+        ("feedback", lambda: _to_core(feedback)),
+        ("objections", lambda: _drop_last(package.get("objections"))),
     ]
     for key, step in steps:
-        while package_size(package) > limit and step(package.get(key)):
+        while package_size(package) > limit and step():
             package[f"{key}_cut"] = True
-    if package_size(package) > limit and "feedback" in package:
-        package["feedback"] = {"note": "Das Feedback war zu lang für das Kontextpaket."}
     return package
+
+
+def _drop_last_key(items: list[Any], key: str) -> bool:
+    """Remove `key` from the last entry that still has it."""
+    for entry in reversed(items):
+        if isinstance(entry, dict) and key in entry:
+            del entry[key]
+            return True
+    return False
+
+
+def _to_core(feedback: dict[str, Any]) -> bool:
+    extra = [k for k in feedback if k not in FEEDBACK_CORE and k != "note"]
+    if not extra:
+        return False
+    for key in extra:
+        del feedback[key]
+    feedback["note"] = "Das Feedback war zu lang für das Kontextpaket; hier nur das Ergebnis."
+    return True
 
 
 def _drop_last(items: Any) -> bool:

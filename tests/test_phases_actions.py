@@ -477,6 +477,7 @@ async def test_a16_not_on_retry_not_on_repetitions_per_entry_of_over(
         **AB,
         "seed": {"liste": {"param": "ideas"}},
         "phases": [
+            parallel("w", ["a", "b"]),  # their first action: no transition (Entscheidung 58)
             {
                 **parallel("x", ["a", "b"]),
                 "over": "liste",
@@ -502,7 +503,7 @@ async def test_a16_not_on_retry_not_on_repetitions_per_entry_of_over(
     assert resets == [("reset", "a"), ("reset", "b"), ("reset", "a")], (
         "one per entry (3 entries: a, b, a) at the first repetition, none in the retry"
     )
-    assert len([c for c in recorder if c[0] == "turn"]) == 12
+    assert len([c for c in recorder if c[0] == "turn" and c[2] == "x"]) == 12
 
 
 async def test_a16_note_next_only_to_the_agent_itself(
@@ -536,11 +537,14 @@ async def test_a16_an_error_of_fresh_folder_ends_the_run(
         raise ArrError("Der alte Arbeitsordner lässt sich nicht ablegen.")
 
     monkeypatch.setattr(Orchestrator, "fresh_folder", fresh_folder)
-    group = {**AB, "phases": [{**parallel("x", ["a", "b"]), "folder": "fresh"}]}
+    group = {
+        **AB,
+        "phases": [parallel("w", ["a", "b"]), {**parallel("x", ["a", "b"]), "folder": "fresh"}],
+    }
     mgr, log = manager(workfolder, group, {"a": answer(), "b": answer()})
     assert await run(mgr) is RunStatus.FAILED
     assert errors(mgr) == ["Der alte Arbeitsordner lässt sich nicht ablegen."]
-    assert log.turns == []
+    assert [t for t in log.turns if t[1] == "x"] == []
 
 
 # --------------------------------------------------------------------------------------------

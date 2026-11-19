@@ -1370,7 +1370,11 @@ class Orchestrator(RunContext):
         self, stage: str, summary: str, options: Sequence[EscalationOption]
     ) -> tuple[EscalationOption, str | None]:
         """`escalate` with the user's hint (`Decision.comment`) for the phase runner. Like
-        `escalate`: pause, inbox item without deadline, `end` after a stop."""
+        `escalate`: pause, inbox item without deadline, `end` after a stop.
+
+        This doubles `escalate` on purpose: `waterfall` keeps the old method until W4b-06
+        removes it; then `escalate` should become a call of this one. Until then a change to
+        the escalation (W4b-07, W4b-09) belongs into both."""
         if self.stop_requested:
             return EscalationOption.END, None
         choices = [EscalationOption(o).value for o in options]

@@ -153,6 +153,18 @@ async def test_exploration_three_variants(workfolder: Path, exchange: str, phase
         assert peers == [None, None, None]
     first = [v for v in log.views if v.stage == phase][0]
     assert first.context["entry"]["title"] == "Idee 1"
+    # what the packages hold (W4b-02b.1, H1): the ranker gets path and text of the three
+    # explorations, the summarizer gets them as standard input, in all three variants
+    [ranker] = log.of("ranker-1")
+    rated = ranker.context["inputs"]
+    assert len(rated) == 3 and all(i["path"] and "/output/" in i["path"] for i in rated)
+    assert all(i["text"].startswith("Text von explorer-") for i in rated)
+    assert sorted(ranker.expected["rate"]) == sorted(gate["ranking"])
+    [summarizer] = log.of("summarizer")
+    explorations = [i for i in summarizer.context["inputs"] if i["source"] == f"phase:{phase}"]
+    assert [i["id"] for i in explorations] == gate["ranking"], "in the order of the ranking"
+    assert all(i["path"] and i["summary"] for i in explorations)
+    assert [i["source"] for i in summarizer.context["inputs"]][0] == "phase:ideen"
 
 
 async def test_exploration_with_given_ideas(workfolder: Path) -> None:
@@ -217,6 +229,14 @@ async def test_review_without_discussion(
     ]
     revision = [v for v in log.of("author") if v.stage == "revision"][0]
     assert [o["id"] for o in revision.context["objections"]] == ["E1", "E2"]
+    # the author sees the reviews of the isolated check (W4b-02b.1, H1): verdict, summary, path
+    reviews = [i for i in revision.context["inputs"] if i["source"] == "phase:pruefung-allein"]
+    assert sorted((i["from"], i["verdict"]) for i in reviews) == [
+        ("judge-1", "minor"),
+        ("judge-2", "major"),
+    ]
+    assert all(i["path"] and "/output/" in i["path"] and i["summary"] for i in reviews)
+    assert "judge-1 in pruefung-allein" in revision.prompt, "in the text the author reads"
     second = [v for v in log.of("judge-1") if v.attempt == 2][0]
     assert second.expected["known_objections"] == ["E1", "E2"]
     beweis = [i for i in second.context["inputs"] if i["source"] == "name:beweis"]
@@ -226,20 +246,9 @@ async def test_review_without_discussion(
     if memory == "reset":
         for judge_id in ("judge-1", "judge-2"):
             own = [c for c in calls if c[1] == judge_id]
-            assert own == [
-                ("reset", judge_id),
-                ("fresh", judge_id, "pruefung-allein", "1"),
-                ("reset", judge_id),
-                ("fresh", judge_id, "pruefung-allein", "2"),
-            ]
-        assert sorted(calls) == sorted(
-            [("reset", j) for j in ("judge-1", "judge-2") for _ in (1, 2)]
-            + [
-                ("fresh", j, "pruefung-allein", n)
-                for j in ("judge-1", "judge-2")
-                for n in ("1", "2")
-            ]
-        )
+            # the first check is the judge's first action: no transition (Entscheidung 58),
+            # as today (`judge_memory: fresh` resets from round 2 on)
+            assert own == [("reset", judge_id), ("fresh", judge_id, "pruefung-allein", "2")]
     else:
         assert calls == []
 

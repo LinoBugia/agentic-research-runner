@@ -12,12 +12,15 @@
 - `isolated`: the phase is sealed at the start of the pass and released after the last
   repetition of the last action, before a gate `judge` rates; a stop or an error in between
   releases it as well (nothing stays half sealed). An error of `release` ends the run.
+  After the release every submission of the pass is read again (`refresh`): nothing read
+  while the phase was sealed goes into a package, the feedback, the inbox or a checkpoint.
 - A gate `judge`: every rater gets one rating action (`action: gate`) with `rate` = the newest
   submissions of the pass that are not its own; the raters work at the same time.
 
 Context and folder of a phase (`reset`, `compact`, `fresh`) apply at the start of every
 action of an agent, also of every entry of `over`, never in a repeated pass (`retry`, the
-user's choice) and never for the repetitions 2 to N of `repeat` (`runner.transition`).
+user's choice), never for the repetitions 2 to N of `repeat` and never before the agent's very
+first action in the run (`runner.transition`, Entscheidung 58).
 """
 
 import asyncio
@@ -36,7 +39,16 @@ from arr.runs.phases.text import MAX_ENTRY_TEXT_CHARS, MAX_TITLE_CHARS, block, l
 if TYPE_CHECKING:
     from arr.runs.phases.runner import PhaseRunner
 
-__all__ = ["MAX_RATE", "over_items", "rate", "ratings_of", "run_pass", "slots", "together"]
+__all__ = [
+    "MAX_RATE",
+    "over_items",
+    "rate",
+    "ratings_of",
+    "refresh",
+    "run_pass",
+    "slots",
+    "together",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -154,11 +166,22 @@ async def run_pass(runner: "PhaseRunner", pass_: Pass) -> None:
         if pass_.sealed:
             released = True
             runner.release(phase.name)
+        refresh(runner, pass_)
     finally:
         if pass_.sealed and not released:
             # a stop (cancel) or an error: nothing stays half sealed; the first error counts
             with contextlib.suppress(Exception):
                 runner.release(phase.name)
+
+
+def refresh(runner: "PhaseRunner", pass_: Pass) -> None:
+    """Read the submissions of the pass again (W4b-02b.1, H1): what was read while the phase
+    was sealed has `sealed` set and a path below `groupchats/sealed/`; after the release they
+    lie below `output/`. Nothing found before the release is used after it."""
+    fresh = {s.id: s for s in runner.ctx.submissions(stage=pass_.phase, attempt=pass_.attempt)}
+    for slot in pass_.slots:
+        if slot.found is not None:
+            slot.found = fresh.get(slot.found.id, slot.found)
 
 
 def _rate_list(subs: list[Submission], rater: str) -> list[int]:

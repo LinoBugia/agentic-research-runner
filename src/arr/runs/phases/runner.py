@@ -160,6 +160,8 @@ class PhaseRunner:
         self.state = RunState()
         self.tasks: Tasks = {}
         self.question = ""
+        self.acted: set[str] = set()
+        """Agents that have begun an action in this run (no transition before the first)."""
 
     # -- start -------------------------------------------------------------------------------
 
@@ -521,7 +523,10 @@ class PhaseRunner:
     async def transition(self, agent: str, phase: ResolvedPhase, attempt: int) -> None:
         """Context and folder at the start of an action (docs/10 §4.6): first the session
         (`reset_session` or `compact_session` with the agent's own `note_next`), then the
-        folder (`fresh_folder`). An `ArrError` of these ends the run."""
+        folder (`fresh_folder`). An `ArrError` of these ends the run. Before the very first
+        action of an agent in the run nothing happens (Entscheidung 58)."""
+        if agent not in self.acted:
+            return  # before its very first action there is no session and nothing to file
         mode = phase.context.get(agent, ContextMode.KEEP)
         folder = phase.folder.get(agent, FolderMode.KEEP)
         if mode is ContextMode.RESET:
@@ -574,27 +579,27 @@ class PhaseRunner:
             package["feedback"] = build_feedback(self.ctx, record, viewer, hint)
 
     def peers(self, pass_: Pass, slot: Slot, mark: int) -> list[dict[str, Any]]:
-        """Summaries of the other actions of the pass from before this repetition began."""
-        subs = self.ctx.submissions(stage=pass_.phase, attempt=pass_.attempt)
+        """`peers: summary` (Entscheidung 58, like today's `digest`): per other agent its newest
+        summary of this pass handed in before the running repetition began (`mark`); never the
+        agent's own, never more than one per agent."""
+        newest: dict[str, Submission] = {}
+        for s in self.ctx.submissions(stage=pass_.phase, attempt=pass_.attempt):
+            if s.agent == slot.agent or s.id > mark or s.action is None:
+                continue
+            if not (s.action == "work" or s.action.startswith("work-")):
+                continue
+            if s.agent not in newest or s.id > newest[s.agent].id:
+                newest[s.agent] = s
         out = []
-        for other in pass_.slots:
-            if other is slot:
-                continue
-            found = [
-                s
-                for s in subs
-                if s.agent == other.agent and s.action == other.action and s.id <= mark
-            ]
-            if not found:
-                continue
-            s = found[-1]
+        for s in sorted(newest.values(), key=lambda s: s.id):
             entry: dict[str, Any] = {
                 "from": shown(self.ctx, slot.agent, s.agent, s.shown_as),
                 "status": s.status,
                 "summary": line(s.summary, MAX_SUMMARY_CHARS),
             }
-            if other.entry is not None:
-                entry["entry"] = other.entry + 1
+            number = s.action.removeprefix("work-") if s.action else ""
+            if number.isdigit():
+                entry["entry"] = int(number)
             out.append(entry)
         return out
 
@@ -656,6 +661,7 @@ class PhaseRunner:
         starts when the wait ends. A stop ends it at once. None: the submission is missing."""
         ctx = self.ctx
         turns = slot.task.turns
+        self.acted.add(slot.agent)
         mark = self.mark()
         used, asked = 0, False
         why: str | None = None
