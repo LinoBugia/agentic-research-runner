@@ -115,12 +115,44 @@ def inodes(root: Path) -> set[int]:
 
 def clear_flags(root: Path) -> None:
     """Give everything below `root` back to the owner, so pytest can delete it: user flags
-    off, folders 0o700, ACLs removed (macOS). Never follows a link; never raises."""
+    off, folders 0o700, ACLs removed (macOS). Never follows a link: a link in the tree keeps
+    its target as it is (review NP2B-G2); never raises."""
     if not os.path.lexists(root):
         return
     _open_up(root)
-    if sys.platform == "darwin" and not root.is_symlink():  # ACLs only after the flags
-        subprocess.run(["/bin/chmod", "-R", "-N", str(root)], capture_output=True, check=False)
+    if sys.platform != "darwin":
+        return
+    parent = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _drop_acls_at(parent, root.name)
+    finally:
+        os.close(parent)
+
+
+def _drop_acls_at(dir_fd: int, name: str) -> None:
+    """Remove the ACL of the entry `name` and of everything below it, relative to folder
+    descriptors; a link is skipped, never its target."""
+    from arr.runs import folders
+
+    try:
+        info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        return
+    with contextlib.suppress(OSError):
+        folders._drop_acl_at(dir_fd, name)
+    if not stat.S_ISDIR(info.st_mode):
+        return
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError:
+        return
+    try:
+        for child in os.listdir(fd):
+            _drop_acls_at(fd, child)
+    finally:
+        os.close(fd)
 
 
 def _open_up(path: Path) -> None:
@@ -187,7 +219,6 @@ class OpenAudit:
 def writer(target: Path, *, seconds: float = 30.0) -> Iterator[Any]:
     """A real process that keeps (re)creating ten files in `target` as fast as it can, never
     stopping; ended by its PID."""
-    import subprocess
 
     program = (
         "import os, sys, time\n"

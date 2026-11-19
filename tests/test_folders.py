@@ -938,6 +938,7 @@ async def test_g3_a_stop_during_fresh_folder_waits_for_the_file_operations(
 
         holder["task"] = asyncio.create_task(stop_while_it_works())
         await ctx.fresh_folder("c-copy", stage="p", attempt=1)
+        holder["after"] = True  # never reached: `fresh_folder` passes the cancellation on
 
     mgr = manager(wf, topology, [FOUR_AGENTS[0]])
     holder["mgr"] = mgr
@@ -949,6 +950,7 @@ async def test_g3_a_stop_during_fresh_folder_waits_for_the_file_operations(
     await asyncio.sleep(0.5)
     assert (_count(retired), _count(run_dir / "agents" / "c-copy" / "work")) == first
     assert status.value == "stopped" and go.is_set()
+    assert "after" not in holder, "fresh_folder swallowed the cancellation"
     [entry] = [e for e in log_entries(run_dir) if e["kind"].startswith("folder_fresh")]
     assert entry["kind"] == "folder_fresh" and entry["data"]["cancelled"] is True
     assert first[0] == holder["start"]  # everything filed away before the finalizer ran
@@ -1041,3 +1043,30 @@ def _owner_gets_it_back(tmp_path: Path) -> Iterator[None]:
     """Flags, ACLs and rights a test lays in its `tmp_path` go at the end, also on failure."""
     with owner_gets_it_back(tmp_path):
         yield
+
+
+@macos_only
+def test_np2b_g2_clearing_flags_never_changes_the_target_of_a_link(tmp_path: Path) -> None:
+    """The clean-up of the tests (`folders_kit.clear_flags`, run after every folder test)
+    removes ACLs only at entries of the tree, never at what a link in it points to. Baits in
+    `tmp_path`, outside the cleaned tree: a file and a folder with an ACL. Positive control:
+    the ACL of a file in the tree is gone."""
+    from folders_kit import clear_flags
+
+    bait = tmp_path / "koeder"
+    (bait / "ordner").mkdir(parents=True)
+    (bait / "datei.txt").write_text("KOEDER")
+    for path in (bait / "datei.txt", bait / "ordner"):
+        _tool("/bin/chmod", "+a", "everyone deny delete", str(path))
+    before = (_acl(bait / "datei.txt"), _acl(bait / "ordner"))
+    tree = tmp_path / "baum"
+    (tree / "unter").mkdir(parents=True)
+    (tree / "unter" / "eigen.txt").write_text("x")
+    _tool("/bin/chmod", "+a", "everyone deny delete", str(tree / "unter" / "eigen.txt"))
+    (tree / "link-datei").symlink_to(bait / "datei.txt")
+    (tree / "unter" / "link-ordner").symlink_to(bait / "ordner")
+    (tree / "kaputt").symlink_to(tmp_path / "gibt-es-nicht")
+    clear_flags(tree)
+    assert (_acl(bait / "datei.txt"), _acl(bait / "ordner")) == before
+    assert all(before)
+    assert _acl(tree / "unter" / "eigen.txt") == ""
