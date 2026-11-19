@@ -60,7 +60,7 @@ from arr.models import WorkspaceMode
 from arr.permissions.policy import RETIRED_DIR, SCRATCH_DIR
 from arr.room.store import STAGING_DIR, SUBMISSIONS_DIR, _folder_part
 from arr.room.types import Submission
-from arr.runs.prepare import PreparedAgent, make_private_dir, refill_work_dir
+from arr.runs.prepare import SCRATCH_MODE, PreparedAgent, make_private_dir, refill_work_dir
 
 __all__ = [
     "MOVE_ROUNDS",
@@ -102,6 +102,9 @@ SYSTEM_XATTRS = frozenset({"com.apple.provenance"})
 _NUMBER_RE = re.compile(r"^(\d+)-")
 _CLEARABLE_FLAGS = stat.UF_IMMUTABLE | stat.UF_APPEND | stat.UF_NOUNLINK
 """User flags that keep the owner from moving or deleting an entry; the owner may clear them."""
+_USER_FLAGS = 0x0000FFFF
+"""All flags an owner may set (`UF_SETTABLE`: `hidden`, `nodump`, `uchg` …); the system flags
+above them need root, so no agent can set them."""
 _STAGING_RESTS = (".submission-", ".orphan-", ".staging-")
 _LOCK_RE = re.compile(r"^\.version-.+\.lock$")
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
@@ -285,6 +288,16 @@ def _remove_xattr(fd: int, name: str) -> None:
     _check(function(fd, os.fsencode(name), 0), name)
 
 
+def _reset_flags(fd: int) -> None:
+    """Clear every user flag of the open entry `fd` itself (`hidden`, `nodump` …)."""
+    flags = getattr(os.fstat(fd), "st_flags", 0)
+    if not _DARWIN or not flags & _USER_FLAGS:
+        return
+    function = _LIBC.fchflags
+    function.argtypes = [ctypes.c_int, ctypes.c_uint]
+    _check(function(fd, flags & ~_USER_FLAGS), "flags")
+
+
 def _drop_acl(fd: int) -> None:
     if not _DARWIN:
         return
@@ -450,7 +463,12 @@ def _not_fresh(where: Path, what: str) -> ArrError:
 
 
 def _strip(fd: int, label: Path) -> None:
-    """Remove the extended attributes and the ACL of the open folder itself (M1)."""
+    """Remove the user flags, extended attributes and the ACL of the open folder itself (M1,
+    W4b-05a.2 NP-G1)."""
+    try:
+        _reset_flags(fd)
+    except OSError:
+        raise _not_fresh(label, "trägt Datei-Flags weiter") from None
     with contextlib.suppress(OSError):
         _drop_acl(fd)
     for name in _xattr_names(fd):
@@ -583,15 +601,19 @@ def _fresh_folder(agent: PreparedAgent, *, stage: str) -> FreshFolder:
         try:
             done.generated = refill_work_dir(agent, build / "work")
             with _folder(build / "work") as build_fd:
-                mode = stat.S_IMODE(os.fstat(build_fd).st_mode)
+                start = os.fstat(build_fd)
                 _strip(work_fd, work)
                 _strip(scratch_fd, scratch)
                 placed = _install(build_fd, work_fd, work)
-            os.fchmod(work_fd, mode)  # the mode of a new working folder, as at the start
+            os.fchmod(work_fd, stat.S_IMODE(start.st_mode))  # as a new working folder
             _verify(work_fd, placed, work)
             _verify(scratch_fd, {}, scratch)
             _strip(work_fd, work)
             _strip(scratch_fd, scratch)
+            # mode and times of both folders as new ones would have them (NP-G1)
+            os.utime(work_fd, ns=(start.st_atime_ns, start.st_mtime_ns))
+            os.fchmod(scratch_fd, SCRATCH_MODE)
+            os.utime(scratch_fd)
         finally:
             remove_quietly(build)
     return done
@@ -879,17 +901,27 @@ def park_end_of_run(run_dir: Path, submissions: Iterable[Submission] | None) -> 
 
 
 def purge_trash(run_dir: Path) -> Cleanup:
-    """Delete everything arr parked or emptied into `retired/.trash/` (after the secret scan).
-    Nothing raises; what cannot be deleted is listed and stays there until slimming."""
+    """Delete everything arr parked or emptied into `retired/.trash/` (after the secret scan)
+    and half builds `retired/.fill-*` of an aborted fresh folder. Nothing raises; what cannot
+    be deleted is listed and stays there until slimming."""
     done = Cleanup()
-    trash = retired_root(run_dir) / TRASH_DIR
-    if not os.path.lexists(trash):
+    root = retired_root(run_dir)
+    # also half builds of a fresh folder a hard abort left behind (W4b-05a.2 NP-G2)
+    try:
+        builds = sorted(n for n in os.listdir(root) if n.startswith(FILL_PREFIX))
+    except OSError:
+        builds = []
+    places = [root / TRASH_DIR, *(root / n for n in builds)]
+    for place in places:
+        if not os.path.lexists(place):
+            continue
+        left = remove_quietly(place)
+        if left:
+            done.failed += [_rel(run_dir, p) for p in left]
+        else:
+            done.removed.append(_rel(run_dir, place))
+    if done.failed or not done.removed:
         return done
-    left = remove_quietly(trash)
-    if left:
-        done.failed = [_rel(run_dir, p) for p in left]
-        return done
-    done.removed.append(_rel(run_dir, trash))
     with contextlib.suppress(OSError):  # nothing was filed away: no `retired/` stays
         os.rmdir(retired_root(run_dir))
     return done
