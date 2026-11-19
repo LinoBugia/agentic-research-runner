@@ -35,6 +35,7 @@ from arr.models import (
     Toolchain,
     WorkfolderSettings,
 )
+from arr.permissions.policy import RunPaths
 from arr.permissions.types import DecidedBy, Decision, DecisionAction
 from arr.resolve import resolve_run
 from arr.runs.compact import PACKAGE_HEADING, PURPOSE
@@ -131,7 +132,12 @@ def live_run(provider: str, model: str, auth: str) -> dict[str, Any]:
         answers["vier"] = (await ctx.turn("solo", ASK_PHASE, stage="vier")).text
 
     manager = manager_for(provider, model, auth, topology)
-    status = asyncio.run(manager.run())
+    try:
+        status = asyncio.run(manager.run())
+    finally:  # the run venv lies outside the workfolder (venv root): remove it, like F5
+        if manager.prepared is not None:
+            paths = RunPaths(manager.workfolder, manager.run_dir, manager.settings.toolchain)
+            shutil.rmtree(paths.venv_dir, ignore_errors=True)
     run_dir = manager.run_dir
     log = read_events(run_dir / "agents" / "solo" / "transcript.jsonl")
     starts = [e for e in log if e["kind"] == "turn_start"]

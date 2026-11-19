@@ -57,7 +57,7 @@ from arr.runs.orchestrator import Orchestrator, StopReason
 
 OFF = {"at": "100%"}
 SUB = {"submission": {"format": "text"}}
-PAUSE_S = 1.5
+PAUSE_S = 3.0
 """Rate-limit pause in the tests of point 1."""
 
 
@@ -119,14 +119,17 @@ async def test_p1_rate_limit_holds_the_next_working_turn(workfolder: Path, where
 
 
 async def test_p1_note_turn_without_rate_limit_does_not_delay(workfolder: Path) -> None:
+    """Without a rate limit the working turn follows the note turn without waiting for the
+    profile: no entry `waiting` (an order and an absent wait, no duration; N7)."""
     manager, _ = await rate_limit_run(workfolder, "none")
     run_dir = manager.run_dir
+    assert not log_entries(run_dir, "rate_limit") and not log_entries(run_dir, "waiting")
+    starts = turn_starts(run_dir, "solo")
+    assert [purpose for _, purpose, _ in starts] == [None, PURPOSE, None]
     note_end = next(
         e["ts"] for e in events(run_dir, "solo") if e["kind"] == "turn_end" and e["turn"] == 2
     )
-    work_start = turn_starts(run_dir, "solo")[2][2]
-    assert work_start - note_end < PAUSE_S / 3, "no wait without a rate limit"
-    assert not log_entries(run_dir, "waiting")
+    assert starts[2][2] >= note_end
 
 
 async def test_p1_emergency_stop_while_waiting_after_the_note_turn(workfolder: Path) -> None:

@@ -171,16 +171,25 @@ async def overlap_run(workfolder: Path, status: str | None) -> dict[str, Any]:
     """After the reviewer's `np_pause_overlap.py`: capacity 2, a and c run, b waits for a slot;
     the run pauses; c ends, so b gets its slot inside the pause; a reports `status`
     (`rejected` = pause of the profile, `allowed_warning` = throttle to one turn, None =
-    nothing); the user resumes while a still runs."""
+    nothing); the user resumes once the report is in, while a still runs. The order is
+    driven by conditions, not by durations (W4b-05b.2, N7: slow CI runners)."""
     marks: dict[str, float] = {}
 
     def a_script() -> dict[str, Any]:
-        marks["resets_at"] = time.time() + 2.5
-        steps: list[dict[str, Any]] = [wait(0.8)]
+        marks["resets_at"] = time.time() + 4.0
+        steps: list[dict[str, Any]] = [wait(0.5)]
         if status is not None:
             steps.append({"do": "rate_limit", "status": status, "resets_at": marks["resets_at"]})
-        steps += [wait(1.0), say("a")]
+        steps += [wait(2.0), say("a")]
         return script(steps)
+
+    def reported(ctx: Orchestrator) -> bool:
+        gate, now = gate_of(ctx), time.time()
+        if status == "rejected":
+            return gate.paused_until > now
+        if status == "allowed_warning":
+            return gate.throttled_until > now
+        return True
 
     async def topology(ctx: RunContext) -> None:
         assert isinstance(ctx, Orchestrator)
@@ -195,7 +204,7 @@ async def overlap_run(workfolder: Path, status: str | None) -> dict[str, Any]:
         async def user() -> None:
             await eventually(lambda: ctx.paused and "c" not in ctx._active)
             await eventually(lambda: gate_of(ctx).active == 2)  # b holds c's slot now
-            await asyncio.sleep(0.7)  # a reports meanwhile
+            await eventually(lambda: reported(ctx), within=10)  # a's report is in
             marks["resume"] = time.time()
             ctx.resume()
 
@@ -227,9 +236,12 @@ async def test_n4_resume_inside_a_rate_limit_pause_waits_for_the_profile(
 
 async def test_n4_counter_check_without_rate_limit_starts_at_resume(workfolder: Path) -> None:
     out = await overlap_run(workfolder, None)
-    assert out["b_start"] - out["resume"] < 0.3, "b starts at once on resume"
-    assert out["b_start"] < out["a_end"]  # beside a: capacity 2
-    assert len(log_entries(out["manager"].run_dir, "waiting")) == 1  # only before the pause
+    # b starts on the resume without waiting again (no entry `waiting` after the one before
+    # the pause): an order, not a duration (N7)
+    assert out["b_start"] >= out["resume"]
+    waits = log_entries(out["manager"].run_dir, "waiting")
+    assert len(waits) == 1 and waits[0]["ts"] < out["resume"]
+    assert not log_entries(out["manager"].run_dir, "rate_limit")
 
 
 async def test_m02_throttle_after_the_pause_waits_for_room(workfolder: Path) -> None:
