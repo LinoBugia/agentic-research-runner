@@ -1,7 +1,7 @@
 """`submit` in a run: tools per topology, MCP, FakeBackend, finalizer, start (W4b-01 A10, A11).
 
 Runs with `topology: phases` get `submit` and not `submit_result`/`submit_rating`, the five old
-topologies the reverse; a `phases` run is refused before its start until W4b-02b. The
+topologies the reverse; since W4b-02b a `phases` run starts (the runner of `arr.runs.phases`). The
 FakeBackend plays `submit` without a model, and the finalizer writes `submissions.json` and an
 overview of the summaries.
 """
@@ -92,9 +92,10 @@ async def test_phases_offers_submit_instead(tmp_path: Path) -> None:
     assert set(tools) - {"submit"} == set(old) - {"submit_result", "submit_rating"}
 
 
-def test_phases_is_a_topology_kind_but_not_available() -> None:
+def test_phases_is_a_topology_kind_and_available() -> None:
+    """Since W4b-02b `phases` runs (the runner of `arr.runs.phases`)."""
     assert TopologyKind("phases") is TopologyKind.PHASES
-    assert TopologyKind.PHASES not in AVAILABLE
+    assert TopologyKind.PHASES in AVAILABLE
 
 
 PHASES_RUN = """\
@@ -107,9 +108,11 @@ agents: [{id: a}]
 """
 
 
-def test_a_phases_run_is_refused_before_the_start(
+def test_a_phases_run_without_phases_is_refused_before_the_start(
     tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Since W4b-02b a `phases` run starts; one without phases fails `check` before anything
+    is created (the message of `arr.plan.check`, with its path)."""
     workfolder = make_workfolder(tmp_path)
     (workfolder / "arr.yaml").write_text("version: 1\ntoolchain: {run_venv: off}\n", "utf-8")
     write_profiles(arr_home, {"fake-auth": "claude_oauth"})
@@ -118,10 +121,7 @@ def test_a_phases_run_is_refused_before_the_start(
     run_file.write_text(PHASES_RUN, encoding="utf-8")
     with pytest.raises(ArrError) as info:
         plan_launch(run_file, cwd=workfolder)
-    assert str(info.value) == (
-        "Die Topologie „phases“ ist noch nicht verfügbar. Verfügbar sind: solo, roundtable, "
-        "exploration, waterfall, review."
-    )
+    assert "phases: „topology: phases“ braucht mindestens eine Phase." in str(info.value)
     assert list((workfolder / "runs").iterdir()) == [], "nothing was prepared"
     # counter-check: the same run with `solo` passes the planning
     run_file.write_text(PHASES_RUN.replace("phases", "solo"), encoding="utf-8")
@@ -287,7 +287,9 @@ async def test_finalizer_adds_nothing_for_old_topologies(tmp_path: Path) -> None
     assert "## Ergebnisse" in summary and "## Abgaben" not in summary
 
 
-def test_planned_stages_of_phases_is_empty_until_the_runner(tmp_path: Path) -> None:
+def test_planned_stages_of_phases_without_phases_is_empty(tmp_path: Path) -> None:
+    """Since W4b-02b the plan of a `phases` run is its phases; without any it is empty and
+    `check_topology` reports the missing phases."""
     run = ResolvedRun(
         project="demo",
         topology={"kind": "phases"},
@@ -296,7 +298,7 @@ def test_planned_stages_of_phases_is_empty_until_the_runner(tmp_path: Path) -> N
         agents=[AgentConfig(id="a", base_id="a", provider="claude", model="m", auth="p")],
     )
     assert planned_stages(run) == []
-    with pytest.raises(ArrError, match="noch nicht verfügbar"):
+    with pytest.raises(ArrError, match="braucht mindestens eine Phase"):
         check_topology(run)
 
 

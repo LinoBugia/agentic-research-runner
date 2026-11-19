@@ -72,6 +72,7 @@ from arr.room.types import (
     Rating,
     Result,
     RoomError,
+    Submission,
     WaitKind,
     WaitState,
 )
@@ -894,9 +895,16 @@ class Orchestrator(RunContext):
         self.log.write("agent_phase", agent=handle.id, stage=stage, previous=previous)
 
     def _posted_result(self, agent_id: str, mark: int) -> bool:
-        return any(
+        """A message `result` after `mark`, or (W4b-02b) a submission with `submit` since the
+        agent's latest turn began: then it counts as having handed in."""
+        if any(
             m.sender == agent_id and m.kind is MessageKind.RESULT
             for m in self.room.messages_after(mark)
+        ):
+            return True
+        since = self._turn_starts.get(agent_id)
+        return since is not None and any(
+            s.ts >= since for s in self.room.submissions(agent=agent_id)
         )
 
     def _start_long_wait(self, handle: AgentHandle, wait: WaitState) -> None:
@@ -1276,6 +1284,118 @@ class Orchestrator(RunContext):
             return data.decode("utf-8")
         except UnicodeDecodeError:
             return None
+
+    # -- W4b-02b: phases (`enter_phase`), submissions, the user's hint --------------------------
+
+    @property
+    def _passes(self) -> dict[str, tuple[str, int]]:
+        """Phase and pass of every agent since its last `enter_phase` (created on first use)."""
+        passes: dict[str, tuple[str, int]] | None = self.__dict__.get("_phase_passes")
+        if passes is None:
+            passes = self.__dict__["_phase_passes"] = {}
+        return passes
+
+    async def enter_phase(self, stage: str, attempt: int, agents: Sequence[str]) -> None:
+        """Pass `attempt` of phase `stage` begins for `agents` (Entscheidung 21): a `done`
+        agent counts as not finished again, also when the same phase repeats; an agent that
+        used up its turns stays `done`, a busy one is left alone. Phase and pass of each agent
+        are readable afterwards (`agent_phase`) and logged (`phase_enter`)."""
+        names = []
+        for agent_id in agents:
+            handle = self._handle(agent_id)
+            self._phase[agent_id] = stage
+            self._passes[agent_id] = (stage, attempt)
+            names.append(agent_id)
+            done = handle.status is AgentStatus.DONE
+            if done and agent_id not in self._exhausted and not self.is_busy(agent_id):
+                self._set_status(handle, AgentStatus.IDLE)
+        self.log.write("phase_enter", stage=stage, attempt=attempt, agents=names)
+
+    def agent_phase(self, agent_id: str) -> tuple[str, int] | None:
+        """Phase and pass the agent entered last with `enter_phase`, None before (W4b-09)."""
+        return self._passes.get(agent_id)
+
+    def submissions(
+        self,
+        *,
+        agent: str | None = None,
+        stage: str | None = None,
+        attempt: int | None = None,
+        name: str | None = None,
+        action: str | None = None,
+        format: str | None = None,
+        latest: bool = False,
+    ) -> list[Submission]:
+        """Submissions of the run, filtered like `RoomStore.submissions` (W4b-01)."""
+        return self.room.submissions(
+            agent=agent,
+            stage=stage,
+            attempt=attempt,
+            name=name,
+            action=action,
+            format=format,
+            latest=latest,
+        )
+
+    def latest_version(self, name: str) -> Submission | None:
+        """The newest version of the named submission `name` (`RoomStore.latest_version`)."""
+        return self.room.latest_version(name)
+
+    def add_version(
+        self,
+        name: str,
+        *,
+        summary: str,
+        format: str = "artifact",
+        body: str | None = None,
+        files: Sequence[str] = (),
+        root: Path | None = None,
+        fields: Mapping[str, Any] | None = None,
+        stage: str | None = None,
+    ) -> Submission:
+        """arr's own version of `name` (`RoomStore.add_version`): copies files and may diff for
+        up to 10 s, so never call it on the event loop."""
+        return self.room.add_version(
+            name,
+            summary=summary,
+            format=format,
+            body=body,
+            files=files,
+            root=root,
+            fields=fields,
+            stage=stage,
+        )
+
+    async def escalate_with_hint(
+        self, stage: str, summary: str, options: Sequence[EscalationOption]
+    ) -> tuple[EscalationOption, str | None]:
+        """`escalate` with the user's hint (`Decision.comment`) for the phase runner. Like
+        `escalate`: pause, inbox item without deadline, `end` after a stop."""
+        if self.stop_requested:
+            return EscalationOption.END, None
+        choices = [EscalationOption(o).value for o in options]
+        self.log.write("escalation", stage=stage, summary=summary, options=choices)
+        self.pause("escalation")
+        try:
+            decision = await self.inbox.ask_escalation(self.run_id, stage, summary, options)
+        finally:
+            self.resume("escalation")
+        option = decision.option if decision is not None and decision.option else None
+        chosen = option or EscalationOption.END
+        hint = decision.comment if decision is not None and option is not None else None
+        self.log.write(
+            "escalation_decided",
+            stage=stage,
+            option=chosen.value,
+            by_user=bool(option),
+            hint=bool(hint),
+        )
+        return chosen, hint
+
+    def channel_messages(self, channel: str) -> list[Message]:
+        """Every message of `channel`, oldest first (input `channel:` of a phase)."""
+        self._channel_config(channel)
+        return self.room.messages(channel)
 
     # helpers for arr.runs.pacing
 
