@@ -161,7 +161,7 @@ class TurnEndData(TypedDict):
 
 
 class CompactionData(TypedDict):
-    """`data` of `compaction`: the engine compacted the session (W4b-05b).
+    """`data` of `compaction`: the engine compacted the session (W4b-05b, docs/10 §4.6).
 
     `trigger` as the engine names it (`auto`, `manual`), `tokens_before` the fill level the
     engine reports for the time before, both None if unknown.
