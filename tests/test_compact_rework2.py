@@ -595,3 +595,31 @@ async def test_m11_two_note_turns_at_once_keep_their_own_flags(workfolder: Path)
     assert seen == {"both": True, "b_while_a_done": True}
     purposes = [e["data"].get("purpose") for e in log_entries(manager.run_dir, "turn")]
     assert purposes.count(PURPOSE) == 2
+
+
+async def test_gn4_end_note_turn_passes_on_errors_but_a_missing_table(workfolder: Path) -> None:
+    """`end_note_turn` raises a locked database (so the orchestrator logs and retries) and
+    passes over only a missing table (Mutation P3, W4b-05b.2)."""
+    store = RoomStore(await finished_run(workfolder))
+    store.begin_note_turn("solo")
+
+    class Fails:
+        def __init__(self, message: str) -> None:
+            self.message = message
+
+        def __enter__(self) -> Any:
+            raise sqlite3.OperationalError(self.message)
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+    real_write = store._write
+    store._write = lambda: Fails("database is locked")  # type: ignore[method-assign]
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        store.end_note_turn("solo")
+    store._write = lambda: Fails("no such table: note_turn")  # type: ignore[method-assign]
+    store.end_note_turn("solo")  # a room from before W4b-05b.1: nothing to clear
+    store._write = real_write  # type: ignore[method-assign]
+    assert store.in_note_turn("solo") is True  # positive control: the flag is still there
+    store.end_note_turn("solo")
+    assert store.in_note_turn("solo") is False
