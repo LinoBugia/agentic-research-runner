@@ -8,7 +8,14 @@ and the cumulative cost and token totals of the client session. Per turn it maps
 - `UserMessage` tool results → `tool_result`; a call without result gets a synthetic error
   result at the end of the turn, so every `tool_call` has its `tool_result`
 - `RateLimitEvent` → `rate_limit`, `ResultMessage` → `turn_end` (plus `error` on failure)
-- `SystemMessage` `compact_boundary` → `compacted` (the backend then resends `context.md`)
+- `SystemMessage` `compact_boundary` → `compaction` event and `compacted` (the backend then
+  resends `context.md`)
+
+**Fill level** (W4b-05b, docs/10 §4.6): the input tokens (`input + cache_read + cache_write`)
+of the last request of the agent's own model in this session; helper requests of other
+models do not count. Unknown in a new session and after a compaction until the next request.
+The window size comes from `ResultMessage.model_usage[<model>].contextWindow`, so it is known
+only from the end of the first turn on.
 
 **Tokens and cost of a turn** come from the same source: the difference of the cumulative
 `model_usage` (all models, incl. helper requests) and `total_cost_usd` to the previous
@@ -34,7 +41,15 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
 
-from arr.backends.base import AgentEvent, CostKind, EventKind, TurnStatus, Usage, UsageData
+from arr.backends.base import (
+    AgentEvent,
+    CompactionData,
+    CostKind,
+    EventKind,
+    TurnStatus,
+    Usage,
+    UsageData,
+)
 
 MISSING_RESULT = "Kein Ergebnis: Der Turn endete, bevor das Werkzeug fertig war."
 NO_RESULT = "Der Turn endete ohne Ergebnis der Claude-CLI."
@@ -98,6 +113,44 @@ def _model_totals(model_usage: Mapping[str, Any] | None) -> Usage:
     return total
 
 
+def context_tokens(usage: UsageData) -> int | None:
+    """Fill level from one request: its whole input (`input + cache_read + cache_write`)."""
+    parts = [usage.get(key) for key in ("input", "cache_read", "cache_write")]
+    counts = [n for n in parts if isinstance(n, int) and not isinstance(n, bool)]
+    return sum(counts) if counts else None
+
+
+def context_window(model_usage: Mapping[str, Any] | None, model: str) -> int | None:
+    """`contextWindow` of `model` in the cumulative `model_usage` of a `ResultMessage` (key or
+    `canonicalModel`), None if it is not there."""
+    usage = model_usage or {}
+    entry = usage.get(model)
+    if not isinstance(entry, Mapping):
+        entry = next(
+            (
+                e
+                for e in usage.values()
+                if isinstance(e, Mapping) and e.get("canonicalModel") == model
+            ),
+            None,
+        )
+    window = entry.get("contextWindow") if isinstance(entry, Mapping) else None
+    return (
+        window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None
+    )
+
+
+def _compaction(data: Mapping[str, Any]) -> CompactionData:
+    meta = data.get("compact_metadata") or data.get("compactMetadata") or {}
+    meta = meta if isinstance(meta, Mapping) else {}
+    trigger = meta.get("trigger")
+    before = meta.get("pre_tokens", meta.get("preTokens"))
+    return CompactionData(
+        trigger=str(trigger) if trigger is not None else None,
+        tokens_before=before if isinstance(before, int) and not isinstance(before, bool) else None,
+    )
+
+
 def _delta(now: int | None, before: int | None) -> int | None:
     if now is None:
         return None
@@ -131,6 +184,10 @@ class ClaudeEvents:
         self.cost_kind = cost_kind
         self.compacted = False
         self.session_id: str | None = None
+        self.context_tokens: int | None = None
+        """Fill level of the session (see module docstring), None while unknown."""
+        self.context_window: int | None = None
+        """Window of the agent's model; stays across sessions (a property of the model)."""
         self.turn = 0
         self._seen: set[str] = set()
         self._totals = Usage()
@@ -142,6 +199,7 @@ class ClaudeEvents:
         """Forget the session: a new CLI counts usage and cost from zero again (W4-03 F5)."""
         self.session_id = None
         self.compacted = False
+        self.context_tokens = None
         self._totals = Usage()
         self._cost_total = None
 
@@ -178,6 +236,9 @@ class ClaudeEvents:
         if isinstance(msg, SystemMessage):
             if msg.subtype == "compact_boundary":
                 self.compacted = True
+                self.context_tokens = None
+                data = _compaction(msg.data or {})
+                return [self.event(EventKind.COMPACTION, data, _raw(msg))]
             elif msg.subtype == "init":
                 self.session_id = msg.data.get("session_id") or self.session_id
         return []
@@ -208,6 +269,8 @@ class ClaudeEvents:
         if msg.usage and msg.message_id and msg.message_id not in self._seen:
             self._seen.add(msg.message_id)
             data = message_usage(msg.usage, msg.model or self.model)
+            if (msg.model or self.model) == self.model:
+                self.context_tokens = context_tokens(data)
             events.append(self.event(EventKind.USAGE, data, raw))
         return _raw_once(events)
 
@@ -244,6 +307,10 @@ class ClaudeEvents:
             data = {"message": message, "type": "turn", "recoverable": True}
             events.append(self.event(EventKind.ERROR, data, _raw(result) if result else None))
         usage, cost = self._turn_usage(result)
+        if result is not None:
+            self.context_window = (
+                context_window(result.model_usage, self.model) or self.context_window
+            )
         data = {
             "status": str(status),
             "usage": {**usage.tokens(), "model": self.model},
@@ -251,6 +318,8 @@ class ClaudeEvents:
             "cost_kind": str(self.cost_kind) if cost is not None and self.cost_kind else None,
             "session": self.session_id,
             "num_turns": result.num_turns if result else None,
+            "context_tokens": self.context_tokens,
+            "context_window": self.context_window,
         }
         if result is not None:
             data["stop_reason"] = result.stop_reason

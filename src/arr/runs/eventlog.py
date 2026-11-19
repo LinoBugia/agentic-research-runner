@@ -422,6 +422,11 @@ def _render_event(rec: Mapping[str, Any], state: _RenderState) -> str | None:
         case "hint":
             where = f" aus #{data['channel']}" if data.get("channel") else ""
             return _quote(f"**Hinweis{where}** ({data.get('method', '?')}): {data.get('text', '')}")
+        case "compaction":
+            before = data.get("tokens_before")
+            known = isinstance(before, int) and not isinstance(before, bool)
+            extra = f", vorher {_tokens(before)} Token" if known else ""
+            return f"*Die Engine hat die Sitzung verdichtet ({clock}{extra}).*"
         case _:  # `usage` shows up summed in `turn_end`; unknown kinds are not shown
             return None
 

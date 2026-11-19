@@ -27,6 +27,8 @@ Script format (YAML)::
             args: {status: done, summary: "Kein Gegenbeispiel.", fields: {verdict: minor,
                    objections: [{text: "Lemma 2 braucht n > 1."}]}}
           - {do: usage, input: 1200, output: 300, cost_usd: 0.02}
+          - {do: usage, input: 900, cache_read: 5000, context_window: 258400}  # window as Codex
+          - {do: compaction}               # the engine compacted the session (W4b-05b)
           - {do: delay, seconds: 0.5}      # interruptible wait
           - {do: hang, seconds: 2}         # wait that ignores interrupt()
           - {do: end, status: limit, message: "Budget erreicht"}   # end the turn now
@@ -35,10 +37,21 @@ Script format (YAML)::
         repeat_last: true       # any number of turns in this stage
         turns:
           - steps: [{do: room, action: post_message, args: {channel: main, body: "…"}}]
+    notes:                      # optional: note turns of auto-compact (W4b-05b)
+      repeat_last: true
+      turns:
+        - steps: [{do: text, text: "### Stand\n…"}, {do: usage, input: 50, output: 20}]
+    context_window: 1000000     # window reported at the end of a turn (null = unknown)
 
 A turn with a stage listed in `by_stage` plays the next entry of that stage; all other turns
 play the next entry of `turns`. So `turns` stays in order even when wake-up turns of a
-variable number come in between.
+variable number come in between. A note turn of auto-compact (its prompt starts with
+`arr.runs.compact.NOTE_HEADING`) plays the next entry of `notes` if the script has it.
+
+Fill level (W4b-05b): every `usage` step of the agent's own model sets the fill level of the
+session to `input + cache_read + cache_write`; a `compaction` step or `reset` makes it unknown.
+`turn_end` carries it as `context_tokens`, with the window (`context_window` of the latest
+`usage` step that gave one, else of the script) as `context_window`.
 
 String values of room `args` that consist of exactly `${name.path}` are replaced by a value
 saved earlier with `save_as` (dotted path; list items by index).
@@ -63,6 +76,7 @@ from pydantic import BaseModel, Field
 
 from arr.backends.base import (
     AgentEvent,
+    CompactionData,
     CostKind,
     ErrorData,
     EventKind,
@@ -84,6 +98,7 @@ from arr.resolve import load_yaml_model, validate_model
 from arr.room.store import AgentRoom
 from arr.room.types import MessageKind, RoomAPI, RoomError, SubmitAPI, VoteChoice, VoteRule
 from arr.room.waiting import WAIT_MAX_S, wait_for_messages
+from arr.runs.compact import NOTE_HEADING
 
 ROOM_TOOL_PREFIX = "mcp__arr-room__"
 """Tool name prefix of room actions in the event log (MCP server `arr-room`, docs/01 §5)."""
@@ -183,6 +198,17 @@ class UsageStep(StrictModel):
     model: str | None = Field(default=None, description="Default: the model of the agent")
     cost_usd: float | None = Field(default=None, ge=0)
     cost_kind: CostKind | None = Field(default=None, description="Default: of the script")
+    context_window: int | None = Field(
+        default=None, gt=0, description="Window reported with this request (like Codex)"
+    )
+
+
+class CompactionStep(StrictModel):
+    """The engine compacted the session (`compaction` event, W4b-05b); fill level unknown."""
+
+    do: Literal["compaction"]
+    trigger: str | None = "auto"
+    tokens_before: int | None = Field(default=None, ge=0)
 
 
 class RateLimitStep(StrictModel):
@@ -238,6 +264,7 @@ Step = Annotated[
     | ToolStep
     | RoomStep
     | UsageStep
+    | CompactionStep
     | RateLimitStep
     | DelayStep
     | HangStep
@@ -272,6 +299,12 @@ class FakeScript(StrictModel):
     repeat_last: bool = False
     turns: list[TurnScript] = Field(default_factory=list)
     by_stage: dict[str, StageScript] = Field(default_factory=dict)
+    notes: StageScript | None = Field(
+        default=None, description="Note turns of auto-compact (W4b-05b)"
+    )
+    context_window: int | None = Field(
+        default=1_000_000, gt=0, description="Window reported at the end of a turn"
+    )
 
 
 def load_script(source: "str | Path | Mapping[str, Any] | FakeScript") -> FakeScript:
@@ -376,6 +409,10 @@ class FakeBackend:
         self.room = room
         self._session = f"fake-{config.id}"
         self._sessions = 1
+        self.context_tokens: int | None = None
+        """Fill level of the session (W4b-05b): input of the last request of its model."""
+        self.context_window: int | None = None
+        """Window from the latest `usage` step that gave one."""
         self.history: list[str] = []
         """Prompts of the current session: what the agent „remembers“ (cleared by `reset`)."""
         self._turn = 0
@@ -431,6 +468,7 @@ class FakeBackend:
         self._sessions += 1
         self._session = f"fake-{self.config.id}-{self._sessions}"
         self.history = []
+        self.context_tokens = None
 
     def session_ref(self) -> dict[str, str]:
         """Session / thread ID for `session.json`, named like the real backend's."""
@@ -474,7 +512,7 @@ class FakeBackend:
                 state, EventKind.TURN_START, TurnStartData(prompt=prompt, stage=stage)
             )
             try:
-                async for event in self._play(state, stage):
+                async for event in self._play(state, stage, note=prompt.startswith(NOTE_HEADING)):
                     yield event
             except Exception as exc:  # script or room bug: report it, keep the turn contract
                 state.status = TurnStatus.ERROR
@@ -497,8 +535,11 @@ class FakeBackend:
         if self._current is not None and self._current[0] is token:
             self._current = None
 
-    async def _play(self, state: _TurnState, stage: str | None) -> AsyncIterator[AgentEvent]:
-        for step in self._turn_script(stage).steps:
+    async def _play(
+        self, state: _TurnState, stage: str | None, *, note: bool = False
+    ) -> AsyncIterator[AgentEvent]:
+        script = self._note_script() if note and self.script.notes else self._turn_script(stage)
+        for step in script.steps:
             for event in self._take_hints(state):
                 yield event
             if self._interrupted.is_set():
@@ -507,6 +548,21 @@ class FakeBackend:
                 yield event
             if state.status is not TurnStatus.OK or state.ended:
                 return
+
+    def _note_script(self) -> TurnScript:
+        """The next entry of `notes` (a note turn of auto-compact)."""
+        notes = self.script.notes
+        assert notes is not None
+        n = self._played.get(NOTE_HEADING, 0) + 1
+        self._played[NOTE_HEADING] = n
+        if n <= len(notes.turns):
+            return notes.turns[n - 1]
+        if notes.repeat_last and notes.turns:
+            return notes.turns[-1]
+        raise FakeScriptError(
+            f"Das Skript für „{self.config.id}“ hat keinen Eintrag für Notiz-Turn {n} "
+            f"(es hat {len(notes.turns)}). Ergänze einen oder setze repeat_last: true."
+        )
 
     def _turn_script(self, stage: str | None) -> TurnScript:
         """Pick the script of the next turn (by `stage` if listed in `by_stage`) or raise."""
@@ -594,7 +650,21 @@ class FakeBackend:
                     reasoning=step.reasoning,
                     model=model,
                 )
+                if model == self.config.model:
+                    filled = [
+                        n for n in (step.input, step.cache_read, step.cache_write) if n is not None
+                    ]
+                    self.context_tokens = sum(filled) if filled else None
+                if step.context_window is not None:
+                    self.context_window = step.context_window
+                    tokens["context_window"] = step.context_window
                 yield event(EventKind.USAGE, tokens)
+            case CompactionStep():
+                self.context_tokens = None
+                yield event(
+                    EventKind.COMPACTION,
+                    CompactionData(trigger=step.trigger, tokens_before=step.tokens_before),
+                )
             case RateLimitStep():
                 yield event(
                     EventKind.RATE_LIMIT,
@@ -758,5 +828,7 @@ class FakeBackend:
             cost_kind=usage.cost_kind.value if usage.cost_kind else None,
             session=self._session,
             num_turns=1 + state.tool_calls,
+            context_tokens=self.context_tokens,
+            context_window=self.context_window or self.script.context_window,
         )
         return self._event(state, EventKind.TURN_END, data)

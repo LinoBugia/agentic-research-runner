@@ -28,10 +28,12 @@ See docs/01-architektur.md §6, docs/02-workfolder-und-runs.md §4, §7, docs/06
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -75,6 +77,19 @@ from arr.room.types import (
     WaitKind,
     WaitState,
 )
+from arr.runs.compact import (
+    PURPOSE,
+    AgentContext,
+    CompactReason,
+    OwnQuestion,
+    OwnResult,
+    OwnSubmission,
+    Pending,
+    Verdict,
+    decide,
+    note_from_text,
+    rebuild_package,
+)
 from arr.runs.context import AgentHandle, DiscussionOutcome, RunContext, TurnJob
 from arr.runs.eventlog import EventLogger
 from arr.runs.pacing import (
@@ -86,6 +101,7 @@ from arr.runs.pacing import (
     run_discussion,
 )
 from arr.runs.prepare import PreparedRun
+from arr.workfolder import read_template
 
 __all__ = [
     "PLAN_STAGE",
@@ -655,11 +671,15 @@ class Orchestrator(RunContext):
     ) -> TurnOutcome:
         agent_id = handle.id
         backend = self.backends[agent_id]
-        events_log = self.loggers[agent_id]
+        if await self._auto_compact(handle, gate, stage):  # a note turn ran (W4b-05b)
+            await self._runnable.wait()
+            if (refused := self._refuse(handle)) is not None:
+                return refused
         handle.turns_used += 1
         number = handle.turns_used
         self._turn_marks[agent_id] = self.last_message_id()
-        full_prompt = self._prompt_with_inbox(agent_id, prompt)
+        rebuild = self._take_rebuild(agent_id, prompt, stage, context)
+        full_prompt = rebuild + self._prompt_with_inbox(agent_id, prompt)
         self.room.add_assignment(agent_id, number, prompt, stage=stage, context=context)
         before = max((r.id for r in self.room.results(agent=agent_id)), default=0)
         if stage is not None:
@@ -681,26 +701,8 @@ class Orchestrator(RunContext):
         self.log.write("turn", agent=agent_id, turn=number, stage=stage)
         started = loop.time()
         record = _TurnRecord()
-
-        async def consume() -> None:
-            async with contextlib.aclosing(backend.run_turn(full_prompt, stage=stage)) as events:
-                async for event in events:
-                    events_log.log(event)
-                    await self._on_event(handle, gate, active, record, event)
-
-        active.consume = asyncio.create_task(consume())
         try:
-            await active.consume
-        except asyncio.CancelledError:
-            if record.status is None:
-                self._close_log(agent_id, record, TurnStatus.INTERRUPTED, "Turn abgebrochen.")
-            outer = asyncio.current_task()
-            if active.ending < 3 or (outer is not None and outer.cancelling()):
-                raise  # the run stops; only arr's own hard end of the turn stays here
-        except Exception as exc:
-            logger.exception("Turn von %s fehlgeschlagen", agent_id)
-            record.error = f"{type(exc).__name__}: {exc}"
-            self._close_log(agent_id, record, TurnStatus.ERROR, record.error)
+            await self._consume(handle, gate, active, record, full_prompt, stage)
         finally:
             self._active.pop(agent_id, None)
             if active.delivery is not None and not active.delivery.done():
@@ -710,6 +712,7 @@ class Orchestrator(RunContext):
             submitted = any(r.id > before for r in self.room.results(agent=agent_id))
             self._finish_status(handle, since=since, mark=mark, was_done=was_done, result=submitted)
             self._write_session(agent_id, backend)
+            self._follow_session(agent_id, backend, measured=True)
             undelivered = self._unseen(agent_id, active.pending)
             for listener in list(self._listeners):
                 listener.on_turn_end(agent_id, undelivered)
@@ -757,6 +760,10 @@ class Orchestrator(RunContext):
         match event.kind:
             case EventKind.TOOL_CALL:
                 active.tool_calls += 1
+            case EventKind.USAGE:
+                self._context_of(handle.id).saw_window(data.get("context_window"))
+            case EventKind.COMPACTION:
+                self._engine_compacted(handle.id, data)
             case EventKind.TEXT:
                 record.text = str(data.get("text", ""))
             case EventKind.ERROR:
@@ -780,6 +787,9 @@ class Orchestrator(RunContext):
                 )
                 record.session = data.get("session")
                 record.num_turns = data.get("num_turns")
+                self._context_of(handle.id).measured(
+                    data.get("context_tokens"), data.get("context_window")
+                )
                 self.cost_usd += record.usage.cost_usd or 0.0
                 budget = self.config.limits.budget_usd
                 if budget is not None and self.cost_usd >= budget:
@@ -1700,3 +1710,289 @@ class Orchestrator(RunContext):
             self._runnable.set()
             if self._on_pause is not None and not self.stop_requested:
                 self._on_pause(False)
+
+    # ----------------------------------------------------------------------------------------
+    # Context: auto-compact and `compact_session` (W4b-05b, docs/10 §4.6, P12)
+    # ----------------------------------------------------------------------------------------
+
+    @functools.cached_property
+    def _contexts(self) -> dict[str, AgentContext]:
+        """Per agent: fill level, window, running action, package for the next turn."""
+        return {agent_id: AgentContext() for agent_id in self._handles}
+
+    def _context_of(self, agent_id: str) -> AgentContext:
+        return self._contexts[agent_id]
+
+    async def compact_session(self, agent_id: str, *, note: str | None = None) -> None:
+        """The agent's next turn starts a new session that arr rebuilds without a model
+        (`context: compact`, docs/10 §4.6): its running turn ends first (the same lock as
+        `reset_session`), then `backend.reset()`; the next turn gets the rebuild package with
+        `note` as the agent's own note (None: without a note). No note turn, no model. Called
+        again before that turn, the last note counts."""
+        self._handle(agent_id)
+        ctx = self._context_of(agent_id)
+        backend = self.backends[agent_id]
+        async with self._locks[agent_id]:
+            self._follow_session(agent_id, backend)
+            tokens, window = ctx.tokens, ctx.window
+            await backend.reset()
+            ctx.new_session()
+            clean = note_from_text(note)
+            ctx.pending = Pending(CompactReason.PHASE, clean)
+        stage = self._phase.get(agent_id, self.stage)
+        self._log_compact(
+            agent_id, CompactReason.PHASE, stage, tokens=tokens, window=window, note=clean
+        )
+
+    async def _auto_compact(
+        self, handle: AgentHandle, gate: ProfileGate, stage: str | None
+    ) -> bool:
+        """Auto-compact right before a turn (docs/10 §4.6): at the agent's threshold a note
+        turn, then a new session whose first turn gets the rebuild package. True if a note
+        turn ran (the caller checks pause and limits again)."""
+        agent_id = handle.id
+        backend = self.backends[agent_id]
+        ctx = self._context_of(agent_id)
+        self._follow_session(agent_id, backend)
+        limit = self.config.limits.turns_per_agent
+        decision = decide(
+            handle.config.compact,
+            tokens=ctx.tokens,
+            window=ctx.window,
+            turns_left=None if limit is None else limit - handle.turns_used,
+            failures=ctx.failures,
+        )
+        if decision.verdict is Verdict.NO_WINDOW and not ctx.window_noted:
+            ctx.window_noted = True
+            self.log.write(
+                "compact_no_window", agent=agent_id, at=handle.config.compact.at, tokens=ctx.tokens
+            )
+        if not decision.compact:
+            return False
+        stage = self._phase.get(agent_id, stage)  # the agent's own stage, not the next one
+        note = await self._note_turn(handle, gate, stage)
+        ok = note is not None
+        if ok:
+            try:
+                await backend.reset()
+            except Exception:
+                logger.exception("Neue Sitzung für %s nach der Notiz fehlgeschlagen", agent_id)
+                ok = False
+        if ok:
+            ctx.new_session()
+            ctx.pending = Pending(CompactReason.AUTO, note)
+        else:
+            ctx.failures += 1
+        self._log_compact(
+            agent_id,
+            CompactReason.AUTO,
+            stage,
+            tokens=decision.tokens,
+            window=decision.window,
+            threshold=decision.threshold,
+            note=note if ok else None,
+            ok=ok,
+            **({} if ok else {"failures": ctx.failures}),
+        )
+        return True
+
+    async def _note_turn(
+        self, handle: AgentHandle, gate: ProfileGate, stage: str | None
+    ) -> str | None:
+        """The note turn of auto-compact, a technical turn (W4b-05b §6.3): no assignment, no
+        phase or `done` change, no wake-up, no inbox, no hints, no turn end for the pacing
+        listeners; numbered, with `purpose: compact`, counted in usage, budget and
+        `turns_per_agent`. Returns the cleaned note, None if the turn failed or said nothing."""
+        agent_id = handle.id
+        backend = self.backends[agent_id]
+        handle.turns_used += 1
+        number = handle.turns_used
+        previous = handle.status
+        note = next((s.note for s in self.room.agent_states() if s.agent == agent_id), "")
+        before = max((r.id for r in self.room.results(agent=agent_id)), default=0)
+        self.room.reset_wait_guard(agent_id)
+        self._set_status(handle, AgentStatus.WORKING)
+        loop = asyncio.get_running_loop()
+        active = _ActiveTurn(
+            backend,
+            HintGate(self.pacing.hint_interval_s, self.pacing.hint_tool_calls),
+            last_event=loop.time(),
+            retry_at_calls=sys.maxsize,  # `deliver_hints` skips the turn: no hints
+        )
+        self._active[agent_id] = active
+        self.log.write("turn", agent=agent_id, turn=number, stage=stage, purpose=PURPOSE)
+        record = _TurnRecord()
+        prompt = read_template("prompts", "compact_note.md").strip()
+        try:
+            await self._consume(handle, gate, active, record, prompt, stage, purpose=PURPOSE)
+        finally:
+            self._active.pop(agent_id, None)
+            self.room.clear_wait(agent_id, WaitKind.MESSAGES)
+            self._waits.pop(agent_id, None)
+            self._write_session(agent_id, backend)
+            self._follow_session(agent_id, backend, measured=True)
+            self._set_status(handle, previous, note)
+        if record.status is None:
+            message = "Der Turn endete ohne Abschluss (turn_end fehlt)."
+            record.error = record.error or message
+            self._close_log(agent_id, record, TurnStatus.ERROR, message)
+        status = record.status or TurnStatus.ERROR
+        if status is TurnStatus.INTERRUPTED and self._limit is not None:
+            status = TurnStatus.LIMIT
+        self.log.write(
+            "turn_end",
+            agent=agent_id,
+            turn=number,
+            status=status.value,
+            cost_usd=record.usage.cost_usd,
+            results=[r.id for r in self.room.results(agent=agent_id) if r.id > before],
+            purpose=PURPOSE,
+        )
+        return note_from_text(record.text) if status is TurnStatus.OK else None
+
+    async def _consume(
+        self,
+        handle: AgentHandle,
+        gate: ProfileGate,
+        active: _ActiveTurn,
+        record: _TurnRecord,
+        prompt: str,
+        stage: str | None,
+        *,
+        purpose: str | None = None,
+    ) -> None:
+        """Run the backend's turn and feed every event to the log and `_on_event`. A cancel
+        goes on unless it is arr's own hard end of the turn (`active.ending` 3)."""
+        agent_id = handle.id
+        events_log = self.loggers[agent_id]
+
+        async def consume() -> None:
+            turn = active.backend.run_turn(prompt, stage=stage)
+            async with contextlib.aclosing(turn) as events:
+                async for event in events:
+                    if purpose is not None and event.kind is EventKind.TURN_START:
+                        event.data["purpose"] = purpose
+                    events_log.log(event)
+                    await self._on_event(handle, gate, active, record, event)
+
+        active.consume = asyncio.create_task(consume())
+        try:
+            await active.consume
+        except asyncio.CancelledError:
+            if record.status is None:
+                self._close_log(agent_id, record, TurnStatus.INTERRUPTED, "Turn abgebrochen.")
+            outer = asyncio.current_task()
+            if active.ending < 3 or (outer is not None and outer.cancelling()):
+                raise  # the run stops; only arr's own hard end of the turn stays here
+        except Exception as exc:
+            logger.exception("Turn von %s fehlgeschlagen", agent_id)
+            record.error = f"{type(exc).__name__}: {exc}"
+            self._close_log(agent_id, record, TurnStatus.ERROR, record.error)
+
+    def _follow_session(
+        self, agent_id: str, backend: AgentBackend, *, measured: bool = False
+    ) -> None:
+        """The fill level belongs to the backend's session: after a turn (`measured`) remember
+        it; before one, a different session (`reset_session`) makes the fill level unknown."""
+        try:
+            ref = dict(backend.session_ref())
+        except Exception:
+            return  # `_write_session` logs it
+        ctx = self._context_of(agent_id)
+        if measured:
+            ctx.session = ref
+        else:
+            ctx.follow(ref)
+
+    def _take_rebuild(
+        self,
+        agent_id: str,
+        prompt: str,
+        stage: str | None,
+        context: Mapping[str, Any] | None,
+    ) -> str:
+        """Remember the running action; after a new session from compaction, the rebuild
+        package for this turn (in front of the inbox), else an empty string."""
+        ctx = self._context_of(agent_id)
+        starts = ctx.start_action(stage, (context or {}).get("attempt"), prompt)
+        pending, ctx.pending = ctx.pending, None
+        if pending is None:
+            return ""
+        run_dir = self.prepared.run_dir
+        package = rebuild_package(
+            read_template("prompts", "compact_rebuild.md"),
+            action=ctx.action,
+            action_below=starts or ctx.action == prompt,
+            submissions=[
+                OwnSubmission(
+                    id=s.id,
+                    format=s.format,
+                    status=s.status,
+                    summary=s.summary,
+                    path=str(run_dir / s.path),
+                    name=s.name,
+                    version=s.version,
+                    stage=s.stage,
+                    attempt=s.attempt,
+                )
+                for s in self.room.submissions(agent=agent_id, latest=True)
+            ],
+            results=[
+                OwnResult(
+                    id=r.id,
+                    kind=r.kind,
+                    title=r.title,
+                    path=str(run_dir / r.path) if r.path else None,
+                    stage=r.stage,
+                )
+                for r in self.room.results(agent=agent_id)
+            ],
+            questions=[
+                OwnQuestion(id=q.id, channel=q.channel, text=q.body)
+                for q in self.room.open_questions_by(agent_id)
+                if is_user_question(q)
+            ],
+            note=pending.note,
+        )
+        return package + "\n\n"
+
+    def _engine_compacted(self, agent_id: str, data: Mapping[str, Any]) -> None:
+        """The engine compacted the session (safety net): fill level unknown, one log entry."""
+        ctx = self._context_of(agent_id)
+        ctx.tokens = None
+        before = data.get("tokens_before")
+        self._log_compact(
+            agent_id,
+            CompactReason.ENGINE,
+            self._phase.get(agent_id, self.stage),
+            tokens=before if isinstance(before, int) else None,
+            window=ctx.window,
+            trigger=data.get("trigger"),
+        )
+
+    def _log_compact(
+        self,
+        agent_id: str,
+        reason: CompactReason,
+        stage: str | None,
+        *,
+        tokens: int | None,
+        window: int | None,
+        threshold: int | None = None,
+        note: str | None = None,
+        ok: bool = True,
+        **extra: Any,
+    ) -> None:
+        """One entry `compact` in `orchestrator.jsonl` per compaction (§6.7); never the note."""
+        self.log.write(
+            "compact",
+            agent=agent_id,
+            reason=reason.value,
+            stage=stage,
+            tokens=tokens,
+            window=window,
+            threshold=threshold,
+            note_chars=len(note) if note else 0,
+            ok=ok,
+            **extra,
+        )
