@@ -23,7 +23,7 @@ from typing import Any
 from arr.backends.base import TurnOutcome
 from arr.models import AgentConfig, AgentStatus, ChannelMode, ResolvedRun
 from arr.permissions.types import EscalationOption
-from arr.room.types import MessageKind, Rating, Result, Submission
+from arr.room.types import Message, MessageKind, Rating, Result, Submission
 
 
 @dataclass(slots=True)
@@ -328,11 +328,28 @@ class RunContext(ABC):
     async def fresh_folder(self, agent_id: str, *, stage: str, attempt: int) -> None:
         """The agent gets a fresh working folder: the old one is filed away (readable for no
         agent), the scratch folder emptied (docs/10 §4.12). Waits for a running turn of the
-        agent. Implemented by W4b-05a, called by W4b-02b."""
+        agent. Implemented by the `Orchestrator` (W4b-05a), called by the phase runner
+        (W4b-02b)."""
         raise NotImplementedError("RunContext.fresh_folder setzt W4b-05a um.")
 
     async def compact_session(self, agent_id: str, *, note: str | None = None) -> None:
         """The agent's next turn starts a new session that arr rebuilds without a model, with
         `note` as the agent's own note (`context: compact`, docs/10 §4.6). Implemented by
-        W4b-05b, called by W4b-02b."""
+        the `Orchestrator` (W4b-05b), called by the phase runner (W4b-02b)."""
         raise NotImplementedError("RunContext.compact_session setzt W4b-05b um.")
+
+    # -- W4b-02b: what the phase runner needs besides the signatures of W4b-02a ------------
+    #
+    # Not abstract: the defaults keep the test contexts of the old topologies working.
+
+    async def escalate_with_hint(
+        self, stage: str, summary: str, options: Sequence[EscalationOption]
+    ) -> tuple[EscalationOption, str | None]:
+        """Like `escalate`, and the user's hint with it (`Decision.comment`, e.g. with
+        „noch ein Durchlauf“; W4b-02b §6.7). The default gives no hint."""
+        return await self.escalate(stage, summary, options), None
+
+    def channel_messages(self, channel: str) -> list[Message]:
+        """Every message of `channel`, oldest first, as arr reads them (an input
+        `channel: <name>` of a phase). The default knows none."""
+        return []

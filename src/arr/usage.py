@@ -57,6 +57,8 @@ class UsageRecord(Record):
     profile: str | None = None
     provider: str | None = None
     model: str | None = None
+    phase: str | None = None
+    """The phase (stage) of the turn, from its `turn_start` (W4b-02b); None if unknown."""
     usage: Usage
 
 
@@ -104,6 +106,9 @@ class RunUsage(Record):
     by_agent: dict[str, AgentUsage] = Field(default_factory=dict)
     by_model: dict[str, UsageTotal] = Field(default_factory=dict)
     by_profile: dict[str, UsageTotal] = Field(default_factory=dict)
+    by_phase: dict[str, UsageTotal] = Field(default_factory=dict)
+    """Sums per phase (stage) of the turns (W4b-02b); turns without a phase are not in it.
+    Older `usage.json` files without it read as empty."""
 
 
 def _cost_kind(value: Any) -> CostKind | None:
@@ -121,11 +126,17 @@ def usage_records(
 ) -> list[UsageRecord]:
     """Extract one `UsageRecord` per `turn_end` from normalized events.
 
-    The model is `turn_end.data.usage.model`, else the model of `config`. Records with
-    invalid numbers are skipped with a warning (a damaged log must not break the summary).
+    The model is `turn_end.data.usage.model`, else the model of `config`; the phase is the
+    `stage` of the `turn_start` of the same turn (W4b-02b). Records with invalid numbers are
+    skipped with a warning (a damaged log must not break the summary).
     """
     records: list[UsageRecord] = []
+    stages: dict[Any, Any] = {}
     for event in events:
+        if event.get("kind") == "turn_start":
+            stage = (event.get("data") or {}).get("stage")
+            stages[event.get("turn")] = stage if isinstance(stage, str) and stage else None
+            continue
         if event.get("kind") != "turn_end":
             continue
         data = event.get("data") or {}
@@ -139,6 +150,7 @@ def usage_records(
                     profile=config.auth if config else None,
                     provider=str(config.provider) if config else None,
                     model=tokens.get("model") or (config.model if config else None),
+                    phase=stages.get(event.get("turn")),
                     usage=Usage(
                         **{name: tokens.get(name) for name in _TOKEN_FIELDS},
                         cost_usd=data.get("cost_usd"),
@@ -198,7 +210,7 @@ def aggregate_usage(
     run_id: str | None = None,
     agents: Iterable[str] = (),
 ) -> RunUsage:
-    """Sum records per agent, model, profile and for the whole run.
+    """Sum records per agent, model, profile, phase and for the whole run.
 
     `agents` lists agents that should appear even without a finished turn (zero rows).
     """
@@ -216,6 +228,8 @@ def aggregate_usage(
         agent.models.setdefault(model, UsageTotal()).add(record.usage)
         result.by_model.setdefault(model, UsageTotal()).add(record.usage)
         result.by_profile.setdefault(profile, UsageTotal()).add(record.usage)
+        if record.phase is not None:
+            result.by_phase.setdefault(record.phase, UsageTotal()).add(record.usage)
     return result
 
 

@@ -16,7 +16,6 @@ import pytest
 from plan_kit import findings, load, resolve, text
 from run_kit import make_workfolder, write_profiles
 
-from arr.errors import ArrError
 from arr.models import (
     MAX_ASSIGNMENTS,
     MAX_FORMATS,
@@ -900,17 +899,19 @@ phases:
 """
 
 
-def test_a11_plan_launch_still_refuses_phases(
+def test_a11_plan_launch_takes_phases_since_the_runner(
     tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """W4b-02b: `plan_launch` takes a valid `phases` run (before: „noch nicht verfügbar“);
+    nothing is created by the planning."""
     workfolder = make_workfolder(tmp_path)
     (workfolder / "arr.yaml").write_text("version: 1\ntoolchain: {run_venv: off}\n", "utf-8")
     write_profiles(arr_home, {"fake-auth": "claude_oauth"})
     monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
     run_file = workfolder / "run.yaml"
     run_file.write_text(PHASES_RUN, encoding="utf-8")
-    with pytest.raises(ArrError, match="„phases“ ist noch nicht verfügbar"):
-        plan_launch(run_file, cwd=workfolder)
+    launch = plan_launch(run_file, cwd=workfolder)
+    assert [p.name for p in launch.resolved.phases] == ["arbeit"]
     assert list((workfolder / "runs").iterdir()) == []
 
 

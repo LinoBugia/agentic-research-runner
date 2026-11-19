@@ -31,6 +31,7 @@ from arr.room.store import USER, AgentRoom, RoomStore
 from arr.room.types import ChannelInfo, Inbox, Message, RoomError, Submission
 from arr.room.waiting import PROVIDER_ENV, STREAK_MAX_S, WaitEnd, WaitOutcome, wait_max_s
 from arr.room.waiting import wait_for_messages as wait_for_messages_
+from arr.runs.phases.view import is_phase_context, render_assignment
 
 log = logging.getLogger("arr.room.server")  # fixed name, also under `python -m`
 
@@ -488,6 +489,8 @@ def build_server(room: AgentRoom) -> MCPServer:
             a = room.get_assignment()
             if a is None:
                 return "Noch kein Auftrag."
+            if is_phase_context(a.context):  # W4b-02b: assignment, format and package readable
+                return f"Turn {a.turn}.\n\n" + render_assignment(a.context)
             text = f"Auftrag (Turn {a.turn}, Stufe {a.stage or '–'}):\n{a.prompt}"
             if a.context:
                 text += "\n\nKontext:\n" + json.dumps(a.context, ensure_ascii=False, indent=2)

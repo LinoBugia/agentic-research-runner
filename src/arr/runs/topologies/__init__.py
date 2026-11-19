@@ -54,8 +54,9 @@ AVAILABLE = {
     TopologyKind.EXPLORATION: "exploration",
     TopologyKind.WATERFALL: "waterfall",
     TopologyKind.REVIEW: "review",
+    TopologyKind.PHASES: "arr.runs.phases.runner",
 }
-"""Topologies implemented (module name in this package)."""
+"""Topologies implemented (module name in this package; `phases` is the runner of W4b-02b)."""
 
 ASK_AGAIN = 1
 """How often a topology asks again for a missing result (or verdict) before it goes on."""
@@ -75,7 +76,8 @@ def _module(kind: TopologyKind | str) -> Any:
             f"Die Topologie „{kind.value}“ ist noch nicht verfügbar. Verfügbar sind: {ready}."
         )
     # imported lazily: the modules import the helpers below
-    return importlib.import_module(f"{__name__}.{AVAILABLE[kind]}")
+    module = AVAILABLE[kind]
+    return importlib.import_module(module if "." in module else f"{__name__}.{module}")
 
 
 def topology_for(kind: TopologyKind | str) -> Topology:
@@ -95,8 +97,10 @@ def check_topology(resolved: ResolvedRun) -> None:
 
 
 def planned_stages(resolved: ResolvedRun) -> list[str]:
-    """The plan of a run (checkpoint `plan`): the names of `stages`, else the topology's
-    fixed `PHASES` (W4-03 F2), else none."""
+    """The plan of a run (checkpoint `plan`): the names of `stages`, the phases of a `phases`
+    run in their order (W4b-02b), else the topology's fixed `PHASES` (W4-03 F2), else none."""
+    if resolved.topology.kind is TopologyKind.PHASES:
+        return [p.name for p in resolved.phases]
     if resolved.stages:
         return [s.name for s in resolved.stages]
     try:
