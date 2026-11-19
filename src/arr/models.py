@@ -387,7 +387,8 @@ def _check_threshold(value: Any) -> Any:
 class Compact(StrictModel):
     """`compact: { at: 60% }`: when arr compacts an agent's session between two turns
     (docs/10 §4.6, P12). `at` is a share of the context window (`"60%"`) or a number of
-    tokens. There is no switch to turn it off (Entscheidung 41)."""
+    tokens. There is no own switch (Entscheidung 41); `at: 100%` turns arr's compaction off,
+    then only the engine compacts (Entscheidung 49)."""
 
     at: Annotated[str | int, BeforeValidator(_check_threshold)] = DEFAULT_COMPACT
 

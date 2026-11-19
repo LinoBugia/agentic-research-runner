@@ -1,0 +1,1 @@
+Deine Sitzung hat neu begonnen: Den bisherigen Verlauf kennst du nicht mehr. Die Dateien in deinem Arbeitsordner sind unverändert. Was folgt, setzt arr aus seinen eigenen Daten wieder ein; danach kommen wie immer ungelesene Nachrichten und der Auftrag dieses Turns. Arbeite daran weiter.
