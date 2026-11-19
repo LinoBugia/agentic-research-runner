@@ -1,5 +1,6 @@
-"""The state of a phases run over its phases (W4b-02b §3.2): visits, passes, scores, the valid
-submission of every phase and the list of objections. Only data; the runner fills it."""
+"""The state of a phases run over its phases (W4b-02b §3.2, docs/10 §6): visits, passes,
+scores, the valid submission of every phase and the list of objections. Only data; the runner
+fills it."""
 
 from dataclasses import dataclass, field
 from typing import Any

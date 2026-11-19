@@ -1,5 +1,5 @@
 """The context package of a phase action as text: the prompt of a turn and `get_assignment`
-(W4b-02b §6.3, §6.13; Entscheidung 14).
+(W4b-02b §6.3, §6.13; docs/10 §4.3; Entscheidung 14).
 
 A package is the `context` of an assignment (`RoomStore.add_assignment`). Its keys are the
 contract for W4b-03, 04 and 07:

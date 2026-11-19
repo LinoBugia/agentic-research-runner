@@ -1,4 +1,5 @@
-"""Agent text in the context package and in the inbox: data, cleaned and limited (W4b-02b §6.3).
+"""Agent text in the context package and in the inbox: data, cleaned and limited (W4b-02b §6.3;
+docs/10 §7).
 
 Summaries, texts, names of files, comments of raters and objections come from agents. They
 enter a context package only as values of the package (JSON strings, never as Markdown of the

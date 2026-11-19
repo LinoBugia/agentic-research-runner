@@ -1,5 +1,5 @@
 """Assignment files of a phases run: read from the run folder, checked, placeholders inserted,
-filed (W4b-02b §6.2; Entscheidung 45, 48).
+filed (W4b-02b §6.2; docs/10 §4.3; Entscheidung 45, 48).
 
 Every `task` of an action and of a rating action is a file. The runner reads it at its start
 from the snapshot in the run folder, never from the workfolder: first from the skill

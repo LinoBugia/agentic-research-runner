@@ -1,4 +1,4 @@
-"""What a phases run must pass before its start (W4b-02b §6.1).
+"""What a phases run must pass before its start (W4b-02b §6.1; docs/10 §4.10).
 
 `start_issues(resolved, context_type)` gives the errors of `arr.plan.check.check` (hints do not
 stop a start; the same error of every agent of a pattern is reported once) and what this
