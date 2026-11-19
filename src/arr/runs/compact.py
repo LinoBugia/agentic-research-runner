@@ -40,6 +40,7 @@ __all__ = [
     "SUBMISSIONS_MAX",
     "SUMMARY_MAX_CHARS",
     "AgentContext",
+    "FULL_ASSIGNMENT",
     "CompactReason",
     "Decision",
     "OwnQuestion",
@@ -64,7 +65,8 @@ PACKAGE_HEADING = "## Neue Sitzung"
 """First line of the rebuild package."""
 
 MAX_NOTE_FAILURES = 2
-"""Failed note turns in a row per agent; after that only the engine compacts (Entscheidung 48)."""
+"""Failed note turns in a row per agent; after that only the engine compacts (W4b-05b
+assignment §6.3). A new session or a compaction of the engine starts the count over."""
 
 NOTE_MAX_CHARS = 8_000
 ACTION_MAX_CHARS = 6_000
@@ -79,6 +81,8 @@ PACKAGE_MAX_CHARS = 28_000
 """Limits of the rebuild package in characters: each part and the whole (W4b-05b §6.4)."""
 
 CUT_MARK = "[… gekürzt]"
+FULL_ASSIGNMENT = "Den vollständigen Auftrag liefert `get_assignment()`."
+"""Line under a cut action in the package (W4b-05b.1, G5)."""
 
 
 class CompactReason(StrEnum):
@@ -190,9 +194,16 @@ class AgentContext:
     session: Mapping[str, str] | None = None
     failures: int = 0
     window_noted: bool = False
+    fill_noted: bool = False
+    """`compact_no_fill` was logged for this agent (a turn with requests left no fill level)."""
+    turn_requests: int = 0
+    turn_compacted: bool = False
+    """Requests and an engine compaction in the running turn (to tell why a fill is unknown)."""
     action_key: tuple[str | None, Any] | None = None
     action: str | None = None
     pending: Pending | None = None
+    sending: Pending | None = None
+    """The package in the prompt of the running turn; spent at its `turn_start` (G4)."""
 
     def measured(self, tokens: Any, window: Any) -> None:
         """A turn ended: its fill level (None stays unknown) and the window if reported."""
@@ -208,6 +219,30 @@ class AgentContext:
         self.tokens = None
         self.session = None
         self.failures = 0
+
+    def engine_compacted(self) -> None:
+        """The engine compacted the session: fill level unknown, failures start over (E7)."""
+        self.tokens = None
+        self.failures = 0
+        self.turn_compacted = True
+
+    def turn_began(self) -> None:
+        """A turn of the agent began (its `turn_start`): a package in its prompt is spent."""
+        self.turn_requests = 0
+        self.turn_compacted = False
+        if self.sending is not None and self.pending is self.sending:
+            self.pending = None
+        self.sending = None
+
+    def fill_missing(self) -> bool:
+        """True once per agent when a turn with requests ended without a fill level and
+        without an engine compaction to explain it (`compact_no_fill`, W4b-05b.1)."""
+        if self.fill_noted or self.tokens is not None or not self.turn_requests:
+            return False
+        if self.turn_compacted:
+            return False
+        self.fill_noted = True
+        return True
 
     def follow(self, session: Mapping[str, str]) -> None:
         """Compare with the backend's session before a turn; another one means a new session."""
@@ -264,6 +299,8 @@ class OwnSubmission:
     version: int | None = None
     stage: str | None = None
     attempt: int = 1
+    sealed: bool = False
+    """Sealed until its stage is released: the package names no path (W4b-05b.1, G2)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,7 +348,12 @@ def _submission(entry: OwnSubmission) -> str:
         parts.append(f"Phase {_line(entry.stage, 60)}")
     if entry.attempt > 1:
         parts.append(f"Durchlauf {entry.attempt}")
-    text = f"- {title} · " + " · ".join(parts) + f"\n  Pfad: {_line(entry.path, 300)}"
+    where = (
+        "versiegelt bis zur Freigabe, noch nicht lesbar"
+        if entry.sealed
+        else f"Pfad: {_line(entry.path, 300)}"
+    )
+    text = f"- {title} · " + " · ".join(parts) + f"\n  {where}"
     summary = _line(entry.summary, SUMMARY_MAX_CHARS)
     return text + (f"\n  Kurzfassung: {summary}" if summary else "")
 
@@ -360,7 +402,10 @@ def rebuild_package(
     if action_below:
         sections.append(_Section("Dein laufender Auftrag", ["Er steht unten (dieser Turn)."]))
     elif action and _clean(action):
-        sections.append(_Section("Dein laufender Auftrag", [cut(_clean(action), ACTION_MAX_CHARS)]))
+        text = _clean(action)
+        if len(text) > ACTION_MAX_CHARS:
+            text = cut(text, ACTION_MAX_CHARS - len(FULL_ASSIGNMENT) - 1) + "\n" + FULL_ASSIGNMENT
+        sections.append(_Section("Dein laufender Auftrag", [text]))
     own = [_submission(s) for s in submissions] + [_result(r) for r in results]
     lines = (
         _bounded(

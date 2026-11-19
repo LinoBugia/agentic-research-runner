@@ -13,6 +13,7 @@ from arr.models import Compact
 from arr.runs import compact as module
 from arr.runs.compact import (
     ACTION_MAX_CHARS,
+    FULL_ASSIGNMENT,
     MAX_NOTE_FAILURES,
     NOTE_HEADING,
     NOTE_MAX_CHARS,
@@ -271,3 +272,37 @@ def test_a13_compact_module_does_no_input_or_output() -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert not calls & {"open", "eval", "exec", "compile", "__import__", "print", "input"}
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-05b.1: mutations M14 and M12, G5
+# --------------------------------------------------------------------------------------------
+
+
+def test_m14_at_most_20_submissions_with_a_line_for_the_rest() -> None:
+    short = [submission(n, summary="k") for n in range(1, 26)]  # far below the size limit
+    text = rebuild_package(HEAD, action=None, submissions=short)
+    shown = [line for line in text.splitlines() if line.startswith("- #")]
+    assert len(shown) == SUBMISSIONS_MAX == 20
+    assert "- [… 5 ältere Abgaben weggelassen]" in text
+    assert shown[0].startswith("- #6 ") and shown[-1].startswith("- #25 ")
+    # counter-check: 20 fit without a line
+    exact = rebuild_package(HEAD, action=None, submissions=short[:20])
+    assert "weggelassen" not in exact
+
+
+def test_m12_the_parts_never_reach_the_whole_limit() -> None:
+    """The limit of the whole stays as a guard; the parts cannot reach it (W4b-05b.1, M12)."""
+    from arr.runs.compact import HEAD_MAX_CHARS, QUESTIONS_MAX_CHARS, SUBMISSIONS_MAX_CHARS
+
+    parts = HEAD_MAX_CHARS + ACTION_MAX_CHARS + SUBMISSIONS_MAX_CHARS + QUESTIONS_MAX_CHARS
+    assert parts + NOTE_MAX_CHARS + 1_000 < PACKAGE_MAX_CHARS  # 1 000 for headings and lines
+
+
+def test_g5_a_cut_action_points_to_get_assignment() -> None:
+    text = rebuild_package(HEAD, action="a" * (ACTION_MAX_CHARS * 2))
+    section = text.split("### Dein laufender Auftrag\n\n", 1)[1].split("\n\n###", 1)[0]
+    assert section.endswith("[… gekürzt]\n" + FULL_ASSIGNMENT)
+    assert len(section) <= ACTION_MAX_CHARS
+    short = rebuild_package(HEAD, action="kurz")
+    assert FULL_ASSIGNMENT not in short  # counter-check

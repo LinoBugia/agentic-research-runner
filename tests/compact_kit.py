@@ -9,6 +9,7 @@ from typing import Any
 
 from run_kit import FAST, Topology, events, fake_factory, log_entries, make_run_input, room
 
+from arr.backends.fake import FakeBackend
 from arr.models import GroupSpec, WorkfolderSettings
 from arr.resolve import resolve_run, validate_model
 from arr.runs.compact import NOTE_HEADING
@@ -144,3 +145,56 @@ def layered_manager(
         settings=settings,
         pacing=FAST,
     )
+
+
+# --------------------------------------------------------------------------------------------
+# FakeBackends with one difference (W4b-05b.1)
+# --------------------------------------------------------------------------------------------
+
+
+class UsageWindowBackend(FakeBackend):
+    """Reports the window only with a request, never at the turn end (like Codex without the
+    window at `turn_end`): only `usage.context_window` can tell the orchestrator."""
+
+    def _turn_end(self, state: Any) -> Any:
+        event = super()._turn_end(state)
+        event.data["context_window"] = None
+        return event
+
+
+class FailingResetBackend(FakeBackend):
+    """`reset()` raises: a new session cannot be started."""
+
+    async def reset(self) -> None:
+        raise RuntimeError("reset kaputt")
+
+
+class FailingStartBackend(FakeBackend):
+    """The `fails`-th turn fails before its `turn_start` (like a CLI that does not start)."""
+
+    def __init__(self, *args: Any, fails: int, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.fails = fails
+        self.calls = 0
+
+    def run_turn(self, prompt: str, *, stage: str | None = None) -> Any:
+        self.calls += 1
+        if self.calls == self.fails:
+            return self._broken()
+        return super().run_turn(prompt, stage=stage)
+
+    async def _broken(self) -> Any:
+        raise RuntimeError("Die CLI startet nicht.")
+        yield  # pragma: no cover - makes this an async generator
+
+
+def swap_backends(manager: RunManager, cls: type[FakeBackend], **kwargs: Any) -> RunManager:
+    """Build the run's FakeBackends as `cls` (same script, room and config)."""
+    inner = manager.backend_factory
+
+    def factory(prepared: Any) -> FakeBackend:
+        made = inner(prepared)
+        return cls(made.config, made.script, run_id=made.run_id, room=made.room, **kwargs)
+
+    manager.backend_factory = factory
+    return manager

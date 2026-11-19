@@ -41,12 +41,15 @@ from run_kit import (
 
 from arr.backends.base import TurnStatus
 from arr.models import RunStatus
+from arr.room.store import NOTE_TURN_REFUSED
 from arr.runs.compact import PACKAGE_HEADING, PURPOSE
 from arr.runs.context import RunContext
 from arr.runs.orchestrator import Orchestrator, StopReason
 from arr.usage import compute_run_usage
 
 OFF = {"at": "100%"}
+NOTE_WAIT_S = 30.0
+"""How long the note turn of the stop tests would wait; a stop must end it far earlier."""
 SUB = {"submission": {"format": "text"}}
 
 
@@ -150,12 +153,16 @@ async def test_a5_note_turn_is_technical(workfolder: Path) -> None:
     assert [(s, p) for _, s, p in assignments(below)] == [("s", "Auftrag."), ("s", "Weiter.")]
     assert [t for t, _, _ in assignments(compacted)] == [1, 3]
 
-    # a `submit` in the note turn hits the assignment from before (attempt 1)
+    # a `submit` in the note turn is refused (Entscheidung 53, W4b-05b.1): no submission,
+    # the agent sees why; the counter-check below the threshold has the same one submission
     subs = compacted.room.submissions(agent="solo")
-    assert [(s.summary, s.stage, s.attempt) for s in subs] == [
-        ("Fassung 1.", "s", 1),
-        ("Im Notiz-Turn.", "s", 1),
+    assert [(s.summary, s.stage, s.attempt) for s in subs] == [("Fassung 1.", "s", 1)]
+    assert [s.summary for s in below.room.submissions(agent="solo")] == ["Fassung 1."]
+    note_results = [
+        e["data"] for e in events(run_dir, "solo") if e["turn"] == 2 and e["kind"] == "tool_result"
     ]
+    assert [r["is_error"] for r in note_results] == [True]
+    assert note_results[0]["content"] == NOTE_TURN_REFUSED
 
     # no inbox in the note turn; the message waits for the turn after it
     sent = prompts(run_dir, "solo")
@@ -323,7 +330,7 @@ def long_note_run(workfolder: Path, outcomes: list[Any], **kwargs: Any) -> Any:
         outcomes.append(await ctx.turn("solo", "eins"))
         outcomes.append(await ctx.turn("solo", "zwei"))
 
-    note = kwargs.pop("note", [say(NOTE), wait(30), fill(650)])
+    note = kwargs.pop("note", [say(NOTE), wait(NOTE_WAIT_S), fill(650)])
     turns = script([say("x"), fill(900)], [say("y"), fill(10)], note_turns=[note])
     return make_manager(
         workfolder, topology, {"solo": turns}, agents=[agent("solo", compact=LOW)], **kwargs
@@ -336,13 +343,13 @@ async def test_a10_stop_during_the_note_turn(workfolder: Path, how: str) -> None
     manager = long_note_run(workfolder, outcomes)
     running = asyncio.create_task(manager.run())
     await eventually(lambda: manager.orchestrator is not None and note_active(manager.orchestrator))
-    started = time.monotonic()
+    started = time.monotonic()  # the note turn would wait NOTE_WAIT_S without the stop
     if how == "stop":
         manager.stop()
     else:
         await manager.orchestrator.halt(StopReason.PROFILE_BLOCKED, profile="fake-auth")
     assert await asyncio.wait_for(running, 10) is RunStatus.STOPPED
-    assert time.monotonic() - started < 5, "the note turn was interrupted"
+    assert time.monotonic() - started < NOTE_WAIT_S / 2, "the note turn was interrupted"
     assert [o.status for o in outcomes] == [TurnStatus.OK, TurnStatus.INTERRUPTED]
     assert ends(manager.run_dir, "solo")[-1]["status"] == "interrupted"
     [entry] = compacts(manager.run_dir)

@@ -178,3 +178,73 @@ async def test_a9_claude_backend_sends_context_again_and_logs_the_compaction(
     assert third[-1].data["context_tokens"] is None  # new session, no request yet
     md = render_transcript([e.to_record() for e in first])
     assert "Die Engine hat die Sitzung verdichtet" in md and "150 k" in md
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-05b.1 point 2 (M2, G1): the main session, whatever the spelling of the model
+# --------------------------------------------------------------------------------------------
+
+USAGE_SONNET = {
+    SONNET: {
+        "inputTokens": 1,
+        "outputTokens": 1,
+        "contextWindow": 1_000_000,
+        "canonicalModel": SONNET,
+    }
+}
+
+
+def request(model: str, mid: str, tokens: int, *, parent: str | None = None) -> AssistantMessage:
+    return AssistantMessage(
+        [TextBlock("t")],
+        model,
+        parent_tool_use_id=parent,
+        message_id=mid,
+        usage={
+            "input_tokens": tokens,
+            "cache_read_input_tokens": 100,
+            "cache_creation_input_tokens": 700,
+            "output_tokens": 3,
+        },
+    )
+
+
+def finish_with(agent_model: str, messages: list[Any]) -> dict[str, Any]:
+    result = ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="s1",
+        total_cost_usd=0.01,
+        model_usage=USAGE_SONNET,
+    )
+    mapper = ClaudeEvents("r", "a", agent_model, CostKind.ESTIMATED)
+    mapper.start_turn(1)
+    for msg in [*messages, result]:
+        mapper.feed(msg)
+    data = mapper.finish()[-1].data
+    return {k: data[k] for k in ("context_tokens", "context_window")}
+
+
+def test_m2_short_names_suffix_and_case_give_the_same_fill_level() -> None:
+    messages = [request(SONNET, "m1", 5_000)]
+    full = finish_with(SONNET, messages)
+    assert full == {"context_tokens": 5_800, "context_window": 1_000_000}  # positive control
+    for configured in ("sonnet", "claude-sonnet-5-5[1m]", "Claude-Sonnet-5-5"):
+        assert finish_with(configured, messages) == full, configured
+
+
+def test_g1_subagent_and_helper_requests_do_not_count() -> None:
+    main = request(SONNET, "m1", 90_000)
+    for configured in (SONNET, "sonnet"):
+        subagent = request(SONNET, "sub1", 2_000, parent="toolu_task_1")  # same model
+        assert finish_with(configured, [main, subagent])["context_tokens"] == 90_800
+        big = request(SONNET, "sub2", 600_000, parent="toolu_task_1")
+        assert finish_with(configured, [main, big])["context_tokens"] == 90_800
+        helper = request(HAIKU, "h1", 900_000)  # another model, main session
+        assert finish_with(configured, [main, helper])["context_tokens"] == 90_800
+    # counter-check: a later main request of the agent's model does count
+    later = request(SONNET, "m2", 120_000)
+    assert finish_with("sonnet", [main, later])["context_tokens"] == 120_800

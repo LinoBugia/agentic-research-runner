@@ -192,6 +192,11 @@ class EventLogger:
         return last
 
     @property
+    def closed(self) -> bool:
+        """True after `close()` (the run is over)."""
+        return self._transcript is None
+
+    @property
     def seq(self) -> int:
         """`seq` of the last logged event (0 before the first)."""
         return self._seq
@@ -469,6 +474,8 @@ def render_transcript(
                 seen_turns.add(turn)
                 open_turn = True
                 label = f"Turn {turn}" + (" (Neustart)" if restart else "")
+                if is_start and _mapping(rec.get("data")).get("purpose") == "compact":
+                    label += " (Übergabe-Notiz)"  # the note turn of auto-compact (W4b-05b.1)
                 head = f"## {label} · {_clock(rec.get('ts'), tz)}"
                 if is_start:
                     data = _mapping(rec.get("data"))

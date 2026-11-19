@@ -14,6 +14,7 @@ from compact_kit import (
     LAYERS,
     LOW,
     NOTE,
+    UsageWindowBackend,
     compacts,
     ends,
     fill,
@@ -25,6 +26,7 @@ from compact_kit import (
     script,
     starts,
     submit,
+    swap_backends,
     turn_log,
 )
 from run_kit import agent, channel, log_entries, make_manager, make_workfolder, post
@@ -212,23 +214,31 @@ async def test_a3_window_unknown_share_does_not_apply_tokens_do(workfolder: Path
 
 
 async def test_a3_window_from_a_request_like_codex(workfolder: Path) -> None:
-    """The window reported with a request (Codex) counts as well as the one of the turn end."""
-    manager = await run_with(
-        workfolder, {"at": "50%"}, 600, 10, context_window=None, repeat_last=False
-    )
-    assert note_turns(manager) == []  # unknown window
-    turns = script([fill(600, context_window=1_000)], [fill(10)], note_turns=[good_note()])
+    """The window only comes with a request (`usage.context_window`), the turn end has none:
+    the share threshold still applies (W4b-05b.1, M20)."""
 
     async def topology(ctx: RunContext) -> None:
         await ctx.turn("solo", "eins")
         await ctx.turn("solo", "zwei")
 
-    turns["context_window"] = None
-    again = make_manager(workfolder, topology, {"solo": turns}, agents=solo(compact={"at": "50%"}))
+    def run(window: int | None) -> Any:
+        first = [fill(600, context_window=window)] if window else [fill(600)]
+        turns = script(first, [fill(10)], note_turns=[good_note()], context_window=None)
+        manager = make_manager(
+            workfolder, topology, {"solo": turns}, agents=solo(compact={"at": "50%"})
+        )
+        return swap_backends(manager, UsageWindowBackend)
+
+    again = run(1_000)
     assert await asyncio.wait_for(again.run(), 30) is RunStatus.DONE
+    assert [e["context_window"] for e in ends(again.run_dir, "solo")] == [None, None, None]
     assert note_turns(again) == [2]
     [entry] = compacts(again.run_dir)
     assert (entry["window"], entry["threshold"]) == (1_000, 500)
+    # counter-check: no window at all, the share does not apply
+    without = run(None)
+    assert await asyncio.wait_for(without.run(), 30) is RunStatus.DONE
+    assert note_turns(without) == []
 
 
 @pytest.mark.parametrize("layer", LAYERS)

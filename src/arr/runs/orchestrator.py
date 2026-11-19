@@ -200,6 +200,11 @@ class OrchestratorLog:
     (an agent became `done` after a turn, with `reason`) and `turn_silent`. Since W3-09:
     `waiting` with reason `result_from` and the awaited agent in `result_from` (L14), and
     `user_question` (`agent`, `channel`, `msg`, `item`, `state` open/answered/closed, L16).
+    Since W4b-05b: `compact` (one per compaction: `agent`, `reason` auto/phase/engine,
+    `stage`, `tokens`, `window`, `threshold`, `note_chars`, `ok`, on a failure `failures`),
+    `compact_no_window` and `compact_no_fill` (once per agent: a share without a known window,
+    a turn with requests without a fill level), and `purpose: compact` at `turn`/`turn_end`
+    of a note turn.
     """
 
     def __init__(self, run_dir: Path) -> None:
@@ -672,6 +677,8 @@ class Orchestrator(RunContext):
         agent_id = handle.id
         backend = self.backends[agent_id]
         if await self._auto_compact(handle, gate, stage):  # a note turn ran (W4b-05b)
+            if not await self._profile_again(handle, gate):
+                return self._not_run(handle)
             await self._runnable.wait()
             if (refused := self._refuse(handle)) is not None:
                 return refused
@@ -713,6 +720,7 @@ class Orchestrator(RunContext):
             self._finish_status(handle, since=since, mark=mark, was_done=was_done, result=submitted)
             self._write_session(agent_id, backend)
             self._follow_session(agent_id, backend, measured=True)
+            self._context_of(agent_id).sending = None  # not started: the package stays (G4)
             undelivered = self._unseen(agent_id, active.pending)
             for listener in list(self._listeners):
                 listener.on_turn_end(agent_id, undelivered)
@@ -760,8 +768,12 @@ class Orchestrator(RunContext):
         match event.kind:
             case EventKind.TOOL_CALL:
                 active.tool_calls += 1
+            case EventKind.TURN_START:
+                self._context_of(handle.id).turn_began()
             case EventKind.USAGE:
-                self._context_of(handle.id).saw_window(data.get("context_window"))
+                ctx = self._context_of(handle.id)
+                ctx.turn_requests += 1
+                ctx.saw_window(data.get("context_window"))
             case EventKind.COMPACTION:
                 self._engine_compacted(handle.id, data)
             case EventKind.TEXT:
@@ -787,9 +799,10 @@ class Orchestrator(RunContext):
                 )
                 record.session = data.get("session")
                 record.num_turns = data.get("num_turns")
-                self._context_of(handle.id).measured(
-                    data.get("context_tokens"), data.get("context_window")
-                )
+                ctx = self._context_of(handle.id)
+                ctx.measured(data.get("context_tokens"), data.get("context_window"))
+                if ctx.fill_missing():
+                    self.log.write("compact_no_fill", agent=handle.id, model=handle.config.model)
                 self.cost_usd += record.usage.cost_usd or 0.0
                 budget = self.config.limits.budget_usd
                 if budget is not None and self.cost_usd >= budget:
@@ -1203,6 +1216,7 @@ class Orchestrator(RunContext):
         self._handle(agent_id)
         async with self._locks[agent_id]:
             await self.backends[agent_id].reset()
+            self._context_of(agent_id).pending = None  # W4b-05b.1: reset drops a compact package
         self.log.write("session_reset", agent=agent_id, stage=self.stage)
 
     def seal_results(self, stage: str, channel: str | None = None) -> None:
@@ -1728,11 +1742,16 @@ class Orchestrator(RunContext):
         (`context: compact`, docs/10 §4.6): its running turn ends first (the same lock as
         `reset_session`), then `backend.reset()`; the next turn gets the rebuild package with
         `note` as the agent's own note (None: without a note). No note turn, no model. Called
-        again before that turn, the last note counts."""
-        self._handle(agent_id)
+        again before that turn, the last note counts. Before the agent's first turn and after
+        the end of the run it does nothing; a later `reset_session` drops the package."""
+        handle = self._handle(agent_id)
         ctx = self._context_of(agent_id)
         backend = self.backends[agent_id]
+        if self.stop_requested or self.loggers[agent_id].closed:
+            return  # the run is over: nothing to compact, nothing to log (G3)
         async with self._locks[agent_id]:
+            if handle.turns_used == 0:
+                return  # no session yet: nothing to rebuild (G3)
             self._follow_session(agent_id, backend)
             tokens, window = ctx.tokens, ctx.window
             await backend.reset()
@@ -1796,6 +1815,31 @@ class Orchestrator(RunContext):
         )
         return True
 
+    async def _profile_again(self, handle: AgentHandle, gate: ProfileGate) -> bool:
+        """After a note turn: did it bring a rate limit (pause or throttle of the profile), the
+        working turn does not start in the slot already taken; it gives the slot back and
+        waits for the profile like any new turn (M1, login protection). False if the run
+        stopped meanwhile (no slot is held then)."""
+        if gate.blocked_until() is None:
+            return True
+        gate.release()
+        if not gate.has_slot():  # docs/09 §4.5: waiting for a free place is visible
+            self._capacity.add(handle.id)
+            self.log.write(
+                "waiting",
+                agent=handle.id,
+                reason="capacity",
+                profile=gate.name,
+                until=gate.blocked_until(),
+            )
+        try:
+            acquired = await gate.acquire(lambda: self.stop_requested)
+        finally:
+            self._capacity.discard(handle.id)
+        if not acquired:
+            gate.active += 1  # `turn` gives back the slot it took; this keeps the count right
+        return acquired
+
     async def _note_turn(
         self, handle: AgentHandle, gate: ProfileGate, stage: str | None
     ) -> str | None:
@@ -1823,9 +1867,11 @@ class Orchestrator(RunContext):
         self.log.write("turn", agent=agent_id, turn=number, stage=stage, purpose=PURPOSE)
         record = _TurnRecord()
         prompt = read_template("prompts", "compact_note.md").strip()
+        self.room.begin_note_turn(agent_id)  # its room tools refuse (Entscheidung 53)
         try:
             await self._consume(handle, gate, active, record, prompt, stage, purpose=PURPOSE)
         finally:
+            self.room.end_note_turn(agent_id)
             self._active.pop(agent_id, None)
             self.room.clear_wait(agent_id, WaitKind.MESSAGES)
             self._waits.pop(agent_id, None)
@@ -1915,9 +1961,10 @@ class Orchestrator(RunContext):
         package for this turn (in front of the inbox), else an empty string."""
         ctx = self._context_of(agent_id)
         starts = ctx.start_action(stage, (context or {}).get("attempt"), prompt)
-        pending, ctx.pending = ctx.pending, None
+        pending = ctx.pending
         if pending is None:
             return ""
+        ctx.sending = pending  # spent once the turn has begun (`turn_start`, G4)
         run_dir = self.prepared.run_dir
         package = rebuild_package(
             read_template("prompts", "compact_rebuild.md"),
@@ -1930,6 +1977,7 @@ class Orchestrator(RunContext):
                     status=s.status,
                     summary=s.summary,
                     path=str(run_dir / s.path),
+                    sealed=s.sealed,
                     name=s.name,
                     version=s.version,
                     stage=s.stage,
@@ -1959,7 +2007,7 @@ class Orchestrator(RunContext):
     def _engine_compacted(self, agent_id: str, data: Mapping[str, Any]) -> None:
         """The engine compacted the session (safety net): fill level unknown, one log entry."""
         ctx = self._context_of(agent_id)
-        ctx.tokens = None
+        ctx.engine_compacted()  # fill level unknown, failed notes start over (E7)
         before = data.get("tokens_before")
         self._log_compact(
             agent_id,

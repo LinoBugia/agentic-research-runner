@@ -12,9 +12,9 @@ wraps them into `AgentEvent`s with the raw notification attached.
   `cachedInputTokens`, so `input` is the uncached part and `cache_read` the cached one.
 - Fill level (W4b-05b, docs/10 §4.6): `last.inputTokens` of the latest request, the window
   from `tokenUsage.modelContextWindow` (also on the `usage` event as `context_window`).
-- Compaction by the engine: the item `contextCompaction` or the notification
-  `thread/compacted` → one `compaction` event (whichever comes first, once until the next
-  request); the fill level is unknown until the next request.
+- Compaction by the engine: the item `contextCompaction` (once by its ID) and the
+  notification `thread/compacted` pair up into one `compaction` event; the fill level is
+  unknown until the next request (`last.inputTokens` 0 counts as unknown).
 - Rate limits: `account/rateLimits/updated` → `rate_limit` with the RunManager's statuses
   (`rate_limit_status`), only when the status or the rounded utilization changes.
 - Blocked commands: the sandbox's blocked commands can be missing in the stream, completely
@@ -224,7 +224,10 @@ class TurnEvents:
     _start: Usage | None = None
     _total: Usage | None = None
     _rate: tuple[str, float | None] | None = None
-    _compacted: bool = False
+    _compaction_items: set[str] = field(default_factory=set)
+    _items_unpaired: int = 0
+    """Compaction items without their `thread/compacted` yet (and the reverse below)."""
+    _notes_unpaired: int = 0
 
     def usage(self) -> Usage:
         """Usage of this turn: difference of the thread's `total` (zero without updates)."""
@@ -267,17 +270,32 @@ class TurnEvents:
                 self.duration_ms = turn.get("durationMs")
         return []
 
-    def _compaction(self) -> list[Event]:
-        """One `compaction` event per compaction: item and notification may both come."""
+    def _compaction(self, item: dict[str, Any] | None = None) -> list[Event]:
+        """One `compaction` event per compaction (W4b-05b.1, M3). The server sends the item
+        `contextCompaction` as `item/started` and `item/completed` (usage updates in between)
+        and may send `thread/compacted`: an item counts once by its ID, and a notification and
+        an item pair up in either order, so each compaction is one event."""
         self.context_tokens, self.measured = None, True
-        if self._compacted:
+        if item is not None:
+            item_id = item.get("id")
+            if isinstance(item_id, str):
+                if item_id in self._compaction_items:
+                    return []
+                self._compaction_items.add(item_id)
+            if self._notes_unpaired:
+                self._notes_unpaired -= 1
+                return []
+            self._items_unpaired += 1
+        elif self._items_unpaired:
+            self._items_unpaired -= 1
             return []
-        self._compacted = True
+        else:
+            self._notes_unpaired += 1
         return [(EventKind.COMPACTION, dict(CompactionData(trigger=None, tokens_before=None)))]
 
     def _item_started(self, item: dict[str, Any]) -> Iterator[Event]:
         if item.get("type") == "contextCompaction":
-            yield from self._compaction()
+            yield from self._compaction(item)
             return
         if item.get("type") in _TOOL_ITEMS and item.get("id") not in self._started:
             self._started.add(item["id"])
@@ -298,7 +316,7 @@ class TurnEvents:
     def _item_completed(self, item: dict[str, Any]) -> Iterator[Event]:
         kind = item.get("type")
         if kind == "contextCompaction":
-            yield from self._compaction()
+            yield from self._compaction(item)
         elif kind == "agentMessage":
             if item.get("text"):
                 yield EventKind.TEXT, dict(TextData(text=item["text"]))
@@ -353,7 +371,9 @@ class TurnEvents:
             data["model"] = self.model
         filled = (usage.get("last") or {}).get("inputTokens")
         self.context_tokens = _count(filled)
-        self.measured, self._compacted = True, False
+        if self.context_tokens == 0:  # no request: e.g. the update right after a compaction
+            self.context_tokens = None
+        self.measured = True
         window = _count(usage.get("modelContextWindow"))
         if window:
             self.context_window = window

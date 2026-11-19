@@ -12,8 +12,10 @@ and the cumulative cost and token totals of the client session. Per turn it maps
   resends `context.md`)
 
 **Fill level** (W4b-05b, docs/10 §4.6): the input tokens (`input + cache_read + cache_write`)
-of the last request of the agent's own model in this session; helper requests of other
-models do not count. Unknown in a new session and after a compaction until the next request.
+of the last request of the main session (`parent_tool_use_id` empty) with the agent's model,
+compared by `same_model` (short names like `sonnet`, `[1m]`, case); helper requests of other
+models and requests of subagents do not count. Unknown in a new session and after a
+compaction until the next request.
 The window size comes from `ResultMessage.model_usage[<model>].contextWindow`, so it is known
 only from the end of the first turn on.
 
@@ -25,6 +27,7 @@ messages carries start values (output tokens of the first chunk), so neither mat
 cost. A reset of the session totals (compaction, `/clear`) counts the new totals as the delta.
 """
 
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -120,21 +123,41 @@ def context_tokens(usage: UsageData) -> int | None:
     return sum(counts) if counts else None
 
 
-def context_window(model_usage: Mapping[str, Any] | None, model: str) -> int | None:
-    """`contextWindow` of `model` in the cumulative `model_usage` of a `ResultMessage` (key or
-    `canonicalModel`), None if it is not there."""
-    usage = model_usage or {}
-    entry = usage.get(model)
-    if not isinstance(entry, Mapping):
+def model_key(name: str | None) -> str:
+    """A model name for comparing: lower case, without a `[…]` suffix such as `[1m]` and
+    without a date suffix (`-20261001`)."""
+    key = (name or "").strip().lower()
+    key = re.sub(r"\[[^\]]*\]$", "", key)
+    return re.sub(r"-\d{8}$", "", key)
+
+
+def same_model(configured: str, reported: str | None) -> bool:
+    """True if the API's model name `reported` is the agent's `configured` model, also when
+    the config uses a short name (`sonnet`), a suffix (`[1m]`) or other case (W4b-05b.1)."""
+    want, got = model_key(configured), model_key(reported)
+    if not want or not got:
+        return False
+    return want == got or want in got.split("-")
+
+
+def context_window(
+    model_usage: Mapping[str, Any] | None, model: str, reported: str | None = None
+) -> int | None:
+    """`contextWindow` of the agent's model in the cumulative `model_usage` of a
+    `ResultMessage`: the entry of the API name `reported` if known, else the entry whose key
+    or `canonicalModel` is `model` (`same_model`); None if there is none."""
+    usage = {k: v for k, v in (model_usage or {}).items() if isinstance(v, Mapping)}
+    entry = usage.get(reported) if reported else None
+    if entry is None:
         entry = next(
             (
                 e
-                for e in usage.values()
-                if isinstance(e, Mapping) and e.get("canonicalModel") == model
+                for key, e in usage.items()
+                if same_model(model, key) or same_model(model, e.get("canonicalModel"))
             ),
             None,
         )
-    window = entry.get("contextWindow") if isinstance(entry, Mapping) else None
+    window = entry.get("contextWindow") if entry is not None else None
     return (
         window if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None
     )
@@ -187,6 +210,8 @@ class ClaudeEvents:
         self.context_tokens: int | None = None
         """Fill level of the session (see module docstring), None while unknown."""
         self.context_window: int | None = None
+        self.reported_model: str | None = None
+        """The API's name of the agent's model, from its main-session requests."""
         """Window of the agent's model; stays across sessions (a property of the model)."""
         self.turn = 0
         self._seen: set[str] = set()
@@ -269,8 +294,10 @@ class ClaudeEvents:
         if msg.usage and msg.message_id and msg.message_id not in self._seen:
             self._seen.add(msg.message_id)
             data = message_usage(msg.usage, msg.model or self.model)
-            if (msg.model or self.model) == self.model:
+            main = msg.parent_tool_use_id is None  # not a subagent's request
+            if main and (msg.model is None or same_model(self.model, msg.model)):
                 self.context_tokens = context_tokens(data)
+                self.reported_model = msg.model or self.reported_model
             events.append(self.event(EventKind.USAGE, data, raw))
         return _raw_once(events)
 
@@ -309,7 +336,8 @@ class ClaudeEvents:
         usage, cost = self._turn_usage(result)
         if result is not None:
             self.context_window = (
-                context_window(result.model_usage, self.model) or self.context_window
+                context_window(result.model_usage, self.model, self.reported_model)
+                or self.context_window
             )
         data = {
             "status": str(status),
