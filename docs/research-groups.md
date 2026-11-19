@@ -1,6 +1,6 @@
 # Research groups: agents, phases, actions and gates
 
-> **Status: design.** Today `arr` ships five fixed group types (`solo`, `roundtable`, `waterfall`, `review`, `exploration`). This document describes the model they are being rebuilt on, so that you can compose your own groups from the same parts. It records where the design is going, not what the code does today. The notation of the group file is settled for the first version; the code that reads it is being built. Built so far: the submission tool with its formats and checks, the result folder with versions and diffs, and the group file itself (its model, the checks and the estimate of turns). No run can use phases yet, because the phase runner is still missing.
+> **Status: design.** Today `arr` ships five fixed group types (`solo`, `roundtable`, `waterfall`, `review`, `exploration`). This document describes the model they are being rebuilt on, so that you can compose your own groups from the same parts. It records where the design is going, not what the code does today. The notation of the group file is settled for the first version; the code that reads it is being built. Built so far: the submission tool with its formats and checks, the result folder with versions and diffs, the group file itself (its model, the checks and the estimate of turns), and the folders (scratch folder, fresh work folders with retired ones, an agent's own record closed to it). No run can use phases yet, because the phase runner is still missing; until then nothing asks for a fresh work folder.
 
 ## The idea
 
@@ -125,7 +125,7 @@ By default the work folder follows the `context` setting of the phase (see [Cont
 
 A shared folder never becomes fresh, because that would take the work away from the others. For an agent in a shared folder, `reset` renews only the session.
 
-After the run, slimming deletes the work folders, retired folders and the copy of the project. The results folder, the transcripts, the chats with their attachments and the diffs stay. Nothing flows back into your project by itself: you take over what you want from the results folder.
+After the run, slimming deletes the work folders, retired folders, the agents' temp folders and the copy of the project. The results folder, the transcripts, the chats with their attachments and the diffs (also those of the retired folders) stay. Nothing flows back into your project by itself: you take over what you want from the results folder.
 
 ## Phases
 
