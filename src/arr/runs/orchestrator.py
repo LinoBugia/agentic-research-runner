@@ -75,6 +75,7 @@ from arr.room.types import (
     WaitKind,
     WaitState,
 )
+from arr.runs import folders
 from arr.runs.context import AgentHandle, DiscussionOutcome, RunContext, TurnJob
 from arr.runs.eventlog import EventLogger
 from arr.runs.pacing import (
@@ -1194,6 +1195,38 @@ class Orchestrator(RunContext):
         async with self._locks[agent_id]:
             await self.backends[agent_id].reset()
         self.log.write("session_reset", agent=agent_id, stage=self.stage)
+
+    async def fresh_folder(self, agent_id: str, *, stage: str, attempt: int) -> None:
+        """The agent gets a fresh working folder in place after its running turn; the old
+        content goes to `retired/`, the scratch folder is emptied (`arr.runs.folders`, W4b-05a).
+        With a new session too, call `reset_session` first (Entscheidung 48). `ArrError` for
+        an agent in a shared folder or when something old would stay; the folder is then not
+        fresh and the run must not go on."""
+        self._handle(agent_id)
+        started = time.monotonic()
+        async with self._locks[agent_id]:
+            try:
+                done = await asyncio.to_thread(
+                    folders.fresh_folder, self.prepared.agents[agent_id], stage=stage
+                )
+            except ArrError as exc:
+                self.log.write(
+                    "folder_fresh_failed",
+                    agent=agent_id,
+                    stage=stage,
+                    attempt=attempt,
+                    message=exc.message,
+                    duration_s=round(time.monotonic() - started, 3),
+                )
+                raise
+        self.log.write(
+            "folder_fresh",
+            agent=agent_id,
+            stage=stage,
+            attempt=attempt,
+            duration_s=round(time.monotonic() - started, 3),
+            **done.log_data(),
+        )
 
     def seal_results(self, stage: str, channel: str | None = None) -> None:
         """Hide the results of `stage` until `release_results` (F4)."""

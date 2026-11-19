@@ -13,12 +13,17 @@ does not stop the others):
    unified diff, binary and very large files as one line, symlinks with their target; files
    written by arr (`AgentFile.generated_paths`) are left out. Symlinks are never followed.
    A link in `base/` to a file excluded by `copy_exclude` is broken and therefore missing in
-   the copy; it is left out with a hint in `summary.md`.
+   the copy; it is left out with a hint in `summary.md`. Each filed-away working folder
+   `retired/<id>/<folder>/` (W4b-05a) gets its diff `agents/<id>/retired-<folder>.diff` by the
+   same rules.
 4. `output/results/NNN-<agent>-<kind>.md` per result (unless the submitted file has that
    name), `output/results.json`, `output/ratings.json`; for submissions of `submit` (W4b-01)
    `output/submissions.json`, only when there are any or the topology is `phases`.
 5. `usage.json`, and an empty `approvals.jsonl` if there were no requests.
-6. `output/summary.md` (German): status and reason, duration, agents, stages with attempts and
+6. Cleaning up (W4b-05a, `arr.runs.folders.clean_up_run`): `scratch/`, the rests of submissions
+   in `groupchats/staging/` and folders in `output/submissions/` without a database row; never
+   below `groupchats/sealed/`. What cannot be deleted is an entry `cleanup` in the log.
+7. `output/summary.md` (German): status and reason, duration, agents, stages with attempts and
    scores, the overview a topology built itself (`review`: verdict and rounds, `exploration`:
    ranking; the latest checkpoint with `overview`, W4-03 F8/F9), results with links, the
    submissions with their summaries (W4b-01, docs/10 §4.8, without a model), a summarizer's
@@ -47,6 +52,7 @@ from arr.models import RunStatus, TopologyKind, WorkspaceMode
 from arr.room.store import RESULTS_DIR, ROOM_DIR, RoomStore
 from arr.room.types import Rating, Result, Submission
 from arr.runs.eventlog import TRANSCRIPT_FILE, read_events, write_transcript_md
+from arr.runs.folders import clean_up_run, retired_diff_name, retired_folders
 from arr.runs.orchestrator import ORCHESTRATOR_LOG, OrchestratorLog, stopped_text
 from arr.runs.prepare import AgentFile, PreparedRun, RunMeta, load_run_meta
 from arr.usage import RunUsage, UsageTotal, compute_run_usage, write_usage_json
@@ -390,6 +396,7 @@ class _Finalizer:
             ("Abgaben", self._submissions),
             ("usage.json", self._usage),
             ("approvals.jsonl", self._approvals),
+            ("Aufräumen", self._clean_up),
         ]
         for label, step in steps:
             self._step(label, step)
@@ -451,6 +458,9 @@ class _Finalizer:
                 cache[work] = self._diff_of(agent.file, work)
             if agent.agent_dir.is_dir():
                 _write_text(agent.agent_dir / DIFF_FILE, cache[work].text)
+                for folder in retired_folders(self.run_dir, agent.id):  # W4b-05a
+                    diff = self._diff_of(agent.file, folder)
+                    _write_text(agent.agent_dir / retired_diff_name(folder), diff.text)
 
     def _diff_of(self, file: AgentFile, work: Path) -> DiffResult:
         """The diff of one working folder; an error stays with this folder."""
@@ -465,6 +475,15 @@ class _Finalizer:
             return DiffResult(f"Änderungen nicht ermittelbar ({type(exc).__name__}).\n")
         self.hints += result.hints
         return result
+
+    def _clean_up(self) -> None:
+        """Scratch folders and rests of submissions (W4b-05a); a failure is a message only."""
+        submissions = self.room.submissions() if self.room is not None else None
+        done = clean_up_run(self.run_dir, submissions)
+        if done.removed or done.failed:
+            OrchestratorLog(self.run_dir).write(
+                "cleanup", removed=done.removed, failed=done.failed, where="finalizer"
+            )
 
     def _results(self) -> None:
         by_result: dict[int, list[Rating]] = {}

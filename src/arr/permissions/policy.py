@@ -78,6 +78,9 @@ __all__ = [
     "LogEvent",
     "PROTECTED_NAMES",
     "PROTECTED_TOP_NAMES",
+    "RETIRED_DIR",
+    "SCRATCH_DIR",
+    "SCRATCH_ENV",
     "PermissionRules",
     "PolicyEngine",
     "Remembered",
@@ -214,6 +217,16 @@ RUN_HIDDEN_PATHS = (
 a sealed stage (independent reviews), the copies on their way there and the room database,
 which holds every result. The same names as `arr.room.store` (`SEALED_DIR`, `STAGING_DIR`,
 `ROOM_DB_FILES`), held equal by a test."""
+
+RETIRED_DIR = "retired"
+"""Filed-away working folders `retired/<id>/<nr>-<phase>/` (W4b-05a, docs/10 §4.12): closed for
+every agent, also for the one that worked in them, without an approval path."""
+
+SCRATCH_DIR = "scratch"
+"""Scratch folders `scratch/<id>/` (W4b-05a): a write root of its agent, closed for the others."""
+
+SCRATCH_ENV = "ARR_SCRATCH"
+"""Environment variable with the absolute path of the agent's scratch folder (both shells)."""
 
 READ_BLOCKED_ROOTS = ("/Volumes",)
 """Besides `~` and the workfolder: roots that are not readable unless on the allowlist."""
@@ -413,6 +426,16 @@ _R_FOREIGN = (
     "Das ist der Ordner eines anderen Agenten (Arbeitskopie, Transkript oder Daten). Er ist nie "
     "lesbar, auch nicht mit Freigabe. Was ein anderer Agent teilen will, hängt er im Chat an "
     "oder gibt es als Ergebnis ab; frag ihn mit @name."
+)
+_R_OWN_LOG = (
+    "Das ist das Protokoll deines eigenen Agenten (Transkript, Roh-Events, Sitzung, Diffs und "
+    "Daten von arr). Es ist für dich nie lesbar und nie beschreibbar, auch nicht mit Freigabe. "
+    "Was bleiben soll, steht in deinem Arbeitsordner, in deinen Abgaben (output/) oder im Chat."
+)
+_R_RETIRED = (
+    "Das ist ein abgelegter Arbeitsordner. Abgelegte Ordner sind für keinen Agenten lesbar, "
+    "auch nicht für den, der darin gearbeitet hat, und auch nicht mit Freigabe. Was bleiben "
+    "sollte, steht in den Abgaben (output/)."
 )
 _R_LOOPBACK = (
     "Verbindungen zu diesem Rechner selbst (localhost, 127.0.0.1, ::1 und Ähnliches) sind nie "
@@ -706,6 +729,26 @@ class RunPaths:
         """Generated Claude plugin of an agent (W1-02: `agents/<id>/plugin`); read-only."""
         return self.run_dir / "agents" / agent.id / "plugin"
 
+    def agent_dir(self, agent: AgentConfig) -> Path:
+        """`agents/<id>/`: below it only the working folder and the plugin are the agent's;
+        transcript, events, session and the other files of arr are closed for it (W4b-05a)."""
+        return self.run_dir / "agents" / agent.id
+
+    @property
+    def retired_dir(self) -> Path:
+        """`retired/`: filed-away working folders, closed for every agent (W4b-05a)."""
+        return self.run_dir / RETIRED_DIR
+
+    @property
+    def scratch_root(self) -> Path:
+        """`scratch/`: the scratch folders of all agents (W4b-05a)."""
+        return self.run_dir / SCRATCH_DIR
+
+    def scratch_dir(self, agent: AgentConfig) -> Path:
+        """The agent's scratch folder `scratch/<id>/`: a write root of its own, foreign for
+        every other agent, emptied with a fresh working folder and deleted at the end."""
+        return self.scratch_root / agent.id
+
     def work_dir(self, agent: AgentConfig) -> Path:
         """Working folder of an agent: `shared/<name>` or `agents/<id>/work` (docs/02 §3.1)."""
         if agent.workspace.mode is WorkspaceMode.SHARED and agent.workspace.name:
@@ -747,11 +790,19 @@ class SandboxProfile:
     hidden: tuple[Path, ...] = ()
     """The `RUN_HIDDEN_PATHS` of the run (also in `sensitive`): sealed results, room database."""
     private_roots: tuple[Path, ...] = ()
-    """`agents/`, `shared/` and `tmp/` of the run: below them only `own` is this agent's
-    (W4-03.1 H1, W4-03.2 N2)."""
+    """`agents/`, `shared/`, `tmp/`, `scratch/` and `retired/` of the run: below them only
+    `own` is this agent's (W4-03.1 H1, W4-03.2 N2, W4b-05a)."""
     own: tuple[Path, ...] = ()
-    """This agent's folder `agents/<id>/`, its working folder, its Run-tmp `tmp/<id>/` and the
-    run folders its configuration names in `read_dirs` (`run:shared/<name>`)."""
+    """What below `private_roots` is this agent's: its working folder, its plugin, its Run-tmp
+    `tmp/<id>/`, its scratch folder and the run folders its configuration names in `read_dirs`
+    (`run:shared/<name>`). Not the rest of `agents/<id>/` (W4b-05a, P16 b): transcript, events,
+    session and the other files of arr there are closed for the agent itself."""
+    scratch_dir: Path | None = None
+    """The agent's scratch folder `scratch/<id>/` (also a write root), None for old profiles."""
+    agent_dir: Path | None = None
+    """`agents/<id>/` of this agent: only for the German reason of a ban below it."""
+    retired_dir: Path | None = None
+    """`retired/` of the run (also a private root): only for the German reason of a ban."""
 
     def resolve(self, raw: str | Path, base: Path | None = None) -> Path:
         """Normalize a path given by the agent (relative to `base` or the work folder)."""
@@ -779,9 +830,11 @@ class SandboxProfile:
         return pattern.casefold() if self.case_insensitive else pattern
 
     def is_foreign(self, path: Path) -> bool:
-        """True if `path` belongs to another agent of the run (W4-03.1 H1, User 10.11.): below
-        `agents/` or `shared/`, but not this agent's own folder or working folder. Transcripts,
-        events, blobs, plugins and working copies of others are never readable for it."""
+        """True if `path` is closed as another agent's (W4-03.1 H1, User 10.11.): below
+        `agents/`, `shared/`, `tmp/`, `scratch/` or `retired/` of the run, but not in `own`.
+        Transcripts, events, blobs, plugins, working copies, Run-tmp and scratch folders of
+        others are never readable for it; nor are the filed-away folders and the agent's own
+        transcript, events and session (W4b-05a)."""
         return (
             self._within_any(path, self.private_roots) >= 0 and self._within_any(path, self.own) < 0
         )
@@ -791,6 +844,10 @@ class SandboxProfile:
         if self._within_any(path, self.hidden) >= 0:
             return _R_HIDDEN
         if self.is_foreign(path):
+            if self.retired_dir is not None and self._within_any(path, [self.retired_dir]) >= 0:
+                return _R_RETIRED
+            if self.agent_dir is not None and self._within_any(path, [self.agent_dir]) >= 0:
+                return _R_OWN_LOG
             return _R_WRITE_OUTSIDE if write else _R_FOREIGN
         return _R_SENSITIVE
 
@@ -899,7 +956,8 @@ def profile_for(
 ) -> SandboxProfile:
     """Build the sandbox and read profile of an agent (docs/07 §3 ①, E19, docs/01 §4.1).
 
-    Write roots: the work folder, Run-tmp and, with `run_venv: overlay`, the run venv.
+    Write roots: the work folder, Run-tmp, the scratch folder `scratch/<id>/` and, with
+    `run_venv: overlay`, the run venv.
     Read allowlist: write roots, `output/`, the attachments of the agent's own channels,
     `read_dirs`, the Python environment (base venv, its installation prefix, `extra_path`),
     the agent's Claude plugin and paths of always-allow read rules. The run's `skills/`
@@ -911,7 +969,10 @@ def profile_for(
     share it. `tools.web` switches the web tools on; always-allow host rules become allowed
     domains of the Claude sandbox. `RUN_HIDDEN_PATHS` of the run (sealed results, the room
     database) are sensitive: never readable, also not with an approval (W4-03 F4). So are the
-    folders of the other agents below `agents/` and `shared/` (W4-03.1 H1, User 10.11.).
+    folders of the other agents below `agents/` and `shared/` (W4-03.1 H1, User 10.11.), the
+    filed-away working folders `retired/`, the other agents' scratch folders and, below the
+    agent's own `agents/<id>/`, everything but the working folder and the plugin: transcript,
+    events, session, diffs, also files that appear later (W4b-05a, P16 b).
     """
     rules = rules or PermissionRules()
     home = Path(os.path.realpath(home or Path.home()))
@@ -926,8 +987,9 @@ def profile_for(
     work_dir = norm(paths.work_dir(agent))
     tmp_dir = norm(paths.agent_tmp_dir(agent))
     run_tmp = norm(paths.tmp_dir)
+    scratch_dir = norm(paths.scratch_dir(agent))
     run_venv = paths.toolchain.run_venv is RunVenvMode.OVERLAY
-    write_roots = [work_dir, tmp_dir] + ([norm(paths.venv_dir)] if run_venv else [])
+    write_roots = [work_dir, tmp_dir, scratch_dir] + ([norm(paths.venv_dir)] if run_venv else [])
 
     read_allow = list(write_roots)
     read_allow.append(norm(paths.output_dir))
@@ -989,7 +1051,9 @@ def profile_for(
     # the folders of the agents: denied for the shells too, so that no read folder or rule
     # „immer“ for the run opens another agent's (W4-03.2 N1, N2); the agent's own folders
     # are more specific write or read entries
+    retired = norm(paths.retired_dir)
     private = [norm(run_dir / "agents"), norm(run_dir / "shared"), run_tmp]
+    private += [norm(paths.scratch_root), retired]  # W4b-05a
     read_deny = [home, *(norm(p) for p in READ_BLOCKED_ROOTS), workfolder, venvs, *private]
     for raw in user_temp_dirs() if temp_dirs is None else temp_dirs:
         temp = norm(raw)
@@ -1015,7 +1079,12 @@ def profile_for(
         base_venv=base_venv,
         hidden=_dedupe(hidden, ci),
         private_roots=tuple(private),
-        own=_dedupe([norm(run_dir / "agents" / agent.id), work_dir, tmp_dir, *configured], ci),
+        own=_dedupe(
+            [work_dir, norm(paths.plugin_dir(agent)), tmp_dir, scratch_dir, *configured], ci
+        ),
+        scratch_dir=scratch_dir,
+        agent_dir=norm(paths.agent_dir(agent)),
+        retired_dir=retired,
     )
 
 

@@ -45,6 +45,7 @@ from arr.models import (
     WorkfolderSettings,
     WorkspaceMode,
 )
+from arr.permissions.policy import SCRATCH_DIR
 from arr.resolve import dump_yaml_model
 from arr.skills import (
     SkillCatalog,
@@ -78,10 +79,12 @@ __all__ = [
     "RESERVED_STATUSES",
     "RunMeta",
     "copy_tree",
+    "fill_work_dir",
     "load_agent_file",
     "load_run_meta",
     "new_run_id",
     "prepare_run",
+    "refill_work_dir",
     "run_venv_location",
 ]
 
@@ -387,8 +390,13 @@ class CopyStats:
         return "copy" if self.copied else "clone"
 
 
-def copy_tree(src: Path, dst: Path, excludes: ExcludeSet | None = None) -> CopyStats:
+def copy_tree(
+    src: Path, dst: Path, excludes: ExcludeSet | None = None, *, into_empty: bool = False
+) -> CopyStats:
     """Copy a folder tree file by file as APFS clones; `dst` must not exist.
+
+    `into_empty`: `dst` is an existing empty folder that keeps its identity (a fresh working
+    folder in place, W4b-05a); it gets the mode and times of `src` as a new one would.
 
     Every regular file is cloned with `clonefile(2)` (never a whole folder, which the man page
     discourages, and never `cp -c`, which silently copies for real). On `EXDEV`/`ENOTSUP` the
@@ -421,7 +429,7 @@ def copy_tree(src: Path, dst: Path, excludes: ExcludeSet | None = None) -> CopyS
         stats.bytes_copied += target.stat().st_size
 
     def walk(source_dir: Path, target_dir: Path, rel: str) -> None:
-        target_dir.mkdir(parents=not rel)
+        target_dir.mkdir(parents=not rel, exist_ok=into_empty and not rel)
         with os.scandir(source_dir) as scan:
             entries = sorted(scan, key=lambda e: e.name)
         for entry in entries:
@@ -652,14 +660,111 @@ def _write_context_files(
 
     Both get the same processed text. Returns the file names written.
     """
-    text = _context_text(source, mode, block)
+    claude_md = source.from_claude_md and mode is not WorkspaceMode.EMPTY
+    return _write_context(work_dir, _context_text(source, mode, block), claude_md=claude_md)
+
+
+def _write_context(work_dir: Path, text: str, *, claude_md: bool) -> list[str]:
+    """`AGENTS.md` (and `CLAUDE.md` with `claude_md`) with `text`; returns the names written."""
     written = []
-    if source.from_claude_md and mode is not WorkspaceMode.EMPTY:
+    if claude_md:
         _write_text(work_dir / "CLAUDE.md", text)
         written.append("CLAUDE.md")
     _write_text(work_dir / "AGENTS.md", text)
     written.append("AGENTS.md")
     return written
+
+
+# --------------------------------------------------------------------------------------------
+# Working folder: filled at the start and again for a fresh one (W4b-05a)
+# --------------------------------------------------------------------------------------------
+
+SCRATCH_MODE = 0o700
+"""Mode of the folders arr makes for agents' files: `scratch/`, `scratch/<id>/`, `retired/` …
+(W5-00 §6 Nr. 1: arr makes each folder, the agent only its content)."""
+
+
+def make_private_dir(path: Path) -> Path:
+    """Make the folder `path` (mode 0700, whatever the umask) unless it is there already as a
+    real folder; a link or file at its place raises `ArrError`. The parent must exist."""
+    try:
+        os.mkdir(path, SCRATCH_MODE)
+    except FileExistsError:
+        if path.is_symlink() or not path.is_dir():
+            raise ArrError(f"{path} ist kein Ordner. arr legt dort keinen an.") from None
+        return path
+    os.chmod(path, SCRATCH_MODE, follow_symlinks=False)
+    return path
+
+
+def _new_folder_mode(parent: Path) -> int:
+    """The mode `mkdir` gives a new folder here (umask), read from a probe folder of arr."""
+    probe = parent / f".arr-mode-{secrets.token_hex(6)}"
+    os.mkdir(probe)
+    try:
+        return os.lstat(probe).st_mode & 0o7777
+    finally:
+        os.rmdir(probe)
+
+
+def fill_work_dir(
+    work_dir: Path,
+    *,
+    mode: WorkspaceMode,
+    base_dir: Path,
+    skills_dir: Path,
+    context: str,
+    claude_md: bool,
+    codex_skills: Sequence[str] = (),
+    into_empty: bool = False,
+) -> tuple[list[str], CopyStats | None]:
+    """Fill an agent's own working folder (`copy` or `empty`): the one place that decides what
+    a working folder holds at the start of a run and after a fresh one (W4b-05a).
+
+    `copy`: a clone of `base/`; `empty`: an empty folder. Then the context files with `context`
+    (`AGENTS.md`, and `CLAUDE.md` with `claude_md`) and, for Codex, its skills from the
+    snapshot `skills_dir` in `.agents/skills`. `into_empty`: `work_dir` exists and is empty.
+    Returns the generated paths (`AgentFile.generated_paths`) and the copy statistics.
+    """
+    if mode is WorkspaceMode.SHARED:
+        raise ValueError("a shared folder is filled by _finish_shared")
+    stats: CopyStats | None = None
+    if mode is WorkspaceMode.COPY:
+        stats = copy_tree(base_dir, work_dir, into_empty=into_empty)
+    else:
+        work_dir.mkdir(exist_ok=into_empty)
+        if into_empty:  # the mode a new folder gets, as at the start (rights the agent took)
+            os.chmod(work_dir, _new_folder_mode(work_dir.parent), follow_symlinks=False)
+    generated = _write_context(work_dir, context, claude_md=claude_md)
+    if codex_skills:
+        install_codex_skills(work_dir, skills_dir, list(codex_skills))
+        generated.append(".agents/skills")
+    return generated, stats
+
+
+def refill_work_dir(agent: "PreparedAgent") -> list[str]:
+    """Fill the agent's emptied working folder in place as at the start of the run (W4b-05a).
+
+    Only from the run folder, never from the project as it is now or from the old folder:
+    `base/`, the skill snapshot `skills/`, the agent's `context.md` (the same text as the
+    `AGENTS.md` of the start, `AgentFile`) and `agent.json` (mode, generated paths, skills).
+    Returns the generated paths.
+    """
+    file = agent.file
+    mode = file.config.workspace.mode
+    context = (agent.run_dir / file.context_file).read_text(encoding="utf-8")
+    codex = file.config.provider is Provider.CODEX and ".agents/skills" in file.generated_paths
+    generated, _ = fill_work_dir(
+        agent.work_dir,
+        mode=mode,
+        base_dir=agent.run_dir / "base",
+        skills_dir=agent.run_dir / "skills",
+        context=context,
+        claude_md="CLAUDE.md" in file.generated_paths,
+        codex_skills=file.skill_ids if codex else (),
+        into_empty=True,
+    )
+    return generated
 
 
 # --------------------------------------------------------------------------------------------
@@ -1185,6 +1290,7 @@ def _build_run(
     (run_dir / "task.md").write_text(plan.task_text, encoding="utf-8")
     for sub in ("output/results", "groupchats/attachments"):
         (run_dir / sub).mkdir(parents=True, exist_ok=True)
+    scratch_root = make_private_dir(run_dir / SCRATCH_DIR)  # W4b-05a
 
     # Project snapshot and skills
     base_dir = run_dir / "base"
@@ -1210,6 +1316,7 @@ def _build_run(
         agent_dir = run_dir / "agents" / agent.id
         agent_dir.mkdir(parents=True)
         (agent_dir / "blobs").mkdir()
+        make_private_dir(scratch_root / agent.id)
         role_source = plan.roles[agent.id]
         if role_source is not None:
             shutil.copyfile(role_source, agent_dir / "role.md")
@@ -1228,14 +1335,22 @@ def _build_run(
             copy_method = shared_stats[name].method
         else:
             work_dir = agent_dir / "work"
-            if mode is WorkspaceMode.COPY:
-                stats = copy_tree(base_dir, work_dir)
+            block = _research_block(run_id, resolved, agent, mode)
+            codex_skills = (
+                plan.agent_skills[agent.id] if agent.provider is not Provider.CLAUDE else []
+            )
+            generated, stats = fill_work_dir(
+                work_dir,
+                mode=mode,
+                base_dir=base_dir,
+                skills_dir=snapshot_dir,
+                context=_context_text(plan.context, mode, block),
+                claude_md=plan.context.from_claude_md and mode is not WorkspaceMode.EMPTY,
+                codex_skills=[s.name for s in codex_skills],
+            )
+            if stats is not None:
                 _warn_if_copied(log, f"agents/{agent.id}/work/", stats)
                 copy_method = stats.method
-            else:
-                work_dir.mkdir()
-            block = _research_block(run_id, resolved, agent, mode)
-            generated = _write_context_files(work_dir, plan.context, mode, block)
 
         own_block = _research_block(run_id, resolved, agent, mode, agent.workspace.name)
         (agent_dir / "context.md").write_text(
@@ -1249,11 +1364,7 @@ def _build_run(
             plugin = agent_dir / "plugin"
             skill_ids = write_claude_plugin(plugin, snapshot_dir, [s.name for s in skills])
             plugin_dir = _rel(run_dir, plugin)
-        elif skills and mode is not WorkspaceMode.SHARED:
-            install_codex_skills(work_dir, snapshot_dir, [s.name for s in skills])
-            skill_ids = [s.name for s in skills]
-            generated.append(".agents/skills")
-        elif skills:
+        elif skills:  # Codex: installed by fill_work_dir or, when shared, by _finish_shared
             skill_ids = [s.name for s in skills]
 
         prepared[agent.id] = AgentFile(
