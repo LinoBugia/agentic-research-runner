@@ -308,7 +308,7 @@ def test_a7_the_codex_profile_stays_within_its_limits_with_many_agents_and_chann
 ) -> None:
     """The new entries are a fixed number per agent (no entry per other agent), so the size
     does not grow with the agents. 150 agents with a long ID and 60 channels of the run, each
-    in the deny list; the new entries add well under 2 KB to the 40 KB bound."""
+    in the deny list; the new entries add 9 entries, each as long as its path (review G4)."""
     from arr.backends import codex_config
 
     long_id = "explorer-" + "x" * 50
@@ -325,7 +325,10 @@ def test_a7_the_codex_profile_stays_within_its_limits_with_many_agents_and_chann
         assert len(entries) < codex_config.ENTRIES_WARN and size < codex_config.PROFILE_MAX_BYTES
         sizes.append((len(entries) - len(old), size - len(codex_config.toml_value(old).encode())))
     assert sizes[0][0] == sizes[1][0] == 2 + 1 + len(policy.CODEX_READ_ONLY_NAMES)
-    assert all(extra < 2000 for _, extra in sizes), sizes
+    # each new entry carries the full path (review G4, accepted, Entscheidung 56): the growth
+    # is bounded by the length of the run path, not by a fixed number of bytes
+    per_entry = len(str(setup.run / "scratch" / long_id)) + len(".gitattributes") + 30
+    assert all(extra < 9 * per_entry for _, extra in sizes), (sizes, per_entry)
 
 
 # --------------------------------------------------------------------------------------------
