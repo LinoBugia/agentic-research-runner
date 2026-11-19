@@ -27,7 +27,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from folders_kit import FOUR_AGENTS, clear_flags, folder_workfolder, manager, run_done
+from folders_kit import (
+    FOUR_AGENTS,
+    folder_workfolder,
+    manager,
+    owner_gets_it_back,
+    run_done,
+)
 
 from arr.errors import ArrError
 from arr.runs import folders
@@ -388,11 +394,12 @@ async def test_cleaning_up_runs_also_when_the_secret_scan_fails(
     assert not (run_dir / "scratch").exists() and not (run_dir / "retired").exists()
 
 
-@pytest.fixture(autouse=True)
-def _flags_off(tmp_path: Path) -> Iterator[None]:
-    yield
-    clear_flags(tmp_path)
-
-
 def test_errno_names_used_here_exist() -> None:
     assert errno.ELOOP and errno.ESTALE
+
+
+@pytest.fixture(autouse=True)
+def _owner_gets_it_back(tmp_path: Path) -> Iterator[None]:
+    """Flags, ACLs and rights a test lays in its `tmp_path` go at the end, also on failure."""
+    with owner_gets_it_back(tmp_path):
+        yield
