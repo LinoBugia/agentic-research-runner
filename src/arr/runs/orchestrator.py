@@ -215,6 +215,15 @@ class OrchestratorLog:
     a turn with requests without a fill level), and `purpose: compact` at `turn`/`turn_end`
     of a note turn. Since W4b-05b.2: `note_turn_flag` (`agent`, `action` begin/end, `error`):
     the flag of a note turn could not be set or cleared in the room.
+    Since W4b-03 (`arr.runs.phases.wake`): `channel_open` with `by: private` for the private
+    channel of an agent to the user (`user.<agent-id>`); `wake_scheduled`, `wake`,
+    `wake_skipped`, `ping_pong` and `wait_end` of the waking in a pass carry `stage` (the
+    phase) and `attempt`; `wake_skipped` has the new reasons `phase_end` (the actions of the
+    pass are done; with `messages`), `ping_pong` and `turns_per_agent`; `wake` has the reason
+    `answer` after the user's answer in every topology (B3); `wait_end` has the reason
+    `phase_end` for a sleeper's `wait_until`; `waiting {channel, reason: user, until, stage,
+    attempt}` and `waiting {channel, reason: none, stage}` while a phase waits for the answer
+    to a question (B3, also for a private channel).
     """
 
     def __init__(self, run_dir: Path) -> None:

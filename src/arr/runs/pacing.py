@@ -23,6 +23,12 @@ is left unread (L15). Wake-up limit (also for the wake-ups of `wait_until`, L10)
 guard and `quiet_after_s` stay as safety nets. Every wait is logged (`waiting`, `round`,
 `wake_scheduled`). Outside a discussion phase nobody is woken automatically; hints and the
 inbox work always.
+
+Since W4b-03 a discussion of a phase `chat` passes `DiscussionSeats`: only the agents with an
+action discuss (kick-off, rounds, wake-ups, the end), each turn carries the context of its
+action and the first one the assignment, the texts name `submit`, and a member that handed in
+and asks only agents outside the discussion counts as finished. Without seats (the old
+topologies) everything is as before. Agents on standby are woken by `arr.runs.phases.wake`.
 """
 
 import asyncio
