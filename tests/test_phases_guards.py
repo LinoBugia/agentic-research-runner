@@ -395,12 +395,13 @@ async def test_k2_in_an_isolated_phase_b3_holds_before_the_release(
 async def test_w12_b3_does_not_hold_for_a_question_of_an_earlier_pass(
     workfolder: Path, hold: dict[str, float]
 ) -> None:
-    """Pass 1: `a` asks, the deadline passes. Pass 2 (`retry`): `a` hands in at once; the old,
-    still open question does not hold pass 2 (mutation W12)."""
+    """Pass 1: `a` asks, the deadline passes. Pass 2 (`retry`): `a` neither asks nor hands in
+    (a submission would close the old question, L18); the old, still open question does not
+    hold pass 2 (mutation W12)."""
 
     def a(view: TurnView) -> list[dict[str, Any]]:
         if view.attempt == 2:
-            return hand_in(view)
+            return []
         return asks(view)
 
     async def user(mgr: Any) -> None:
