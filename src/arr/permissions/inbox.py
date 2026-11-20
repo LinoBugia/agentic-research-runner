@@ -85,6 +85,7 @@ from arr.permissions.types import (
     TightenedSource,
     UserQuestion,
 )
+from arr.submissions.text import clean_text
 
 __all__ = [
     "ApprovalDecider",
@@ -168,9 +169,12 @@ class Screener(Protocol):
         """The outcome for a request equal to a withdrawn decision of the screener."""
         ...
 
-    def without_model(self, item: ApprovalItem, context: ScreenContext) -> Decision | None:
-        """For a tightened request (W4b-09): the deny it gets before any call, or None (the
-        item opens for the user). Never asks the model."""
+    def without_model(
+        self, item: ApprovalItem, context: ScreenContext
+    ) -> Decision | EscalatedBy | None:
+        """For a tightened request (W4b-09): the deny it gets before any call; or the item
+        opens for the user, with the note of the pre-check (`EscalatedBy`) or without one
+        (None). Never asks the model."""
         ...
 
 
@@ -281,11 +285,13 @@ class ApprovalInbox:
         tight = self._tighten(assessment.request.agent_id)
         with self._lock:
             item = self._equal_open(assessment)
+            passed_on: EscalatedBy | None = None
             if self.screener is not None and (tight is not None or item is not None):
                 draft = self._draft(assessment, tight)
-                refusal = self._without_model(draft, assessment)
-                if refusal is not None:
-                    return self._refuse(draft, refusal)
+                verdict = self._without_model(draft, assessment)
+                if isinstance(verdict, Decision):
+                    return self._refuse(draft, verdict)
+                passed_on = verdict
             if item is None:
                 item = self._new(assessment, tight)
                 waiter: asyncio.Future[Decision | None] = loop.create_future()
@@ -296,7 +302,7 @@ class ApprovalInbox:
                     screening = asyncio.create_task(self._screen(item, assessment))
                     self._decider_tasks[item.id] = screening
                 else:
-                    item = self._publish(item, assessment)
+                    item = self._publish(item, assessment, passed_on)
             else:
                 item = self._join(item, assessment)
                 waiter = self._waiters[item.id]
@@ -690,9 +696,12 @@ class ApprovalInbox:
             return TightenedBy(source=TightenedSource.UNKNOWN)
         return found
 
-    def _without_model(self, item: ApprovalItem, assessment: Assessment) -> Decision | None:
-        """The screener's deny for an item the user decides instead of the model, or None;
-        anything but a deny, or a failure, is a deny (fail closed)."""
+    def _without_model(
+        self, item: ApprovalItem, assessment: Assessment
+    ) -> Decision | EscalatedBy | None:
+        """What the screener says without its model for an item the user decides instead: a
+        deny, a note for the user (`EscalatedBy`) or None; an allow, anything else, or a
+        failure is a deny (fail closed)."""
         assert self.screener is not None
 
         def revoked() -> bool:
@@ -704,8 +713,8 @@ class ApprovalInbox:
         except Exception:
             logger.exception("Vorprüfung ohne Aufsichts-Agenten für %s fehlgeschlagen", item.id)
             return _check_failed_deny(item)
-        if outcome is None:
-            return None
+        if outcome is None or isinstance(outcome, EscalatedBy):
+            return outcome
         if not isinstance(outcome, Decision) or outcome.action is not DecisionAction.DENY:
             return _check_failed_deny(item)
         return outcome
@@ -798,17 +807,19 @@ class ApprovalInbox:
                 except Exception:
                     logger.exception("Rückfall nach Zurückziehen für %s fehlgeschlagen", item_id)
                     outcome = _fallback_deny(item)
-            if isinstance(outcome, Decision) and outcome.decided_by is DecidedBy.GATEKEEPER:
+            if isinstance(outcome, EscalatedBy) or outcome.decided_by is DecidedBy.GATEKEEPER:
                 tight = self._tighten(item.agent_id or "")
                 if tight is not None:
-                    # tightened while it was screened (a new phase): the model's answer does not
-                    # count, the user decides; the pre-check's deny holds (W4b-09)
+                    # tightened while it was screened (a new phase, W4b-09): the item names the
+                    # setting; a decision of the model does not count, the user decides, but
+                    # the pre-check's deny holds
                     item = self._update(item, ApprovalStatus.OPEN, None, tightened_by=tight)
-                    refusal = self._without_model(item, assessment)
-                    if refusal is None:
-                        self._publish(item, assessment)
-                        return
-                    outcome = refusal
+                    if isinstance(outcome, Decision):
+                        verdict = self._without_model(item, assessment)
+                        if not isinstance(verdict, Decision):
+                            self._publish(item, assessment, verdict)
+                            return
+                        outcome = verdict
             if isinstance(outcome, EscalatedBy):
                 self._publish(item, assessment, outcome)
                 return
@@ -989,13 +1000,20 @@ def _escalation_choices(item: ApprovalItem) -> str:
     return "\n".join(lines)
 
 
+def _line(value: object) -> str:
+    """Agent text for one field of a card: no control or format characters (ESC sequences,
+    `\\r`, bidi, zero-width and tag characters, `arr.submissions.text.clean_text`), line breaks
+    shown as „⏎“, so no field can start a line of its own (W4b-09.1, G4)."""
+    return clean_text(value).replace("\n", " ⏎ ").replace("\t", " ")
+
+
 def format_escalation(item: ApprovalItem) -> str:
     """German text of an escalation of a topology for the terminal (docs/03 §4.4)."""
-    lines = [_RULE, f"Eskalation {item.id} · der Run ist pausiert", f"Run:    {item.run_id}"]
+    lines = [_RULE, f"Eskalation {item.id} · der Run ist pausiert", f"Run:    {_line(item.run_id)}"]
     if item.stage:
-        lines.append(f"Stufe:  {item.stage}")
+        lines.append(f"Stufe:  {_line(item.stage)}")
     if item.summary:
-        lines.append(f"Stand:  {item.summary}")
+        lines.append(f"Stand:  {_line(item.summary)}")
     lines += ["", _escalation_choices(item)]
     return redact("\n".join(lines))
 
@@ -1016,7 +1034,11 @@ def tightened_text(tightened: TightenedBy) -> str:
 
 
 def format_item(item: ApprovalItem) -> str:
-    """German text of a permission request for the terminal; secrets are removed."""
+    """German text of a permission request for the terminal; secrets are removed.
+
+    Every field that comes from an agent (or a note of the supervising agent) is one cleaned
+    line (`_line`); the line „Warum bei dir“ stands at most once and is arr's own text.
+    """
     request = item.request
     lines = [_RULE]
     deadline = (
@@ -1025,44 +1047,49 @@ def format_item(item: ApprovalItem) -> str:
         else ""
     )
     lines.append(f"Freigabe-Anfrage {item.id}{deadline}")
-    lines.append(f"Run:            {item.run_id}")
+    lines.append(f"Run:            {_line(item.run_id)}")
     if request is not None:
-        who = request.agent_id
-        extras = [x for x in (f"Rolle {request.role}" if request.role else None,) if x]
+        who = _line(request.agent_id)
+        extras = [x for x in (f"Rolle {_line(request.role)}" if request.role else None,) if x]
         if request.provider:
             extras.append(str(request.provider))
         if extras:
             who += f" ({', '.join(extras)})"
         lines.append(f"Agent:          {who}")
-        lines.append(f"Werkzeug:       {request.tool}")
+        lines.append(f"Werkzeug:       {_line(request.tool)}")
         if request.command:
-            lines.append(f"Befehl:         {request.command}")
+            lines.append(f"Befehl:         {_line(request.command)}")
         if request.paths:
-            lines.append(f"Pfade:          {', '.join(request.paths)}")
+            lines.append(f"Pfade:          {', '.join(_line(p) for p in request.paths)}")
         if request.urls:
-            lines.append(f"URLs:           {', '.join(request.urls)}")
+            lines.append(f"URLs:           {', '.join(_line(u) for u in request.urls)}")
         if request.hosts:
-            lines.append(f"Hosts:          {', '.join(request.hosts)}")
+            lines.append(f"Hosts:          {', '.join(_line(h) for h in request.hosts)}")
         if request.work_dir:
-            lines.append(f"Arbeitsordner:  {request.work_dir}")
+            lines.append(f"Arbeitsordner:  {_line(request.work_dir)}")
         if request.categories:
             words = ", ".join(_CATEGORY_WORDS[c] for c in request.categories)
             lines.append(f"Kategorien:     {words}")
     if item.risk is not None:
-        lines.append(f"Risiko:         {_RISK_WORDS[item.risk.level]} – {item.risk.text}")
+        lines.append(f"Risiko:         {_RISK_WORDS[item.risk.level]} – {_line(item.risk.text)}")
     if request is not None:
-        lines.append(f"Begründung des Agenten: {request.reason or '(keine angegeben)'}")
+        lines.append(f"Begründung des Agenten: {_line(request.reason or '(keine angegeben)')}")
     if item.summary:
-        lines.append(f"Einschätzung von arr:   {item.summary}")
+        lines.append(f"Einschätzung von arr:   {_line(item.summary)}")
+    passed_on = None
     if item.escalated_by is not None:
         who = (
             "Vollmacht (von arr geprüft)"
             if item.escalated_by.decider is DecidedBy.MANDATE_RULE
             else "Aufsichts-Agent"
         )
-        lines.append(f"Warum bei dir:          {who}: {item.escalated_by.note}")
+        passed_on = f"{who}: {_line(item.escalated_by.note)}"
     if item.tightened_by is not None:
-        lines.append(f"Warum bei dir:          {tightened_text(item.tightened_by)}")
+        lines.append(f"Warum bei dir:          {_line(tightened_text(item.tightened_by))}")
+        if passed_on is not None:
+            lines.append(f"Vorher geprüft:         {passed_on}")
+    elif passed_on is not None:
+        lines.append(f"Warum bei dir:          {passed_on}")
     lines.append("")
     lines.append(_CHOICES)
     return redact("\n".join(lines))

