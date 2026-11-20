@@ -21,6 +21,14 @@ the grey zone passes `GatekeeperStage.screen` before it can reach the user (docs
    deny with `gatekeeper`). An `allow` is checked against the mandate once more (it may have
    changed meanwhile) and always has the scope `once`; „immer“ is set only by the user.
 
+With `decider: user` at an agent or phase (W4b-09) the inbox never calls `screen` for its
+requests: `GatekeeperStage.without_model` puts the user where the model would be asked. With
+`gatekeeper_then_user` everything goes to the user, with the verdict of the hard pre-check as
+without the setting (`escalated_by` of `mandate_rule` outside the mandate); with `gatekeeper` the
+hard pre-check (and a withdrawn decision) still denies as without the setting, and only what
+passes reaches the user.
+Such requests are no call: no line in `gatekeeper.jsonl`, they do not count against the cap.
+
 Every call is a line in `gatekeeper.jsonl` of the run (profile, model, tokens, cost, outcome):
 it counts in `usage.json`, in the record per profile and against the run's budget. The
 gatekeeper never sees run starts, escalations or questions to the user (E15): the inbox only
@@ -574,6 +582,7 @@ _NOTE_BUDGET = "Das Budget des Runs ist aufgebraucht."
 _NOTE_TIMEOUT = "Der Aufsichts-Agent hat nicht rechtzeitig geantwortet."
 _NOTE_FAILED = "Der Aufruf des Aufsichts-Agenten ist fehlgeschlagen."
 _NOTE_INVALID = "Die Antwort des Aufsichts-Agenten war kein gültiges JSON mit Entscheidung."
+_NOTE_NO_PRECHECK = "Die Vorprüfung der Vollmacht war nicht möglich."
 _NOTE_E15 = "Run-Starts, Eskalationen und Fragen entscheidest nur du (E15)."
 _DENY_TAIL = " Arbeite ohne weiter oder frage im Chat nach."
 
@@ -643,6 +652,39 @@ class GatekeeperStage:
     def revoked(self, item: ApprovalItem) -> Outcome:
         """The outcome for a request equal to one the user withdrew: never the model's."""
         return self._away(item, _NOTE_REVOKED, DecidedBy.GATEKEEPER)
+
+    def without_model(self, item: ApprovalItem, context: ScreenContext) -> Outcome | None:
+        """The user stands where the model would be asked (`decider: user` at an agent or
+        phase, W4b-09, Entscheidung 65). Never calls the model, writes no line to
+        `gatekeeper.jsonl` and leaves `calls` as it is.
+
+        `gatekeeper_then_user`: the item always opens for the user. The hard pre-check still
+        runs (plain code) so the user sees its verdict as without the setting: outside the
+        mandate, or with a missing or broken mandate, an `EscalatedBy` of `mandate_rule` with
+        the same note; inside, None. If the pre-check itself fails, the note says so.
+
+        `gatekeeper`: None, the item opens for the user; or the deny it gets without the
+        setting before any call: the hard pre-check (outside, missing or broken mandate, the
+        same deny by `mandate_rule`) and a withdrawn decision for an equal request (the same
+        deny by `fixed_rule`). The limits that only guard a call (cap of calls, budget,
+        profile, Not-Aus, time of a call) do not apply: there is no call.
+        """
+        if item.type is not ApprovalType.PERMISSION or item.request is None:
+            return self._away(item, _NOTE_E15, DecidedBy.GATEKEEPER)
+        if self.to_user:
+            try:
+                mandate, verdict = self._precheck(context.assessment)
+            except Exception:  # noqa: BLE001 - the user decides anyway, with this note
+                log.exception("Vorprüfung der Vollmacht für %s fehlgeschlagen", item.id)
+                return EscalatedBy(decider=DecidedBy.MANDATE_RULE, note=_NOTE_NO_PRECHECK)
+        else:
+            mandate, verdict = self._precheck(context.assessment)
+        if isinstance(verdict, str) or mandate is None:
+            note = verdict if isinstance(verdict, str) else "Vollmacht fehlt."
+            return self._away(item, note, DecidedBy.MANDATE_RULE)
+        if not self.to_user and context.revoked():
+            return self.revoked(item)
+        return None
 
     # -- checks ----------------------------------------------------------------------------
 

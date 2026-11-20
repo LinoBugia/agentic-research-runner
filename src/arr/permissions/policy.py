@@ -60,6 +60,7 @@ from arr.permissions.types import (
     RequestCategory,
     Risk,
     RiskLevel,
+    TightenedBy,
     UserQuestion,
 )
 from arr.settings import app_dir
@@ -2136,6 +2137,12 @@ class ApprovalLogEntry(Record):
 
     `escalated_by` (W4-04): in the line `open` of an item the mandate check or the supervising
     agent passed on to the user, who did it and why.
+
+    `tightened_by` (W4b-09): in the first line of an item (`open`, or `decided` when the
+    pre-check denied it before it reached the user) whose agent or phase has `decider: user`:
+    `source` (`agent`, `phase`, `unknown`) and, for a phase, `stage` and `attempt`. Absent for
+    every other item, so a run without `decider` at agents and phases writes the lines it did
+    before.
     """
 
     ts: float = Field(default_factory=time.time)
@@ -2146,6 +2153,7 @@ class ApprovalLogEntry(Record):
     rule: AlwaysRule | None = None
     question: UserQuestion | None = None
     escalated_by: EscalatedBy | None = None
+    tightened_by: TightenedBy | None = None
     note: str | None = None
 
 
