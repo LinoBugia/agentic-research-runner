@@ -1,0 +1,994 @@
+{
+ "gatekeeper/phases": {
+  "approvals.jsonl": [
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decision",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "allow",
+     "changes": [],
+     "decided_by": "gatekeeper",
+     "reason": "sympy ist ein übliches Mathe-Paket.",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decided",
+    "item_id": "item-1",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decision",
+    "request": {
+     "agent_id": "r1",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "allow",
+     "changes": [],
+     "decided_by": "gatekeeper",
+     "reason": "sympy ist ein übliches Mathe-Paket.",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decided",
+    "item_id": "item-2",
+    "request": {
+     "agent_id": "r1",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decision",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://oeis.org/A000001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "deny",
+     "changes": [],
+     "decided_by": "mandate_rule",
+     "reason": "Netzwerk nur zu pypi.org, files.pythonhosted.org, arxiv.org. oeis.org gehört nicht dazu. Arbeite ohne weiter oder frage im Chat nach.",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decided",
+    "item_id": "item-3",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://oeis.org/A000001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   }
+  ],
+  "gatekeeper.jsonl": [
+   {
+    "cost_kind": "estimated",
+    "cost_usd": 0.001,
+    "item_id": "item-1",
+    "model": "fake-haiku",
+    "outcome": "allow",
+    "profile": "fake-auth",
+    "usage": {
+     "cache_read": null,
+     "cache_write": null,
+     "input": 120,
+     "output": 30,
+     "reasoning": null
+    }
+   },
+   {
+    "cost_kind": "estimated",
+    "cost_usd": 0.001,
+    "item_id": "item-2",
+    "model": "fake-haiku",
+    "outcome": "allow",
+    "profile": "fake-auth",
+    "usage": {
+     "cache_read": null,
+     "cache_write": null,
+     "input": 120,
+     "output": 30,
+     "reasoning": null
+    }
+   }
+  ],
+  "status": "done"
+ },
+ "gatekeeper/solo": {
+  "approvals.jsonl": [
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decision",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "allow",
+     "changes": [],
+     "decided_by": "gatekeeper",
+     "reason": "sympy ist ein übliches Mathe-Paket.",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decided",
+    "item_id": "item-1",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   }
+  ],
+  "gatekeeper.jsonl": [
+   {
+    "cost_kind": "estimated",
+    "cost_usd": 0.001,
+    "item_id": "item-1",
+    "model": "fake-haiku",
+    "outcome": "allow",
+    "profile": "fake-auth",
+    "usage": {
+     "cache_read": null,
+     "cache_write": null,
+     "input": 120,
+     "output": 30,
+     "reasoning": null
+    }
+   }
+  ],
+  "status": "done"
+ },
+ "gatekeeper_then_user/phases": {
+  "approvals.jsonl": [
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decision",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "allow",
+     "changes": [],
+     "decided_by": "gatekeeper",
+     "reason": "sympy ist ein übliches Mathe-Paket.",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decided",
+    "item_id": "item-1",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decision",
+    "request": {
+     "agent_id": "r1",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "allow",
+     "changes": [],
+     "decided_by": "gatekeeper",
+     "reason": "sympy ist ein übliches Mathe-Paket.",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decided",
+    "item_id": "item-2",
+    "request": {
+     "agent_id": "r1",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decision",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://oeis.org/A000001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "escalated_by": {
+     "decider": "mandate_rule",
+     "note": "Netzwerk nur zu pypi.org, files.pythonhosted.org, arxiv.org. oeis.org gehört nicht dazu."
+    },
+    "event": "open",
+    "item_id": "item-3",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://oeis.org/A000001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "deny",
+     "changes": [],
+     "decided_by": "user",
+     "reason": "Vom User entschieden.",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decided",
+    "item_id": "item-3",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://oeis.org/A000001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   }
+  ],
+  "gatekeeper.jsonl": [
+   {
+    "cost_kind": "estimated",
+    "cost_usd": 0.001,
+    "item_id": "item-1",
+    "model": "fake-haiku",
+    "outcome": "allow",
+    "profile": "fake-auth",
+    "usage": {
+     "cache_read": null,
+     "cache_write": null,
+     "input": 120,
+     "output": 30,
+     "reasoning": null
+    }
+   },
+   {
+    "cost_kind": "estimated",
+    "cost_usd": 0.001,
+    "item_id": "item-2",
+    "model": "fake-haiku",
+    "outcome": "allow",
+    "profile": "fake-auth",
+    "usage": {
+     "cache_read": null,
+     "cache_write": null,
+     "input": 120,
+     "output": 30,
+     "reasoning": null
+    }
+   }
+  ],
+  "status": "done"
+ },
+ "gatekeeper_then_user/solo": {
+  "approvals.jsonl": [
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decision",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "allow",
+     "changes": [],
+     "decided_by": "gatekeeper",
+     "reason": "sympy ist ein übliches Mathe-Paket.",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decided",
+    "item_id": "item-1",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   }
+  ],
+  "gatekeeper.jsonl": [
+   {
+    "cost_kind": "estimated",
+    "cost_usd": 0.001,
+    "item_id": "item-1",
+    "model": "fake-haiku",
+    "outcome": "allow",
+    "profile": "fake-auth",
+    "usage": {
+     "cache_read": null,
+     "cache_write": null,
+     "input": 120,
+     "output": 30,
+     "reasoning": null
+    }
+   }
+  ],
+  "status": "done"
+ },
+ "user/phases": {
+  "approvals.jsonl": [
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decision",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "open",
+    "item_id": "item-1",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "deny",
+     "changes": [],
+     "decided_by": "user",
+     "reason": "Vom User entschieden.",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decided",
+    "item_id": "item-1",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decision",
+    "request": {
+     "agent_id": "r1",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "open",
+    "item_id": "item-2",
+    "request": {
+     "agent_id": "r1",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "deny",
+     "changes": [],
+     "decided_by": "user",
+     "reason": "Vom User entschieden.",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decided",
+    "item_id": "item-2",
+    "request": {
+     "agent_id": "r1",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decision",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://oeis.org/A000001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "open",
+    "item_id": "item-3",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://oeis.org/A000001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "deny",
+     "changes": [],
+     "decided_by": "user",
+     "reason": "Vom User entschieden.",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decided",
+    "item_id": "item-3",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://oeis.org/A000001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   }
+  ],
+  "gatekeeper.jsonl": [],
+  "status": "done"
+ },
+ "user/solo": {
+  "approvals.jsonl": [
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decision",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "ask",
+     "changes": [],
+     "decided_by": "fixed_rule",
+     "reason": "Braucht eine Freigabe (Netzwerk).",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "open",
+    "item_id": "item-1",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   },
+   {
+    "decision": {
+     "action": "deny",
+     "changes": [],
+     "decided_by": "user",
+     "reason": "Vom User entschieden.",
+     "risk": {
+      "level": "medium",
+      "text": "Daten aus dem Netz können den Agenten beeinflussen, Inhalte können abfließen."
+     },
+     "scope": "once"
+    },
+    "event": "decided",
+    "item_id": "item-1",
+    "request": {
+     "agent_id": "p",
+     "categories": [
+      "network"
+     ],
+     "command": "curl https://arxiv.org/abs/2101.00001",
+     "hosts": [],
+     "paths": [],
+     "provider": "claude",
+     "reason": "Ich lese ein Paper.",
+     "role": "explorer",
+     "run_id": "<run>",
+     "tool": "Bash",
+     "urls": []
+    }
+   }
+  ],
+  "gatekeeper.jsonl": [],
+  "status": "done"
+ }
+}

@@ -205,6 +205,37 @@ class EscalatedBy(Record):
         return self
 
 
+class TightenedSource(StrEnum):
+    """Why a request is with the user although the run lets the supervising agent decide
+    (`decider: user` at an agent or phase, W4b-09, docs/10 §4.11).
+
+    `agent`: the agent's own setting; `phase`: the phase the agent entered last; `unknown`:
+    arr could not tell (unknown agent, failed lookup, phase not known), so the user decides.
+    """
+
+    AGENT = "agent"
+    PHASE = "phase"
+    UNKNOWN = "unknown"
+
+
+class TightenedBy(Record):
+    """The setting that makes the user decide a request (W4b-09, docs/10 §4.11): its source
+    and, for a phase, its name and pass. Built by arr from the resolved run, never from text of
+    an agent."""
+
+    source: TightenedSource
+    stage: str | None = None
+    attempt: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _phase_names_its_pass(self) -> Self:
+        if (self.source is TightenedSource.PHASE) != (self.stage is not None):
+            raise ValueError("„stage“ gehört genau zur Quelle „phase“.")
+        if (self.stage is None) != (self.attempt is None):
+            raise ValueError("„stage“ und „attempt“ stehen nur zusammen.")
+        return self
+
+
 class UserQuestion(Record):
     """A question of an agent to the user in a channel (`@user`, docs/09 §4.2, L16)."""
 
@@ -243,6 +274,9 @@ class ApprovalItem(Record):
     risk: Risk | None = None
     deadline: float | None = None
     escalated_by: EscalatedBy | None = None
+    tightened_by: TightenedBy | None = Field(
+        default=None, description="Permission: `decider: user` sent it to the user (W4b-09)"
+    )
     stage: str | None = Field(default=None, description="Escalation: stage that failed")
     summary: str | None = None
     options: list[EscalationOption] = Field(default_factory=list)
@@ -260,6 +294,8 @@ class ApprovalItem(Record):
             raise ValueError("Eine Eskalation braucht mindestens eine Option.")
         if (self.type is ApprovalType.QUESTION) != (self.question is not None):
             raise ValueError("„question“ gehört genau zu einer Frage an den User.")
+        if self.tightened_by is not None and self.type is not ApprovalType.PERMISSION:
+            raise ValueError("„tightened_by“ gibt es nur bei Berechtigungsanfragen.")
         if (self.status is ApprovalStatus.DECIDED) and self.decision is None:
             raise ValueError("Ein entschiedener Eintrag braucht „decision“.")
         if self.status is ApprovalStatus.OPEN and self.decision is not None:
