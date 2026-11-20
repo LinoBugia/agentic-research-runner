@@ -9,14 +9,17 @@ from typing import Any
 
 import pytest
 from phases_kit import (
+    Hooks,
     TurnView,
     errors,
+    gate,
     hand_in,
     manager,
     of_kind,
     parallel,
     private,
     run,
+    run_with,
     say,
     solo,
     waker_of,
@@ -173,29 +176,38 @@ async def test_a17_two_sleepers_that_talk_forever_hold_nothing(
     workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
 ) -> None:
     """`s` and `t` (both on standby) address each other in every wake-up, without a limit of
-    wake-ups and without the ping-pong guard. The phase ends with the action of `a`.
-    Counter-check: a phase that waits for its sleepers to be quiet runs until `wall_time`."""
+    wake-ups and without the ping-pong guard; they refuse hints, so a message during a turn
+    wakes after it (no timing). `a` hands in once the chain runs; the phase then ends.
+    Counter-check: an end of the actions that waits for the sleepers to be quiet never comes;
+    ten more wake-ups after the submission show it, then the test stops the run. Steered by
+    counts in the log, no duration (W4b-03.1, G7)."""
     from arr.runs.pacing import PingPongTracker
     from arr.runs.phases import wake
 
+    hooks = Hooks().install(monkeypatch)
+    hooks.no_hints.update({"s", "t"})
     monkeypatch.setattr(PingPongTracker, "observe", lambda self, msg: None)
     if naive:
 
-        async def wait_for_quiet(self: Any) -> None:
-            quiet = 0
-            while quiet < 100:  # a second without a wake-up (the naive phase, on purpose)
-                quiet = 0 if self.due or self.turns else quiet + 1
-                await asyncio.sleep(0.01)
-            self.waking = False
+        async def never(self: Any) -> None:
+            await asyncio.Event().wait()  # the naive phase waits for quiet sleepers
 
-        monkeypatch.setattr(wake.Waker, "end_actions", wait_for_quiet)
+        monkeypatch.setattr(wake.Waker, "end_actions", never)
 
     def a(view: TurnView) -> list[dict[str, Any]]:
-        return [say("k", "@s Fang an."), {"do": "delay", "seconds": 0.3}, *hand_in(view)]
+        return [say("k", "@s Fang an."), gate(), *hand_in(view)]
 
     def talks_to(other: str) -> Any:
-        # the other one has ended its turn when the message comes, so it is woken
-        return lambda view: [{"do": "delay", "seconds": 0.05}, say("k", f"@{other} Weiter so.")]
+        return lambda view: [say("k", f"@{other} Weiter so.")]
+
+    async def helper(mgr: Any) -> None:
+        await eventually(lambda: len(of_kind(mgr, "wake")) >= 6, within=30)  # the chain runs
+        hooks.open("a")
+        await eventually(lambda: bool(of_kind(mgr, "turn_end", agent="a")), within=30)
+        if naive:
+            after = len(of_kind(mgr, "wake"))
+            await eventually(lambda: len(of_kind(mgr, "wake")) >= after + 10, within=30)
+            mgr.stop()
 
     phase = {**solo("p", "a"), "standby": ["s", "t"], "channels": ["k"]}
     group = {
@@ -203,13 +215,15 @@ async def test_a17_two_sleepers_that_talk_forever_hold_nothing(
         "channels": [k("a", "s", "t", max_wakeups_per_agent=10**6)],
         "phases": [phase],
     }
-    mgr, log, found = await case(
-        workfolder, group, {"a": a, "s": talks_to("t"), "t": talks_to("s")}
+    policies = {"a": a, "s": talks_to("t"), "t": talks_to("s")}
+    mgr, log = manager(
+        workfolder, group, policies, limits={"wall_time": "60s", "turns_per_agent": ENDLESS}
     )
+    status = await run_with(mgr, helper)
     if naive:
-        assert found["hang"], found
+        assert status is RunStatus.STOPPED and not of_kind(mgr, "checkpoint", phase="gate")
         return
-    assert not found["hang"] and found["status"] is RunStatus.DONE, found
+    assert status is RunStatus.DONE, errors(mgr)
     assert of_kind(mgr, "checkpoint", phase="gate")
 
 
@@ -217,29 +231,47 @@ async def test_a17_two_sleepers_that_talk_forever_hold_nothing(
 async def test_a17_ping_pong_in_the_direct_channel_of_a_solo_phase_ends(
     workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
 ) -> None:
-    """`a` asks `s` again after every answer, `s` asks back: the ping-pong guard stops the
-    wake-ups of `s`. Counter-check without the guard: `s` is woken for every question."""
+    """`a` asks `s` eight times, each after the answer to the last one (a gate the test opens),
+    and `s` asks back each time: the ping-pong guard stops the wake-ups of `s`. Counter-check
+    without the guard: every one of the eight questions wakes `s`. The threshold is the
+    number of questions actually asked (W4b-03.1, G7)."""
     from arr.runs.pacing import PingPongTracker
 
+    hooks = Hooks().install(monkeypatch)
     if naive:
         monkeypatch.setattr(PingPongTracker, "observe", lambda self, msg: None)
+    asked = 8
 
     def a(view: TurnView) -> list[dict[str, Any]]:
         steps: list[dict[str, Any]] = []
-        for n in range(20):
-            steps += [say("k", f"@s Frage {n}?"), room("wait_for_messages", seconds=0.3)]
+        for n in range(asked):
+            steps += [say("k", f"@s Frage {n}?"), gate()]
         return [*steps, *hand_in(view)]
+
+    async def helper(mgr: Any) -> None:
+        for n in range(1, asked + 1):
+            settled = lambda n=n: (  # noqa: E731
+                len(of_kind(mgr, "turn_end", agent="s"))
+                + len(of_kind(mgr, "wake_skipped", agent="s"))
+                >= n
+            )
+            await eventually(settled, within=30)
+            hooks.open("a")
 
     phase = {**solo("p", "a"), "standby": ["s"], "channels": ["k"]}
     group = {**AGENTS, "channels": [k("a", "s", max_wakeups_per_agent=10**6)], "phases": [phase]}
-    mgr, log, found = await case(
-        workfolder, group, {"a": a, "s": lambda v: [say("k", "@a Und du?")]}
+    mgr, log = manager(
+        workfolder,
+        group,
+        {"a": a, "s": lambda v: [say("k", "@a Und du?")]},
+        limits={"wall_time": "60s", "turns_per_agent": ENDLESS},
     )
-    assert not found["hang"] and found["status"] is RunStatus.DONE, found
+    assert await run_with(mgr, helper) is RunStatus.DONE, errors(mgr)
     if naive:
-        assert len(woken(log, "s")) > 10
+        assert len(woken(log, "s")) == asked, "every question wakes it"
     else:
         assert of_kind(mgr, "ping_pong") and len(woken(log, "s")) <= 4
+        assert len(woken(log, "s")) + len(of_kind(mgr, "wake_skipped", agent="s")) == asked
 
 
 async def test_a17_many_messages_at_once_wake_at_most_once_each(workfolder: Path) -> None:
@@ -263,18 +295,37 @@ async def test_a17_questions_nobody_answers_end(
     from arr.runs.phases import wake
 
     def a(view: TurnView) -> list[dict[str, Any]]:
+        if "# Auftrag –" not in view.prompt:
+            return [room("wait_until", minutes=0.005)]
         return [
             say("k", "@s Eins?", kind="question"),
+            gate(),  # the second question comes after the first one woke `s`
             say("k", "@s Zwei?", kind="question"),
             say("k", "@b Drei?", kind="question"),
             say(private("a"), "@user Vier?", kind="question"),
             room("wait_until", minutes=0.005),
         ]
 
+    async def helper(mgr: Any) -> None:
+        await eventually(lambda: bool(of_kind(mgr, "wake", agent="s")), within=30)
+        hooks.open("a")
+
     phase = {**solo("p", "a", turns=2), "standby": ["s"], "channels": ["k"]}
     group = {**AGENTS, "channels": [k("a", "s", "b", max_wakeups_per_agent=1)], "phases": [phase]}
     monkeypatch.setattr(wake, "user_question_hold_s", lambda: 0.2)
-    mgr, log, found = await case(workfolder, group, {"a": a, "s": lambda v: []})
+    # `s` refuses hints: the second question is unseen whether or not its first wake-up turn
+    # still runs, so it reaches the limit either way (no timing)
+    hooks = Hooks().install(monkeypatch)
+    hooks.no_hints.add("s")
+    mgr, log = manager(
+        workfolder,
+        group,
+        {"a": a, "s": lambda v: []},
+        limits={"wall_time": WALL, "turns_per_agent": ENDLESS},
+    )
+    status = await run_with(mgr, helper)
+    limits = [e["data"].get("limit") for e in log_entries(mgr.run_dir, "limit")]
+    found = {"status": status, "hang": "wall_time" in limits}
     assert not found["hang"] and found["status"] is RunStatus.DONE, found
     assert len(log.of("a")) == 3 and log.of("b") == []
     assert of_kind(mgr, "wake_skipped", agent="s", reason="max_wakeups_per_agent")

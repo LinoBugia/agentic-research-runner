@@ -314,9 +314,11 @@ PRIVATE_BRIEF = (
     "Steckbrief #{name}\n"
     "Dein privater Kanal zum User: Hier fragst du ihn mit einer `question` an `@user`, in jeder "
     "Phase, auch in einer isolierten. Nur der User liest diesen Kanal; kein anderer Agent sieht "
-    "ihn."
+    "ihn. Brauchst du die Antwort, beende den Turn ohne Abgabe: Die Phase wartet bis zu fünf "
+    "Minuten. Gibst du ab, gilt deine Frage als erledigt."
 )
-"""The pinned brief of a private channel (two sentences after the title)."""
+"""The pinned brief of a private channel: what it is for, who reads it, and (W4b-03.1, E1 a,
+Entscheidung 67) that handing in closes an open question."""
 
 
 def private_channel(agent_id: str) -> str:

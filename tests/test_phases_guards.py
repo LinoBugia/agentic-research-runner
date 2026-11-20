@@ -4,25 +4,23 @@ K2, W9–W13, W15, W18–W20, O7, C4, C5, P6) and the five small changes (N2–N
 No test waits for a duration or depends on the speed of the machine. They are steered by hooks
 (`Hooks`), each set and checked against the log:
 
-- `gate(agent)` is a step of a turn that waits until the test opens it (`hooks.open(agent)`),
-  without reading a message (unlike `wait_for_messages`); hints still reach the turn,
-- `hooks.no_hints` holds agents whose backend refuses every hint (as when Codex' `steer` fails):
-  a message that arrives during their turn stays unseen,
-- `hooks.hold_poll()` stops the orchestrator from reading new messages until `release_poll()`,
-- `hooks.capacity(1)` gives the profile one place, so a turn can wait for it.
+`phases_kit.Hooks`: `gate()` (a step that waits until the test opens it, without reading a
+message), `no_hints` (the backend refuses hints: a message during the turn stays unseen) and
+`hold_poll()` (the orchestrator reads no new message until `release_poll()`); one place in the
+profile (`make_settings` with `fake-auth: 1`) makes a turn wait for it.
 """
 
-import asyncio
-import contextlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 from phases_kit import (
+    Hooks,
     TurnView,
     entries,
     errors,
+    gate,
     hand_in,
     manager,
     of_kind,
@@ -38,7 +36,6 @@ from phases_kit import (
 )
 from run_kit import eventually, make_manager, make_workfolder, room, turns
 
-from arr.backends.fake import FakeBackend
 from arr.models import RunStatus
 from arr.room.store import USER
 from arr.room.types import MessageKind, MessageVia
@@ -46,70 +43,13 @@ from arr.runs import pacing
 from arr.runs.orchestrator import Orchestrator
 from arr.runs.phases import wake
 
-GATE = 4242.0
-"""Seconds of a `delay` step that the hooks turn into a gate."""
 AGENTS = {"agents": [{"id": a} for a in ("a", "b", "s", "t", "c")]}
 ASK = "@user Darf ich annehmen, dass n prim ist?"
 
 
-class Hooks:
-    def __init__(self) -> None:
-        self.gates: dict[str, asyncio.Event] = {}
-        self.no_hints: set[str] = set()
-        self.poll_held = False
-
-    def event(self, agent: str) -> asyncio.Event:
-        return self.gates.setdefault(agent, asyncio.Event())
-
-    def open(self, agent: str) -> None:
-        self.event(agent).set()
-
-    def hold_poll(self) -> None:
-        self.poll_held = True
-
-    def release_poll(self) -> None:
-        self.poll_held = False
-
-
 @pytest.fixture
 def hooks(monkeypatch: pytest.MonkeyPatch) -> Hooks:
-    h = Hooks()
-    wait = FakeBackend._wait
-
-    async def gated(self: FakeBackend, seconds: float, state: Any) -> Any:
-        if seconds != GATE:
-            async for event in wait(self, seconds, state):
-                yield event
-            return
-        gate = h.event(self.config.id)
-        while not gate.is_set() and not self._interrupted.is_set():
-            for event in self._take_hints(state):
-                yield event
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(gate.wait(), 0.05)
-        gate.clear()  # one opening lets one gate pass
-        for event in self._take_hints(state):
-            yield event
-
-    deliver = FakeBackend.deliver_hint
-
-    async def deliver_hint(self: FakeBackend, text: str) -> bool:
-        return False if self.config.id in h.no_hints else await deliver(self, text)
-
-    poll = Orchestrator.poll
-
-    def held_poll(self: Orchestrator) -> None:
-        if not h.poll_held:
-            poll(self)
-
-    monkeypatch.setattr(FakeBackend, "_wait", gated)
-    monkeypatch.setattr(FakeBackend, "deliver_hint", deliver_hint)
-    monkeypatch.setattr(Orchestrator, "poll", held_poll)
-    return h
-
-
-def gate() -> dict[str, Any]:
-    return {"do": "delay", "seconds": GATE}
+    return Hooks().install(monkeypatch)
 
 
 @pytest.fixture
@@ -846,3 +786,37 @@ async def test_n5_a_wake_up_from_two_channels_counts_against_the_free_one(
     wakes = of_kind(mgr, "wake", agent="s")
     assert [(w["channel"], w["count"]) for w in wakes] == [("k1", 1), ("k2", 1)]
     assert of_kind(mgr, "wake_skipped", agent="s") == []
+
+
+# --------------------------------------------------------------------------------------------
+# N8 (E1 a, Entscheidung 67): a question to the user and a submission in the same turn
+# --------------------------------------------------------------------------------------------
+
+
+async def test_n8_ask_and_hand_in_in_the_same_turn_closes_the_question(
+    workfolder: Path, hooks: Hooks, hold: dict[str, float]
+) -> None:
+    """Who hands in is done: the question asked in the same turn is closed at once (`result`),
+    the phase does not wait, its inbox item is no longer open, and a later answer of the user
+    gives no turn. The brief of the private channel says so."""
+
+    def a(view: TurnView) -> list[dict[str, Any]]:
+        return [say(private("a"), ASK, kind="question"), *hand_in(view)]
+
+    async def user(mgr: Any) -> None:
+        await eventually(lambda: count(mgr, "turn", agent="b") == 1, within=30)
+        assert not [i for i in mgr.inbox.pending() if i.type.value == "question"]
+        answer_in_channel(mgr, "a")
+        await polled(mgr, mgr.room.messages(private("a"))[-1].id)
+        hooks.open("b")
+
+    group = {**AGENTS, "phases": [solo("p", "a"), solo("q", "b")]}
+    policies = {"a": a, "b": lambda v: [gate(), *hand_in(v)]}
+    mgr, log = manager(workfolder, group, policies)
+    assert await run_with(mgr, user) is RunStatus.DONE, errors(mgr)
+    states = [(d["state"], d.get("reason")) for d in of_kind(mgr, "user_question")]
+    assert states == [("open", None), ("closed", "result")]
+    assert not waits_for_user(mgr)
+    assert [v.stage for v in log.of("a")] == ["p"], "the answer gives no turn"
+    brief = mgr.room.messages(private("a"))[0].body
+    assert "Gibst du ab, gilt deine Frage als erledigt." in brief

@@ -499,3 +499,86 @@ def waker_of(mgr: RunManager) -> Any:
         return None
     found = [w for w in orch._listeners if isinstance(w, Waker)]
     return found[0] if found else None
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-03.1: hooks instead of durations
+# --------------------------------------------------------------------------------------------
+
+GATE = 4242.0
+"""Seconds of a `delay` step that `Hooks` turns into a gate."""
+
+
+class Hooks:
+    """Steering for tests without durations (W4b-03.1):
+
+    - `gate()` is a step of a turn that waits until the test opens it (`open(agent)`), without
+      reading a message (unlike `wait_for_messages`); hints still reach the turn,
+    - agents in `no_hints` refuse every hint (as when Codex' `steer` fails),
+    - `hold_poll()` stops the orchestrator from reading new messages until `release_poll()`.
+    """
+
+    def __init__(self) -> None:
+        import asyncio
+
+        self.gates: dict[str, asyncio.Event] = {}
+        self.no_hints: set[str] = set()
+        self.poll_held = False
+
+    def event(self, agent: str) -> Any:
+        import asyncio
+
+        return self.gates.setdefault(agent, asyncio.Event())
+
+    def open(self, agent: str) -> None:
+        self.event(agent).set()
+
+    def hold_poll(self) -> None:
+        self.poll_held = True
+
+    def release_poll(self) -> None:
+        self.poll_held = False
+
+    def install(self, monkeypatch: Any) -> "Hooks":
+        import contextlib
+
+        from arr.runs.orchestrator import Orchestrator
+
+        hooks = self
+        wait = FakeBackend._wait
+
+        async def gated(self: FakeBackend, seconds: float, state: Any) -> Any:
+            if seconds != GATE:
+                async for event in wait(self, seconds, state):
+                    yield event
+                return
+            gate = hooks.event(self.config.id)
+            while not gate.is_set() and not self._interrupted.is_set():
+                for event in self._take_hints(state):
+                    yield event
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(gate.wait(), 0.05)
+            gate.clear()  # one opening lets one gate pass
+            for event in self._take_hints(state):
+                yield event
+
+        deliver = FakeBackend.deliver_hint
+
+        async def deliver_hint(self: FakeBackend, text: str) -> bool:
+            return False if self.config.id in hooks.no_hints else await deliver(self, text)
+
+        poll = Orchestrator.poll
+
+        def held_poll(self: Orchestrator) -> None:
+            if not hooks.poll_held:
+                poll(self)
+
+        monkeypatch.setattr(FakeBackend, "_wait", gated)
+        monkeypatch.setattr(FakeBackend, "deliver_hint", deliver_hint)
+        monkeypatch.setattr(Orchestrator, "poll", held_poll)
+        return self
+
+
+def gate() -> dict[str, Any]:
+    """A step that waits until the test opens the gate of the agent (`Hooks.open`)."""
+    return {"do": "delay", "seconds": GATE}
