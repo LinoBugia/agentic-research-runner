@@ -65,6 +65,8 @@ from arr.permissions.policy import (
     RunPaths,
     profile_for,
 )
+from arr.permissions.tightening import tightened_by
+from arr.permissions.types import TightenedBy
 from arr.room.store import RoomStore
 from arr.runs.context import RunContext
 from arr.runs.eventlog import EventLogger
@@ -572,6 +574,7 @@ class RunManager:
             decider=self.decider,
             timeout=resolved.approvals.timeout,
             screener=self._gatekeeper(run_dir, write_roots),
+            tightened=self._tightened,
         )
 
         for agent_id, agent in prepared.agents.items():
@@ -639,6 +642,18 @@ class RunManager:
             budget_left=budget_left,
             charge=charge,
             is_blocked=is_blocked,
+        )
+
+    def _tightened(self, agent_id: str) -> TightenedBy | None:
+        """Whether `decider: user` at the agent or its phase sends its requests to the user
+        (W4b-09, `arr.permissions.tightening`): from the resolved run and, bound late like
+        `budget_left`, the phase the agent entered last. Called by the inbox on its loop."""
+        orch = self.orchestrator
+        return tightened_by(
+            self.resolved.agents,
+            self.resolved.phases,
+            agent_id,
+            orch.agent_phase if orch is not None else None,
         )
 
     async def _run_topology(self) -> None:

@@ -25,6 +25,16 @@ or the item opens for the user with `escalated_by` and the reason in its `open` 
 such items reach the decider of the user. A withdrawn decision of the supervising agent makes
 equal requests of the run skip it (docs/07 §4 Nr. 3).
 
+An agent or a phase with `decider: user` tightens the decider (W4b-09, docs/10 §4.11): the
+callback `tightened` (`arr.permissions.tightening`) says, the moment a request arrives, whether
+its agent is tightened. Such a request never reaches the model of the supervising agent: it
+opens for the user at once with `tightened_by` in its first line; with `decider: gatekeeper`
+only what the pre-check lets through opens for the user, the rest is denied as before
+(`Screener.without_model`). An installation pass of the supervising agent does not cover it,
+and an answer of the supervising agent for an agent that was tightened while it screened does
+not count. A looser setting never wins: when in doubt, the user decides or the request is
+denied.
+
 Items live in memory; every step is appended to `approvals.jsonl` (docs/02 §4).
 See docs/07-berechtigungen-und-freigaben.md §3-§6.
 """
@@ -56,6 +66,7 @@ from arr.permissions.policy import (
     is_codex_escalation,
     redact,
 )
+from arr.permissions.tightening import Tightening
 from arr.permissions.types import (
     ApprovalItem,
     ApprovalStatus,
@@ -70,6 +81,8 @@ from arr.permissions.types import (
     RequestCategory,
     Risk,
     RiskLevel,
+    TightenedBy,
+    TightenedSource,
     UserQuestion,
 )
 
@@ -83,6 +96,7 @@ __all__ = [
     "format_item",
     "install_hosts",
     "item_id_prefix",
+    "tightened_text",
 ]
 
 logger = logging.getLogger(__name__)
@@ -154,6 +168,11 @@ class Screener(Protocol):
         """The outcome for a request equal to a withdrawn decision of the screener."""
         ...
 
+    def without_model(self, item: ApprovalItem, context: ScreenContext) -> Decision | None:
+        """For a tightened request (W4b-09): the deny it gets before any call, or None (the
+        item opens for the user). Never asks the model."""
+        ...
+
 
 class ApprovalInbox:
     """Queue of open permission requests and escalations of one run (docs/07 §3 ③, §6).
@@ -170,6 +189,10 @@ class ApprovalInbox:
     Items, grants and new rules live in memory: after a restart open items are gone (the
     waiting agents too) and grants with scope agent/run no longer apply, so those requests
     ask again (fail-safe).
+
+    `tightened` answers for an agent whether `decider: user` sends its requests to the user
+    (W4b-09); it is called on the event loop of the inbox only (`ask`, `_settle_screened`,
+    `_by_install_pass`), never from `resolve`. If it raises, the request counts as tightened.
     """
 
     def __init__(
@@ -182,10 +205,12 @@ class ApprovalInbox:
         on_rule: Callable[[AlwaysRule], None] | None = None,
         on_note: Callable[[str], None] | None = None,
         screener: Screener | None = None,
+        tightened: Tightening | None = None,
     ) -> None:
         self.engine = engine
         self.decider = decider
         self.screener = screener
+        self.tightened = tightened
         self.timeout = timeout.total_seconds() if isinstance(timeout, timedelta) else timeout
         self.log = log if log is not None else engine.log
         self.on_rule = on_rule
@@ -245,17 +270,28 @@ class ApprovalInbox:
         Equal is what `_merge_key` says. A join shares item, deadline and decision. Never
         raises because of the decider; when the last waiting caller is cancelled, the item
         becomes obsolete.
+
+        A tightened request (W4b-09) never goes to the screener: it opens for the user at once,
+        or joins an equal item that is open for the user. Where the user stands in for the model
+        (`Screener.without_model`), a request that would be denied before any call is denied
+        here as well, also before it may join an item of the user.
         """
         loop = asyncio.get_running_loop()
         screening: asyncio.Task[None] | None = None
+        tight = self._tighten(assessment.request.agent_id)
         with self._lock:
             item = self._equal_open(assessment)
+            if self.screener is not None and (tight is not None or item is not None):
+                draft = self._draft(assessment, tight)
+                refusal = self._without_model(draft, assessment)
+                if refusal is not None:
+                    return self._refuse(draft, refusal)
             if item is None:
-                item = self._new(assessment)
+                item = self._new(assessment, tight)
                 waiter: asyncio.Future[Decision | None] = loop.create_future()
                 self._waiters[item.id] = waiter
                 self._waiting[item.id] = 1
-                if self.screener is not None:
+                if self.screener is not None and tight is None:
                     self._screening.add(item.id)
                     screening = asyncio.create_task(self._screen(item, assessment))
                     self._decider_tasks[item.id] = screening
@@ -588,6 +624,8 @@ class ApprovalInbox:
             or _high_risk(risk)
         ):
             return None
+        if decided_by is DecidedBy.GATEKEEPER and self._tighten(request.agent_id) is not None:
+            return None  # `decider: user`: nothing of the supervising agent covers it (W4b-09)
         decision = Decision(
             action=DecisionAction.ALLOW,
             decided_by=decided_by,
@@ -612,12 +650,14 @@ class ApprovalInbox:
         self._counters[prefix] += 1
         return f"{prefix}_{self._counters[prefix]:04d}"
 
-    def _new(self, assessment: Assessment) -> ApprovalItem:
-        """A new permission item in memory; `_publish` or the screener's outcome follows."""
+    def _draft(
+        self, assessment: Assessment, tight: TightenedBy | None, item_id: str = ""
+    ) -> ApprovalItem:
+        """A permission item for `assessment`, not yet in the inbox (no ID without `item_id`)."""
         now = time.time()
         request = assessment.request
-        item = ApprovalItem(
-            id=self._next_id(request.run_id),
+        return ApprovalItem(
+            id=item_id,
             type=ApprovalType.PERMISSION,
             created_at=now,
             run_id=request.run_id,
@@ -625,11 +665,61 @@ class ApprovalInbox:
             request=request,
             risk=assessment.decision.risk,
             deadline=None if self.screener is not None else now + self.timeout,
+            tightened_by=tight,
             summary=assessment.decision.reason,
         )
+
+    def _new(self, assessment: Assessment, tight: TightenedBy | None = None) -> ApprovalItem:
+        """A new permission item in memory; `_publish` or the screener's outcome follows."""
+        item = self._draft(assessment, tight, self._next_id(assessment.request.run_id))
         self._items[item.id] = item
         self._item_keys[item.id] = assessment.items
         return item
+
+    def _tighten(self, agent_id: str) -> TightenedBy | None:
+        """Whether `decider: user` sends this agent's requests to the user (W4b-09); a broken
+        callback counts as tightened (source `unknown`)."""
+        if self.tightened is None:
+            return None
+        try:
+            found = self.tightened(agent_id)
+        except Exception:
+            logger.exception("Entscheider für %s ließ sich nicht feststellen", agent_id)
+            return TightenedBy(source=TightenedSource.UNKNOWN)
+        if found is not None and not isinstance(found, TightenedBy):
+            return TightenedBy(source=TightenedSource.UNKNOWN)
+        return found
+
+    def _without_model(self, item: ApprovalItem, assessment: Assessment) -> Decision | None:
+        """The screener's deny for an item the user decides instead of the model, or None;
+        anything but a deny, or a failure, is a deny (fail closed)."""
+        assert self.screener is not None
+
+        def revoked() -> bool:
+            with self._lock:
+                return bool(assessment.items & self._revoked_items)
+
+        try:
+            outcome = self.screener.without_model(item, ScreenContext(assessment, revoked=revoked))
+        except Exception:
+            logger.exception("Vorprüfung ohne Aufsichts-Agenten für %s fehlgeschlagen", item.id)
+            return _check_failed_deny(item)
+        if outcome is None:
+            return None
+        if not isinstance(outcome, Decision) or outcome.action is not DecisionAction.DENY:
+            return _check_failed_deny(item)
+        return outcome
+
+    def _refuse(self, draft: ApprovalItem, decision: Decision) -> Decision:
+        """Store a draft that is denied before it reaches anybody: one line `decided`."""
+        assert draft.request is not None
+        item = draft.model_copy(update={"id": self._next_id(draft.run_id)})
+        self._items[item.id] = item
+        if decision.risk is None:
+            decision = decision.model_copy(update={"risk": item.risk})
+        item = self._update(item, ApprovalStatus.DECIDED, decision)
+        self._write(LogEvent.DECIDED, item, first=True)
+        return decision
 
     def _publish(
         self, item: ApprovalItem, assessment: Assessment, escalated_by: EscalatedBy | None = None
@@ -708,6 +798,17 @@ class ApprovalInbox:
                 except Exception:
                     logger.exception("Rückfall nach Zurückziehen für %s fehlgeschlagen", item_id)
                     outcome = _fallback_deny(item)
+            if isinstance(outcome, Decision) and outcome.decided_by is DecidedBy.GATEKEEPER:
+                tight = self._tighten(item.agent_id or "")
+                if tight is not None:
+                    # tightened while it was screened (a new phase): the model's answer does not
+                    # count, the user decides; the pre-check's deny holds (W4b-09)
+                    item = self._update(item, ApprovalStatus.OPEN, None, tightened_by=tight)
+                    refusal = self._without_model(item, assessment)
+                    if refusal is None:
+                        self._publish(item, assessment)
+                        return
+                    outcome = refusal
             if isinstance(outcome, EscalatedBy):
                 self._publish(item, assessment, outcome)
                 return
@@ -724,7 +825,7 @@ class ApprovalInbox:
             if decision.risk is None:
                 decision = decision.model_copy(update={"risk": item.risk})
             item = self._update(item, ApprovalStatus.DECIDED, decision)
-            self._write(LogEvent.DECIDED, item)
+            self._write(LogEvent.DECIDED, item, first=True)  # nothing was written while screened
             if decision.action is DecisionAction.ALLOW and not _high_risk(item.risk):
                 self._grant_install_pass(item.request, item.id, decision.decided_by)
         self._wake(item_id, decision)
@@ -809,7 +910,9 @@ class ApprovalInbox:
         request: PermissionRequest | None = None,
         decision: Decision | None = None,
         note: str | None = None,
+        first: bool = False,
     ) -> None:
+        """One line of `item`; `first` marks the first line of an item that is not `open`."""
         if self.log is None:
             return
         self.log.write(
@@ -820,6 +923,7 @@ class ApprovalInbox:
                 decision=decision or item.decision,
                 question=item.question if event is LogEvent.OPEN else None,
                 escalated_by=item.escalated_by if event is LogEvent.OPEN else None,
+                tightened_by=item.tightened_by if event is LogEvent.OPEN or first else None,
                 note=note,
             )
         )
@@ -896,6 +1000,21 @@ def format_escalation(item: ApprovalItem) -> str:
     return redact("\n".join(lines))
 
 
+def tightened_text(tightened: TightenedBy) -> str:
+    """One German sentence why `decider: user` sends a request to the user (W4b-09)."""
+    if tightened.source is TightenedSource.AGENT:
+        return "Die Einstellung des Agenten (decider: user) verlangt deine Entscheidung."
+    if tightened.source is TightenedSource.PHASE:
+        return (
+            f"Die Phase „{tightened.stage}“ (Durchlauf {tightened.attempt}) verlangt deine "
+            "Entscheidung (decider: user)."
+        )
+    return (
+        "arr konnte nicht sicher feststellen, ob für diese Anfrage decider: user gilt, "
+        "deshalb entscheidest du."
+    )
+
+
 def format_item(item: ApprovalItem) -> str:
     """German text of a permission request for the terminal; secrets are removed."""
     request = item.request
@@ -942,6 +1061,8 @@ def format_item(item: ApprovalItem) -> str:
             else "Aufsichts-Agent"
         )
         lines.append(f"Warum bei dir:          {who}: {item.escalated_by.note}")
+    if item.tightened_by is not None:
+        lines.append(f"Warum bei dir:          {tightened_text(item.tightened_by)}")
     lines.append("")
     lines.append(_CHOICES)
     return redact("\n".join(lines))
@@ -1134,6 +1255,17 @@ def _fallback_deny(item: ApprovalItem) -> Decision:
         action=DecisionAction.DENY,
         decided_by=DecidedBy.FIXED_RULE,
         reason="Der Aufsichts-Agent konnte nicht entscheiden, deshalb abgelehnt. " + TIMEOUT_REASON,
+        risk=item.risk,
+    )
+
+
+def _check_failed_deny(item: ApprovalItem) -> Decision:
+    """Deny by arr's own rule when the check before the user's decision failed (W4b-09)."""
+    return Decision(
+        action=DecisionAction.DENY,
+        decided_by=DecidedBy.FIXED_RULE,
+        reason="Die Prüfung vor der Entscheidung des Users ist fehlgeschlagen, deshalb abgelehnt. "
+        + TIMEOUT_REASON,
         risk=item.risk,
     )
 

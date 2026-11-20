@@ -21,6 +21,12 @@ the grey zone passes `GatekeeperStage.screen` before it can reach the user (docs
    deny with `gatekeeper`). An `allow` is checked against the mandate once more (it may have
    changed meanwhile) and always has the scope `once`; „immer“ is set only by the user.
 
+With `decider: user` at an agent or phase (W4b-09) the inbox never calls `screen` for its
+requests: `GatekeeperStage.without_model` puts the user where the model would be asked. With
+`gatekeeper_then_user` everything goes to the user; with `gatekeeper` the hard pre-check (and a
+withdrawn decision) still denies as without the setting, and only what passes reaches the user.
+Such requests are no call: no line in `gatekeeper.jsonl`, they do not count against the cap.
+
 Every call is a line in `gatekeeper.jsonl` of the run (profile, model, tokens, cost, outcome):
 it counts in `usage.json`, in the record per profile and against the run's budget. The
 gatekeeper never sees run starts, escalations or questions to the user (E15): the inbox only
@@ -643,6 +649,35 @@ class GatekeeperStage:
     def revoked(self, item: ApprovalItem) -> Outcome:
         """The outcome for a request equal to one the user withdrew: never the model's."""
         return self._away(item, _NOTE_REVOKED, DecidedBy.GATEKEEPER)
+
+    def without_model(self, item: ApprovalItem, context: ScreenContext) -> Decision | None:
+        """The user stands where the model would be asked (`decider: user` at an agent or
+        phase, W4b-09, Entscheidung 65): None, the item opens for the user; or the deny it
+        gets without the setting before any call. Never calls the model, writes no line to
+        `gatekeeper.jsonl` and leaves `calls` as it is.
+
+        `gatekeeper_then_user`: always None, the user decides everything. `gatekeeper`: the
+        hard pre-check holds as without the setting (outside, missing or broken mandate: the
+        same deny by `mandate_rule`), and so does a withdrawn decision for an equal request
+        (the same deny by `fixed_rule`). The limits that only guard a call (cap of calls,
+        budget, profile, Not-Aus, time of a call) do not apply: there is no call.
+        """
+        if self.to_user:
+            return None
+        outcome: Outcome | None = None
+        if item.type is not ApprovalType.PERMISSION or item.request is None:
+            outcome = self._away(item, _NOTE_E15, DecidedBy.GATEKEEPER)
+        else:
+            mandate, verdict = self._precheck(context.assessment)
+            if isinstance(verdict, str) or mandate is None:
+                note = verdict if isinstance(verdict, str) else "Vollmacht fehlt."
+                outcome = self._away(item, note, DecidedBy.MANDATE_RULE)
+            elif context.revoked():
+                outcome = self.revoked(item)
+        if outcome is None:
+            return None
+        assert isinstance(outcome, Decision)  # without `to_user` `_away` always denies
+        return outcome
 
     # -- checks ----------------------------------------------------------------------------
 
