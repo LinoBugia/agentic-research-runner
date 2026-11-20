@@ -1,7 +1,7 @@
 """W4b-02b A21: the test groups of `tests/fixtures/phases/` from start to end with FakeBackend
 agents: `solo`, `waterfall` (rework, best attempt, `on_exhausted`), `exploration` in all three
 variants of `exchange`, `review` with `discussion_rounds: 0` (`judge_memory` keep and reset).
-`review` with its defaults, `roundtable` and `beispiel` are refused before the start."""
+Since W4b-03 (A20) `review` with its defaults, `roundtable` and `beispiel` run as well."""
 
 from pathlib import Path
 from typing import Any
@@ -20,7 +20,6 @@ from phases_kit import (
 )
 from run_kit import make_workfolder
 
-from arr.errors import ConfigError
 from arr.models import RunStatus
 from arr.permissions.types import EscalationOption
 from arr.room.store import RoomStore
@@ -257,38 +256,142 @@ async def test_review_without_discussion(
         assert calls == []
 
 
-@pytest.mark.parametrize(
-    ("name", "params", "path", "sentence"),
-    [
-        (
-            "review",
-            {},
-            "phases[3].topology",
-            "Die Topologie „chat“ (Phase „diskussion“) ist in dieser Version noch nicht verfügbar.",
-        ),
-        (
-            "roundtable",
-            {},
-            "phases[0].topology",
-            "Die Topologie „chat“ (Phase „diskussion“) ist in dieser Version noch nicht verfügbar.",
-        ),
-        (
-            "beispiel",
-            {},
-            "phases[2].standby",
-            "Agenten auf Abruf („standby“, Phase „beweis“) sind in dieser Version noch nicht "
-            "verfügbar.",
-        ),
-    ],
-)
-def test_refused_before_the_start(
-    workfolder: Path, name: str, params: dict[str, Any], path: str, sentence: str
-) -> None:
-    from arr.runs.topologies import check_topology
+# --------------------------------------------------------------------------------------------
+# W4b-03 A20: `review` with its defaults (discussion), `roundtable` and `beispiel` run now
+# --------------------------------------------------------------------------------------------
 
-    mgr, _log = fixture_manager(workfolder, name, {}, params=params)
-    with pytest.raises(ConfigError) as info:
-        check_topology(mgr.resolved)
-    found = {i.path: i.message for i in info.value.issues}
-    assert found.get(path, "").startswith(sentence), info.value
-    assert not (workfolder / "runs").exists() or list((workfolder / "runs").iterdir()) == []
+
+async def test_w4b03_review_with_its_defaults_discusses(workfolder: Path) -> None:
+    """`fassung` → `pruefung` (isolated) → `diskussion` (`chat` in #judges, one round) →
+    `revision` → `pruefung` → `diskussion` (accept) → stop."""
+
+    def judging(view: TurnView) -> list[dict[str, Any]]:
+        verdict = "minor" if view.attempt == 1 else "accept"
+        return hand_in(view, verdict=verdict)
+
+    mgr, log = fixture_manager(
+        workfolder, "review", {"author": answer(), "judge-1": judging, "judge-2": judging}
+    )
+    assert await run(mgr) is RunStatus.DONE, errors(mgr)
+    assert entered(mgr) == [
+        "fassung",
+        "pruefung",
+        "diskussion",
+        "revision",
+        "pruefung",
+        "diskussion",
+    ]
+    seq = turns(log)
+    assert seq[0] == ("author", "fassung", 1, "work")
+    by_phase: dict[tuple[str | None, int], list[str]] = {}
+    for agent, stage, attempt, _action in seq:
+        by_phase.setdefault((stage, attempt), []).append(agent)
+    assert sorted(by_phase[("pruefung", 1)]) == ["judge-1", "judge-2"]
+    assert sorted(by_phase[("diskussion", 1)]) == ["judge-1", "judge-2"]
+    assert by_phase[("revision", 1)] == ["author"]
+    assert sorted(by_phase[("diskussion", 2)]) == ["judge-1", "judge-2"]
+    gates = [c["value"] for c in checkpoints(mgr, "gate") if c["stage"] == "diskussion"]
+    assert gates == ["minor", "accept"]
+    ends = [e["ended_by"] for e in of_kind_entries(mgr, "discussion_end")]
+    assert ends == ["all_done", "all_done"]
+    talk = [v for v in log.views if v.stage == "diskussion"]
+    assert all(v.context["submission"]["format"] == "review" for v in talk)
+    assert all("Mitglied" in v.prompt for v in talk), "the anonymous channel shows aliases"
+
+
+async def test_w4b03_roundtable_discusses_and_summarizes(workfolder: Path) -> None:
+    """`diskussion` (`chat` in #runde, `rounds`, 3 rounds; the summarizer is a member but not
+    in the phase) → `zusammenfassung` (the channel as input)."""
+
+    def talks(view: TurnView) -> list[dict[str, Any]]:
+        if "Runde 1 von" in view.prompt.split("## Auftrag")[-1]:
+            from run_kit import room
+
+            return [room("post_message", channel="runde", body=f"Beitrag von {view.agent}.")]
+        return hand_in(view)
+
+    policies = {"diskutant-1": talks, "diskutant-2": talks, "summarizer": answer()}
+    mgr, log = fixture_manager(workfolder, "roundtable", policies)
+    assert await run(mgr) is RunStatus.DONE, errors(mgr)
+    assert entered(mgr) == ["diskussion", "zusammenfassung"]
+    assert turns(log) == [
+        ("diskutant-1", "diskussion", 1, "work"),
+        ("diskutant-2", "diskussion", 1, "work"),
+        ("diskutant-1", "diskussion", 1, "work"),
+        ("diskutant-2", "diskussion", 1, "work"),
+        ("summarizer", "zusammenfassung", 1, "work"),
+    ]
+    [end] = of_kind_entries(mgr, "discussion_end")
+    assert (end["ended_by"], end["rounds"]) == ("all_done", 2)
+    summary = log.of("summarizer")[0]
+    channel = [i for i in summary.context["inputs"] if i["source"] == "channel:runde"]
+    assert channel and any("Beitrag von diskutant-1." in m["text"] for m in channel[0]["messages"])
+
+
+async def test_w4b03_beispiel_with_a_sleeper_in_the_direct_channel(workfolder: Path) -> None:
+    """The example of docs/10 §4.9: in `beweis` the prover asks the strategist (on standby)
+    through #rueckfrage, the strategist is woken and answers, the prover hands in."""
+    from run_kit import room
+
+    def prover(view: TurnView) -> list[dict[str, Any]]:
+        if view.stage == "beweis" and "# Auftrag –" in view.prompt:
+            return [
+                room(
+                    "post_message",
+                    channel="rueckfrage",
+                    body="@strategist Welcher Ansatz?",
+                    kind="question",
+                ),
+                room("wait_for_messages", seconds=40),
+                *hand_in(view),
+            ]
+        return hand_in(view)
+
+    def strategist(view: TurnView) -> list[dict[str, Any]]:
+        return [
+            room("inbox", save_as="box"),
+            room(
+                "post_message",
+                channel="rueckfrage",
+                body="Induktion über n.",
+                kind="answer",
+                reply_to="${box.open_questions.0.id}",
+            ),
+        ]
+
+    def judge(view: TurnView) -> list[dict[str, Any]]:
+        return hand_in(view, verdict="accept")
+
+    policies: dict[str, Any] = {
+        "ideator": answer(),
+        "explorer-1": answer(),
+        "explorer-2": answer(),
+        "prover": prover,
+        "strategist": strategist,
+        "judge-1": judge,
+        "judge-2": judge,
+        "writer": answer(),
+    }
+    decider = Choose(EscalationOption.CONTINUE)
+    mgr, log = fixture_manager(workfolder, "beispiel", policies, decider=decider)
+    assert await run(mgr) is RunStatus.DONE, errors(mgr)
+    assert entered(mgr) == [
+        "ideen",
+        "exploration",
+        "beweis",
+        "pruefung",
+        "urteil",
+        "zusammenfassung",
+    ]
+    [wake] = [v for v in log.of("strategist") if v.context.get("standby")]
+    assert wake.stage == "beweis" and "#rueckfrage" in wake.prompt
+    assert [v.stage for v in log.of("strategist")] == ["beweis"]
+    [end] = of_kind_entries(mgr, "discussion_end")
+    assert end["channel"] == "judges"
+    assert [c["value"] for c in checkpoints(mgr, "gate") if c["stage"] == "urteil"] == ["accept"]
+
+
+def of_kind_entries(mgr: Any, kind: str) -> list[dict[str, Any]]:
+    from phases_kit import of_kind
+
+    return of_kind(mgr, kind)
