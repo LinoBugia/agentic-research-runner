@@ -44,7 +44,7 @@ from typing import TYPE_CHECKING, Any
 
 from arr.models import ResolvedPhase, WakeOn
 from arr.room.address import Address, address
-from arr.room.store import ORCHESTRATOR, private_config, private_owner
+from arr.room.store import ORCHESTRATOR, USER, private_config, private_owner
 from arr.room.types import DeliveryStatus, Message
 from arr.runs.pacing import PING_PONG_NOTE, PingPongTracker, user_question_hold_s
 from arr.runs.phases.state import Pass, Slot
@@ -127,6 +127,10 @@ class Waker:
         }
         self.delegated: set[str] = set()
         """Channels whose tracker a running discussion feeds (W4b-03 §6.5)."""
+        self.sleeper_pairs_only: set[str] = set()
+        """Channels where the ping-pong guard counts only pairs with an agent on standby: the
+        discussion channel of a `chat` in `rounds`, which has no guard of its own (W4b-03.1,
+        E4)."""
         self.waking = True
         self.due: dict[str, _Due] = {}
         self.woken: set[tuple[str, int]] = set()
@@ -194,7 +198,8 @@ class Waker:
         config, members = entry
         if msg.channel not in self.delegated:
             pair = self.trackers[msg.channel].observe(msg)
-            if pair is not None:
+            quiet = msg.channel in self.sleeper_pairs_only
+            if pair is not None and not (quiet and not set(pair) & set(self.sleepers)):
                 self._ping_pong(msg.channel, pair)
         for member in members:
             reason = self._reason(msg, member, config)
@@ -226,7 +231,10 @@ class Waker:
     def _reason(self, msg: Message, member: str, config: "GroupChatConfig") -> str | None:
         if msg.sender in (member, ORCHESTRATOR):
             return None
-        return _wakes(address(msg, member, self.orch.sender_of), config.wake_on)
+        how = address(msg, member, self.orch.sender_of)
+        if how is None and msg.sender == USER and private_owner(msg.channel) == member:
+            how = Address.MENTION  # E2: in its private channel every message of the user is direct
+        return _wakes(how, config.wake_on)
 
     def _take(self, agent: str, msg: Message, reason: str) -> None:
         if agent in self.sleepers:
@@ -299,22 +307,30 @@ class Waker:
 
     def _fire(self, agent: str, due: _Due) -> None:
         channel = due.channels[0]
-        config = self.channels[channel][0]
         if self.orch.exhausted(agent):
             self._log("wake_skipped", channel=channel, agent=agent, reason="turns_per_agent")
             return
         if any(self._guarded(agent, c) for c in due.channels):
             self._log("wake_skipped", channel=channel, agent=agent, reason="ping_pong")
             return
-        if self.orch.wakeups(channel, agent) >= config.max_wakeups_per_agent:
+        # it counts against the first channel of its messages that is below its limit; only
+        # when all of them are at their limit it lapses (W4b-03.1, G4)
+        free = [
+            c
+            for c in due.channels
+            if self.orch.wakeups(c, agent) < self.channels[c][0].max_wakeups_per_agent
+        ]
+        if not free:
             self._log(
                 "wake_skipped",
                 channel=channel,
                 agent=agent,
                 reason="max_wakeups_per_agent",
-                limit=config.max_wakeups_per_agent,
+                limit=self.channels[channel][0].max_wakeups_per_agent,
+                channels=due.channels,
             )
             return
+        channel = free[0]
         count = self.orch.count_wakeup(channel, agent)
         self._log(
             "wake",
@@ -430,6 +446,16 @@ async def _answer_turn(
     config = private_config(owner) if owner is not None else orch.config.channel(channel)
     agent = slot.agent
     if orch.stop_requested:
+        return
+    if orch.exhausted(agent):  # W4b-03.1 (G5): no turn left, so no wake-up either
+        orch.log.write(
+            "wake_skipped",
+            channel=channel,
+            agent=agent,
+            reason="turns_per_agent",
+            stage=phase.name,
+            attempt=pass_.attempt,
+        )
         return
     if orch.wakeups(channel, agent) >= config.max_wakeups_per_agent:
         orch.log.write(

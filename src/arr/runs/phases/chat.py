@@ -90,6 +90,8 @@ async def run_pass(runner: "PhaseRunner", pass_: Pass) -> None:
     )
     if shared and waker is not None:
         waker.delegated.add(channel)  # the discussion counts the exchanges in its channel
+    elif waker is not None:  # `rounds` has no guard, as `discuss` today: only pairs with a sleeper
+        waker.sleeper_pairs_only.add(channel)
     try:
         outcome = await ctx.discuss(channel, stage=phase.name, rounds=phase.rounds, seats=seats)
     finally:
