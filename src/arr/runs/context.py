@@ -14,7 +14,7 @@ are not abstract and raise `NotImplementedError` until W4b-02b, 05a and 05b impl
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -81,6 +81,9 @@ class DiscussionSeats:
       the phase, so one exchange is counted and flagged once.
     - `submit`: the texts of the discussion name `submit` (a `phases` run) instead of
       `submit_result`.
+    - `finished`: a member that is not `done` but idle counts as finished when this says so:
+      it handed in and asks no other member of the discussion (a question to an agent on
+      standby or to one that is not in the phase holds nothing, Entscheidung 64).
     """
 
     members: Sequence[str]
@@ -88,6 +91,7 @@ class DiscussionSeats:
     first: dict[str, str] = field(default_factory=dict)
     ping_pong: Any = None
     submit: bool = True
+    finished: Callable[[str], bool] | None = None
 
 
 @dataclass(slots=True)

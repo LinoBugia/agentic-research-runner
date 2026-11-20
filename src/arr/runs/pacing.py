@@ -361,6 +361,16 @@ def _members(config: GroupChatConfig, seats: DiscussionSeats | None) -> list[str
     return list(seats.members) if seats is not None else list(config.members)
 
 
+def _finished(orch: "Orchestrator", seats: DiscussionSeats | None, member: str) -> bool:
+    """Finished in the discussion: `done`, or (a phase `chat`, W4b-03) idle and finished by
+    `seats.finished` (handed in, no open question to another member)."""
+    status = orch.agent_status(member)
+    if status is AgentStatus.DONE:
+        return True
+    rule = seats.finished if seats is not None else None
+    return rule is not None and status is AgentStatus.IDLE and rule(member)
+
+
 def _job(
     seats: DiscussionSeats | None,
     member: str,
@@ -565,7 +575,7 @@ async def _run_rounds(
         if orch.stop_requested:
             outcome.ended_by = _stop_end(orch)
             break
-        members = [m for m in seated if orch.agent_status(m) is not AgentStatus.DONE]
+        members = [m for m in seated if not _finished(orch, seats, m)]
         if not members:
             outcome.ended_by = DiscussionEnd.ALL_DONE
             break
@@ -593,11 +603,11 @@ async def _run_rounds(
             if m.sender in members and m.kind is not MessageKind.PASS
         }
         if not posted:
-            done = all(orch.agent_status(m) is AgentStatus.DONE for m in seated)
+            done = all(_finished(orch, seats, m) for m in seated)
             outcome.ended_by = DiscussionEnd.ALL_DONE if done else DiscussionEnd.ALL_PASSED
             break
     else:
-        if all(orch.agent_status(m) is AgentStatus.DONE for m in seated):
+        if all(_finished(orch, seats, m) for m in seated):
             outcome.ended_by = DiscussionEnd.ALL_DONE
     return outcome
 
@@ -738,7 +748,7 @@ class _EventDiscussion:
             return "question"
         if how in (Address.MENTION, Address.REPLY) and WakeOn.MENTION in wake_on:
             return how.value
-        if self.orch.agent_status(member) is AgentStatus.DONE:
+        if _finished(self.orch, self.seats, member):
             return None
         if how is Address.QUESTION_ALL and WakeOn.QUESTION in wake_on:
             return how.value
@@ -880,7 +890,7 @@ class _EventDiscussion:
         return [
             m
             for m in self.members
-            if self.orch.agent_status(m) is not AgentStatus.DONE
+            if not _finished(self.orch, self.seats, m)
             and self.orch.long_wait(m) is None
             and not self._busy(m)
         ]
@@ -901,7 +911,7 @@ class _EventDiscussion:
             self._start(tg, member, prompt)
 
     def _all_done(self) -> bool:
-        return all(self.orch.agent_status(m) is AgentStatus.DONE for m in self.members)
+        return all(_finished(self.orch, self.seats, m) for m in self.members)
 
     def _wake_for_unread(self) -> bool:
         """L15: before `all_done`, wake every member a direct message to is unread for.
@@ -1032,7 +1042,7 @@ class _EventDiscussion:
             async with asyncio.TaskGroup() as tg:
                 if self.kickoff:
                     for member in self.members:
-                        if self.orch.agent_status(member) is not AgentStatus.DONE:
+                        if not _finished(self.orch, self.seats, member):
                             self._start(tg, member, self.prompt)
                 while True:
                     # take the newest messages first: a question posted just before its

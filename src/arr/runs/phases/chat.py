@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from arr.models import ChannelMode
 from arr.plan.read import ACTION_WORK
+from arr.room.address import is_user_question
 from arr.runs.context import DiscussionEnd, DiscussionSeats
 from arr.runs.phases.state import HOW_NORMAL, Pass, Slot
 from arr.runs.phases.view import ask_again_prompt, render_assignment
@@ -68,11 +69,24 @@ async def run_pass(runner: "PhaseRunner", pass_: Pass) -> None:
     config = ctx.config.channel(channel)
     waker = runner.waker
     shared = waker is not None and config.mode is ChannelMode.EVENT
+    members = [s.agent for s in slots]
+    by_agent = {s.agent: s for s in slots}
+    room = getattr(ctx, "room", None)
+
+    def finished(agent: str) -> bool:
+        """Handed in, and no open question to another discussing agent (a question to an
+        agent on standby or not in the phase holds nothing, §6.4, Entscheidung 64)."""
+        if runner._newest(by_agent[agent], phase.name, pass_.attempt, mark) is None:
+            return False
+        asked = room.open_questions_by(agent) if room is not None else []
+        return not any(set(q.to) & set(members) for q in asked if not is_user_question(q))
+
     seats = DiscussionSeats(
-        members=[s.agent for s in slots],
+        members=members,
         contexts={s.agent: s.context for s in slots if s.context is not None},
         first={s.agent: render_assignment(s.context) for s in slots if s.context is not None},
         ping_pong=waker.trackers.get(channel) if shared and waker is not None else None,
+        finished=finished,
     )
     if shared and waker is not None:
         waker.delegated.add(channel)  # the discussion counts the exchanges in its channel

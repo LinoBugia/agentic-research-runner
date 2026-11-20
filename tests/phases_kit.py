@@ -449,7 +449,10 @@ def say(channel: str, body: str, **args: Any) -> dict[str, Any]:
 
 
 def entries(mgr: RunManager, *kinds: str) -> list[tuple[str, dict[str, Any]]]:
-    """`(kind, data)` of the log entries of these kinds, in the order they were written."""
+    """`(kind, data)` of the log entries of these kinds, in the order they were written (none
+    before the run is prepared)."""
+    if mgr.prepared is None:
+        return []
     return [
         (e["kind"], e["data"])
         for e in OrchestratorLog(mgr.run_dir).entries()
