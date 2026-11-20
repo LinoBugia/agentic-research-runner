@@ -16,7 +16,7 @@ from typing import Any
 import login_guard_kit as kit
 import pytest
 from fake_messages_api import ToolCall
-from fake_responses_api import FakeResponsesApi, _sse
+from fake_responses_api import _USAGE, FakeResponsesApi, _sse
 
 from arr.models import ResolvedRun, TopologyKind
 from arr.resolve import dump_yaml_model, load_yaml_model
@@ -101,7 +101,9 @@ text(JSON.stringify(answer));
 """An `exec` cell as a model writes it: Codex offers MCP tools only inside `functions.exec`, as
 `tools.mcp__arr_room__<tool>` (W4b-00, prompt `codex.md`). A server that is not ready yet
 gives no function; then the cell says so and the next request sends it again, after a pause,
-for at most `WAIT_S` (under the load of the whole suite the server needs some seconds)."""
+for at most `WAIT_S`. Under load the room server needs some seconds (W4b-03 §6.9: 0.3 s
+alone, 1.5 s beside 32 and 5.2 s beside 100 busy processes on 10 cores); Codex 0.163.0 waits
+about 30 s for it (`startup_timeout_sec`) and adds its tools to the running turn."""
 
 WAIT_S = 90.0
 PAUSE_S = 0.5
@@ -162,12 +164,11 @@ class McpResponsesApi(FakeResponsesApi):
         return (
             _sse({"type": "response.created", "response": {"id": response}})
             + _sse({"type": "response.output_item.done", "output_index": 0, "item": item})
-            + _sse(
-                {
-                    "type": "response.completed",
-                    "response": {"id": response, "usage": {"input_tokens": 1, "output_tokens": 1}},
-                }
-            )
+            # the whole usage: without `total_tokens` Codex 0.163.0 cannot read the event, takes
+            # the stream for broken, sends the same request again five times and then ends the
+            # turn with „stream disconnected before completion“ (W4b-03 §6.9). That ended the
+            # turn after about 7 s, before a room server under load was ready.
+            + _sse({"type": "response.completed", "response": {"id": response, "usage": _USAGE}})
         )
 
     @property
