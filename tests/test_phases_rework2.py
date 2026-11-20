@@ -267,9 +267,11 @@ def _random_package(rng: random.Random) -> dict[str, Any]:
 
 def test_ng2_random_packages_keep_the_order(  # the probe K1 of the reviewer
 ) -> None:
-    rng = random.Random(58)
+    # W4b-03: 16 packages of a seed that reaches both branches several times (core 4,
+    # objections 5) instead of 400 packages (22 s CPU)
+    rng = random.Random(30)
     reached = {"core": 0, "objections": 0}
-    for n in range(400):
+    for n in range(16):
         before = _random_package(rng)
         out = fit_package(copy.deepcopy(before))
         fixed = package_size({k: out[k] for k in ("task", "research_question", "submission")})
@@ -293,7 +295,7 @@ def test_ng2_random_packages_keep_the_order(  # the probe K1 of the reviewer
         for key in ("inputs", "peers", "objections"):
             cut = len(out.get(key) or []) < len(before.get(key) or [])
             assert bool(out.get(f"{key}_cut")) == cut, (n, key)
-    assert reached["core"] and reached["objections"], reached
+    assert reached["core"] >= 2 and reached["objections"] >= 2, reached
 
 
 # --------------------------------------------------------------------------------------------

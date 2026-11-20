@@ -16,12 +16,6 @@ turns:
           score: 7.5
           comment: "Tragfähig, der Randfall n = 1 fehlt noch."
           criteria: { correctness: 8, originality: 7 }
-      - do: room
-        action: vote
-        args:
-          proposal_id: "${assignment.context.proposal_id}"
-          choice: "yes"
-          reason: "Der Vorschlag ist begründet."
       - do: usage
         input: 700
         output: 120

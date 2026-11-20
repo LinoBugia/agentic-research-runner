@@ -14,13 +14,17 @@ The modules, from the bottom up:
 - `start`: what the runner refuses before the start (and again at its own start).
 - `work`: one pass of a phase `solo` or `parallel`: actions, turns, waits, `isolated`, `over`,
   `repeat`, and the rating actions of a gate `judge`.
+- `chat`: one pass of a phase `chat`: the discussion of the agents with an action in the first
+  channel of the phase, one follow-up question each (W4b-03).
+- `wake`: waking in every phase (agents on standby, the end of `wait_until` by a message) and
+  holding a phase while a question to the user is open (B3) (W4b-03).
 - `runner`: the run over all phases: seeds, entering phases, gates, routes, loops,
   checkpoints, the user's choice.
 
 Hooks for the later orders: a topology of a phase is one function `run_pass(runner, pass_)`
-registered in `runner.PASSES`. W4b-03 (`chat`, `standby`) and W4b-04 (`moderated`) add a module
-each, register it there and remove their entry from `start.NOT_YET` (and, for `standby`,
-`start.STANDBY_READY`). Nothing else of the runner changes.
+registered in `runner.PASSES`. W4b-04 (`moderated`) adds a module, registers it there and
+removes its entry from `start.NOT_YET`; when its actions are done it calls
+`runner.after_actions` (end of waking, B3).
 
 This `__init__` imports nothing, so `arr.room.server` can import `view` without the runner.
 """

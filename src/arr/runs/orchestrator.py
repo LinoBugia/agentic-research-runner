@@ -56,7 +56,7 @@ from arr.backends.base import (
 from arr.errors import ArrError
 from arr.models import AgentStatus, ResolvedRun, Rubric
 from arr.permissions.inbox import ApprovalInbox
-from arr.permissions.types import ApprovalType, EscalationOption
+from arr.permissions.types import ApprovalType, DecisionAction, EscalationOption
 from arr.room.address import address, is_user_question
 from arr.room.store import (
     ORCHESTRATOR,
@@ -65,6 +65,7 @@ from arr.room.store import (
     AgentRoom,
     ChannelState,
     RoomStore,
+    private_channel,
 )
 from arr.room.types import (
     DeliveryStatus,
@@ -92,7 +93,13 @@ from arr.runs.compact import (
     note_from_text,
     rebuild_package,
 )
-from arr.runs.context import AgentHandle, DiscussionOutcome, RunContext, TurnJob
+from arr.runs.context import (
+    AgentHandle,
+    DiscussionOutcome,
+    DiscussionSeats,
+    RunContext,
+    TurnJob,
+)
 from arr.runs.eventlog import EventLogger
 from arr.runs.pacing import (
     HintGate,
@@ -208,6 +215,15 @@ class OrchestratorLog:
     a turn with requests without a fill level), and `purpose: compact` at `turn`/`turn_end`
     of a note turn. Since W4b-05b.2: `note_turn_flag` (`agent`, `action` begin/end, `error`):
     the flag of a note turn could not be set or cleared in the room.
+    Since W4b-03 (`arr.runs.phases.wake`): `channel_open` with `by: private` for the private
+    channel of an agent to the user (`user.<agent-id>`); `wake_scheduled`, `wake`,
+    `wake_skipped`, `ping_pong` and `wait_end` of the waking in a pass carry `stage` (the
+    phase) and `attempt`; `wake_skipped` has the new reasons `phase_end` (the actions of the
+    pass are done; with `messages`), `ping_pong` and `turns_per_agent`; `wake` has the reason
+    `answer` after the user's answer in every topology (B3); `wait_end` has the reason
+    `phase_end` for a sleeper's `wait_until`; `waiting {channel, reason: user, until, stage,
+    attempt}` and `waiting {channel, reason: none, stage}` while a phase waits for the answer
+    to a question (B3, also for a private channel).
     """
 
     def __init__(self, run_dir: Path) -> None:
@@ -833,19 +849,29 @@ class Orchestrator(RunContext):
 
     def _prompt_with_inbox(self, agent_id: str, prompt: str) -> str:
         view = self._views[agent_id]
-        channels = [c for c in self.config.groupchats if agent_id in c.members]
+        groups = [c.name for c in self.config.groupchats if agent_id in c.members]
+        private = [name for name, owner in self._private.items() if owner == agent_id]
+        channels = groups + private
         if not channels:
             return prompt
         inbox = view.inbox()
         user_messages = []
         for channel in channels:
-            if channel.name in self._waiting:
+            if channel in self._waiting:
                 continue
-            cursor = self.room.cursor(agent_id, channel.name)
+            cursor = self.room.cursor(agent_id, channel)
             user_messages += [
-                m for m in self.room.messages(channel.name, after_id=cursor) if m.sender == USER
+                m for m in self.room.messages(channel, after_id=cursor) if m.sender == USER
             ]
         direct = [m for m in view.messages_for_me() if m.sender != ORCHESTRATOR]
+        if private:
+            # W4b-03: the private channel is counted only when something is new in it, and an
+            # agent with no other channel gets an inbox only then (its prompt stays as before)
+            unread = {c: n for c, n in inbox.unread.items() if n or c not in private}
+            inbox = inbox.model_copy(update={"unread": unread})
+            news = inbox.open_questions or any(unread.values()) or user_messages or direct
+            if not groups and not news:
+                return prompt
         return render_turn_prompt(agent_id, prompt, inbox, user_messages, direct)
 
     def _set_status(self, handle: AgentHandle, status: AgentStatus, note: str = "") -> None:
@@ -985,16 +1011,22 @@ class Orchestrator(RunContext):
         except RoomError:
             return False
 
-    def new_result(self, agent_id: str, since: float, after: int = 0) -> Result | Message | None:
+    def new_result(
+        self, agent_id: str, since: float, after: int = 0
+    ) -> Result | Message | Submission | None:
         """The first result `agent_id` submitted after `since` (Unix time): `submit_result` or
-        a message `result` with an ID above `after`, in any channel (L14); None if there is none
-        yet. What of it the waiting agent may see decides `arr.runs.pacing`."""
+        a message `result` with an ID above `after`, in any channel (L14), or (W4b-03 §6.8) a
+        submission of `submit` that is not sealed; None if there is none yet. What of it the
+        waiting agent may see decides `arr.runs.pacing`."""
         for result in self.room.results(agent=agent_id):
             if result.ts > since:
                 return result
         for msg in self.room.messages_after(after):
             if msg.sender == agent_id and msg.kind is MessageKind.RESULT and msg.ts > since:
                 return msg
+        for sub in self.room.submissions(agent=agent_id):
+            if sub.ts > since and not sub.sealed:
+                return sub
         return None
 
     def view(self, agent_id: str) -> AgentRoom:
@@ -1150,15 +1182,18 @@ class Orchestrator(RunContext):
         rounds: int | None = None,
         context: Mapping[str, Any] | None = None,
         kickoff: bool = True,
+        seats: DiscussionSeats | None = None,
     ) -> DiscussionOutcome:
-        """Discussion phase as specified in `RunContext.discuss`; logs its start and end."""
+        """Discussion phase as specified in `RunContext.discuss`; logs its start and end.
+        With `seats` (a phase `chat`, W4b-03) only `seats.members` discuss."""
         try:
             config = self.config.channel(channel)
         except KeyError:
             raise ArrError(f"Den Kanal „{channel}“ gibt es in diesem Run nicht.") from None
+        members = list(seats.members) if seats is not None else list(config.members)
         if stage is not None:
             await self.checkpoint(stage, channel=channel, phase="discussion")
-            for member in config.members:  # F1: a new phase, `done` from before ends
+            for member in members:  # F1: a new phase, `done` from before ends
                 if member in self._handles and not self.is_busy(member):
                     self._enter_phase(self._handles[member], stage)
         if channel in self._waiting:
@@ -1168,7 +1203,14 @@ class Orchestrator(RunContext):
             )
         self.log.write("discussion_start", channel=channel, mode=config.mode.value, stage=stage)
         outcome = await run_discussion(
-            self, channel, prompt, stage=stage, rounds=rounds, context=context, kickoff=kickoff
+            self,
+            channel,
+            prompt,
+            stage=stage,
+            rounds=rounds,
+            context=context,
+            kickoff=kickoff,
+            seats=seats,
         )
         self.log.write(
             "discussion_end",
@@ -1367,6 +1409,8 @@ class Orchestrator(RunContext):
         for agent_id in agents:
             handle = self._handle(agent_id)
             self._phase[agent_id] = stage
+            if self._passes.get(agent_id) != (stage, attempt):
+                self._new_wakeup_count(agent_id)  # W4b-03 (T13): wake-ups count per pass
             self._passes[agent_id] = (stage, attempt)
             names.append(agent_id)
             done = handle.status is AgentStatus.DONE
@@ -1464,6 +1508,62 @@ class Orchestrator(RunContext):
         self._channel_config(channel)
         return self.room.messages(channel)
 
+    # -- W4b-03: private channels, who is in the pass, wake-ups per pass, questions --------
+
+    _participants: frozenset[str] | None = None
+    """While a pass of a phase runs: its participants (with an action, on standby, raters);
+    only they hear of messages (`_recipients`, Entscheidung 64). None: everybody (the old
+    topologies)."""
+
+    @property
+    def _private(self) -> dict[str, str]:
+        """The private channels of the agents to the user: channel → agent (created on first
+        use; filled by `open_private_channels`)."""
+        private: dict[str, str] | None = self.__dict__.get("_private_channels")
+        if private is None:
+            private = self.__dict__["_private_channels"] = {}
+        return private
+
+    def open_private_channels(self) -> dict[str, str]:
+        """Give every agent of the run its private channel to the user (W4b-03, Entscheidung
+        30) before its first turn: `user.<agent-id>`, only the agent a member, open in every
+        phase. Calling it again changes nothing. Returns agent → channel."""
+        out = {}
+        for agent_id in self._handles:
+            name = private_channel(agent_id)
+            if self.room.create_private_channel(agent_id) is not None:
+                self.log.write("channel_open", channel=name, stage=self.stage, by="private")
+            self._private[name] = agent_id
+            out[agent_id] = name
+        return out
+
+    def private_channel(self, agent_id: str) -> str | None:
+        """The private channel of `agent_id` to the user, None in a run without them."""
+        name = private_channel(agent_id)
+        return name if self._private.get(name) == agent_id else None
+
+    def set_participants(self, agents: Sequence[str] | None) -> None:
+        """The participants of the pass that begins (None: no pass, everybody hears again).
+        A message in a channel of the phase reaches only them, as a hint or a wake-up."""
+        self._participants = frozenset(agents) if agents is not None else None
+        if self._participants is not None:
+            for active_id, active in self._active.items():
+                if active_id not in self._participants:
+                    active.pending.clear()
+
+    def _new_wakeup_count(self, agent_id: str) -> None:
+        """T13: the wake-ups of an agent count anew when it enters another pass."""
+        for key in [k for k in self._wakeups if k[1] == agent_id]:
+            del self._wakeups[key]
+
+    def user_question_answered(self, item_id: str) -> bool:
+        """True if the user answered the question of the inbox item `item_id` (L16)."""
+        try:
+            item = self.inbox.get(item_id)
+        except ArrError:
+            return False
+        return item.decision is not None and item.decision.action is DecisionAction.ANSWER
+
     # helpers for arr.runs.pacing
 
     def agent_status(self, agent_id: str) -> AgentStatus:
@@ -1536,12 +1636,27 @@ class Orchestrator(RunContext):
             await asyncio.sleep(self.pacing.poll_interval_s)
 
     def _recipients(self, msg: Message) -> list[str]:
+        """Who hears of `msg` (hints, the end of a `wait_until`): the members of an open
+        channel but its sender, of a message of the orchestrator only its addressees. Since
+        W4b-03 the private channel of an agent has only that agent, and while a pass of a
+        phase runs only its participants hear anything (Entscheidung 64)."""
         if msg.channel in self._waiting:
             return []
         if msg.sender == ORCHESTRATOR:
-            return list(msg.to)
-        members = self.config.channel(msg.channel).members
-        return [m for m in members if m != msg.sender]
+            found = list(msg.to)
+        else:
+            owner = self._private.get(msg.channel)
+            if owner is not None:
+                members: Sequence[str] = [owner]
+            else:
+                try:
+                    members = self.config.channel(msg.channel).members
+                except KeyError:
+                    return []  # a channel arr does not know (not of this run)
+            found = [m for m in members if m != msg.sender]
+        if self._participants is not None:
+            found = [m for m in found if m in self._participants]
+        return found
 
     def poll(self) -> None:
         """Take new messages: queue hints, tell discussions, set `user` delivery states."""

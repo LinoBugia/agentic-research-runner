@@ -20,7 +20,6 @@ AGENT_TOOLS = {
     "read_messages",
     "post_message",
     "get_attachment",
-    "vote",
     "set_status",
     "submit_result",
     "submit_rating",
@@ -28,7 +27,8 @@ AGENT_TOOLS = {
     "wait_for_messages",
     "wait_until",
 }
-MODERATOR_TOOLS = {"give_floor", "call_vote", "pin", "close_discussion"}
+REMOVED_TOOLS = {"vote", "give_floor", "call_vote", "pin", "close_discussion"}
+"""Gone for every run since W4b-03 (§6.7, Entscheidung 11, 12, 27)."""
 FOOTER = re.compile(r"\n\n---\nungelesen: (nichts|.+)$")
 
 
@@ -85,9 +85,11 @@ async def tool_names(store: RoomStore, agent: str) -> set[str]:
         return {t.name for t in (await client.list_tools()).tools}
 
 
-async def test_tool_list_and_moderator_tools_only_for_moderator(store: RoomStore) -> None:
+async def test_tool_list_has_no_vote_and_no_moderator_tools(store: RoomStore) -> None:
+    """W4b-03 A15: the moderator of a channel gets the same tools as everybody (old run)."""
     assert await tool_names(store, "explorer-1") == AGENT_TOOLS
-    assert await tool_names(store, "critic") == AGENT_TOOLS | MODERATOR_TOOLS
+    assert await tool_names(store, "critic") == AGENT_TOOLS
+    assert not (await tool_names(store, "critic")) & REMOVED_TOOLS
 
 
 async def test_all_agent_tools_over_mcp_with_footer(store: RoomStore) -> None:
@@ -141,9 +143,7 @@ async def test_all_agent_tools_over_mcp_with_footer(store: RoomStore) -> None:
         assert thread.count("[#") == 2
 
         proposal = await e1.ok("post_message", channel="main", body="Ansatz B", kind="proposal")
-        proposal_id = int(re.search(r"#(\d+)", proposal).group(1))
-        voted = await critic.ok("vote", proposal_id=proposal_id, choice="yes", reason="ok")
-        assert voted == f"Stimme zu #{proposal_id} gespeichert: yes."
+        assert "gepostet" in proposal
 
         assignment = await e1.ok("get_assignment")
         assert assignment.startswith("Auftrag (Turn 1, Stufe explore):\nFinde Ideen")
@@ -163,20 +163,22 @@ async def test_all_agent_tools_over_mcp_with_footer(store: RoomStore) -> None:
     assert store.ratings()[0].criteria == {"Tiefe": 7}
 
 
-async def test_moderator_tools_over_mcp(store: RoomStore) -> None:
+async def test_removed_tools_cannot_be_called_over_mcp(store: RoomStore) -> None:
+    """W4b-03 A15: a call of a removed tool is an error, also for the moderator of a channel;
+    nothing is written."""
+    before = len(store.messages_after(0))
     async with Client(build_server(store.for_agent("critic"))) as client:
-        critic = Agent(client)
-        assert await critic.ok("give_floor", agent="explorer-1", prompt="Schritt 3?") == (
-            "explorer-1 hat das Wort."
-        )
-        proposal = store.for_agent("explorer-1").post_message("seminar", "B", kind="proposal")
-        assert await critic.ok("call_vote", proposal_id=proposal.id, rule="unanimous") == (
-            f"Abstimmung über #{proposal.id} gestartet."
-        )
-        assert await critic.ok("pin", msg_id=proposal.id) == f"Nachricht #{proposal.id} angeheftet."
-        closed = await critic.ok("close_discussion", decision="Wir nehmen B")
-        assert closed.startswith("Diskussion in #seminar beendet, Entscheidung #")
-    assert store.floor_requests()[0].agent == "explorer-1"
+        for tool, args in (
+            ("vote", {"proposal_id": 1, "choice": "yes"}),
+            ("give_floor", {"agent": "explorer-1", "prompt": "Schritt 3?"}),
+            ("call_vote", {"proposal_id": 1}),
+            ("pin", {"msg_id": 1}),
+            ("close_discussion", {"decision": "B"}),
+        ):
+            result = await client.call_tool(tool, args)
+            assert result.is_error, tool
+    assert len(store.messages_after(0)) == before
+    assert store.channel_state("seminar").value == "open"
 
 
 async def test_rejections_over_mcp_are_german(store: RoomStore) -> None:
@@ -196,13 +198,9 @@ async def test_rejections_over_mcp_are_german(store: RoomStore) -> None:
         for tool, args in (("post_message", {"body": "x"}), ("read_messages", {})):
             text = await critic.error(tool, channel="judges", **args)
             assert "Der Kanal #judges ist noch geschlossen. Er öffnet ab Phase „judge“." in text
-        # Moderator tools: not offered to others, and only for own channels.
-        result = await c1.call_tool("pin", {"msg_id": 1})
-        assert result.is_error
-        assert "Du bist nicht Moderator von #main" in await critic.error("pin", msg_id=1)
-        assert "nicht Moderator von #main" in await critic.error(
-            "close_discussion", decision="x", channel="main"
-        )
+        # The removed moderator tools are offered to nobody (W4b-03).
+        assert (await c1.call_tool("pin", {"msg_id": 1})).is_error
+        assert (await c2.call_tool("pin", {"msg_id": 1})).is_error
         assert "Unbekannte Nachrichtenart „chat“" in await e1.error(
             "post_message", channel="main", body="x", kind="chat"
         )

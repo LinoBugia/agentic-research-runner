@@ -158,18 +158,11 @@ async def test_a1_solo_and_parallel_run_to_the_end(workfolder: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------------
-# A2: refused before the start until the order that builds it is merged
+# A2: refused before the start until the order that builds it is merged (W4b-03: `chat` and
+# `standby` run now, only `moderated` waits for W4b-04)
 # --------------------------------------------------------------------------------------------
 
 NOT_YET = {
-    "chat": (
-        {
-            "phases": [{**parallel("d", ["a", "b"]), "topology": "chat"}],
-            "channels": [{"name": "k", "members": ["a", "b"]}],
-        },
-        "phases[0].topology",
-        "Die Topologie „chat“ (Phase „d“) ist in dieser Version noch nicht verfügbar.",
-    ),
     "moderated": (
         {
             "phases": [
@@ -179,12 +172,27 @@ NOT_YET = {
         "phases[0].topology",
         "Die Topologie „moderated“ (Phase „m“) ist in dieser Version noch nicht verfügbar.",
     ),
-    "standby": (
-        {"phases": [{**solo("s", "a"), "standby": ["b"]}]},
-        "phases[0].standby",
-        "Agenten auf Abruf („standby“, Phase „s“) sind in dieser Version noch nicht verfügbar.",
-    ),
 }
+
+READY_SINCE_W4B03 = {
+    "chat": {
+        "phases": [{**parallel("d", ["a", "b"]), "topology": "chat"}],
+        "channels": [{"name": "k", "members": ["a", "b"]}],
+    },
+    "standby": {"phases": [{**solo("s", "a"), "standby": ["b"]}]},
+}
+
+
+@pytest.mark.parametrize("case", list(READY_SINCE_W4B03))
+def test_w4b03_chat_and_standby_pass_the_start_check(case: str) -> None:
+    """W4b-03 A1: `chat` and `standby` are no longer refused; `moderated` still is."""
+    group = READY_SINCE_W4B03[case]
+    if case == "chat":
+        group = {**group, "phases": [{**group["phases"][0], "channels": ["k"]}]}
+    resolved = resolved_of({**TWO, **group})
+    check_topology(resolved)
+    assert start.start_issues(resolved, Orchestrator) == []
+    assert start.READY == "solo, parallel, chat" and start.STANDBY_READY
 
 
 @pytest.mark.parametrize("case", list(NOT_YET))
@@ -241,17 +249,35 @@ def test_a2_plan_launch_creates_nothing_for_a_refused_run(
     workfolder: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_file = launch_setup(workfolder, arr_home, monkeypatch)
-    run_file.write_text(
-        RUN_FILE.replace("topology: solo\n", "topology: solo\n    standby: [b]\n"), "utf-8"
-    )
-    with pytest.raises(ConfigError, match="noch nicht verfügbar"):
+    moderated = "topology: moderated\n    max_assignments: 2\n    standby: [b]\n"
+    run_file.write_text(RUN_FILE.replace("topology: solo\n", moderated), "utf-8")
+    with pytest.raises(ConfigError, match="noch nicht verfügbar") as info:
         plan_launch(run_file, cwd=workfolder)
+    assert [i.path for i in info.value.issues] == ["phases[0].topology"]
     assert list((workfolder / "runs").iterdir()) == []
+
+
+@pytest.mark.parametrize("case", ["chat", "standby"])
+def test_w4b03_plan_launch_accepts_chat_and_standby(
+    workfolder: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    run_file = launch_setup(workfolder, arr_home, monkeypatch)
+    if case == "chat":
+        text = (
+            RUN_FILE.replace("    topology: parallel\n", "    topology: chat\n    channels: [k]\n")
+            + "channels: [{name: k, members: [a, b]}]\n"
+        )
+    else:
+        text = RUN_FILE.replace("topology: solo\n", "topology: solo\n    standby: [b]\n")
+    run_file.write_text(text, "utf-8")
+    launch = plan_launch(run_file, cwd=workfolder)
+    assert [p.name for p in launch.resolved.phases] == ["arbeit", "pruefung"]
 
 
 async def test_a2_the_runner_checks_again_at_its_start(workfolder: Path) -> None:
     """`check_topology` skipped: the runner refuses at its start, before any turn."""
-    group = {**TWO, "phases": [{**solo("s", "a"), "standby": ["b"]}]}
+    phase = {**solo("m", "a"), "topology": "moderated", "max_assignments": 2, "standby": ["b"]}
+    group = {**TWO, "phases": [phase]}
     mgr, log = manager(workfolder, group, {"a": answer()})
     assert await run(mgr) is RunStatus.FAILED
     assert "noch nicht verfügbar" in errors(mgr)[0] and log.turns == []

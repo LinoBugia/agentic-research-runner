@@ -50,17 +50,13 @@ ROOM_TOOLS = [  # docs/06-gruppenchats.md §9
     "read_messages",
     "post_message",
     "get_attachment",
-    "vote",
     "set_status",
     "submit_result",
     "submit_rating",
     "get_assignment",
-    "give_floor",
-    "call_vote",
-    "pin",
-    "close_discussion",
     "wait_until",  # docs/09 §4.3
 ]
+REMOVED_TOOLS = ["vote", "give_floor", "call_vote", "pin", "close_discussion"]  # W4b-03 §6.7
 
 
 def fields(model: Any) -> set[str]:
@@ -150,6 +146,8 @@ def test_room_types() -> None:
     assert RoomAPI._is_protocol  # type: ignore[attr-defined]
     for tool in ROOM_TOOLS:
         assert callable(getattr(RoomAPI, tool)), tool
+    for tool in REMOVED_TOOLS:
+        assert not hasattr(RoomAPI, tool), tool
 
 
 def test_room_api_is_runtime_checkable() -> None:

@@ -204,14 +204,9 @@ REFUSED_TOOLS = [
     room("submit_rating", result_id=1, score=5, comment="c"),
     post("main", "im Notiz-Turn"),
     post("main", "Frage im Notiz-Turn?", kind="question", to=["user"]),
-    room("vote", proposal_id=1, choice="yes"),
     room("set_status", status="done", note="fertig"),
     room("wait_for_messages", seconds=1),
     room("wait_until", minutes=1),
-    room("give_floor", agent="peer", prompt="p"),
-    room("call_vote", proposal_id=1),
-    room("pin", msg_id=1),
-    room("close_discussion", decision="d"),
     room("read_messages"),
 ]
 

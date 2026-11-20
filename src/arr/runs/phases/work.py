@@ -141,13 +141,16 @@ async def _action(
         await runner.transition(slot.agent, phase, pass_.attempt)
     await ctx.enter_phase(phase.name, pass_.attempt, [slot.agent])
     context = runner.package(phase, pass_, slot, repetition=repetition, mark=mark)
+    slot.context, slot.mark = context, runner.mark()  # for a turn after the user's answer (B3)
     found = await runner.act(slot, phase.name, pass_.attempt, context)
     if found is not None:
         slot.found = found
 
 
 async def run_pass(runner: "PhaseRunner", pass_: Pass) -> None:
-    """Run the actions of a pass of a phase `solo` or `parallel` (and seal, release)."""
+    """Run the actions of a pass of a phase `solo` or `parallel` (and seal, release). When the
+    actions are done, `runner.after_actions` ends the waking of sleepers and holds the phase
+    for an open question to the user (W4b-03 B3), before an isolated phase is released."""
     ctx = runner.ctx
     phase = ctx.config.phase(pass_.phase)
     if phase.isolated:
@@ -163,6 +166,7 @@ async def run_pass(runner: "PhaseRunner", pass_: Pass) -> None:
                 await together(
                     [_action(runner, phase, pass_, slot, repetition, mark) for slot in block_]
                 )
+        await runner.after_actions(phase, pass_)
         if pass_.sealed:
             released = True
             runner.release(phase.name)
@@ -220,6 +224,7 @@ async def rate(runner: "PhaseRunner", phase: ResolvedPhase, pass_: Pass) -> list
         await ctx.enter_phase(phase.name, pass_.attempt, [slot.agent])
         rate_ids = _rate_list(subs, slot.agent)
         context = runner.rating_package(phase, pass_, slot, subs, rate_ids, mark)
+        slot.context, slot.mark = context, runner.mark()  # for a turn after the answer (B3)
         found = await runner.act(slot, phase.name, pass_.attempt, context)
         if found is not None:
             slot.found = found

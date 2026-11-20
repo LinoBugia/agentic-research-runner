@@ -2,6 +2,7 @@
 scores, the valid submission of every phase and the list of objections. Only data; the runner
 fills it."""
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,7 +23,10 @@ HOW_USER = "user_retry"
 @dataclass
 class Slot:
     """One action of a pass: who, which (`Expectation.action`), the assignment, the entry of
-    an `over` list (index from 0 and its data), and the newest submission found for it."""
+    an `over` list (index from 0 and its data), and the newest submission found for it.
+
+    `context` and `mark` (W4b-03): the context package of the action and the submission mark
+    taken at its start, kept for a turn after the user's answer (B3, `wake.hold`)."""
 
     agent: str
     action: str
@@ -32,16 +36,20 @@ class Slot:
     item: dict[str, Any] | None = None
     found: Submission | None = None
     turns: int = 0
+    context: dict[str, Any] | None = None
+    mark: int = 0
 
 
 @dataclass
 class Pass:
-    """A pass of a phase while it runs."""
+    """A pass of a phase while it runs; `started` is the Unix time of its start (a question to
+    the user asked since then holds it, W4b-03 B3)."""
 
     phase: str
     attempt: int
     how: str
     hint: str | None = None
+    started: float = field(default_factory=time.time)
     slots: list[Slot] = field(default_factory=list)
     sealed: bool = False
     raters: list[Slot] = field(default_factory=list)

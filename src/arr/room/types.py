@@ -60,7 +60,8 @@ class VoteChoice(StrEnum):
 
 
 class VoteRule(StrEnum):
-    """Rule of a vote started with `call_vote` (docs/06-gruppenchats.md §5.3)."""
+    """Rule of a vote in a channel (docs/06-gruppenchats.md §5.3). Since W4b-03 no room tool
+    starts a vote any more (Entscheidung 11, 27); the type stays for old rooms and `service/`."""
 
     MAJORITY = "majority"
     UNANIMOUS = "unanimous"
@@ -203,7 +204,8 @@ class Submission(Record):
 
 
 class Vote(Record):
-    """A vote on a proposal (docs/06 §7, table `vote` in docs/02 §5)."""
+    """A vote on a proposal (docs/06 §7, table `vote` in docs/02 §5). Since W4b-03 agents cannot
+    vote any more; old rooms keep their votes readable."""
 
     proposal_id: int
     agent: str
@@ -334,10 +336,6 @@ class RoomAPI(Protocol):
         """Return the absolute path of an attachment of a message in one of my channels."""
         ...
 
-    def vote(self, proposal_id: int, choice: VoteChoice, reason: str = "") -> Vote:
-        """Vote on a proposal; a second vote replaces the first."""
-        ...
-
     def set_status(self, status: AgentStatus, note: str = "") -> None:
         """Report the own status, typically `working` or `done` with a short summary."""
         ...
@@ -378,28 +376,6 @@ class RoomAPI(Protocol):
 
     def get_assignment(self) -> Assignment | None:
         """Current assignment with stage and context package, or None before the first turn."""
-        ...
-
-    def give_floor(self, agent: str, prompt: str, channel: str | None = None) -> None:
-        """Moderator only: give an agent the floor with a concrete question.
-
-        `channel` may be omitted if the agent moderates exactly one channel.
-        """
-        ...
-
-    def call_vote(self, proposal_id: int, rule: VoteRule = VoteRule.MAJORITY) -> None:
-        """Moderator only: start a vote on a proposal."""
-        ...
-
-    def pin(self, msg_id: int) -> None:
-        """Moderator only: pin a message."""
-        ...
-
-    def close_discussion(self, decision: str, channel: str | None = None) -> Message:
-        """Moderator only: end the discussion and post the `decision`.
-
-        `channel` may be omitted if the agent moderates exactly one channel.
-        """
         ...
 
 

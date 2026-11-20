@@ -326,10 +326,10 @@ class RoomServer(MCPServer):
 def build_server(room: AgentRoom) -> MCPServer:
     """MCP server with the room tools of docs/06 §9 bound to `room.agent_id`.
 
-    Moderator tools are only registered if the agent moderates at least one channel; the
-    store checks the moderator for every call as well. A run with the topology `phases` gets
-    `submit` and not `submit_result`/`submit_rating`, the five old topologies the reverse
-    (W4b-01).
+    A run with the topology `phases` gets `submit` and not `submit_result`/`submit_rating`,
+    the five old topologies the reverse (W4b-01). Since W4b-03 no run offers `vote`, `call_vote`,
+    `give_floor`, `pin` or `close_discussion` (Entscheidung 11, 12, 27): gates read submissions,
+    and the topology `moderated` (W4b-04) replaces the moderator.
     """
     server = RoomServer(room)
 
@@ -397,17 +397,6 @@ def build_server(room: AgentRoom) -> MCPServer:
         return _respond(
             room, "get_attachment", lambda: _attachment_text(room.get_attachment(msg_id, name))
         )
-
-    @server.tool(
-        description="Über einen Vorschlag (proposal) abstimmen: `choice` yes, no oder abstain, "
-        "mit kurzer Begründung. Eine zweite Stimme ersetzt die erste."
-    )
-    def vote(proposal_id: int, choice: str, reason: str = "") -> str:
-        def call() -> str:
-            v = room.vote(proposal_id, choice, reason)
-            return f"Stimme zu #{v.proposal_id} gespeichert: {v.choice.value}."
-
-        return _respond(room, "vote", call)
 
     @server.tool(
         description="Eigenen Status melden: `working` oder `done` (mit kurzem Fazit in `note`)."
@@ -498,8 +487,6 @@ def build_server(room: AgentRoom) -> MCPServer:
 
         return _respond(room, "get_assignment", call)
 
-    if room.moderated_channels():
-        _add_moderator_tools(server, room)
     return server
 
 
@@ -580,49 +567,6 @@ def _add_old_submit_tools(server: MCPServer, room: AgentRoom) -> None:
             return f"Bewertung #{r.id} für Ergebnis #{r.result_id} gespeichert ({r.score:g})."
 
         return _respond(room, "submit_rating", call)
-
-
-def _add_moderator_tools(server: MCPServer, room: AgentRoom) -> None:
-    @server.tool(
-        description="Nur Moderator: einem Mitglied das Wort geben, mit konkreter Frage in "
-        "`prompt`. `channel` darf fehlen, wenn du genau einen Kanal moderierst."
-    )
-    def give_floor(agent: str, prompt: str, channel: str | None = None) -> str:
-        def call() -> str:
-            room.give_floor(agent, prompt, channel)
-            return f"{agent} hat das Wort."
-
-        return _respond(room, "give_floor", call)
-
-    @server.tool(
-        description="Nur Moderator: Abstimmung über einen Vorschlag starten, `rule` majority "
-        "oder unanimous."
-    )
-    def call_vote(proposal_id: int, rule: str = "majority") -> str:
-        def call() -> str:
-            room.call_vote(proposal_id, rule)
-            return f"Abstimmung über #{proposal_id} gestartet."
-
-        return _respond(room, "call_vote", call)
-
-    @server.tool(description="Nur Moderator: eine Nachricht anheften, z. B. einen Zwischenstand.")
-    def pin(msg_id: int) -> str:
-        def call() -> str:
-            room.pin(msg_id)
-            return f"Nachricht #{msg_id} angeheftet."
-
-        return _respond(room, "pin", call)
-
-    @server.tool(
-        description="Nur Moderator: Diskussion beenden und das Ergebnis als `decision` posten. "
-        "`channel` darf fehlen, wenn du genau einen Kanal moderierst."
-    )
-    def close_discussion(decision: str, channel: str | None = None) -> str:
-        def call() -> str:
-            msg = room.close_discussion(decision, channel)
-            return f"Diskussion in #{msg.channel} beendet, Entscheidung #{msg.id}."
-
-        return _respond(room, "close_discussion", call)
 
 
 def main() -> None:
