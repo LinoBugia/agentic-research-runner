@@ -422,8 +422,9 @@ async def run_discussion(
     else:
         raise ArrError(f"Die Taktung „moderated“ (Kanal #{channel}) gibt es erst ab Welle 4.")
     if outcome.ended_by not in (DiscussionEnd.STOPPED, DiscussionEnd.LIMIT):
+        seated = (seats,) if seats is not None else ()
         await _hold_for_user_questions(
-            orch, config, stage, context, outcome, rounds or DEFAULT_ROUNDS, seats
+            orch, config, stage, context, outcome, rounds or DEFAULT_ROUNDS, *seated
         )
     return outcome
 
@@ -484,13 +485,15 @@ async def _hold_for_user_questions(
             if item.decision is not None and item.decision.action is DecisionAction.ANSWER:
                 answered.append(question)
         if answered:
+            # without seats (the old topologies) the calls are those of `main`
+            seated = (seats,) if seats is not None else ()
             if config.mode is ChannelMode.EVENT:
                 await _answered_in_event(
-                    orch, config, stage, context, outcome, rounds, answered, seats
+                    orch, config, stage, context, outcome, rounds, answered, *seated
                 )
             else:
                 for question in answered:
-                    await _wake_for_answer(orch, config, stage, context, question, outcome, seats)
+                    await _wake_for_answer(orch, config, stage, context, question, outcome, *seated)
             if outcome.ended_by in (DiscussionEnd.STOPPED, DiscussionEnd.LIMIT):
                 break
             continue
