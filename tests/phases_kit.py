@@ -431,3 +431,68 @@ def judge_gate(
     }
     gate.update(extra)
     return gate
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-03: channels, waking, holding
+# --------------------------------------------------------------------------------------------
+
+
+def private(agent: str) -> str:
+    """The private channel of `agent` to the user (W4b-03)."""
+    return f"user.{agent}"
+
+
+def say(channel: str, body: str, **args: Any) -> dict[str, Any]:
+    """A message of the agent (`post_message`)."""
+    return room("post_message", channel=channel, body=body, **args)
+
+
+def entries(mgr: RunManager, *kinds: str) -> list[tuple[str, dict[str, Any]]]:
+    """`(kind, data)` of the log entries of these kinds, in the order they were written."""
+    return [
+        (e["kind"], e["data"])
+        for e in OrchestratorLog(mgr.run_dir).entries()
+        if not kinds or e["kind"] in kinds
+    ]
+
+
+def of_kind(mgr: RunManager, kind: str, **match: Any) -> list[dict[str, Any]]:
+    """Data of the log entries of `kind` whose fields equal `match`."""
+    return [
+        d for k, d in entries(mgr, kind) if all(d.get(key) == value for key, value in match.items())
+    ]
+
+
+def woken(log: Log, agent: str) -> list[TurnView]:
+    """The wake-up turns of a sleeper (their context says `standby`)."""
+    return [v for v in log.of(agent) if v.context.get("standby")]
+
+
+async def run_with(
+    mgr: RunManager, helper: Callable[[RunManager], Any], within: float = 60
+) -> RunStatus:
+    """Run the manager with `helper(mgr)` beside it (e.g. the user answering); the helper is
+    cancelled when the run ends, its error is raised."""
+    import contextlib
+
+    task = asyncio.create_task(helper(mgr))
+    try:
+        status = await run(mgr, within)
+    finally:
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    return status
+
+
+def waker_of(mgr: RunManager) -> Any:
+    """The waker of the running pass (`arr.runs.phases.wake.Waker`), None between passes."""
+    from arr.runs.phases.wake import Waker
+
+    orch = mgr.orchestrator
+    if orch is None:
+        return None
+    found = [w for w in orch._listeners if isinstance(w, Waker)]
+    return found[0] if found else None

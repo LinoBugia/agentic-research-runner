@@ -96,7 +96,7 @@ from arr.errors import ArrError
 from arr.models import AgentConfig, AgentStatus, Provider, StrictModel
 from arr.resolve import load_yaml_model, validate_model
 from arr.room.store import AgentRoom
-from arr.room.types import MessageKind, RoomAPI, RoomError, SubmitAPI, VoteChoice, VoteRule
+from arr.room.types import MessageKind, RoomAPI, RoomError, SubmitAPI
 from arr.room.waiting import WAIT_MAX_S, wait_for_messages
 from arr.runs.compact import NOTE_HEADING
 
@@ -151,30 +151,23 @@ class RoomAction(StrEnum):
     READ_MESSAGES = "read_messages"
     POST_MESSAGE = "post_message"
     GET_ATTACHMENT = "get_attachment"
-    VOTE = "vote"
     SET_STATUS = "set_status"
     SUBMIT_RESULT = "submit_result"
     SUBMIT_RATING = "submit_rating"
     SUBMIT = "submit"  # W4b-01: `SubmitAPI`, the tool of the phase toolkit
     GET_ASSIGNMENT = "get_assignment"
-    GIVE_FLOOR = "give_floor"
-    CALL_VOTE = "call_vote"
-    PIN = "pin"
-    CLOSE_DISCUSSION = "close_discussion"
     WAIT_UNTIL = "wait_until"
     WAIT_FOR_MESSAGES = "wait_for_messages"  # blocks like the MCP tool (`arr.room.waiting`)
 
 
 _ENUM_ARGS: dict[str, dict[str, type[StrEnum]]] = {
     RoomAction.POST_MESSAGE: {"kind": MessageKind},
-    RoomAction.VOTE: {"choice": VoteChoice},
     RoomAction.SET_STATUS: {"status": AgentStatus},
-    RoomAction.CALL_VOTE: {"rule": VoteRule},
 }
 
 
 class RoomStep(StrictModel):
-    """A call of the agent's `RoomAPI`: message, question, answer, result, rating, vote, status …
+    """A call of the agent's `RoomAPI`: message, question, answer, result, rating, status …
 
     `action` is the method name, `args` its arguments (enum values as strings). A `RoomError`
     becomes a failed tool result and the turn goes on, as the agent would see it.

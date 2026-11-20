@@ -23,9 +23,6 @@ from arr.room.types import (
     Rating,
     Result,
     RoomError,
-    Vote,
-    VoteChoice,
-    VoteRule,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "fake"
@@ -40,7 +37,6 @@ class StubRoom:
         self.messages: list[Message] = []
         self.results: list[Result] = []
         self.ratings: list[Rating] = []
-        self.votes: list[Vote] = []
         self.status: tuple[AgentStatus, str] | None = None
         self.open_questions = open_questions or []
         self.assignment: Assignment | None = None
@@ -104,14 +100,6 @@ class StubRoom:
         self._record("get_attachment", msg_id=msg_id, name=name)
         return Path("/nonexistent") / name
 
-    def vote(self, proposal_id: int, choice: VoteChoice, reason: str = "") -> Vote:
-        self._record("vote", proposal_id=proposal_id, choice=choice, reason=reason)
-        vote = Vote(
-            proposal_id=proposal_id, agent=self._agent_id, choice=choice, reason=reason, ts=1.0
-        )
-        self.votes.append(vote)
-        return vote
-
     def set_status(self, status: AgentStatus, note: str = "") -> None:
         self._record("set_status", status=status, note=note)
         self.status = (status, note)
@@ -156,19 +144,6 @@ class StubRoom:
     def get_assignment(self) -> Assignment | None:
         self._record("get_assignment")
         return self.assignment
-
-    def give_floor(self, agent: str, prompt: str, channel: str | None = None) -> None:
-        self._record("give_floor", agent=agent, prompt=prompt, channel=channel)
-
-    def call_vote(self, proposal_id: int, rule: VoteRule = VoteRule.MAJORITY) -> None:
-        self._record("call_vote", proposal_id=proposal_id, rule=rule)
-
-    def pin(self, msg_id: int) -> None:
-        self._record("pin", msg_id=msg_id)
-
-    def close_discussion(self, decision: str, channel: str | None = None) -> Message:
-        self._record("close_discussion", decision=decision, channel=channel)
-        return self.post_message(channel or "main", decision, MessageKind.DECISION)
 
 
 def make_config(agent_id: str = "explorer-1", provider: str = "claude") -> AgentConfig:
@@ -382,7 +357,7 @@ async def test_all_step_kinds_script_plays_and_calls_the_room() -> None:
         "tool_call",  # Bash, failing
         "tool_result",
         *["tool_call", "tool_result"]
-        * 7,  # 3x post_message, submit_result, submit_rating, vote, set_status
+        * 6,  # 3x post_message, submit_result, submit_rating, set_status
         "rate_limit",
         "usage",
         "error",
@@ -399,7 +374,6 @@ async def test_all_step_kinds_script_plays_and_calls_the_room() -> None:
         "post_message",
         "submit_result",
         "submit_rating",
-        "vote",
         "set_status",
     ]
     idea, question, answer = room.messages
@@ -409,11 +383,10 @@ async def test_all_step_kinds_script_plays_and_calls_the_room() -> None:
     assert room.results[0].title == "Idee A"
     rating = room.ratings[0]
     assert (rating.result_id, rating.score, rating.criteria) == (1, 8, {"clarity": 9})
-    assert room.votes[0].choice is VoteChoice.NO and room.votes[0].reason == "zu vage"
     assert room.status == (AgentStatus.WORKING, "rechnet")
     # enum arguments arrive as enums, not as bare strings
     assert isinstance(room.calls[0][1]["kind"], MessageKind)
-    assert isinstance(room.calls[5][1]["choice"], VoteChoice)
+    assert isinstance(room.calls[5][1]["status"], AgentStatus)
 
     # room actions show up as tool calls of the room MCP server, with the result as JSON
     call = next(e for e in events if e.data.get("name") == ROOM_TOOL_PREFIX + "post_message")
@@ -436,7 +409,7 @@ async def test_all_step_kinds_script_plays_and_calls_the_room() -> None:
         "billed",
         "fake-explorer-1",
     )
-    assert end["num_turns"] == 1 + 9  # 2 plain tools + 7 room calls
+    assert end["num_turns"] == 1 + 8  # 2 plain tools + 6 room calls
 
 
 async def test_tool_ids_pair_call_and_result() -> None:
@@ -477,13 +450,21 @@ async def test_room_error_becomes_failed_tool_result_and_turn_goes_on() -> None:
 @pytest.mark.parametrize(
     ("step", "message"),
     [
-        ({"do": "room", "action": "pin", "args": {"msg": 1}}, "ungültige Argumente"),
+        ({"do": "room", "action": "get_attachment", "args": {"msg": 1}}, "ungültige Argumente"),
         (
-            {"do": "room", "action": "vote", "args": {"proposal_id": 1, "choice": "vielleicht"}},
+            {
+                "do": "room",
+                "action": "post_message",
+                "args": {"channel": "m", "body": "x", "kind": "vielleicht"},
+            },
             "kein gültiger Wert",
         ),
         (
-            {"do": "room", "action": "pin", "args": {"msg_id": "${gibt_es_nicht.id}"}},
+            {
+                "do": "room",
+                "action": "get_attachment",
+                "args": {"msg_id": "${gibt_es_nicht.id}", "name": "x"},
+            },
             "save_as",
         ),
     ],
@@ -591,7 +572,6 @@ async def test_rater_script_rates_the_result_from_the_assignment_context() -> No
     backend = await started(FIXTURES / "rater.yaml", room, agent="judge-1")
     await play(backend)
     assert room.ratings[0].result_id == 4 and room.ratings[0].score == 7.5
-    assert room.votes[0].proposal_id == 9 and room.votes[0].choice is VoteChoice.YES
 
 
 # --------------------------------------------------------------------------------------------
@@ -904,7 +884,7 @@ async def test_hang_ignores_interrupt_until_its_time_is_up() -> None:
     assert end.kind is EventKind.TURN_END and end.data["status"] == "interrupted"
 
 
-async def test_moderator_and_reading_actions_run_against_the_room() -> None:
+async def test_reading_actions_run_against_the_room() -> None:
     room = StubRoom("mod-1")
     room.messages.append(
         Message(
@@ -915,37 +895,21 @@ async def test_moderator_and_reading_actions_run_against_the_room() -> None:
         {"do": "room", "action": "inbox", "save_as": "inbox"},
         {"do": "room", "action": "list_channels"},
         {"do": "room", "action": "get_attachment", "args": {"msg_id": 1, "name": "beweis.pdf"}},
-        {"do": "room", "action": "give_floor", "args": {"agent": "explorer-1", "prompt": "Bitte"}},
-        {"do": "room", "action": "call_vote", "args": {"proposal_id": 1, "rule": "unanimous"}},
-        {"do": "room", "action": "pin", "args": {"msg_id": 1}},
-        {
-            "do": "room",
-            "action": "close_discussion",
-            "args": {"decision": "Wir nehmen Idee A.", "channel": "main"},
-            "save_as": "decision",
-        },
     ]
     backend = await started({"turns": [{"steps": steps}]}, room, agent="mod-1")
     events = await play(backend)
 
-    assert [name for name, _ in room.calls] == [
-        "inbox",
-        "list_channels",
-        "get_attachment",
-        "give_floor",
-        "call_vote",
-        "pin",
-        "close_discussion",
-        "post_message",  # the stub posts the decision
-    ]
+    assert [name for name, _ in room.calls] == ["inbox", "list_channels", "get_attachment"]
     results = [e for e in events if e.kind is EventKind.TOOL_RESULT]
-    assert len(results) == 7 and not any(r.data["is_error"] for r in results)
+    assert len(results) == 3 and not any(r.data["is_error"] for r in results)
     assert json.loads(results[0].data["content"])["unread"] == {"main": 2}
     assert json.loads(results[1].data["content"]) == []
     assert json.loads(results[2].data["content"]).endswith("beweis.pdf")  # Path → str
-    assert [r.data["content"] for r in results[3:6]] == ["ok", "ok", "ok"]
-    assert json.loads(results[6].data["content"])["kind"] == "decision"
-    assert room.calls[3][1] == {"agent": "explorer-1", "prompt": "Bitte", "channel": None}
-    assert room.calls[4][1]["rule"] is VoteRule.UNANIMOUS
-    assert room.calls[5][1] == {"msg_id": 1}
     assert events[-1].data["status"] == "ok"
+
+
+@pytest.mark.parametrize("action", ["vote", "give_floor", "call_vote", "pin", "close_discussion"])
+def test_w4b03_a_script_with_a_removed_room_action_is_refused(action: str) -> None:
+    """W4b-03 §6.7: the five removed tools are no room actions of a script any more."""
+    with pytest.raises(ConfigError):
+        load_script({"turns": [{"steps": [{"do": "room", "action": action}]}]})

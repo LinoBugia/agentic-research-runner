@@ -32,9 +32,6 @@ turns:
         action: submit_rating
         args: { result_id: "${result.id}", score: 8, comment: "gut", criteria: { clarity: 9 } }
       - do: room
-        action: vote
-        args: { proposal_id: 3, choice: "no", reason: "zu vage" }
-      - do: room
         action: set_status
         args: { status: working, note: "rechnet" }
       - { do: rate_limit, status: allowed_warning, utilization: 0.82, resets_at: 1761240000 }

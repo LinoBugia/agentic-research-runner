@@ -63,9 +63,6 @@ from arr.room.types import (
     Result,
     RoomError,
     Submission,
-    Vote,
-    VoteChoice,
-    VoteRule,
     WaitGuard,
     WaitKind,
     WaitState,
@@ -73,7 +70,7 @@ from arr.room.types import (
 from arr.runs.prepare import load_agent_file
 from arr.submissions.check import Checked, SubmissionError, check_submission
 from arr.submissions.diff import diff_pairs
-from arr.submissions.formats import Expectation, SubmissionStatus
+from arr.submissions.formats import _SLUG_RE, Expectation, SubmissionStatus
 
 log = logging.getLogger(__name__)
 
@@ -174,7 +171,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS submission_version ON submission(name, version
 CREATE TABLE IF NOT EXISTS sealed_submission(submission_id INTEGER PRIMARY KEY, stage TEXT);
 CREATE TABLE IF NOT EXISTS note_turn(agent TEXT PRIMARY KEY, since REAL);
 """
-"""Tables of docs/02 §5 plus `channel.state`, `msg.via`/`msg.delivery`, `poll`, `floor`,
+"""Tables of docs/02 §5 plus `channel.state`, `msg.via`/`msg.delivery`, `poll`, `floor` (both
+unused since W4b-03 removed the moderator tools; old rooms keep them readable),
 `agent_report` (the status an agent reported itself), `agent_wait` (one row per agent and
 kind of wait, docs/09 §4.3) and `wait_guard` (the limits of waiting, L7, L10, L12). Rooms of
 runs before W3-07 lack the last three, rooms before W3-09 the column `agent_wait.result_from`
@@ -241,26 +239,13 @@ class ChannelState(StrEnum):
     """State of a channel in `channel.state` (docs/06-gruppenchats.md §2, §5.3).
 
     `waiting`: `open_from` not reached, agents can neither read nor write; `open`: normal;
-    `closed`: discussion ended (`close_discussion`), readable but no new agent messages.
+    `closed`: discussion ended, readable but no new agent messages (rooms from before W4b-03,
+    when the moderator tool `close_discussion` still existed; nothing closes a channel now).
     """
 
     WAITING = "waiting"
     OPEN = "open"
     CLOSED = "closed"
-
-
-@dataclass(frozen=True)
-class FloorRequest:
-    """A `give_floor` call of a moderator, picked up by the orchestrator (docs/06 §5.3)."""
-
-    id: int
-    ts: float
-    channel: str
-    moderator: str
-    agent: str
-    prompt: str
-    msg_id: int
-    handled: bool
 
 
 @dataclass(frozen=True)
@@ -311,6 +296,52 @@ def _alias(index: int) -> str:
 
 def _channel_name(name: str) -> str:
     return name.strip().removeprefix("#")
+
+
+PRIVATE_PREFIX = "user."
+"""The private channel of an agent to the user is `user.<agent-id>` (W4b-03, Entscheidung 30).
+
+No channel of a group can have this name: a channel name is a slug (`_SLUG_RE`), which has no
+dot (Entscheidung 45, no reserved name in the schema). An agent ID is a slug as well, so the
+name is one safe part of a path (no `/`, no `..`, no dot at the start): it becomes the folder
+`groupchats/attachments/<name>/` and the files `groupchats/<name>.md|jsonl` of the export."""
+
+_PRIVATE_SLUG = "private"
+"""Stands in for the name while the stored configuration is validated (`GroupChatConfig.name`
+is a slug); the real name comes back afterwards."""
+
+PRIVATE_BRIEF = (
+    "Steckbrief #{name}\n"
+    "Dein privater Kanal zum User: Hier fragst du ihn mit einer `question` an `@user`, in jeder "
+    "Phase, auch in einer isolierten. Nur der User liest diesen Kanal; kein anderer Agent sieht "
+    "ihn."
+)
+"""The pinned brief of a private channel (two sentences after the title)."""
+
+
+def private_channel(agent_id: str) -> str:
+    """Name of the private channel of `agent_id` to the user."""
+    return PRIVATE_PREFIX + agent_id
+
+
+def private_owner(channel: str) -> str | None:
+    """The agent whose private channel `channel` is, None for any other name."""
+    if not channel.startswith(PRIVATE_PREFIX):
+        return None
+    owner = channel.removeprefix(PRIVATE_PREFIX)
+    return owner if _SLUG_RE.fullmatch(owner) and owner not in RESERVED_SENDERS else None
+
+
+def private_config(agent_id: str) -> GroupChatConfig:
+    """The fixed settings of a private channel: the defaults of `GroupChatConfig` (event, not
+    anonymous, wake-ups on mention and question), the agent its only member. The name is set
+    without validation, because it is no slug on purpose."""
+    config = GroupChatConfig(
+        name=_PRIVATE_SLUG,
+        purpose="Privater Kanal zum User",
+        members=[agent_id],
+    )
+    return config.model_copy(update={"name": private_channel(agent_id)})
 
 
 def _enum[E: StrEnum](cls: type[E], value: Any, what: str) -> E:
@@ -385,16 +416,6 @@ def _row_to_rating(row: sqlite3.Row) -> Rating:
         score=row["score"],
         criteria=json.loads(row["criteria"] or "{}"),
         comment=row["comment"] or "",
-    )
-
-
-def _row_to_vote(row: sqlite3.Row) -> Vote:
-    return Vote(
-        proposal_id=row["proposal_id"],
-        agent=row["agent"],
-        choice=VoteChoice(row["choice"]),
-        reason=row["reason"] or "",
-        ts=row["ts"],
     )
 
 
@@ -919,12 +940,34 @@ class RoomStore:
                 "SELECT agent, alias FROM member WHERE channel=? ORDER BY rowid", (name,)
             )
         }
-        return _Channel(
-            name=name,
-            config=GroupChatConfig.model_validate_json(row["config"]),
-            state=ChannelState(row["state"]),
-            members=members,
-        )
+        if private_owner(name) is not None:
+            # W4b-03: the name of a private channel is no slug; check the rest, keep the name
+            data = json.loads(row["config"])
+            data["name"] = _PRIVATE_SLUG
+            config = GroupChatConfig.model_validate(data).model_copy(update={"name": name})
+        else:
+            config = GroupChatConfig.model_validate_json(row["config"])
+        return _Channel(name=name, config=config, state=ChannelState(row["state"]), members=members)
+
+    def create_private_channel(self, agent_id: str) -> Message | None:
+        """Create the private channel of `agent_id` to the user (W4b-03, docs/10 §4.5): only
+        the agent is a member, the user is the fixed address `user`; open in every phase.
+        Returns its brief, None if it exists already (the phase runner calls this at its start,
+        before the first turn)."""
+        if agent_id in RESERVED_SENDERS or not _SLUG_RE.fullmatch(agent_id):
+            raise ArrError(f"„{agent_id}“ ist keine Agent-ID für einen privaten Kanal.")
+        config = private_config(agent_id)
+        with self._read() as con:
+            if con.execute("SELECT 1 FROM channel WHERE name=?", (config.name,)).fetchone():
+                return None
+        brief = self.create_channel(config, brief=PRIVATE_BRIEF.format(name=config.name))
+        with self._write() as con:  # the brief counts as read: it stays pinned in `inbox()`
+            con.execute(
+                "INSERT INTO cursor(agent, channel, last_id) VALUES(?,?,?) "
+                "ON CONFLICT(agent, channel) DO UPDATE SET last_id=max(last_id, excluded.last_id)",
+                (agent_id, config.name, brief.id),
+            )
+        return brief
 
     def channel_names(self) -> list[str]:
         """Names of all channels in creation order."""
@@ -1137,13 +1180,6 @@ class RoomStore:
             )
             return self._load_msg(con, msg_id)
 
-    def pin(self, msg_id: int, pinned: bool = True) -> None:
-        """Pin or unpin a message, e.g. the running summary „Stand der Diskussion“ (docs/06 §8)."""
-        with self._write() as con:
-            cur = con.execute("UPDATE msg SET pinned=? WHERE id=?", (int(pinned), msg_id))
-            if cur.rowcount == 0:
-                raise ArrError(f"Die Nachricht #{msg_id} gibt es nicht.")
-
     def message(self, msg_id: int) -> Message:
         """One message with the real sender ID and, in anonymous channels, its alias."""
         with self._read() as con:
@@ -1187,48 +1223,8 @@ class RoomStore:
         return row[0] if row else 0
 
     # ----------------------------------------------------------------------------------------
-    # Votes, floor, agent state, assignments, results, ratings
+    # Agent state, assignments, results, ratings
     # ----------------------------------------------------------------------------------------
-
-    def votes(self, proposal_id: int) -> list[Vote]:
-        """All current votes on a proposal."""
-        with self._read() as con:
-            rows = con.execute(
-                "SELECT * FROM vote WHERE proposal_id=? ORDER BY ts", (proposal_id,)
-            ).fetchall()
-        return [_row_to_vote(r) for r in rows]
-
-    def vote_rule(self, proposal_id: int) -> VoteRule | None:
-        """Rule of a vote started with `call_vote`, None if none was started."""
-        with self._read() as con:
-            row = con.execute(
-                "SELECT rule FROM poll WHERE proposal_id=?", (proposal_id,)
-            ).fetchone()
-        return VoteRule(row[0]) if row else None
-
-    def floor_requests(self, *, pending_only: bool = True) -> list[FloorRequest]:
-        """`give_floor` requests of moderators; the orchestrator turns them into turns."""
-        sql = "SELECT * FROM floor" + (" WHERE handled=0" if pending_only else "") + " ORDER BY id"
-        with self._read() as con:
-            rows = con.execute(sql).fetchall()
-        return [
-            FloorRequest(
-                id=r["id"],
-                ts=r["ts"],
-                channel=r["channel"],
-                moderator=r["moderator"],
-                agent=r["agent"],
-                prompt=r["prompt"],
-                msg_id=r["msg_id"],
-                handled=bool(r["handled"]),
-            )
-            for r in rows
-        ]
-
-    def mark_floor_handled(self, request_id: int) -> None:
-        """Mark a floor request as turned into a turn."""
-        with self._write() as con:
-            con.execute("UPDATE floor SET handled=1 WHERE id=?", (request_id,))
 
     def _set_state(
         self, con: sqlite3.Connection, agent: str, status: AgentStatus, note: str
@@ -2010,7 +2006,12 @@ class AgentRoom:
                 (self.agent_id,),
             )
         ]
-        return [ch for n in names if (ch := self.store._load_channel(con, n)) is not None]
+        return [
+            ch
+            for n in names
+            if (ch := self.store._load_channel(con, n)) is not None
+            and not self._foreign_private(ch)
+        ]
 
     def _readable(self, con: sqlite3.Connection) -> list[_Channel]:
         return [ch for ch in self._my_channels(con) if ch.state is not ChannelState.WAITING]
@@ -2018,6 +2019,8 @@ class AgentRoom:
     def _channel(self, con: sqlite3.Connection, name: str, *, write: bool = False) -> _Channel:
         name = _channel_name(name)
         ch = self.store._load_channel(con, name)
+        if ch is not None and self._foreign_private(ch):
+            ch = None  # W4b-03: another agent's private channel answers like a missing one
         if ch is None or self.agent_id not in ch.members:
             mine = ", ".join(f"#{c.name}" for c in self._my_channels(con)) or "keine"
             if ch is None:
@@ -2044,12 +2047,19 @@ class AgentRoom:
         self, con: sqlite3.Connection, msg_id: int, *, write: bool = False
     ) -> tuple[sqlite3.Row, _Channel]:
         row = con.execute("SELECT * FROM msg WHERE id=?", (msg_id,)).fetchone()
-        if row is None:
+        ch = self.store._load_channel(con, row["channel"]) if row is not None else None
+        if row is None or (ch is not None and self._foreign_private(ch)):
+            # W4b-03: a message in another agent's private channel answers like a missing one
             raise RoomError(f"Die Nachricht #{msg_id} gibt es nicht.")
-        ch = self.store._load_channel(con, row["channel"])
         if ch is None or self.agent_id not in ch.members:
             raise RoomError(f"Die Nachricht #{msg_id} gibt es in deinen Kanälen nicht.")
         return row, self._channel(con, ch.name, write=write)
+
+    def _foreign_private(self, ch: _Channel) -> bool:
+        """The private channel of another agent to the user (W4b-03): for this agent it does
+        not exist, whatever its member list says."""
+        owner = private_owner(ch.name)
+        return owner is not None and owner != self.agent_id
 
     def _view(self, msg: Message, ch: _Channel) -> Message:
         """Message as this agent sees it: aliases instead of IDs in anonymous channels."""
@@ -2063,27 +2073,6 @@ class AgentRoom:
                 "to": [ch.display(a) for a in msg.to],
             }
         )
-
-    def _moderated(self, con: sqlite3.Connection) -> list[_Channel]:
-        return [ch for ch in self._my_channels(con) if ch.config.moderator == self.agent_id]
-
-    def _moderated_channel(
-        self, con: sqlite3.Connection, channel: str | None, tool: str
-    ) -> _Channel:
-        moderated = self._moderated(con)
-        if not moderated:
-            raise RoomError(f"„{tool}“ darf nur der Moderator eines Kanals benutzen.")
-        if channel is None:
-            if len(moderated) > 1:
-                names = ", ".join(f"#{c.name}" for c in moderated)
-                raise RoomError(f"Du moderierst mehrere Kanäle ({names}). Gib „channel“ an.")
-            return self._channel(con, moderated[0].name, write=True)
-        ch = self._channel(con, channel, write=True)
-        if ch.config.moderator != self.agent_id:
-            raise RoomError(
-                f"Du bist nicht Moderator von #{ch.name}. „{tool}“ ist dort nicht erlaubt."
-            )
-        return ch
 
     def shown_name(self, agent: str) -> str:
         """How this agent sees `agent`: its alias when an anonymous channel of mine hides it,
@@ -2099,11 +2088,6 @@ class AgentRoom:
         """True if this agent may read `channel` (a member, not waiting for `open_from`)."""
         with self.store._read() as con:
             return any(ch.name == channel for ch in self._readable(con))
-
-    def moderated_channels(self) -> list[str]:
-        """Channels this agent moderates (the server offers moderator tools only then)."""
-        with self.store._read() as con:
-            return [ch.name for ch in self._moderated(con)]
 
     @staticmethod
     def _source_parts(rel: str) -> list[str]:
@@ -2433,7 +2417,10 @@ class AgentRoom:
         self.not_in_note_turn()
         kind = _enum(MessageKind, kind, "Nachrichtenart")
         if kind is MessageKind.VOTE:
-            raise RoomError("Stimmen gibst du mit dem Tool „vote“ ab, nicht als Nachricht.")
+            raise RoomError(
+                "Abstimmungen im Kanal gibt es nicht mehr. Schreib deine Meinung als Nachricht, "
+                "z. B. als „objection“ oder „answer“; was zählt, steht in den Abgaben."
+            )
         if not body.strip() and kind is not MessageKind.PASS:
             raise RoomError("Die Nachricht ist leer.")
         # Copy before taking the write lock; inside the transaction only a rename remains.
@@ -2547,35 +2534,6 @@ class AgentRoom:
                 return path
         names = ", ".join(a.name for a in msg.refs) or "keine"
         raise RoomError(f"Die Nachricht #{msg_id} hat keinen Anhang „{name}“. Anhänge: {names}.")
-
-    def vote(self, proposal_id: int, choice: VoteChoice, reason: str = "") -> Vote:
-        """Vote on a `proposal`; a second vote replaces the first. Also posts a `vote` message."""
-        self.not_in_note_turn()
-        choice = _enum(VoteChoice, choice, "Stimme")
-        with self.store._write() as con:
-            row, ch = self._message_in_my_channel(con, proposal_id, write=True)
-            if row["kind"] != MessageKind.PROPOSAL:
-                raise RoomError(
-                    f"#{proposal_id} ist kein Vorschlag (proposal), sondern „{row['kind']}“."
-                )
-            vote = Vote(
-                proposal_id=proposal_id,
-                agent=self.agent_id,
-                choice=choice,
-                reason=reason,
-                ts=_now(),
-            )
-            con.execute(
-                "INSERT INTO vote(proposal_id, agent, choice, reason, ts) VALUES(?,?,?,?,?) "
-                "ON CONFLICT(proposal_id, agent) DO UPDATE SET choice=excluded.choice, "
-                "reason=excluded.reason, ts=excluded.ts",
-                (proposal_id, self.agent_id, choice.value, reason, vote.ts),
-            )
-            body = f"Stimme zu #{proposal_id}: {choice.value}" + (f" – {reason}" if reason else "")
-            self.store._insert_msg(
-                con, ch.name, self.agent_id, MessageKind.VOTE, body, reply_to=proposal_id
-            )
-            return vote
 
     def set_status(self, status: AgentStatus, note: str = "") -> None:
         """Report `working` or `done` (with a short summary)."""
@@ -3042,68 +3000,3 @@ class AgentRoom:
             shown=self._shown_label,
             current=current,
         )
-
-    # ----------------------------------------------------------------------------------------
-    # Moderator tools (docs/06 §5.3)
-    # ----------------------------------------------------------------------------------------
-
-    def give_floor(self, agent: str, prompt: str, channel: str | None = None) -> None:
-        """Give a member the floor; posts a note to them and queues a turn for the orchestrator."""
-        self.not_in_note_turn()
-        if not prompt.strip():
-            raise RoomError("Gib eine konkrete Frage oder Aufgabe in „prompt“ an.")
-        with self.store._write() as con:
-            ch = self._moderated_channel(con, channel, "give_floor")
-            [target] = self._targets(ch, [agent])
-            body = f"Das Wort hat {ch.display(target)}: {prompt}"
-            msg_id = self.store._insert_msg(
-                con, ch.name, self.agent_id, MessageKind.NOTE, body, to=[target]
-            )
-            con.execute(
-                "INSERT INTO floor(ts, channel, moderator, agent, prompt, msg_id) "
-                "VALUES(?,?,?,?,?,?)",
-                (_now(), ch.name, self.agent_id, target, prompt, msg_id),
-            )
-
-    def call_vote(self, proposal_id: int, rule: VoteRule = VoteRule.MAJORITY) -> None:
-        """Start a vote on a proposal in a channel I moderate."""
-        self.not_in_note_turn()
-        rule = _enum(VoteRule, rule, "Regel")
-        with self.store._write() as con:
-            row, ch = self._message_in_my_channel(con, proposal_id, write=True)
-            self._moderated_channel(con, ch.name, "call_vote")
-            if row["kind"] != MessageKind.PROPOSAL:
-                raise RoomError(
-                    f"#{proposal_id} ist kein Vorschlag (proposal), sondern „{row['kind']}“."
-                )
-            con.execute(
-                "INSERT INTO poll(proposal_id, channel, rule, called_by, ts) VALUES(?,?,?,?,?) "
-                "ON CONFLICT(proposal_id) DO UPDATE SET rule=excluded.rule, ts=excluded.ts",
-                (proposal_id, ch.name, rule.value, self.agent_id, _now()),
-            )
-            rule_text = "Mehrheit" if rule is VoteRule.MAJORITY else "einstimmig"
-            body = f"Abstimmung über #{proposal_id} ({rule_text}). Stimmt mit „vote“ ab."
-            self.store._insert_msg(
-                con, ch.name, self.agent_id, MessageKind.NOTE, body, reply_to=proposal_id
-            )
-
-    def pin(self, msg_id: int) -> None:
-        """Pin a message in a channel I moderate."""
-        self.not_in_note_turn()
-        with self.store._write() as con:
-            _, ch = self._message_in_my_channel(con, msg_id, write=True)
-            self._moderated_channel(con, ch.name, "pin")
-            con.execute("UPDATE msg SET pinned=1 WHERE id=?", (msg_id,))
-
-    def close_discussion(self, decision: str, channel: str | None = None) -> Message:
-        """Post the `decision` and close the channel for further agent messages."""
-        self.not_in_note_turn()
-        if not decision.strip():
-            raise RoomError("Die Entscheidung („decision“) darf nicht leer sein.")
-        with self.store._write() as con:
-            ch = self._moderated_channel(con, channel, "close_discussion")
-            msg_id = self.store._insert_msg(
-                con, ch.name, self.agent_id, MessageKind.DECISION, decision, pinned=True
-            )
-            self.store._set_channel_state(con, ch.name, ChannelState.CLOSED)
-            return self._view(self.store._load_msg(con, msg_id), ch)

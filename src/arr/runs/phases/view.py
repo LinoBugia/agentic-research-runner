@@ -33,6 +33,7 @@ from arr.submissions.formats import BUILTIN, VERDICTS
 
 __all__ = [
     "DATA_KEYS",
+    "answer_prompt",
     "ask_again_prompt",
     "continue_prompt",
     "describe_submission",
@@ -151,6 +152,13 @@ def render_assignment(context: Mapping[str, Any]) -> str:
         "mehrmals ab, zählt die neueste. `get_assignment` zeigt dir diesen Auftrag noch einmal.",
         "",
     ]
+    private = context.get("user_channel")
+    if isinstance(private, str) and private:
+        out += [
+            f"Den User fragst du in deinem privaten Kanal #{private} mit einer `question` an "
+            "`@user`; nur der User liest ihn.",
+            "",
+        ]
     cuts = ("inputs_cut", "peers_cut", "objections_cut", "feedback_cut")
     data = {key: context[key] for key in (*DATA_KEYS, *cuts) if context.get(key)}
     if data:
@@ -174,6 +182,7 @@ _WHY = {
     "deadline": "Die Frist deines `wait_until` ist abgelaufen.",
     "file": "Die Datei, auf die du gewartet hast, ist da: „{detail}“.",
     "submission": "{detail} hat eine Abgabe gemacht, auf die du gewartet hast.",
+    "message": "Eine Nachricht an dich ist da; sie steht in deinem Posteingang.",
 }
 
 
@@ -199,3 +208,13 @@ def ask_again_prompt(context: Mapping[str, Any], why: str | None = None, detail:
         "`summary` ist eine gültige Abgabe. Ohne Abgabe gilt sie danach als fehlend."
     )
     return f"{reason} {text}".strip()
+
+
+def answer_prompt(context: Mapping[str, Any]) -> str:
+    """The turn after the user answered a question of the agent (B3, W4b-03 §6.6)."""
+    return (
+        f"Der User hat deine Frage beantwortet ({header(context)}). Die Antwort steht in deinem "
+        "Posteingang. Prüfe deine Annahme damit. Ändert sich deine Abgabe, gib sie mit `submit` "
+        "neu ab (es zählt die neueste); fehlt sie noch, gib jetzt ab. `get_assignment` zeigt dir "
+        "den Auftrag noch einmal."
+    )

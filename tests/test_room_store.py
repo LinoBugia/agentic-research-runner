@@ -37,8 +37,6 @@ from arr.room.types import (
     MessageVia,
     RoomAPI,
     RoomError,
-    VoteChoice,
-    VoteRule,
 )
 from arr.runs.prepare import AgentFile, prepare_run
 
@@ -277,7 +275,7 @@ def test_post_message_validates_kind_length_target_and_reply(store: RoomStore) -
         critic.post_message("main", "x", reply_to=side_brief)
     with pytest.raises(RoomError, match="leer"):
         critic.post_message("main", "  ")
-    with pytest.raises(RoomError, match="Tool „vote“"):
+    with pytest.raises(RoomError, match="Abstimmungen im Kanal gibt es nicht mehr"):
         critic.post_message("main", "ja", kind="vote")
     with pytest.raises(RoomError, match="nur der Moderator und der Orchestrator"):
         critic.post_message("main", "Beschlossen", kind="decision")
@@ -576,27 +574,6 @@ def test_anonymous_channel_accepts_only_aliases(store: RoomStore) -> None:
     assert [m.sender for m in store.messages("anon")][-1] == "explorer-1"
 
 
-def test_give_floor_in_anonymous_channel_accepts_only_aliases(run_dir: Path) -> None:
-    store = RoomStore.create(run_dir)
-    store.create_channel(
-        GroupChatConfig(
-            name="blind",
-            members=["critic", "judge-1", "judge-2"],
-            mode="moderated",
-            moderator="critic",
-            anonymous=True,
-        )
-    )
-    critic = room(store, "critic")
-    with pytest.raises(RoomError) as real_id:
-        critic.give_floor("judge-1", "Dein Urteil?")
-    with pytest.raises(RoomError) as unknown:
-        critic.give_floor("nobody-1", "Dein Urteil?")
-    assert str(real_id.value).replace("judge-1", "nobody-1") == str(unknown.value)
-    critic.give_floor("Mitglied B", "Dein Urteil?")
-    assert store.floor_requests()[0].agent == "judge-1"
-
-
 def test_failed_post_removes_staged_attachments(store: RoomStore) -> None:
     write(store, "explorer-1", "x.md", "x")
     with pytest.raises(RoomError, match="zu lang"):
@@ -618,23 +595,6 @@ def test_inbox(store: RoomStore) -> None:
     assert [q.body for q in inbox.open_questions] == ["?"]
     assert [m.channel for m in inbox.pinned] == ["main", "main", "side", "anon", "seminar"]
     assert e1.unread_counts() == (inbox.unread, 1)
-
-
-def test_votes(store: RoomStore) -> None:
-    e1, critic = room(store, "explorer-1"), room(store, "critic")
-    proposal = e1.post_message("main", "Wir nehmen Ansatz B", kind="proposal")
-    critic.vote(proposal.id, "no", "zu vage")  # type: ignore[arg-type]
-    vote = critic.vote(proposal.id, VoteChoice.YES, "überzeugt")
-    assert (vote.choice, vote.reason) == (VoteChoice.YES, "überzeugt")
-    assert [(v.agent, v.choice) for v in store.votes(proposal.id)] == [("critic", "yes")]
-    vote_msgs = [m for m in store.messages("main") if m.kind is MessageKind.VOTE]
-    assert [m.reply_to for m in vote_msgs] == [proposal.id, proposal.id]
-    with pytest.raises(RoomError, match="kein Vorschlag"):
-        critic.vote(store.messages("main")[0].id, VoteChoice.YES)
-    with pytest.raises(RoomError, match="Unbekannte Stimme „vielleicht“"):
-        critic.vote(proposal.id, "vielleicht")  # type: ignore[arg-type]
-    with pytest.raises(RoomError, match="in deinen Kanälen nicht"):
-        room(store, "judge-1").vote(proposal.id, VoteChoice.YES)
 
 
 def test_set_status(store: RoomStore) -> None:
@@ -697,69 +657,51 @@ def test_submit_rating(store: RoomStore) -> None:
 
 
 # --------------------------------------------------------------------------------------------
-# Moderator tools
+# W4b-03 §6.7: votes and moderator tools are gone; old rooms stay readable
 # --------------------------------------------------------------------------------------------
 
+REMOVED = ("vote", "give_floor", "call_vote", "pin", "close_discussion")
 
-def test_moderator_tools(store: RoomStore) -> None:
-    critic, e1 = room(store, "critic"), room(store, "explorer-1")
-    assert critic.moderated_channels() == ["seminar"]
-    critic.give_floor("explorer-1", "Erkläre Schritt 3")
-    [request] = store.floor_requests()
-    assert (request.channel, request.agent, request.prompt) == (
-        "seminar",
-        "explorer-1",
-        "Erkläre Schritt 3",
-    )
-    note = store.message(request.msg_id)
-    assert note.to == ["explorer-1"] and "Erkläre Schritt 3" in note.body
-    store.mark_floor_handled(request.id)
-    assert store.floor_requests() == []
 
+def test_w4b03_the_removed_tools_are_gone(store: RoomStore) -> None:
+    critic = room(store, "critic")
+    for name in REMOVED:
+        assert not hasattr(critic, name), name
+    for name in ("pin", "votes", "vote_rule", "floor_requests", "mark_floor_handled"):
+        assert not hasattr(store, name), name
+    assert not hasattr(critic, "moderated_channels")
+    import arr.room.store as store_module
+
+    assert not hasattr(store_module, "FloorRequest")
+
+
+def test_w4b03_an_old_room_with_votes_and_pins_stays_readable(store: RoomStore) -> None:
+    """The tables `vote`, `poll`, `floor` and the column `pinned` stay: a room from before
+    W4b-03 with a vote, a poll, a floor request and a pinned message reads as before."""
+    e1 = room(store, "explorer-1")
     proposal = e1.post_message("seminar", "Annahme", kind="proposal")
-    critic.call_vote(proposal.id, "unanimous")  # type: ignore[arg-type]
-    assert store.vote_rule(proposal.id) is VoteRule.UNANIMOUS
-    critic.pin(proposal.id)
+    with store._write() as con:  # what the removed tools wrote
+        con.execute(
+            "INSERT INTO vote(proposal_id, agent, choice, reason, ts) VALUES(?,?,?,?,?)",
+            (proposal.id, "critic", "yes", "ok", 1.0),
+        )
+        con.execute(
+            "INSERT INTO poll(proposal_id, channel, rule, called_by, ts) VALUES(?,?,?,?,?)",
+            (proposal.id, "seminar", "majority", "critic", 1.0),
+        )
+        con.execute(
+            "INSERT INTO floor(ts, channel, moderator, agent, prompt, msg_id) VALUES(?,?,?,?,?,?)",
+            (1.0, "seminar", "critic", "explorer-1", "Bitte", proposal.id),
+        )
+        con.execute("UPDATE msg SET pinned=1 WHERE id=?", (proposal.id,))
+        con.execute("UPDATE channel SET state='closed' WHERE name='seminar'")
     assert store.message(proposal.id).pinned
-
-    decision = critic.close_discussion("Ansatz B wird verfolgt")
-    assert (decision.kind, decision.pinned, decision.channel) == ("decision", True, "seminar")
-    assert store.channel_state("seminar") is ChannelState.CLOSED
+    assert any(m.id == proposal.id for m in e1.inbox().pinned)
+    assert [m.id for m in e1.read_messages("seminar", only_new=False)][-1] == proposal.id
     with pytest.raises(RoomError, match="Diskussion in #seminar ist beendet"):
         e1.post_message("seminar", "noch was")
-    assert e1.read_messages("seminar")[-1].id == decision.id
-
-
-def test_moderator_tools_are_rejected_for_others(store: RoomStore) -> None:
-    e1, critic = room(store, "explorer-1"), room(store, "critic")
-    proposal = e1.post_message("main", "Vorschlag", kind="proposal")
-    calls = [
-        lambda: e1.give_floor("critic", "Bitte"),
-        lambda: e1.call_vote(proposal.id),
-        lambda: e1.pin(proposal.id),
-        lambda: e1.close_discussion("Ende"),
-    ]
-    for call in calls:
-        with pytest.raises(RoomError, match="nur der Moderator eines Kanals"):
-            call()
-    with pytest.raises(RoomError, match="nicht Moderator von #main"):
-        critic.pin(proposal.id)
-    with pytest.raises(RoomError, match="nicht Moderator von #main"):
-        critic.close_discussion("Ende", channel="main")
-    with pytest.raises(RoomError, match="„judge-1“ ist kein Mitglied von #seminar"):
-        critic.give_floor("judge-1", "Bitte")
-    assert store.channel_state("main") is ChannelState.OPEN
-
-
-def test_moderator_of_several_channels_must_name_one(run_dir: Path) -> None:
-    store = RoomStore.create(run_dir)
-    for name in ("a", "b"):
-        store.create_channel(
-            GroupChatConfig(name=name, members=["critic"], mode="moderated", moderator="critic")
-        )
-    with pytest.raises(RoomError, match="mehrere Kanäle \\(#a, #b\\)"):
-        room(store, "critic").close_discussion("Ende")
-    assert room(store, "critic").close_discussion("Ende", channel="b").channel == "b"
+    assert "seminar" in [c.name for c in store.channels()]
+    store.export_all()
 
 
 # --------------------------------------------------------------------------------------------
@@ -853,11 +795,11 @@ def test_export_anonymous_keeps_real_ids(store: RoomStore) -> None:
 
 
 def test_closing_a_channel_closes_its_open_questions(store: RoomStore) -> None:
-    e1, e2, critic = room(store, "explorer-1"), room(store, "explorer-2"), room(store, "critic")
+    e1, e2 = room(store, "explorer-1"), room(store, "explorer-2")
     question = e1.post_message("seminar", "Stimmt Schritt 3?", kind="question", to=["explorer-2"])
     other = e1.post_message("main", "Und hier?", kind="question", to=["explorer-2"])
     assert e2.unread_counts()[1] == 2
-    critic.close_discussion("Schritt 3 stimmt")
+    store.set_channel_state("seminar", ChannelState.CLOSED)  # since W4b-03 only arr closes one
     assert not store.message(question.id).open and store.message(other.id).open
     assert [q.id for q in e2.inbox().open_questions] == [other.id]
     assert e2.unread_counts()[1] == 1

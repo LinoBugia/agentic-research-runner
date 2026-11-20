@@ -67,6 +67,30 @@ class DiscussionEnd(StrEnum):
 
 
 @dataclass(slots=True)
+class DiscussionSeats:
+    """Who discusses in a discussion of a phase `chat` and with what (W4b-03, docs/10 §4.5).
+
+    - `members`: the agents that discuss (the agents with an action); only they get the
+      kick-off and rounds, are woken by the discussion and count for its end. Other members of
+      the channel (agents on standby, agents not in the phase) are left to the phase runner.
+    - `contexts`: the context package of each member's action; every turn of a member in the
+      discussion carries it (else `submit` would not know the expected submission).
+    - `first`: text put in front of a member's first turn of the discussion (the assignment
+      with its format); taken out when that turn starts.
+    - `ping_pong`: a `arr.runs.pacing.PingPongTracker` the discussion shares with the waking of
+      the phase, so one exchange is counted and flagged once.
+    - `submit`: the texts of the discussion name `submit` (a `phases` run) instead of
+      `submit_result`.
+    """
+
+    members: Sequence[str]
+    contexts: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    first: dict[str, str] = field(default_factory=dict)
+    ping_pong: Any = None
+    submit: bool = True
+
+
+@dataclass(slots=True)
 class DiscussionOutcome:
     """Result of `RunContext.discuss`: why it ended, rounds, wake-ups and all turns (docs/06 §5)."""
 
@@ -189,6 +213,7 @@ class RunContext(ABC):
         rounds: int | None = None,
         context: Mapping[str, Any] | None = None,
         kickoff: bool = True,
+        seats: DiscussionSeats | None = None,
     ) -> DiscussionOutcome:
         """Run a discussion phase in `channel` with the channel's pacing and wait for its end.
 
@@ -209,6 +234,9 @@ class RunContext(ABC):
           stop. `DiscussionOutcome.rounds` counts the idle rounds.
         - Wake-up turns get `stage` and `context` like the kick-off turns. Hints mid-turn and
           the inbox work in and outside of discussions.
+        - `seats` (W4b-03, a phase `chat`): only `seats.members` discuss, each turn of a member
+          carries its own context, the first one starts with `seats.first`; without `seats`
+          all members of the channel discuss with `context`, as before.
         """
 
     # -- W4-03: phases, channels, sealed results, sessions, files ---------------------------
@@ -353,3 +381,24 @@ class RunContext(ABC):
         """Every message of `channel`, oldest first, as arr reads them (an input
         `channel: <name>` of a phase). The default knows none."""
         return []
+
+    # -- W4b-03: private channels to the user, the participants of a pass ------------------
+    #
+    # Not abstract: a context without channels (the test contexts of the old topologies) keeps
+    # the defaults; the `Orchestrator` implements them.
+
+    def open_private_channels(self) -> dict[str, str]:
+        """Give every agent its private channel to the user (`user.<agent-id>`, Entscheidung
+        30): only the agent a member, open in every phase, also an isolated one. The phase
+        runner calls it at its start, before the first turn. Returns agent → channel; the
+        default knows no channels."""
+        return {}
+
+    def private_channel(self, agent_id: str) -> str | None:
+        """The private channel of `agent_id` to the user, None without one."""
+        return None
+
+    def set_participants(self, agents: Sequence[str] | None) -> None:
+        """The participants of the pass that begins (with an action, on standby, raters): only
+        they hear of messages, as a hint or a wake-up (Entscheidung 64). None ends that."""
+        return None

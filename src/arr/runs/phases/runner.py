@@ -58,7 +58,7 @@ from arr.permissions.types import EscalationOption
 from arr.plan.read import ACTION_GATE, build_expectation, enter, follow
 from arr.room.types import Submission
 from arr.runs.context import RunContext
-from arr.runs.phases import work
+from arr.runs.phases import chat, work
 from arr.runs.phases.gates import NO_RATING, GateOutcome, judge_mean, judge_rank, signal
 from arr.runs.phases.inputs import (
     build_feedback,
@@ -80,6 +80,7 @@ from arr.runs.phases.state import (
 from arr.runs.phases.tasks import KIND_GATE, KIND_WORK, Tasks, load_tasks
 from arr.runs.phases.text import MAX_SUMMARY_CHARS, MAX_TITLE_CHARS, fit_package, line
 from arr.runs.phases.view import ask_again_prompt, continue_prompt, render_assignment
+from arr.runs.phases.wake import Waker, hold
 from arr.runs.topologies import SOURCE, require_task
 
 __all__ = ["OPTIONS", "PASSES", "WAIT_POLL_S", "PhaseRunner", "check", "run"]
@@ -91,8 +92,9 @@ PassFunction = Callable[["PhaseRunner", Pass], Awaitable[None]]
 PASSES: dict[PhaseTopology, PassFunction] = {
     PhaseTopology.SOLO: work.run_pass,
     PhaseTopology.PARALLEL: work.run_pass,
+    PhaseTopology.CHAT: chat.run_pass,
 }
-"""The topology of a phase → the function that runs one pass of it (W4b-03, 04 add theirs)."""
+"""The topology of a phase → the function that runs one pass of it (W4b-04 adds `moderated`)."""
 
 OPTIONS = (EscalationOption.CONTINUE, EscalationOption.RETRY, EscalationOption.END)
 """What the user may choose at a gate `user`, after `escalate` and without a result."""
@@ -161,7 +163,10 @@ class PhaseRunner:
         self.tasks: Tasks = {}
         self.question = ""
         self.acted: set[str] = set()
-        """Agents that have begun an action in this run (no transition before the first)."""
+        """Agents that have begun an action in this run (no transition before the first); a
+        sleeper's wake-up turn puts it here as well (W4b-03, N-G4)."""
+        self.waker: Waker | None = None
+        """The waking of the running pass (W4b-03): sleepers, the end of `wait_until`."""
 
     # -- start -------------------------------------------------------------------------------
 
@@ -180,6 +185,7 @@ class PhaseRunner:
         )
         if not self.run_config.phases:
             return
+        self.ctx.open_private_channels()  # W4b-03: before the first turn, one per agent
         await self.plant_seeds()
         nxt = await self.enter(self.run_config.phases[0].name, HOW_NORMAL, {})
         while nxt is not None and not self.ctx.stop_requested:
@@ -260,6 +266,9 @@ class PhaseRunner:
         return entry.phase, how, None
 
     def _channels(self, phase: ResolvedPhase) -> None:
+        """Open exactly the channels of the phase and close all others of `run.yaml`. The
+        private channels to the user are not in `run.yaml`: they stay open in every phase,
+        also an isolated one (W4b-03, Entscheidung 30)."""
         for channel in self.run_config.groupchats:
             if channel.name in phase.channels:
                 self.ctx.open_channel(channel.name)
@@ -274,18 +283,39 @@ class PhaseRunner:
         await ctx.checkpoint(
             name, phase="pass_start", attempt=attempt, how=how, agents=phase.agents
         )
-        self._channels(phase)
-        await ctx.enter_phase(name, attempt, phase.participants)
         pass_ = Pass(name, attempt, how, hint)
-        await PASSES[phase.topology](self, pass_)
-        if ctx.stop_requested:
-            return None
-        rater_subs: list[Submission] = []
-        if phase.gate.type is GateType.JUDGE and pass_.list_missing is None:
-            rater_subs = await work.rate(self, phase, pass_)
+        self._channels(phase)
+        ctx.set_participants(phase.participants)  # Entscheidung 64: the others hear nothing
+        await ctx.enter_phase(name, attempt, phase.participants)  # before any turn (§6.1)
+        self.waker = Waker.attach(self, phase, pass_)
+        try:
+            await PASSES[phase.topology](self, pass_)
             if ctx.stop_requested:
                 return None
+            rater_subs: list[Submission] = []
+            if phase.gate.type is GateType.JUDGE and pass_.list_missing is None:
+                await work.rate(self, phase, pass_)
+                if ctx.stop_requested:
+                    return None
+                await hold(self, phase, pass_, pass_.raters)  # B3 after the rating actions
+                if ctx.stop_requested:
+                    return None
+                rater_subs = [s.found for s in pass_.raters if s.found is not None]
+        finally:
+            if self.waker is not None:
+                await self.waker.detach()
+            self.waker = None
         return self.book(phase, pass_, rater_subs)
+
+    async def after_actions(self, phase: ResolvedPhase, pass_: Pass) -> None:
+        """The actions of a pass are done (W4b-03): no sleeper is woken any more (a running
+        wake-up turn ends first, §6.4), then B3 holds the phase while a question of an agent
+        with an action to the user is open (§6.6). The topologies call it before they release
+        an isolated phase, so a turn after the user's answer sees no other submission."""
+        if self.waker is not None:
+            await self.waker.end_actions()
+        if not self.ctx.stop_requested:
+            await hold(self, phase, pass_, pass_.slots)
 
     # -- gates -------------------------------------------------------------------------------
 
@@ -557,13 +587,17 @@ class PhaseRunner:
     def _base(
         self, phase: ResolvedPhase, pass_: Pass, slot: Slot, expected: dict[str, Any]
     ) -> dict[str, Any]:
-        return {
+        base = {
             "phase": phase.name,
             "attempt": pass_.attempt,
             "task": slot.text,
             "research_question": self.question,
             "submission": expected,
         }
+        private = self.ctx.private_channel(slot.agent)
+        if private is not None:  # W4b-03: only in the package of its own agent
+            base["user_channel"] = private
+        return base
 
     def _objections(self, package: dict[str, Any], task: Any) -> None:
         relevant = task.submission.format == "review" or task.submission.name is not None
@@ -688,18 +722,26 @@ class PhaseRunner:
         return None
 
     async def wait(self, agent: str) -> tuple[str | None, str]:
-        """After `wait_until`: wait for the deadline, the file or a submission of the awaited
-        agent that `agent` may read (a sealed one does not count); a stop ends the wait. Uses
+        """After `wait_until`: wait for the deadline, the file, a submission of the awaited
+        agent that `agent` may read (a sealed one does not count) or (W4b-03 §6.4) a direct
+        message to it in an open channel of the phase or its private channel, which the waker
+        of the pass hands over (no second read of the room); a stop ends the wait. Uses
         `long_wait`, `until_file_exists` and `end_long_wait` of the orchestrator."""
         ctx = self.ctx
+        waker = self.waker
         get = getattr(ctx, "long_wait", None)
         wait = get(agent) if callable(get) else None
         if wait is None:
+            if waker is not None:
+                waker.clear(agent)  # its next turn shows them in the inbox
             return None, ""
         why: str | None = None
         detail = ""
         try:
             while not ctx.stop_requested:
+                if waker is not None and waker.take_message(agent) is not None:
+                    why = "message"
+                    break
                 if time.time() >= wait.until:
                     why = "deadline"
                     break
@@ -717,4 +759,6 @@ class PhaseRunner:
             end = getattr(ctx, "end_long_wait", None)
             if callable(end):
                 end(agent)
+            if waker is not None:
+                waker.clear(agent)
         return why, detail

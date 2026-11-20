@@ -4,8 +4,7 @@
 stop a start; the same error of every agent of a pattern is reported once) and what this
 version of the runner cannot run yet, each with its path and a German sentence:
 
-- phases with `topology: chat` or `moderated` (`NOT_YET`; W4b-03, W4b-04),
-- phases with `standby` (W4b-03),
+- phases with `topology: moderated` (`NOT_YET`; W4b-04); `chat` and `standby` run since W4b-03,
 - `folder: fresh` and `context: compact` only with a context class that does not implement
   `fresh_folder` or `compact_session` (a test context). The `Orchestrator` implements both
   (W4b-05a, W4b-05b), so a real run is never refused for them (W4b-02b.1 Teil 2). The check
@@ -34,15 +33,14 @@ __all__ = [
 ]
 
 NOT_YET: dict[PhaseTopology, str] = {
-    PhaseTopology.CHAT: "chat",
     PhaseTopology.MODERATED: "moderated",
 }
-"""Topologies of a phase this version refuses at the start (W4b-03 and W4b-04 remove theirs)."""
+"""Topologies of a phase this version refuses at the start (W4b-04 removes `moderated`)."""
 
-STANDBY_READY = False
-"""Agents on standby (`standby`) can run (W4b-03 sets it)."""
+STANDBY_READY = True
+"""Agents on standby (`standby`) can run (since W4b-03)."""
 
-READY = "solo, parallel"
+READY = "solo, parallel, chat"
 
 
 def implements(context_type: type, method: str) -> bool:
