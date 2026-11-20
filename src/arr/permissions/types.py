@@ -219,8 +219,9 @@ class TightenedSource(StrEnum):
 
 
 class TightenedBy(Record):
-    """The setting that makes the user decide a request (W4b-09): its source and, for a phase,
-    its name and pass. Built by arr from the resolved run, never from text of an agent."""
+    """The setting that makes the user decide a request (W4b-09, docs/10 §4.11): its source
+    and, for a phase, its name and pass. Built by arr from the resolved run, never from text of
+    an agent."""
 
     source: TightenedSource
     stage: str | None = None
