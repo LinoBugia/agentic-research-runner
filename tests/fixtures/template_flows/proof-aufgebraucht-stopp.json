@@ -33,6 +33,92 @@
    }
   ]
  ],
+ "sight": [
+  [
+   "strategie",
+   1,
+   {
+    "strategist": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "skizze",
+   1,
+   {
+    "prover": {
+     "eingaben": [
+      "vorstufen"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "skizze",
+   2,
+   {
+    "prover": {
+     "eingaben": [
+      "bewertungen",
+      "vorstufen"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ]
+ ],
  "submissions": {
   "skizze/prover": {
    "format": "artifact",
@@ -98,7 +184,12 @@
  "ranking": [],
  "end": {
   "status": "done",
-  "how": "stopp"
+  "how": "stopp",
+  "reason": "- **Grund:** Die Stufe „skizze“ wurde nicht bestanden (stage_failed).",
+  "stage_lines": [
+   "- **strategie:** bestanden, akzeptiert: #n, Score 8, 1 Versuch",
+   "- **skizze:** nicht bestanden, Run beendet, akzeptiert: keins, Score 6, 2 Versuche"
+  ]
  },
  "resets": {},
  "fresh_folders": {},

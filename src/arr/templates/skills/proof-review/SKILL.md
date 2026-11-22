@@ -5,7 +5,7 @@ description: Lässt einen Beweis oder Beweisentwurf von mehreren unabhängigen J
 
 # Proof Review (Research-Group)
 
-Ein Autor liefert den Beweis (aus dem Projekt oder neu geschrieben). Judges prüfen ihn unabhängig voneinander, besprechen ihre Gutachten danach in `#judges` und geben ein Urteil ab (`accept`, `minor`, `major`, `reject`). Ist das Urteil nicht `accept`, überarbeitet der Autor den Beweis, und die Prüfung beginnt von vorn.
+Ein Autor liefert den Beweis (aus dem Projekt oder neu geschrieben). Judges prüfen ihn unabhängig voneinander, besprechen ihre Gutachten danach in `#judges` und geben ein Urteil ab (`accept`, `minor`, `major`, `reject`). Bei `minor` oder `major` überarbeitet der Autor den Beweis, und die Prüfung beginnt von vorn; `accept` und `reject` beenden den Run.
 
 ## Ablauf in Phasen
 
@@ -49,4 +49,4 @@ Agenten: `author` (Claude Opus), `judge-1 …` (Claude Sonnet und ChatGPT im Wec
 
 ## Ergebnis
 
-`read_run_summary(run_id)` nennt die Abgaben mit ihren Kurzfassungen. Im Run-Ordner liegen die Fassungen des Beweises unter `output/beweis/v<n>/` (ab der zweiten mit `diff.patch`), die Gutachten unter `output/submissions/` (je Abgabe ein Ordner `NNN-<phase>-<judge>/`). Übernimm einen Beweis ins Projekt nur nach Rücksprache mit dem User.
+`read_run_summary(run_id)` nennt die Abgaben mit ihren Kurzfassungen; die Gutachten mit Urteil und Einwänden liest du mit `read_results(run_id, kind="review")`. Im Run-Ordner liegen die Fassungen des Beweises unter `output/beweis/v<n>/` (ab der zweiten mit `diff.patch`), die Gutachten unter `output/submissions/` (je Abgabe ein Ordner `NNN-<phase>-<judge>/`). Übernimm einen Beweis ins Projekt nur nach Rücksprache mit dem User.

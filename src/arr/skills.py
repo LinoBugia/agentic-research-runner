@@ -43,6 +43,8 @@ __all__ = [
     "SkillInfo",
     "StartSkills",
     "SkillUpdate",
+    "StartSkillUpdate",
+    "StartSkillsUpdate",
     "check_research_skills",
     "copy_skill_tree",
     "discover_skills",
@@ -857,21 +859,21 @@ def tree_digest(files: dict[str, bytes]) -> str:
 
 
 CURRENT_DIGESTS: dict[str, tuple[str, str]] = {
-    ARR_SKILL: ("fe2b0aa", "7bdf5f9ad35848d60c125d753211a0f46bb13a29c97e209a5261ce74790ed791"),
+    ARR_SKILL: ("c82f909", "ef12554041a5820b4665cf46c5b70e9c7d7035175f432bf2276a371c3d2557f7"),
     "exploration": (
         "W4b-06a",
-        "2cf7194304bda17784bd1ae8798b6cf4923744593013cf558d774d562fd75d46",
+        "feb2423dc651e34ef456a0db20da1add71b78c4803e4c747ed1632effc755ccc",
     ),
     "latex-writeup": (
         "81cb75e",
         "44dcbbcbe1a996f725eb9651dd08fc636317eb1d2db965349471d73f957d1f36",
     ),
-    "proof": ("W4b-06a", "7c0dd09501bf3cb5095262eb978888aa684baa2b96fde6b5b0375c46c76d202c"),
+    "proof": ("W4b-06a", "64fa3add21db893a9b036f1bd551c4c65c817adc1beabcdf1de2aa5b2439c7af"),
     "proof-review": (
         "W4b-06a",
-        "1570675770c1b2312c69b3664a7dbd16a06dc26fd131efa6c3516bfaac4916cc",
+        "8ef9e33a89051327957463a765ad32632317f9dd455a880fc17c9294bd4569ef",
     ),
-    "roundtable": ("W4b-06a", "3c1aedf708a10d07db6b8e502752f9923f5597bc78f8f44ad9a8abc1b61ce7b3"),
+    "roundtable": ("W4b-06a", "d30453152f47d9dafc6937a9710ddcd7aea61a861cfdbefbff599f303c21cd2f"),
     "sympy-check": (
         "1fccb85",
         "324a9f2a829f7c2d99a48935685fcd14fb70d67107713f07a8c2a8d396c1a342",
@@ -882,7 +884,10 @@ CURRENT_DIGESTS: dict[str, tuple[str, str]] = {
 start skill moves the old entry into `EARLIER_DIGESTS` and enters the new one here."""
 
 EARLIER_DIGESTS: dict[str, tuple[tuple[str, str], ...]] = {
-    ARR_SKILL: (("81cb75e", "1e6af18c02255b66e4341b2fab99056ca23f2be2454b6b6c068f82489df93d0e"),),
+    ARR_SKILL: (
+        ("81cb75e", "1e6af18c02255b66e4341b2fab99056ca23f2be2454b6b6c068f82489df93d0e"),
+        ("fe2b0aa", "7bdf5f9ad35848d60c125d753211a0f46bb13a29c97e209a5261ce74790ed791"),
+    ),
     "exploration": (
         ("81cb75e", "1e75c86906f2aa5df9ad048ec99061b7277e4adaf00e243bad6cbc00fb093fbc"),
         ("fe2b0aa", "3e2b880fe8767073315bd617b94bf0d8b1ecbc5caa0352622756210ccb5772c1"),
@@ -927,9 +932,36 @@ class SkillUpdate(StrEnum):
     CURRENT = "current"
     """It is the current version already."""
     CHANGED = "changed"
-    """It matches no version arr shipped (changed by the user, or not a plain folder): left."""
+    """It matches no version arr shipped (changed by the user, own files beside the shipped
+    ones, or not a plain folder): left as it is."""
     MISSING = "missing"
     """There is none; it is not created (that is „Start-Skills anlegen“)."""
+    FAILED = "failed"
+    """A read or write failed; the start skill is as before (`StartSkillUpdate.note` says)."""
+
+
+@dataclass(frozen=True, slots=True)
+class StartSkillUpdate:
+    """The result for one start skill. `note`: with `UPDATED` the hidden folder of the old
+    version that could not be removed (empty if none), with `FAILED` the German reason."""
+
+    result: SkillUpdate
+    note: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class StartSkillsUpdate:
+    """Result of `update_start_skills`: one entry per start skill, in the order asked."""
+
+    skills: dict[str, StartSkillUpdate]
+
+    @property
+    def results(self) -> dict[str, SkillUpdate]:
+        return {name: item.result for name, item in self.skills.items()}
+
+    @property
+    def failed(self) -> bool:
+        return any(item.result is SkillUpdate.FAILED for item in self.skills.values())
 
 
 _UPDATE_TEXT = {
@@ -939,15 +971,29 @@ _UPDATE_TEXT = {
     SkillUpdate.MISSING: "fehlt, wird nicht angelegt (das geht über „Start-Skills anlegen“)",
 }
 
+IGNORED_NAMES = frozenset({".DS_Store", "__pycache__"})
+"""Names below a start skill that `update_start_skills` neither compares nor keeps (Finder
+and Python leave them). Every other name starting with `.` or `_` is a file of the user: the
+skill then counts as changed and is never replaced (W4b-06a.1, H1)."""
+
 
 class _Irregular(Exception):
-    """A link, a file instead of a folder, or anything but plain files and folders."""
+    """A link, a file instead of a folder, anything but plain files and folders, or an own
+    file of the user (a name starting with `.` or `_`, except `IGNORED_NAMES`)."""
+
+
+class _OldKept(OSError):
+    """The swap failed and the old version could not be put back: it lies under `kept`."""
+
+    def __init__(self, cause: OSError, kept: str) -> None:
+        super().__init__(cause.errno, cause.strerror or str(cause))
+        self.kept = kept
 
 
 def _read_tree(parent: int, name: str) -> dict[str, bytes] | None:
-    """The counted files below `parent/name`, read through descriptors without following any
-    link; None if there is nothing. Raises `_Irregular` for anything but plain files and
-    folders (links included) and for a tree that is too big to be a skill."""
+    """The files below `parent/name`, read through descriptors without following any link;
+    None if there is nothing. Raises `_Irregular` for anything but plain files and folders
+    (links included), for an own file of the user and for a tree too big to be a skill."""
     try:
         info = os.stat(name, dir_fd=parent, follow_symlinks=False)
     except FileNotFoundError:
@@ -960,8 +1006,10 @@ def _read_tree(parent: int, name: str) -> dict[str, bytes] | None:
     def walk(folder: int, prefix: str) -> None:
         nonlocal total
         for entry in sorted(os.listdir(folder)):
+            if entry in IGNORED_NAMES:
+                continue
             if entry.startswith((".", "_")):
-                continue  # not part of a tree, as in `start_skill_files`
+                raise _Irregular(entry)  # arr ships no such name: the user's own file
             mode = os.stat(entry, dir_fd=folder, follow_symlinks=False).st_mode
             if stat.S_ISDIR(mode):
                 sub = os.open(entry, _DIR_FLAGS, dir_fd=folder)
@@ -1014,32 +1062,39 @@ def _digest_in(root: int, name: str) -> str | None:
     return None if files is None else tree_digest(files)
 
 
-def _swap(root: int, name: str, new: str) -> None:
+def _swap(root: int, name: str, new: str) -> str:
     """Put the folder `new` (hidden, below `root`) in place of `name`; the old one goes to a
-    hidden name first and is removed after. On a failure the old one is back in place."""
+    hidden name first and is removed after. On a failure of the swap the old one is back in
+    place (`_OldKept` if even that fails). Returns the hidden name of the old version if it
+    could not be removed after the swap (W4b-06a.1, M3), else `""`."""
     old = f".{name}.arr-{secrets.token_hex(6)}.old"
     os.rename(name, old, src_dir_fd=root, dst_dir_fd=root)
     try:
         os.rename(new, name, src_dir_fd=root, dst_dir_fd=root)
-    except BaseException:
+    except OSError as exc:
         try:
             os.rename(old, name, src_dir_fd=root, dst_dir_fd=root)
         except OSError:
             log.error("Start-Skill %s: alte Fassung liegt unter skills/%s", name, old)
+            raise _OldKept(exc, old) from None
         raise
-    _remove_tree(root, old)
+    try:
+        _remove_tree(root, old)
+    except OSError:
+        log.warning("Start-Skill %s: alte Fassung bleibt unter skills/%s", name, old)
+    return old if _exists(root, old) else ""
 
 
-def _update_one(root: int, name: str) -> SkillUpdate:
+def _update_one(root: int, name: str) -> StartSkillUpdate:
     found = _digest_in(root, name)
     if found is None:
-        return SkillUpdate.MISSING
+        return StartSkillUpdate(SkillUpdate.MISSING)
     files = start_skill_files(name)
     if found == tree_digest(files):
-        return SkillUpdate.CURRENT
+        return StartSkillUpdate(SkillUpdate.CURRENT)
     shipped = {digest for _commit, digest in EARLIER_DIGESTS.get(name, ())}
     if found not in shipped:
-        return SkillUpdate.CHANGED
+        return StartSkillUpdate(SkillUpdate.CHANGED)
     temp = f".{name}.arr-{secrets.token_hex(6)}.tmp"
     os.mkdir(temp, 0o755, dir_fd=root)
     try:
@@ -1050,45 +1105,91 @@ def _update_one(root: int, name: str) -> SkillUpdate:
             os.close(folder)
         if _digest_in(root, name) != found:  # changed meanwhile: never replaced
             _remove_tree(root, temp)
-            return SkillUpdate.CHANGED
-        _swap(root, name, temp)
+            return StartSkillUpdate(SkillUpdate.CHANGED)
+        kept = _swap(root, name, temp)
     except BaseException:
         _remove_tree(root, temp)
         raise
-    return SkillUpdate.UPDATED
+    return StartSkillUpdate(SkillUpdate.UPDATED, kept)
+
+
+def _existing_skills_root(workfolder: str | Path) -> int | None:
+    """Descriptor of `<workfolder>/skills`, None if there is none (updating creates nothing,
+    W4b-06a.1 N2); it must not be a link."""
+    try:
+        base = os.open(Path(workfolder), os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise SkillFileError(f"Der Workfolder ist nicht lesbar ({exc.strerror or exc}).") from None
+    try:
+        return os.open(SKILLS_DIR, _DIR_FLAGS, dir_fd=base)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+            raise SkillFileError(SKILLS_LINK) from None
+        raise SkillFileError(
+            f"Der Ordner {SKILLS_DIR} ließ sich nicht öffnen ({exc.strerror or exc})."
+        ) from None
+    finally:
+        os.close(base)
 
 
 def update_start_skills(
     workfolder: str | Path, names: Sequence[str] = START_SKILLS
-) -> dict[str, SkillUpdate]:
+) -> StartSkillsUpdate:
     """Bring unchanged start skills in `<workfolder>/skills/` to the version of this arr.
 
     A start skill equal byte for byte to an earlier version arr shipped (`EARLIER_DIGESTS`) is
     replaced by the current one: built in a hidden folder next to it, its checksum read once
-    more right before the swap, no link followed; on a failure the old version stays complete
-    and nothing half is left. One that matches no shipped version (changed by the user, a link,
-    a file) is never touched; a missing one is not created. Running it again changes nothing.
-    Raises `SkillFileError` with a German message if a folder cannot be read or written.
+    more right before the swap, no link followed; on a failure the old version stays complete.
+    One that matches no shipped version (changed by the user, an own file with `.` or `_`, a
+    link, a file) is never touched; a missing one is not created, nor is `skills/`. A failure
+    at one start skill is reported for it and the others are still done (W4b-06a.1 N1).
+    Raises `SkillFileError` with a German message for a name that is no start skill (before
+    reading anything) or a `skills/` that cannot be opened.
     """
-    out: dict[str, SkillUpdate] = {}
-    root = _open_skills_root(workfolder)
+    unknown = [n for n in names if n not in START_SKILLS]
+    if unknown:
+        raise SkillFileError(f"„{unknown[0]}“ ist kein Start-Skill.")
+    root = _existing_skills_root(workfolder)
+    if root is None:
+        return StartSkillsUpdate({n: StartSkillUpdate(SkillUpdate.MISSING) for n in names})
+    out: dict[str, StartSkillUpdate] = {}
     try:
         for name in names:
             try:
                 out[name] = _update_one(root, name)
+            except _OldKept as exc:
+                out[name] = StartSkillUpdate(
+                    SkillUpdate.FAILED,
+                    f"ließ sich nicht aktualisieren ({exc.strerror}). Die bisherige Fassung liegt "
+                    f"unter {SKILLS_DIR}/{exc.kept}; benenne sie zurück in „{name}“.",
+                )
             except OSError as exc:
-                raise SkillFileError(
-                    f"Der Start-Skill „{name}“ ließ sich nicht aktualisieren "
-                    f"({exc.strerror or exc}). Die bisherige Fassung ist unverändert."
-                ) from None
+                out[name] = StartSkillUpdate(
+                    SkillUpdate.FAILED,
+                    f"ließ sich nicht aktualisieren ({exc.strerror or exc}). Die bisherige "
+                    "Fassung ist unverändert.",
+                )
     finally:
         os.close(root)
-    updated = [n for n, r in out.items() if r is SkillUpdate.UPDATED]
+    updated = [n for n, r in out.items() if r.result is SkillUpdate.UPDATED]
     if updated:
         log.info("Start-Skills aktualisiert: %s", ", ".join(updated))
-    return out
+    return StartSkillsUpdate(out)
 
 
-def update_lines(results: dict[str, SkillUpdate]) -> list[str]:
+def update_lines(update: StartSkillsUpdate) -> list[str]:
     """One German line per start skill for `arr skills update`."""
-    return [f"{name}: {_UPDATE_TEXT[result]}" for name, result in results.items()]
+    lines = []
+    for name, item in update.skills.items():
+        if item.result is SkillUpdate.FAILED:
+            lines.append(f"{name}: {item.note}")
+        elif item.result is SkillUpdate.UPDATED and item.note:
+            lines.append(
+                f"{name}: aktualisiert; die alte Fassung liegt noch unter "
+                f"{SKILLS_DIR}/{item.note}, lösche sie selbst."
+            )
+        else:
+            lines.append(f"{name}: {_UPDATE_TEXT[item.result]}")
+    return lines

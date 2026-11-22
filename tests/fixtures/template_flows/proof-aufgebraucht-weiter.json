@@ -42,6 +42,121 @@
    }
   ]
  ],
+ "sight": [
+  [
+   "strategie",
+   1,
+   {
+    "strategist": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "skizze",
+   1,
+   {
+    "prover": {
+     "eingaben": [
+      "vorstufen"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "skizze",
+   2,
+   {
+    "prover": {
+     "eingaben": [
+      "bewertungen",
+      "vorstufen"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "beweis",
+   1,
+   {
+    "prover": {
+     "eingaben": [
+      "vorstufen"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ]
+ ],
  "submissions": {
   "beweis/prover": {
    "format": "artifact",
@@ -132,7 +247,13 @@
  "ranking": [],
  "end": {
   "status": "done",
-  "how": "ende"
+  "how": "ende",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": [
+   "- **strategie:** bestanden, akzeptiert: #n, Score 8, 1 Versuch",
+   "- **skizze:** bester Versuch übernommen, akzeptiert: #n, Score 6, 2 Versuche",
+   "- **beweis:** bestanden, akzeptiert: #n, Score 8, 1 Versuch"
+  ]
  },
  "resets": {},
  "fresh_folders": {},

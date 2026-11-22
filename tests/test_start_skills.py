@@ -260,14 +260,20 @@ CASES: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
         {"author": answer(), "judge-1": answer(), "judge-2": answer()},
     ),
     "proof": (
-        {"n_raters": 1, "max_attempts": 1},
-        {"strategist": answer(), "prover": answer(), "rater-1": answer(score=8)},
+        {"n_raters": 2, "max_attempts": 1},
+        {
+            "strategist": answer(),
+            "prover": answer(),
+            "rater-1": answer(score=8),
+            "rater-2": answer(score=8),
+        },
     ),
     "exploration": (
-        {"n_ideas": 1, "n_explorers": 1, "n_rankers": 1, "turns_per_idea": 1},
+        {"n_ideas": 2, "n_explorers": 2, "n_rankers": 1, "turns_per_idea": 1},
         {
-            "ideator": answer(items=1),
+            "ideator": answer(items=2),
             "explorer-1": answer(),
+            "explorer-2": answer(),
             "ranker-1": answer(score=8),
             "summarizer": answer(),
         },
@@ -296,8 +302,8 @@ async def test_a2_fake_run_of_each_group_skill_ends_done(wf: Path, name: str) ->
     assert await manager.run() is RunStatus.DONE
     built = set(builders["calls"])
     assert built == {(a.provider.value, a.id) for a in launch.resolved.agents}
-    if name in ("proof-review", "roundtable"):  # two replicas: Claude and ChatGPT
-        assert {provider for provider, _agent in built} == {"claude", "codex"}
+    # two replicas of a `mix` in every template: Claude and ChatGPT (W4b-06a.1 N6)
+    assert {provider for provider, _agent in built} == {"claude", "codex"}
     checkpoints = [e["data"] for e in log_entries(manager.run_dir, "checkpoint")]
     entered = [c["stage"] for c in checkpoints if c.get("phase") == "pass_start"]
     gates = {c["stage"]: c["value"] for c in checkpoints if c.get("phase") == "gate"}
@@ -674,39 +680,62 @@ def test_w4_05_1_sympy_check_assumptions_and_constants(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------------------------
 
 
-def most_turns(name: str, params: dict[str, Any], agents: list[str]) -> dict[str, int]:
+def most_turns(
+    name: str, params: dict[str, Any], agents: list[str], turns: dict[str, int] | None = None
+) -> dict[str, int]:
     """Turns per agent in the worst case of the phase templates (W4b-06a A4), computed here
-    from the phases, independent of `arr.plan.estimate`: every action has `turns: 1` and one
+    from the phases, independent of `arr.plan.estimate`: an action takes its `turns` and one
     ask-again; a `chat` phase gives `rounds` turns and one ask-again; no wake-ups, no answers
-    of the user (B3), no note turns of Auto-Compact.
+    of the user (B3), no note turns of Auto-Compact. `turns` maps a phase (`<phase>` for its
+    work actions, `<phase>:gate` for the rating action) to the `turns` of the template
+    (W4b-06a.1 N4); a phase not named takes 1.
     """
+
+    def action(phase: str) -> int:
+        return (turns or {}).get(phase, 1) + 1  # its turns and the ask-again
+
     out: dict[str, int] = {}
-    action = 1 + 1  # `turns: 1` and the ask-again
     if name == "proof-review":
         rev, rounds = int(params["max_revisions"]), int(params["discussion_rounds"])
         visits = 1 + rev  # pruefung (or pruefung-allein) and diskussion per round
+        check = action("pruefung" if rounds else "pruefung-allein")
         talk = rounds + 1 if rounds else 0  # Entscheidung 47: also a single judge talks
-        writes = 0 if params.get("artifact") else 1
-        out["author"] = action * writes + action * rev
-        out |= {a: visits * (action + talk) for a in agents if a.startswith("judge")}
+        writes = 0 if params.get("artifact") else action("fassung")
+        out["author"] = writes + rev * action("revision")
+        out |= {a: visits * (check + talk) for a in agents if a.startswith("judge")}
     elif name == "proof":
         attempts = int(params["max_attempts"])
-        out["strategist"] = attempts * action
-        out["prover"] = 2 * attempts * action
-        out |= {a: 3 * attempts * action for a in agents if a.startswith("rater")}
+        out["strategist"] = attempts * action("strategie")
+        out["prover"] = attempts * (action("skizze") + action("beweis"))
+        rate = sum(action(f"{s}:gate") for s in ("strategie", "skizze", "beweis"))
+        out |= {a: attempts * rate for a in agents if a.startswith("rater")}
     elif name == "exploration":
         n_ideas, repeat = int(params["n_ideas"]), int(params["turns_per_idea"])
+        phase = {"none": "exploration", "digest": "exploration-digest"}.get(
+            str(params.get("exchange", "none")), "exploration-kanal"
+        )
         explorers = [a for a in agents if a.startswith("explorer")]
         for k, explorer in enumerate(explorers):
             entries = len(range(k, n_ideas, len(explorers)))
-            out[explorer] = entries * repeat * action  # Entscheidung 58: ask-again per repeat
-        out["ideator"] = action
-        out |= {a: action for a in agents if a.startswith("ranker")}
-        out["summarizer"] = action
+            out[explorer] = entries * repeat * action(phase)  # Entscheidung 58: per repeat
+        out["ideator"] = action("ideen")
+        out |= {a: action(f"{phase}:gate") for a in agents if a.startswith("ranker")}
+        out["summarizer"] = action("zusammenfassung")
     elif name == "roundtable":
         rounds = int(params["rounds"])
         out |= {a: rounds + 1 for a in agents if a.startswith("diskutant")}
-        out["summarizer"] = action
+        out["summarizer"] = action("zusammenfassung")
+    return out
+
+
+def template_turns(resolved: Any) -> dict[str, int]:
+    """`turns` of the template per phase (the largest of its actions) and per rating action."""
+    out: dict[str, int] = {}
+    for phase in resolved.phases:
+        if phase.actions:
+            out[phase.name] = max(a.turns for a in phase.actions)
+        if phase.gate.action is not None:
+            out[f"{phase.name}:gate"] = phase.gate.action.turns
     return out
 
 
@@ -722,17 +751,23 @@ def corner_cases(spec: Any) -> list[dict[str, Any]]:
     ]
 
 
-def worst_case_over(name: str, limit: int | None = None) -> dict[str, Any]:
-    """The corners where an agent needs more than `limit` (default: the template's own)."""
-    path = resources.files("arr").joinpath("templates/skills", name, "group.yaml")
-    spec = load_group_spec(Path(str(path)))
+def worst_case_over(
+    name: str, limit: int | None = None, group: Path | None = None
+) -> dict[str, Any]:
+    """The corners where an agent needs more than `limit` (default: the template's own);
+    `group` is another `group.yaml` of the template (a counter-check)."""
+    path = group or Path(
+        str(resources.files("arr").joinpath("templates/skills", name, "group.yaml"))
+    )
+    spec = load_group_spec(path)
     limit = limit if limit is not None else spec.limits.turns_per_agent
     settings = _check_settings(WorkfolderSettings())
     found: dict[str, Any] = {}
     for params in corner_cases(spec):
         resolved = resolve_run(RunInput(project="p", skill=name, task="x"), spec, settings, params)
         assert check(resolved).errors == [], (name, params)
-        worst = most_turns(name, resolved.params, [a.id for a in resolved.agents])
+        agents = [a.id for a in resolved.agents]
+        worst = most_turns(name, resolved.params, agents, template_turns(resolved))
         too_many = {a: n for a, n in worst.items() if n > limit}
         if too_many:
             found[str(params)] = too_many
@@ -758,6 +793,33 @@ def test_w4_05_1_the_turn_check_finds_too_tight_limits(name: str, limit: int) ->
     """Counter-check: a limit below the worst case runs out at a corner (the old
     limits of proof-review, 10, and exploration, 12, would too)."""
     assert worst_case_over(name, limit)
+
+
+@pytest.mark.parametrize(
+    ("name", "old", "new"),
+    [
+        (
+            "proof-review",
+            "judge-*: { task: tasks/pruefen.md, submission: { format: review }, turns: 1 }",
+            "judge-*: { task: tasks/pruefen.md, submission: { format: review }, turns: 3 }",
+        ),
+        (
+            "proof",
+            "submission: { format: artifact, name: strategie }, turns: 1 }",
+            "submission: { format: artifact, name: strategie }, turns: 9 }",
+        ),
+    ],
+)
+def test_n4_the_turn_check_reads_turns_from_the_template(
+    tmp_path: Path, name: str, old: str, new: str
+) -> None:
+    """W4b-06a.1 N4: more `turns` in the template run out of `turns_per_agent` (judges with
+    `turns: 3`: 3 × (4 + 2) = 18 > 12)."""
+    text = template_texts(name)["group.yaml"]
+    assert old in text
+    group = tmp_path / "group.yaml"
+    group.write_text(text.replace(old, new, 1), encoding="utf-8")
+    assert worst_case_over(name, group=group)
 
 
 def test_w4_05_1_the_turn_check_counts_the_phases() -> None:

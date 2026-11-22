@@ -52,6 +52,132 @@
    }
   ]
  ],
+ "sight": [
+  [
+   "fassung",
+   1,
+   {
+    "author": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "pruefung",
+   1,
+   {
+    "judge-1": {
+     "eingaben": [
+      "beweis"
+     ],
+     "kanaele": [],
+     "versiegelt": true
+    },
+    "judge-2": {
+     "eingaben": [
+      "beweis"
+     ],
+     "kanaele": [],
+     "versiegelt": true
+    }
+   }
+  ],
+  [
+   "diskussion",
+   1,
+   {
+    "judge-1": {
+     "eingaben": [
+      "beweis",
+      "einwaende",
+      "gutachten"
+     ],
+     "kanaele": [
+      "judges"
+     ],
+     "versiegelt": false
+    },
+    "judge-2": {
+     "eingaben": [
+      "beweis",
+      "einwaende",
+      "gutachten"
+     ],
+     "kanaele": [
+      "judges"
+     ],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "revision",
+   1,
+   {
+    "author": {
+     "eingaben": [
+      "beweis",
+      "einwaende",
+      "gutachten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "pruefung",
+   2,
+   {
+    "judge-1": {
+     "eingaben": [
+      "beweis",
+      "einwaende"
+     ],
+     "kanaele": [],
+     "versiegelt": true
+    },
+    "judge-2": {
+     "eingaben": [
+      "beweis",
+      "einwaende"
+     ],
+     "kanaele": [],
+     "versiegelt": true
+    }
+   }
+  ],
+  [
+   "diskussion",
+   2,
+   {
+    "judge-1": {
+     "eingaben": [
+      "beweis",
+      "einwaende",
+      "gutachten"
+     ],
+     "kanaele": [
+      "judges"
+     ],
+     "versiegelt": false
+    },
+    "judge-2": {
+     "eingaben": [
+      "beweis",
+      "einwaende",
+      "gutachten"
+     ],
+     "kanaele": [
+      "judges"
+     ],
+     "versiegelt": false
+    }
+   }
+  ]
+ ],
  "submissions": {
   "diskussion/judge-1": {
    "format": "review",
@@ -98,7 +224,9 @@
  "ranking": [],
  "end": {
   "status": "done",
-  "how": "stopp"
+  "how": "stopp",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": []
  },
  "resets": {
   "judge-1": 1,

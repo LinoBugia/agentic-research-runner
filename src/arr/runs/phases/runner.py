@@ -470,7 +470,8 @@ class PhaseRunner:
             nxt = await self.enter(target, how, info)
         await self.ctx.checkpoint(phase.name, phase="route", **info)
         if nxt is None or nxt[0] != phase.name:
-            await self._stage_end(phase, record, nxt is None)
+            ends = nxt is None and not self._left_by_next(route, info)
+            await self._stage_end(phase, record, ends)
         return nxt
 
     async def _gate_checkpoint(
@@ -500,19 +501,35 @@ class PhaseRunner:
             data["ranking"] = outcome.ranking
         await self.ctx.checkpoint(phase.name, **data)
 
-    async def _stage_end(self, phase: ResolvedPhase, record: PassRecord, last: bool) -> None:
+    def _left_by_next(self, route: Route | None, info: Mapping[str, Any]) -> bool:
+        """True if the run leaves the phase over `next`, also past the end of the plan (its
+        best attempt counts, as `on_fail: continue` of the old `waterfall`); False if it ends
+        there: route `stop`, `on_exhausted: stop` or the user's „Beenden“ (W4b-06a.1, Entscheidung
+        81)."""
+        if info.get("asked_user"):
+            return info.get("choice") == EscalationOption.CONTINUE.value
+        exhausted = info.get("exhausted") or []
+        if exhausted:
+            route = self.run_config.phase(exhausted[-1]).on_exhausted
+        return route is RouteKeyword.NEXT
+
+    async def _stage_end(self, phase: ResolvedPhase, record: PassRecord, ends: bool) -> None:
+        """Checkpoint `stage_end` when a phase is left. With a threshold gate the outcome is
+        `passed`, `best_accepted` (left over `next`) or `stage_failed` (`ends`: the run ends here
+        because the phase did not pass; then nothing is accepted, as in the old `waterfall`)."""
         valid = self.state.valid.get(phase.name, [])
         outcome = "done"
         if phase.gate.type is GateType.JUDGE and phase.gate.rule is GateRule.MEAN:
             if record.outcome.result == "pass":
                 outcome = "passed"
             else:
-                outcome = "stage_failed" if last else "best_accepted"
+                outcome = "stage_failed" if ends else "best_accepted"
+        failed = outcome == "stage_failed"
         data: dict[str, Any] = {
             "phase": "stage_end",
             "attempt": record.attempt,
             "outcome": outcome,
-            "accepted": valid[0].id if valid else None,
+            "accepted": valid[0].id if valid and not failed else None,
             "valid": [s.id for s in valid],
             "attempts": self.state.visits.get(phase.name, 0),
         }

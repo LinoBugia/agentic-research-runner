@@ -144,7 +144,12 @@ def test_a9_the_rules_of_phases_runs() -> None:
     rule4, rule8 = new[3], new[7]
     assert "Auf einen Agenten wartest du mit `wait_for_messages`." in rule4
     assert "Brauchst du die Antwort des Users, warte mit `wait_until` bis zu fünf Minuten" in rule4
-    assert "eine Antwort oder Notiz des Users beendet das Warten" in rule4
+    # N5 (W4b-06a.1): in a group channel only an answer ends the wait, in the private channel
+    # also a note (`room/address.py`, `runs/phases/wake.py`)
+    assert (
+        "eine Antwort des Users (in deinem privaten Kanal auch eine Notiz) beendet das Warten."
+        in rule4
+    )
     assert "begründeten Annahme" in rule4 and "in deiner Abgabe" in rule4
     assert "Wer abgibt, ist fertig; seine offene Frage gilt damit als erledigt." in rule4
     assert "nie mit `wait_until`" not in rule4

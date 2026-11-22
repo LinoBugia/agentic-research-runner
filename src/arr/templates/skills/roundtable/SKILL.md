@@ -12,7 +12,7 @@ Diskutanten bearbeiten die Frage gemeinsam im Kanal `#runde`, in höchstens `rou
 | Phase | Wer | Abgabe | Weiter |
 |---|---|---|---|
 | diskussion | diskutant-1 … in `#runde`, `rounds` Runden | `text` (Fazit) je Diskutant | → zusammenfassung |
-| zusammenfassung | summarizer, liest den Verlauf von `#runde` | `text` | Ende; entfällt mit `summarizer: keine` |
+| zusammenfassung | summarizer, liest den Verlauf von `#runde` | `text` | Ende; entfällt mit `summarizer: none` |
 
 Der Zusammenfasser ist Mitglied von `#runde`, diskutiert aber nicht mit.
 
@@ -35,7 +35,7 @@ Nicht sinnvoll, wenn Ansätze unabhängig und gründlich erkundet werden sollen 
 |---|---|---|---|
 | rounds | 3 | 1–6 | Anzahl der Diskussionsrunden |
 | n_diskutanten | 2 | 2–5 | Anzahl der Diskutanten, abwechselnd Claude und ChatGPT |
-| summarizer | summarizer | | `summarizer`: Zusammenfassung am Ende; `keine`: ohne |
+| summarizer | summarizer | | `summarizer`: Zusammenfassung am Ende; `none`: ohne |
 
 Die Höchstwerte sind so gewählt, dass 10 Turns je Agent reichen (ein Turn je Runde und eine Nachfrage). Mehr Turns gehen über `overrides={"limits": {"turns_per_agent": …}}`.
 
@@ -43,4 +43,4 @@ Agenten: `diskutant-1 …` (Claude Sonnet und ChatGPT im Wechsel; Modell und Pro
 
 ## Ergebnis
 
-`read_run_summary(run_id)` nennt die Abgaben mit ihren Kurzfassungen. Den Verlauf liest du mit `read_groupchat(run_id, channel="runde")`. Im Run-Ordner liegen die Fazits und die Zusammenfassung unter `output/submissions/` (je Abgabe ein Ordner `NNN-<phase>-<agent>/`).
+`read_run_summary(run_id)` nennt die Abgaben mit ihren Kurzfassungen. Den Verlauf liest du mit `read_groupchat(run_id, channel="runde")`, die Fazits mit `read_results(run_id, stage="diskussion")`. Im Run-Ordner liegen die Fazits und die Zusammenfassung unter `output/submissions/` (je Abgabe ein Ordner `NNN-<phase>-<agent>/`).

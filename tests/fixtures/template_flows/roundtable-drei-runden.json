@@ -22,6 +22,50 @@
    }
   ]
  ],
+ "sight": [
+  [
+   "diskussion",
+   1,
+   {
+    "diskutant-1": {
+     "eingaben": [],
+     "kanaele": [
+      "runde"
+     ],
+     "versiegelt": false
+    },
+    "diskutant-2": {
+     "eingaben": [],
+     "kanaele": [
+      "runde"
+     ],
+     "versiegelt": false
+    },
+    "summarizer": {
+     "eingaben": [],
+     "kanaele": [
+      "runde"
+     ],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "zusammenfassung",
+   1,
+   {
+    "summarizer": {
+     "eingaben": [
+      "verlauf"
+     ],
+     "kanaele": [
+      "runde"
+     ],
+     "versiegelt": false
+    }
+   }
+  ]
+ ],
  "submissions": {
   "zusammenfassung/summarizer": {
    "format": "text",
@@ -34,7 +78,9 @@
  "ranking": [],
  "end": {
   "status": "done",
-  "how": "ende"
+  "how": "ende",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": []
  },
  "resets": {},
  "fresh_folders": {},

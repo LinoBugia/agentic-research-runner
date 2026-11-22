@@ -16,6 +16,7 @@ from run_kit import make_workfolder
 from templates_kit import (
     CASES,
     DEVIATIONS,
+    FIXTURE_OF,
     FLOWS,
     Case,
     compare,
@@ -23,6 +24,7 @@ from templates_kit import (
     new_manager,
     new_policies,
     run_new,
+    structure_issues,
 )
 
 from arr.skills import start_skill_files
@@ -103,3 +105,89 @@ async def test_a6_note_next_stays_private(workfolder: Path) -> None:
     others = [v for v in log.views if v.agent != "judge-1"]
     assert others and not any("geheime Notiz" in v.prompt for v in others)
     assert not any("geheime Notiz" in str(v.context) for v in others)
+
+
+@pytest.mark.parametrize("name", sorted(FIXTURE_OF))
+def test_a6_the_templates_keep_the_agreed_structure(name: str) -> None:
+    """M2 c: phases as in the test data of W4b-02a, `turns: 1` everywhere, isolated checks,
+    every task file there."""
+    assert structure_issues(name) == []
+
+
+@pytest.mark.parametrize(
+    ("name", "old", "new", "what"),
+    [
+        ("proof-review", "turns: 1 }", "turns: 3 }", "turns 3 statt 1"),
+        ("proof-review", "    isolated: true\n", "", "nicht isoliert"),
+        ("proof", "tasks/skizze.md", "tasks/beweis.md", "phases weichen"),
+        ("exploration", "      - { peers: summary }\n", "", "phases weichen"),
+    ],
+)
+def test_a6_the_structure_check_finds_changes(name: str, old: str, new: str, what: str) -> None:
+    files = start_skill_files(name)
+    text = files["group.yaml"].decode()
+    assert old in text
+    files["group.yaml"] = text.replace(old, new, 1).encode()
+    assert any(what in issue for issue in structure_issues(name, files))
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-06a.1 point 7: the end of a phase that did not pass (H3, M1, Entscheidung 81)
+# --------------------------------------------------------------------------------------------
+
+
+def _case(case_id: str) -> Case:
+    [case] = [c for c in CASES if c.id == case_id]
+    return case
+
+
+async def test_p7_the_old_line_in_stage_end_turns_the_comparison_red(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Counter-check: with the old rule („stage_failed“ whenever no phase follows) the last
+    stage of `proof` with `next` differs from the old topology."""
+    from arr.runs.phases.runner import PhaseRunner
+
+    monkeypatch.setattr(PhaseRunner, "_left_by_next", lambda self, route, info: False)
+    case = _case("proof-hohe-schwelle")
+    _mgr, flow = await run_new(workfolder, case)
+    with pytest.raises(AssertionError, match="Abweichung ohne Ausnahme"):
+        compare(case, flow)
+
+
+@pytest.mark.parametrize(
+    ("case_id", "reason", "line"),
+    [
+        (
+            "proof-aufgebraucht-stopp",
+            "Die Phase „skizze“ wurde nicht bestanden (stage_failed).",
+            "- **skizze:** nicht bestanden, Run beendet, akzeptiert: keins",
+        ),
+        (
+            "proof-hohe-schwelle",
+            "Die Topologie ist regulär durchgelaufen.",
+            "- **beweis:** bester Versuch übernommen, akzeptiert: #",
+        ),
+    ],
+)
+async def test_p7_summary_and_run_detail_name_the_end(
+    workfolder: Path, case_id: str, reason: str, line: str
+) -> None:
+    from arr.runs.inspect import run_reason
+    from arr.runs.orchestrator import OrchestratorLog
+    from arr.runs.prepare import load_run_meta
+    from arr.service.api_models import StageStatus
+    from arr.service.real_api import RealApi
+
+    mgr, _flow = await run_new(workfolder, _case(case_id))
+    summary = (mgr.run_dir / "output" / "summary.md").read_text("utf-8")
+    assert f"- **Grund:** {reason}" in summary
+    assert line in summary
+    entries = list(OrchestratorLog(mgr.run_dir).entries())
+    assert run_reason(load_run_meta(mgr.run_dir), entries) == reason
+    detail = await RealApi(workfolder, base_url="http://test").get_run(mgr.run_dir.name)
+    stages = {s.key: s.status for s in detail.stages}
+    if case_id == "proof-aufgebraucht-stopp":
+        assert stages["skizze"] is StageStatus.FAILED
+    else:
+        assert stages["beweis"] is StageStatus.DONE, "best attempt, not „nicht bestanden“"

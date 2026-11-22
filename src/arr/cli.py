@@ -375,8 +375,10 @@ def skills_update(workfolder: WorkfolderOption = None) -> None:
 
     root = _runs_workfolder(workfolder)
     try:
-        results = update_start_skills(root)
+        update = update_start_skills(root)
     except SkillFileError as exc:
         _fail(str(exc))
-    for line in update_lines(results):
+    for line in update_lines(update):
         typer.echo(line)
+    if update.failed:
+        raise typer.Exit(code=1)

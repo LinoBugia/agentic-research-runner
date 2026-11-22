@@ -224,10 +224,10 @@ PHASES_CONVERSATION_RULES = (
     *CONVERSATION_RULES[:3],
     "Wer jemanden fragt, schreibt `@name` (oder `to`); `@alle` fragt alle, `@user` den User "
     "(nur er antwortet darauf). Auf einen Agenten wartest du mit `wait_for_messages`. Brauchst "
-    "du die Antwort des Users, warte mit `wait_until` bis zu fünf Minuten; eine Antwort oder "
-    "Notiz des Users beendet das Warten. Antwortet er nicht, arbeite mit einer begründeten "
-    "Annahme weiter und nenne sie in deiner Abgabe. Wer abgibt, ist fertig; seine offene Frage "
-    "gilt damit als erledigt.",
+    "du die Antwort des Users, warte mit `wait_until` bis zu fünf Minuten; eine Antwort des "
+    "Users (in deinem privaten Kanal auch eine Notiz) beendet das Warten. Antwortet er nicht, "
+    "arbeite mit einer begründeten Annahme weiter und nenne sie in deiner Abgabe. Wer abgibt, "
+    "ist fertig; seine offene Frage gilt damit als erledigt.",
     *CONVERSATION_RULES[4:7],
     "Wer seinen Teil erledigt hat, gibt ab (`submit`). Fertig heißt: Du wartest nicht mehr, "
     "bleibst aber ansprechbar. Wartest du auf die Abgabe eines anderen, warte mit "

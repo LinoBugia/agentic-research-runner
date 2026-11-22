@@ -36,6 +36,76 @@
    }
   ]
  ],
+ "sight": [
+  [
+   "fassung",
+   1,
+   {
+    "author": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "pruefung-allein",
+   1,
+   {
+    "judge-1": {
+     "eingaben": [
+      "beweis"
+     ],
+     "kanaele": [],
+     "versiegelt": true
+    },
+    "judge-2": {
+     "eingaben": [
+      "beweis"
+     ],
+     "kanaele": [],
+     "versiegelt": true
+    }
+   }
+  ],
+  [
+   "revision",
+   1,
+   {
+    "author": {
+     "eingaben": [
+      "beweis",
+      "einwaende",
+      "gutachten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "pruefung-allein",
+   2,
+   {
+    "judge-1": {
+     "eingaben": [
+      "beweis",
+      "einwaende"
+     ],
+     "kanaele": [],
+     "versiegelt": true
+    },
+    "judge-2": {
+     "eingaben": [
+      "beweis",
+      "einwaende"
+     ],
+     "kanaele": [],
+     "versiegelt": true
+    }
+   }
+  ]
+ ],
  "submissions": {
   "fassung/author": {
    "format": "artifact",
@@ -74,7 +144,9 @@
  "ranking": [],
  "end": {
   "status": "done",
-  "how": "stopp"
+  "how": "stopp",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": []
  },
  "resets": {
   "judge-1": 1,

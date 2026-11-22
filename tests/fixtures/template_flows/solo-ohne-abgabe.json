@@ -13,6 +13,19 @@
    }
   ]
  ],
+ "sight": [
+  [
+   "arbeit",
+   1,
+   {
+    "worker": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ]
+ ],
  "submissions": {},
  "items": {},
  "gates": [],
@@ -20,7 +33,9 @@
  "ranking": [],
  "end": {
   "status": "done",
-  "how": "ende"
+  "how": "ende",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": []
  },
  "resets": {},
  "fresh_folders": {},

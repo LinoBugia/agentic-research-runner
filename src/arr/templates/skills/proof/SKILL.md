@@ -45,4 +45,4 @@ Agenten: `strategist` (Claude Sonnet), `prover` (Claude Opus), `rater-1 …` (Cl
 
 ## Ergebnis
 
-`read_run_summary(run_id)` nennt je Stufe die Abgaben, Scores und welcher Versuch gilt. Im Run-Ordner liegen die Fassungen unter `output/strategie/v<n>/`, `output/skizze/v<n>/` und `output/beweis/v<n>/`, die Bewertungen unter `output/submissions/`. Übernimm einen Beweis ins Projekt nur nach Rücksprache mit dem User.
+`read_run_summary(run_id)` nennt je Stufe die Abgaben, Scores und welcher Versuch gilt; die Fassungen und Bewertungen einer Stufe liest du mit `read_results(run_id, stage="skizze")` (ebenso `strategie`, `beweis`). Im Run-Ordner liegen die Fassungen unter `output/strategie/v<n>/`, `output/skizze/v<n>/` und `output/beweis/v<n>/`, die Bewertungen unter `output/submissions/`. Übernimm einen Beweis ins Projekt nur nach Rücksprache mit dem User.

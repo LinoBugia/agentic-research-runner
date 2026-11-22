@@ -18,6 +18,7 @@ side writes or checks it as `tests/fixtures/template_flows/<template>-<case>.jso
 
 import json
 import os
+import re
 import shutil
 from collections import Counter
 from collections.abc import Mapping
@@ -284,8 +285,154 @@ def _summary_file(mgr: RunManager) -> bool:
     return (mgr.run_dir / SUMMARY_FILE).is_file()
 
 
-def new_flow(mgr: RunManager, status: Any) -> dict[str, Any]:
+def _summary(mgr: RunManager) -> dict[str, Any]:
+    """What `summary.md` says about the end: the line `Grund` and the lines of the stages with
+    a threshold (H3). „Phase“ in a phases run is „Stufe“ in an old one; result numbers differ
+    by design and read `#n`."""
+    path = mgr.run_dir / SUMMARY_FILE
+    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    reason = next((line for line in text.splitlines() if line.startswith("- **Grund:**")), "")
+    reason = reason.replace("Die Phase „", "Die Stufe „")
+    outcomes = ("bestanden", "nicht bestanden", "bester Versuch übernommen")
+    stages = [
+        re.sub(r"#\d+", "#n", line)
+        for line in text.splitlines()
+        if re.match(r"- \*\*[\w-]+:\*\* ", line) and line.split(":** ", 1)[1].startswith(outcomes)
+    ]
+    return {"reason": reason, "stage_lines": stages}
+
+
+class _Sight:
+    """What an agent sees in a turn: names of its inputs („Eingaben“, mapped per template onto
+    the same words for both sides), the open group channels it is a member of, and whether the
+    submissions of its phase are sealed (M2 of the review)."""
+
+    def __init__(self, mgr: RunManager, log: Any) -> None:
+        resolved = mgr.prepared.resolved if mgr.prepared else None
+        chats = list(resolved.groupchats) if resolved else []
+        self.members = {c.name: set(c.members) for c in chats}
+        self.open = {c.name for c in chats if not c.open_from}
+        self.sealed: set[str] = set()
+        self.views: dict[str, list[Any]] = {}
+        for view in log.views if log is not None else []:
+            self.views.setdefault(view.agent, []).append(view)
+        self.seen: Counter[str] = Counter()
+        self.found: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+
+    def event(self, kind: str, data: Mapping[str, Any], phase_of: Any) -> None:
+        channel = str(data.get("channel") or "")
+        if kind == "channel_open" and channel in self.members:
+            self.open.add(channel)
+        elif kind == "channel_close":
+            self.open.discard(channel)
+        elif kind == "results_sealed":
+            self.sealed.add(phase_of(data.get("stage")))
+        elif kind == "results_released":
+            self.sealed.discard(phase_of(data.get("stage")))
+
+    def turn(self, agent: str, phase: str, visit: int, tags: Any) -> None:
+        """A turn began (in the order of the log; also note turns, which the views hold)."""
+        mine = self.views.get(agent, [])
+        index = self.seen[agent]
+        self.seen[agent] += 1
+        view = mine[index] if index < len(mine) else None
+        here = self.found.setdefault((phase, visit), {}).setdefault(
+            agent, {"eingaben": set(), "kanaele": set(), "versiegelt": False}
+        )
+        if view is not None:
+            here["eingaben"] |= set(tags(view))
+        here["kanaele"] |= {c for c in self.open if agent in self.members.get(c, set())}
+        here["versiegelt"] = here["versiegelt"] or phase in self.sealed
+
+    def skip(self, agent: str) -> None:
+        self.seen[agent] += 1
+
+    def sections(self, turns: list[list[Any]]) -> list[list[Any]]:
+        out = []
+        for phase, visit, agents in turns:
+            got = self.found.get((phase, visit), {})
+            out.append(
+                [
+                    phase,
+                    visit,
+                    {
+                        a: {
+                            "eingaben": sorted(got[a]["eingaben"]),
+                            "kanaele": sorted(got[a]["kanaele"]),
+                            "versiegelt": got[a]["versiegelt"],
+                        }
+                        for a in agents
+                        if a in got
+                    },
+                ]
+            )
+        return out
+
+
+def _new_tags(template: str) -> Any:
+    def tags(view: Any) -> set[str]:
+        ctx = view.context
+        fmt = (ctx.get("submission") or {}).get("format")
+        out: set[str] = set()
+        for item in ctx.get("inputs") or []:
+            kind, _, name = str(item.get("source", "")).partition(":")
+            if fmt == "rating":
+                out.add("zu-bewerten")
+            elif kind == "channel":
+                out.add("verlauf")
+            elif kind == "name" and name == "beweis" or item.get("name") == "beweis":
+                out.add("beweis")
+            elif kind == "phase" and template == "proof-review":
+                out.add("gutachten")
+            elif kind == "phase" and template == "proof":
+                out.add("vorstufen")
+            elif kind == "phase" and name.startswith("exploration"):
+                out.add("staende")
+            elif kind == "phase" and template == "roundtable":
+                out.add("fazits")
+        if ctx.get("objections"):
+            out.add("einwaende")
+        if ctx.get("entry"):
+            out.add("eintrag")
+        if ctx.get("peers"):
+            out.add("auszuege")
+        if ctx.get("feedback"):
+            out.add("bewertungen")
+        return out
+
+    return tags
+
+
+def _old_tags(view: Any) -> set[str]:
+    ctx = view.context
+    out: set[str] = set()
+    if "artifact" in ctx:
+        out.add("beweis")
+    if ctx.get("reviews"):
+        out.add("gutachten")
+    if ctx.get("objections"):
+        out.add("einwaende")
+    if ctx.get("idea"):
+        out.add("eintrag")
+    if ctx.get("digest"):
+        out.add("auszuege")
+    if ctx.get("result_id") or ctx.get("result_ids"):
+        out.add("zu-bewerten")
+    elif ctx.get("results"):
+        out.add("staende")
+    if ctx.get("accepted"):
+        out.add("vorstufen")
+    if ctx.get("rework"):
+        out.add("bewertungen")
+    if view.stage == "zusammenfassung" and ctx.get("channel"):
+        out.add("verlauf")
+    return out
+
+
+def new_flow(mgr: RunManager, status: Any, log: Any = None, template: str = "") -> dict[str, Any]:
     """The flow of a `phases` run."""
+    sight = _Sight(mgr, log)
+    tags = _new_tags(template)
     seq: list[tuple[str, int, str]] = []
     visits: Counter[str] = Counter()
     gates: list[list[Any]] = []
@@ -300,14 +447,17 @@ def new_flow(mgr: RunManager, status: Any) -> dict[str, Any]:
             elif kind == "gate" and data["value"] != "done":
                 gates.append([data["stage"], data["value"]])
             elif kind == "route":
-                ended = data.get("entered", "") is None
-                early = data.get("route") != "next" or bool(data.get("exhausted"))
-                routes.append("stopp" if ended and early else "ende" if ended else "weiter")
+                routes.append(_route_end(mgr, data))
             elif kind == "stage_end" and data.get("outcome") != "done":
                 ends.append([data["stage"], data["outcome"], data.get("accepted")])
-        elif entry["kind"] == "turn" and not data.get("purpose"):
+        elif entry["kind"] == "turn" and data.get("purpose"):
+            sight.skip(data["agent"])
+        elif entry["kind"] == "turn":
             stage = data.get("stage")
             seq.append((stage, visits[stage], data["agent"]))
+            sight.turn(data["agent"], stage, visits[stage], tags)
+        else:
+            sight.event(entry["kind"], data, str)
     store = RoomStore(mgr.run_dir)
     subs = store.submissions()
     by_id = {s.id: s for s in subs}
@@ -341,8 +491,10 @@ def new_flow(mgr: RunManager, status: Any) -> dict[str, Any]:
         [stage, outcome, by_id[acc].attempt if acc in by_id else None]
         for stage, outcome, acc in ends
     ]
+    turns = _sections(seq)
     return {
-        "turns": _sections(seq),
+        "turns": turns,
+        "sight": sight.sections(turns),
         "submissions": dict(sorted(counted.items())),
         "items": dict(sorted(items.items())),
         "gates": gates,
@@ -351,11 +503,26 @@ def new_flow(mgr: RunManager, status: Any) -> dict[str, Any]:
         "end": {
             "status": str(getattr(status, "value", status)),
             "how": routes[-1] if routes and routes[-1] != "weiter" else "ende",
+            **_summary(mgr),
         },
         **_sessions(mgr),
         "files": sorted([list(f) for f in files])
         + ([["summary.md"]] if _summary_file(mgr) else []),
     }
+
+
+def _route_end(mgr: RunManager, data: Mapping[str, Any]) -> str:
+    """„weiter“ while the run goes on; at its end „ende“ if it left the last phase over `next`
+    (also an exhausted one with `on_exhausted: next`, or the user's „Weiter“), else „stopp“."""
+    if data.get("entered", "") is not None:
+        return "weiter"
+    if data.get("asked_user"):
+        return "ende" if data.get("choice") == "continue" else "stopp"
+    route = str(data.get("route"))
+    exhausted = data.get("exhausted") or []
+    if exhausted and mgr.prepared is not None:
+        route = str(mgr.prepared.resolved.phase(exhausted[-1]).on_exhausted)
+    return "ende" if route == "next" else "stopp"
 
 
 def _entry_number(sub: Any) -> int:
@@ -389,11 +556,12 @@ class OldMap:
         return str(stage)
 
 
-def old_flow(mgr: RunManager, status: Any, template: str) -> dict[str, Any]:
+def old_flow(mgr: RunManager, status: Any, template: str, log: Any = None) -> dict[str, Any]:
     """The flow of a run of an old topology, on the names of the phases."""
     resolved = mgr.prepared.resolved if mgr.prepared else None
     params = dict(resolved.params) if resolved else {}
     mapping = OldMap(template, params)
+    sight = _Sight(mgr, log)
     seq: list[tuple[str, int, str]] = []
     gates: list[list[Any]] = []
     ends: list[list[Any]] = []
@@ -429,7 +597,9 @@ def old_flow(mgr: RunManager, status: Any, template: str) -> dict[str, Any]:
                 ranking = [int(str(r["idea"]).removeprefix("I")) for r in scored]
                 if data["ranking"]:
                     gates.append([mapping.phase("bewertung"), "ranked"])
-        elif entry["kind"] == "turn" and not data.get("purpose"):
+        elif entry["kind"] == "turn" and data.get("purpose"):
+            sight.skip(data["agent"])
+        elif entry["kind"] == "turn":
             stage = data.get("stage")
             phase = mapping.phase(stage)
             if template == "proof-review" and phase != "fassung":
@@ -439,6 +609,9 @@ def old_flow(mgr: RunManager, status: Any, template: str) -> dict[str, Any]:
             else:
                 visit = 1
             seq.append((phase, visit, data["agent"]))
+            sight.turn(data["agent"], phase, visit, _old_tags)
+        else:
+            sight.event(entry["kind"], data, mapping.phase)
     store = RoomStore(mgr.run_dir)
     results = store.results()
     by_id = {r.id: r for r in results}
@@ -475,14 +648,16 @@ def old_flow(mgr: RunManager, status: Any, template: str) -> dict[str, Any]:
     ]
     if template == "proof" and ends and ends[-1][1] == "stage_failed":
         how = "stopp"
+    turns = _sections(seq)
     return {
-        "turns": _sections(seq),
+        "turns": turns,
+        "sight": sight.sections(turns),
         "submissions": dict(sorted(counted.items())),
         "items": dict(sorted(items.items())),
         "gates": gates,
         "stage_ends": accepted,
         "ranking": ranking,
-        "end": {"status": str(getattr(status, "value", status)), "how": how},
+        "end": {"status": str(getattr(status, "value", status)), "how": how, **_summary(mgr)},
         **_sessions(mgr),
         "files": sorted([list(f) for f in files])
         + ([["summary.md"]] if _summary_file(mgr) else []),
@@ -603,6 +778,25 @@ CASES: tuple[Case, ...] = (
         {"artifact": PROJECT_PROOF},
         {"verdicts": _verdicts("minor", "accept")},
     ),
+    Case("proof-review", "reject", {}, {"verdicts": _verdicts("reject")}),
+    Case(
+        "proof-review",
+        "reject-ohne-revision",
+        {"max_revisions": 0},
+        {"verdicts": _verdicts("reject")},
+    ),
+    Case(
+        "proof-review",
+        "einstimmig",
+        {"verdict": "unanimous"},
+        {"verdicts": {"judge-1": ["accept", "accept"], "judge-2": ["minor", "accept"]}},
+    ),
+    Case(
+        "proof-review",
+        "drei-judges-mehrheit",
+        {"judges": 3},
+        {"verdicts": {"judge-1": ["accept"], "judge-2": ["accept"], "judge-3": ["minor"]}},
+    ),
     Case("proof", "bestanden", {}, {"scores": {}}),
     Case("proof", "nacharbeit", {}, {"scores": {"strategie/1": 4, "strategie/2": 8}}),
     Case(
@@ -624,7 +818,14 @@ CASES: tuple[Case, ...] = (
         {"scores": {"skizze/1": 6, "skizze/2": 5}},
         decider="end",
     ),
+    Case(
+        "proof",
+        "hohe-schwelle",
+        {"pass_score": 9},
+        {"scores": {}},
+    ),
     Case("exploration", "ideator", {}, {"items": 3}),
+    Case("exploration", "zwei-ranker", {"n_rankers": 2}, {"items": 3}),
     Case("exploration", "mehr-ideen", {"n_ideas": 2, "turns_per_idea": 1}, {"items": 4}),
     Case("exploration", "vorgegeben", {"ideas": ["Modulo 4", "Gaußsche Zahlen"]}, {}),
     Case("exploration", "digest", {"exchange": "digest"}, {"items": 3}),
@@ -640,7 +841,10 @@ CASES: tuple[Case, ...] = (
     Case("solo", "mit-abgabe", {"max_turns": 3}, {"hand_in": True}),
     Case("solo", "ohne-abgabe", {"max_turns": 3}, {"hand_in": False}),
 )
-"""The cases of §6.3 of the order W4b-06a."""
+"""The cases of §6.3 of the order W4b-06a, with those of the review (W4b-06a.1: `reject`,
+mixed verdicts with `unanimous` and a majority of three, the last stage with `next`, two
+rankers); `proof-review-reject-ohne-revision` is the target of the deviation
+`reject-beendet`."""
 
 NEW_PARAMS = {
     "judge_memory": {"fresh": "reset", "continue": "keep"},
@@ -674,6 +878,24 @@ def _entry_score(number: int) -> float:
     return float(max(1, 10 - number))
 
 
+_ROUND = re.compile(r"Runde (\d+) von (\d+) in #")
+
+
+def last_round(view: Any) -> bool:
+    """The turn is in the last round of its discussion, as the prompt of the phase (or of the
+    old topology) says it, not as the case expects it (M2 of the review); a turn without a
+    round (an ask-again) counts as the last."""
+    found = _ROUND.findall(view.prompt)
+    if not found:
+        return True
+    number, of = found[-1]
+    return int(number) >= int(of)
+
+
+def talk(channel: str, view: Any) -> dict[str, Any]:
+    return room("post_message", channel=channel, body=f"Beitrag von {view.agent}.")
+
+
 def old_policies(case: Case) -> dict[str, Policy]:
     """Policies of the old side for `case` (`submit_result`, `submit_rating`)."""
     t = case.template
@@ -691,6 +913,8 @@ def old_policies(case: Case) -> dict[str, Policy]:
             return [old_result("artifact", "Beweis", path=path)]
 
         def judge(view: Any) -> list[dict[str, Any]]:
+            if view.stage == "diskussion" and not last_round(view):
+                return [talk("judges", view)]
             mine = verdicts[view.agent]
             verdict = mine[min(int(view.context.get("round", 1)), len(mine)) - 1]
             objections = [] if verdict == "accept" else [f"{view.agent}: Lücke"]
@@ -740,7 +964,7 @@ def old_policies(case: Case) -> dict[str, Policy]:
     if t == "roundtable":
 
         def diskutant(view: Any) -> list[dict[str, Any]]:
-            return [room("post_message", channel="runde", body=f"Beitrag von {view.agent}.")]
+            return [talk("runde", view)]
 
         def summarizer(view: Any) -> list[dict[str, Any]]:
             if view.stage == "diskussion":
@@ -762,6 +986,8 @@ def new_policies(case: Case) -> dict[str, Policy]:
         verdicts = case.act["verdicts"]
 
         def judge(view: Any) -> list[dict[str, Any]]:
+            if view.stage == "diskussion" and not last_round(view):
+                return [talk("judges", view)]
             mine = verdicts[view.agent]
             verdict = mine[min(view.attempt, len(mine)) - 1]
             objections = [] if verdict == "accept" else [{"text": f"{view.agent}: Lücke"}]
@@ -790,15 +1016,11 @@ def new_policies(case: Case) -> dict[str, Policy]:
         items = int(case.act.get("items", 3))
         return {"ideator": answer(items=items), **explorers, **rankers, "summarizer": answer()}
     if t == "roundtable":
-        rounds = int(case.params.get("rounds", 3))
 
         def diskutant(view: Any) -> list[dict[str, Any]]:
-            if view.turn < rounds:
-                return [room("post_message", channel="runde", body=f"Beitrag von {view.agent}.")]
-            return [
-                room("post_message", channel="runde", body=f"Beitrag von {view.agent}."),
-                *hand_in(view),
-            ]
+            if not last_round(view):
+                return [talk("runde", view)]
+            return [talk("runde", view), *hand_in(view)]
 
         return {**{f"diskutant-{i}": diskutant for i in range(1, 6)}, "summarizer": answer()}
     raise KeyError(t)
@@ -818,11 +1040,11 @@ async def run_old(workfolder: Path, case: Case) -> tuple[RunManager, dict[str, A
     from phases_kit import run
 
     if case.template == "solo":
-        mgr, _log = old_solo_manager(
+        mgr, log = old_solo_manager(
             workfolder, old_policies(case), max_turns=int(case.params["max_turns"])
         )
     else:
-        mgr, _log = old_manager(
+        mgr, log = old_manager(
             workfolder,
             case.template,
             old_policies(case),
@@ -830,7 +1052,7 @@ async def run_old(workfolder: Path, case: Case) -> tuple[RunManager, dict[str, A
             decider=decider_for(case),
         )
     status = await run(mgr)
-    return mgr, old_flow(mgr, status, case.template)
+    return mgr, old_flow(mgr, status, case.template, log)
 
 
 async def run_new(
@@ -839,11 +1061,11 @@ async def run_new(
     from phases_kit import run
 
     if case.template == "solo":
-        mgr, _log = new_solo_manager(
+        mgr, log = new_solo_manager(
             workfolder, new_policies(case), max_turns=int(case.params["max_turns"])
         )
     else:
-        mgr, _log = new_manager(
+        mgr, log = new_manager(
             workfolder,
             case.template,
             new_policies(case),
@@ -852,7 +1074,7 @@ async def run_new(
             files=files,
         )
     status = await run(mgr)
-    return mgr, new_flow(mgr, status)
+    return mgr, new_flow(mgr, status, log, case.template)
 
 
 # --------------------------------------------------------------------------------------------
@@ -910,8 +1132,17 @@ def _more_ideas(flow: dict[str, Any], case: Case) -> None:
         flow["ranking"].append(number)
 
 
+def _sight_of(flow: dict[str, Any], phase: str, visit: int = 1) -> dict[str, Any]:
+    for name, number, agents in flow["sight"]:
+        if name == phase and number == visit:
+            return agents
+    raise KeyError((phase, visit))
+
+
 def _summarizer_not_in_discussion(flow: dict[str, Any], case: Case) -> None:
     del _section(flow, "diskussion")["summarizer"]
+    del _sight_of(flow, "diskussion")["summarizer"]
+    _sight_of(flow, "zusammenfassung")["summarizer"]["kanaele"] = []  # #runde is an input
     for i in range(1, int(case.params.get("n_diskutanten", 2)) + 1):
         _add_submission(flow, f"diskussion/diskutant-{i}", "text", 1)
 
@@ -923,6 +1154,13 @@ def _one_judge_discusses(flow: dict[str, Any], case: Case) -> None:
         if name == "pruefung":
             turns.append(["diskussion", visit, {"judge-1": 1}])
     flow["turns"] = turns
+    seen = {"eingaben": ["beweis", "einwaende", "gutachten"], "kanaele": ["judges"]}
+    sight = []
+    for name, visit, agents in flow["sight"]:
+        sight.append([name, visit, agents])
+        if name == "pruefung":
+            sight.append(["diskussion", visit, {"judge-1": {**seen, "versiegelt": False}}])
+    flow["sight"] = sight
     rounds = sum(1 for t in turns if t[0] == "diskussion")
     _add_submission(flow, "diskussion/judge-1", "review", rounds)
 
@@ -931,11 +1169,26 @@ def _reset_gives_a_fresh_folder(flow: dict[str, Any], case: Case) -> None:
     flow["fresh_folders"] = {a: n for a, n in flow["resets"].items() if a.startswith("judge")}
 
 
-def _failed_stage_names_its_best(flow: dict[str, Any], case: Case) -> None:
-    for end in flow["stage_ends"]:
-        if end[1] == "stage_failed":
-            scores = {a: _score(case, end[0], a) for a in (1, 2)}
-            end[2] = max(scores, key=lambda a: (scores[a], a))
+def _reject_ends(flow: dict[str, Any], case: Case) -> None:
+    """The run ends after the first `reject` as the old topology does without revisions."""
+    target = load_flow("proof-review", "reject-ohne-revision")
+    flow.clear()
+    flow.update({k: v for k, v in target.items() if k not in META})
+
+
+def _raters_see_their_submission(flow: dict[str, Any], case: Case) -> None:
+    for _name, visit, agents in flow["sight"]:
+        for agent, seen in agents.items():
+            if agent.startswith("rater"):
+                seen["eingaben"] = ["zu-bewerten"] + (["bewertungen"] if visit > 1 else [])
+                seen["eingaben"] = sorted(seen["eingaben"])
+
+
+def _project_proof_not_an_input(flow: dict[str, Any], case: Case) -> None:
+    for name, visit, agents in flow["sight"]:
+        if visit == 1 and name in ("diskussion", "revision"):
+            for seen in agents.values():
+                seen["eingaben"] = [e for e in seen["eingaben"] if e != "beweis"]
 
 
 def _same(flow: dict[str, Any], case: Case) -> None:
@@ -1012,20 +1265,43 @@ DEVIATIONS: tuple[Deviation, ...] = (
         _reset_gives_a_fresh_folder,
     ),
     Deviation(
+        "reject-beendet",
+        "proof-review",
+        "`reject` beendet den Run (Gate `reject: stop`); die alte Topologie überarbeitete auch "
+        "nach `reject`, solange Revisionen übrig waren (Entwurf 10 §5, Zeile `urteil`: „reject → "
+        "Stopp“; dem User am 22.11. gemeldet). Soll: der alte Ablauf ohne Revisionen",
+        lambda c: (
+            any("reject" in v for v in c.act.get("verdicts", {}).values())
+            and int(c.params.get("max_revisions", 1)) > 0
+        ),
+        _reject_ends,
+    ),
+    Deviation(
+        "befund-bewerter-sehen-ihre-abgabe",
+        "proof",
+        "Befund: Die Rater bekommen nur die Abgabe, die sie bewerten (die alte Topologie gab "
+        "ihnen auch die angenommenen Vorstufen), und bei einer Wiederholung wie alle Teilnehmer "
+        "das Ergebnis des Gates (Entscheidung 16); `from` liest keine Bewertungen (Entscheidung "
+        "58). In der Vorlage nicht änderbar: Die Bewertungs-Action hat keine eigenen Eingaben",
+        lambda c: True,
+        _raters_see_their_submission,
+    ),
+    Deviation(
+        "befund-beweis-aus-projekt-ohne-eingabe",
+        "proof-review",
+        "Befund: Kommt der Beweis aus dem Projekt (`artifact`), bekommen `diskussion` und "
+        "`revision` im ersten Durchlauf nur die Gutachten als Eingabe, nicht den Beweis (der "
+        "Seed ist keine Abgabe einer Phase; die Standard-Eingaben nennen ihn nicht). Die Judges "
+        "hatten ihn in `pruefung`, der Autor hat ihn in seiner Kopie des Projekts",
+        lambda c: bool(c.params.get("artifact")),
+        _project_proof_not_an_input,
+    ),
+    Deviation(
         "abgabe-ueber-submit",
         "*",
         "Abgabe über `submit` mit Format statt `submit_result`/`submit_rating` und Textzeile "
         "(P1, Entscheidung 11); im Ablauf auf Formate abgebildet",
         lambda c: True,
-    ),
-    Deviation(
-        "befund-stage-end-nennt-besten",
-        "proof",
-        "Befund (nicht in der Tabelle des Auftrags): Endet der Run an einer nicht bestandenen "
-        "Stufe, nennt der Checkpoint `stage_end` den besten Versuch, die alte Topologie keinen. "
-        "Für den User ändert sich nichts: Der Run stoppt hier wie heute.",
-        lambda c: c.params.get("on_fail") in ("stop", "escalate"),
-        _failed_stage_names_its_best,
     ),
 )
 
@@ -1063,3 +1339,43 @@ def compare(case: Case, flow: Mapping[str, Any]) -> list[str]:
     }
     assert not wrong, f"{case.id}: Abweichung ohne Ausnahme ({', '.join(applied)}): {wrong}"
     return applied
+
+
+# --------------------------------------------------------------------------------------------
+# Structure of the templates (M2 c of the review)
+# --------------------------------------------------------------------------------------------
+
+FIXTURE_OF = {
+    "proof-review": "review",
+    "proof": "waterfall",
+    "exploration": "exploration",
+    "roundtable": "roundtable",
+}
+"""Start skill → its phases in `tests/fixtures/phases/` (W4b-02a)."""
+
+
+def structure_issues(name: str, files: Mapping[str, bytes] | None = None) -> list[str]:
+    """What a template does differently from the agreed structure: its phases are those of the
+    test data of W4b-02a (actions, tasks, `inputs`, channels, gates, routes, `turns`), every
+    action and rating action has `turns: 1` (Festlegung des Leads, 22.11.), the checks
+    (`pruefung*`) are isolated, and every task file named is in the skill."""
+    files = files or start_skill_files(name)
+    group, _ = parse_yaml_text(files["group.yaml"].decode("utf-8"), "group.yaml")
+    fixture_text = (TESTS / "fixtures" / "phases" / f"{FIXTURE_OF[name]}.yaml").read_text("utf-8")
+    fixture, _ = parse_yaml_text(fixture_text, "fixture.yaml")
+    issues = []
+    if group.get("phases") != fixture.get("phases"):
+        issues.append("phases weichen von den Testdaten ab")
+    for phase in group.get("phases") or []:
+        actions = list((phase.get("actions") or {}).values())
+        gate = phase.get("gate") or {}
+        if isinstance(gate.get("action"), dict):
+            actions.append(gate["action"])
+        for action in actions:
+            if action.get("turns") != 1:
+                issues.append(f"{phase['name']}: turns {action.get('turns')!r} statt 1")
+            if action.get("task") not in files:
+                issues.append(f"{phase['name']}: Auftrag {action.get('task')} fehlt")
+        if str(phase["name"]).startswith("pruefung") and phase.get("isolated") is not True:
+            issues.append(f"{phase['name']}: nicht isoliert")
+    return issues

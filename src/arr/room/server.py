@@ -206,9 +206,9 @@ wait stands, the turn ends as usual, and the advice is for the turn after it."""
 
 USER_MAY_NOT_ANSWER_PHASES = (
     "Deine Frage an den User ist noch offen, und er antwortet vielleicht lange nicht. Brauchst "
-    "du die Antwort, warte einmal mit `wait_until` bis zu fünf Minuten; eine Antwort oder Notiz "
-    "des Users beendet das Warten. Antwortet er bis dahin nicht, arbeite mit einer begründeten "
-    "Annahme weiter und nenne sie in deiner Abgabe."
+    "du die Antwort, warte einmal mit `wait_until` bis zu fünf Minuten; eine Antwort des Users "
+    "(in deinem privaten Kanal auch eine Notiz) beendet das Warten. Antwortet er bis dahin "
+    "nicht, arbeite mit einer begründeten Annahme weiter und nenne sie in deiner Abgabe."
 )
 """`USER_MAY_NOT_ANSWER` in a run with phases (W4b-06a, Entscheidung 69): there the agent may
 wait for the user once with `wait_until`, at most five minutes."""

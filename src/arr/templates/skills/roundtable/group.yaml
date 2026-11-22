@@ -18,8 +18,8 @@ params:
     doc: "Anzahl der Diskutanten, abwechselnd Claude und ChatGPT"
   summarizer:
     default: summarizer
-    choices: [summarizer, keine]
-    doc: "summarizer: der Agent summarizer fasst am Ende zusammen; keine: keine Zusammenfassung"
+    choices: [summarizer, none]
+    doc: "summarizer: der Agent summarizer fasst am Ende zusammen; none: keine Zusammenfassung"
 
 limits:
   wall_time: 45m

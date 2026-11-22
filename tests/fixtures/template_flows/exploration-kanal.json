@@ -29,6 +29,63 @@
    }
   ]
  ],
+ "sight": [
+  [
+   "ideen",
+   1,
+   {
+    "ideator": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "exploration-kanal",
+   1,
+   {
+    "explorer-1": {
+     "eingaben": [
+      "eintrag"
+     ],
+     "kanaele": [
+      "werkstatt"
+     ],
+     "versiegelt": false
+    },
+    "explorer-2": {
+     "eingaben": [
+      "eintrag"
+     ],
+     "kanaele": [
+      "werkstatt"
+     ],
+     "versiegelt": false
+    },
+    "ranker-1": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "zusammenfassung",
+   1,
+   {
+    "summarizer": {
+     "eingaben": [
+      "staende"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ]
+ ],
  "submissions": {
   "exploration-kanal/explorer-1": {
    "format": "text",
@@ -66,7 +123,9 @@
  ],
  "end": {
   "status": "done",
-  "how": "ende"
+  "how": "ende",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": []
  },
  "resets": {},
  "fresh_folders": {},

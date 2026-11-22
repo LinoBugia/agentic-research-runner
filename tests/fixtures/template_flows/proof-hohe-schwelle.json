@@ -1,0 +1,393 @@
+{
+ "template": "proof",
+ "case": "hohe-schwelle",
+ "params": {
+  "pass_score": 9
+ },
+ "turns": [
+  [
+   "strategie",
+   1,
+   {
+    "strategist": 1,
+    "rater-1": 1,
+    "rater-2": 1
+   }
+  ],
+  [
+   "strategie",
+   2,
+   {
+    "strategist": 1,
+    "rater-1": 1,
+    "rater-2": 1
+   }
+  ],
+  [
+   "skizze",
+   1,
+   {
+    "prover": 1,
+    "rater-1": 1,
+    "rater-2": 1
+   }
+  ],
+  [
+   "skizze",
+   2,
+   {
+    "prover": 1,
+    "rater-1": 1,
+    "rater-2": 1
+   }
+  ],
+  [
+   "beweis",
+   1,
+   {
+    "prover": 1,
+    "rater-1": 1,
+    "rater-2": 1
+   }
+  ],
+  [
+   "beweis",
+   2,
+   {
+    "prover": 1,
+    "rater-1": 1,
+    "rater-2": 1
+   }
+  ]
+ ],
+ "sight": [
+  [
+   "strategie",
+   1,
+   {
+    "strategist": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "strategie",
+   2,
+   {
+    "strategist": {
+     "eingaben": [
+      "bewertungen"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "skizze",
+   1,
+   {
+    "prover": {
+     "eingaben": [
+      "vorstufen"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "skizze",
+   2,
+   {
+    "prover": {
+     "eingaben": [
+      "bewertungen",
+      "vorstufen"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "beweis",
+   1,
+   {
+    "prover": {
+     "eingaben": [
+      "vorstufen"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "beweis",
+   2,
+   {
+    "prover": {
+     "eingaben": [
+      "bewertungen",
+      "vorstufen"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-1": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    },
+    "rater-2": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ]
+ ],
+ "submissions": {
+  "beweis/prover": {
+   "format": "artifact",
+   "count": 2
+  },
+  "beweis/rater-1": {
+   "format": "rating",
+   "count": 2
+  },
+  "beweis/rater-2": {
+   "format": "rating",
+   "count": 2
+  },
+  "skizze/prover": {
+   "format": "artifact",
+   "count": 2
+  },
+  "skizze/rater-1": {
+   "format": "rating",
+   "count": 2
+  },
+  "skizze/rater-2": {
+   "format": "rating",
+   "count": 2
+  },
+  "strategie/rater-1": {
+   "format": "rating",
+   "count": 2
+  },
+  "strategie/rater-2": {
+   "format": "rating",
+   "count": 2
+  },
+  "strategie/strategist": {
+   "format": "artifact",
+   "count": 2
+  }
+ },
+ "items": {
+  "beweis": {
+   "versions": 2,
+   "last_by": "prover"
+  },
+  "skizze": {
+   "versions": 2,
+   "last_by": "prover"
+  },
+  "strategie": {
+   "versions": 2,
+   "last_by": "strategist"
+  }
+ },
+ "gates": [
+  [
+   "strategie",
+   "fail"
+  ],
+  [
+   "strategie",
+   "fail"
+  ],
+  [
+   "skizze",
+   "fail"
+  ],
+  [
+   "skizze",
+   "fail"
+  ],
+  [
+   "beweis",
+   "fail"
+  ],
+  [
+   "beweis",
+   "fail"
+  ]
+ ],
+ "stage_ends": [
+  [
+   "strategie",
+   "best_accepted",
+   2
+  ],
+  [
+   "skizze",
+   "best_accepted",
+   2
+  ],
+  [
+   "beweis",
+   "best_accepted",
+   2
+  ]
+ ],
+ "ranking": [],
+ "end": {
+  "status": "done",
+  "how": "ende",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": [
+   "- **strategie:** bester Versuch übernommen, akzeptiert: #n, Score 8, 2 Versuche",
+   "- **skizze:** bester Versuch übernommen, akzeptiert: #n, Score 8, 2 Versuche",
+   "- **beweis:** bester Versuch übernommen, akzeptiert: #n, Score 8, 2 Versuche"
+  ]
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "beweis",
+   "prover",
+   "artifact"
+  ],
+  [
+   "beweis",
+   "rater-1",
+   "rating"
+  ],
+  [
+   "beweis",
+   "rater-2",
+   "rating"
+  ],
+  [
+   "skizze",
+   "prover",
+   "artifact"
+  ],
+  [
+   "skizze",
+   "rater-1",
+   "rating"
+  ],
+  [
+   "skizze",
+   "rater-2",
+   "rating"
+  ],
+  [
+   "strategie",
+   "rater-1",
+   "rating"
+  ],
+  [
+   "strategie",
+   "rater-2",
+   "rating"
+  ],
+  [
+   "strategie",
+   "strategist",
+   "artifact"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}

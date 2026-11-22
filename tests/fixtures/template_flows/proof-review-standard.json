@@ -27,6 +27,65 @@
    }
   ]
  ],
+ "sight": [
+  [
+   "fassung",
+   1,
+   {
+    "author": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false
+    }
+   }
+  ],
+  [
+   "pruefung",
+   1,
+   {
+    "judge-1": {
+     "eingaben": [
+      "beweis"
+     ],
+     "kanaele": [],
+     "versiegelt": true
+    },
+    "judge-2": {
+     "eingaben": [
+      "beweis"
+     ],
+     "kanaele": [],
+     "versiegelt": true
+    }
+   }
+  ],
+  [
+   "diskussion",
+   1,
+   {
+    "judge-1": {
+     "eingaben": [
+      "beweis",
+      "gutachten"
+     ],
+     "kanaele": [
+      "judges"
+     ],
+     "versiegelt": false
+    },
+    "judge-2": {
+     "eingaben": [
+      "beweis",
+      "gutachten"
+     ],
+     "kanaele": [
+      "judges"
+     ],
+     "versiegelt": false
+    }
+   }
+  ]
+ ],
  "submissions": {
   "diskussion/judge-1": {
    "format": "review",
@@ -65,7 +124,9 @@
  "ranking": [],
  "end": {
   "status": "done",
-  "how": "stopp"
+  "how": "stopp",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": []
  },
  "resets": {},
  "fresh_folders": {},

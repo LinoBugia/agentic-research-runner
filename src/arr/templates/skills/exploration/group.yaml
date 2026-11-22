@@ -35,8 +35,8 @@ params:
     doc: "Anzahl der Ranker, mindestens einer"
   summarizer:
     default: summarizer
-    choices: [summarizer, keine]
-    doc: "summarizer: der Agent summarizer fasst am Ende zusammen; keine: keine Zusammenfassung"
+    choices: [summarizer, none]
+    doc: "summarizer: der Agent summarizer fasst am Ende zusammen; none: keine Zusammenfassung"
 
 rubric:
   scale: [1, 10]

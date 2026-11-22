@@ -58,3 +58,18 @@ async def test_a12_an_old_run_names_submit_result(workfolder: Path) -> None:
     context = (mgr.run_dir / "agents" / "author" / "context.md").read_text("utf-8")
     assert "- Ergebnisse gibst du mit `submit_result` ab." in context
     assert prepare.default_role(mgr.prepared.resolved) == prepare.DEFAULT_ROLE
+
+
+async def test_p7_an_old_run_keeps_its_wording(workfolder: Path) -> None:
+    """W4b-06a.1 point 7: in a run without phases the reason reads as before."""
+    from arr.runs.inspect import run_reason
+    from arr.runs.orchestrator import OrchestratorLog
+    from arr.runs.prepare import load_run_meta
+
+    [case] = [c for c in CASES if c.id == "proof-aufgebraucht-stopp"]
+    mgr, _flow = await run_old(workfolder, case)
+    reason = "Die Stufe „skizze“ wurde nicht bestanden (stage_failed)."
+    summary = (mgr.run_dir / "output" / "summary.md").read_text("utf-8")
+    assert f"- **Grund:** {reason}" in summary
+    entries = list(OrchestratorLog(mgr.run_dir).entries())
+    assert run_reason(load_run_meta(mgr.run_dir), entries) == reason
