@@ -1,5 +1,6 @@
 # Start skill `exploration` as phases (W4b-06a). `exchange` switches between three variants
-# of the phase `exploration`.
+# of the phase `exploration`. `zusammenfassung` names the list `ideen` as an input: given ideas
+# (seed) are no submission of a phase, the standard inputs would not reach them (W4b-06a.2).
 kind: research-group
 version: 1
 description: Ansätze zu einer Frage breit erkunden und bewerten
@@ -137,5 +138,10 @@ phases:
   - name: zusammenfassung
     topology: solo
     when: { param: summarizer, equals: summarizer }
+    inputs:
+      - { name: ideen, content: full }
+      - { from: exploration }
+      - { from: exploration-digest }
+      - { from: exploration-kanal }
     actions:
       summarizer: { task: tasks/zusammenfassen.md, submission: { format: text }, turns: 1 }

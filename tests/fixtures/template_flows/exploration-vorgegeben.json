@@ -59,6 +59,7 @@
    {
     "summarizer": {
      "eingaben": [
+      "ideen",
       "staende"
      ],
      "kanaele": [],

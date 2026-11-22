@@ -74,6 +74,29 @@ FALSIFIED = {
         "routes: { pass: next, fail: retry }",
         "routes: { pass: next, fail: next }",
     ),
+    # W4b-06a.2: without the proof as an input of `diskussion` and `revision`, the proof from
+    # the project (seed) does not reach them
+    "diskussion-ohne-beweis": (
+        "proof-review-artefakt-aus-projekt",
+        "proof-review",
+        'rounds: "{{ params.discussion_rounds }}"\n    inputs:\n'
+        "      - { name: beweis, content: full }\n      - { from: pruefung }\n",
+        'rounds: "{{ params.discussion_rounds }}"\n',
+    ),
+    "revision-ohne-beweis": (
+        "proof-review-artefakt-aus-projekt",
+        "proof-review",
+        "on_exhausted: stop\n    inputs:\n      - { name: beweis, content: full }\n",
+        "on_exhausted: stop\n    inputs:\n",
+    ),
+    # without the list as an input of `zusammenfassung`, given ideas (seed) do not reach it
+    "zusammenfassung-ohne-ideen": (
+        "exploration-vorgegeben",
+        "exploration",
+        "    inputs:\n      - { name: ideen, content: full }\n      - { from: exploration }\n"
+        "      - { from: exploration-digest }\n      - { from: exploration-kanal }\n",
+        "",
+    ),
 }
 
 

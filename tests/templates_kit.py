@@ -387,12 +387,16 @@ def _new_tags(template: str) -> Any:
                 out.add("verlauf")
             elif kind == "name" and name == "beweis" or item.get("name") == "beweis":
                 out.add("beweis")
+            elif kind == "name" and name == "ideen" or item.get("name") == "ideen":
+                out.add("ideen")  # the list of ideas, from the ideator or given (seed)
             elif kind == "phase" and template == "proof-review":
                 out.add("gutachten")
             elif kind == "phase" and template == "proof":
                 out.add("vorstufen")
             elif kind == "phase" and name.startswith("exploration"):
                 out.add("staende")
+            elif kind == "phase" and name == "ideen":
+                out.add("ideen")
             elif kind == "phase" and template == "roundtable":
                 out.add("fazits")
         if ctx.get("objections"):
@@ -431,6 +435,8 @@ def _old_tags(view: Any) -> set[str]:
         out.add("bewertungen")
     if view.stage == "zusammenfassung" and ctx.get("channel"):
         out.add("verlauf")
+    if ctx.get("overview"):  # the summary of `exploration`: ranking with the ideas
+        out.add("ideen")
     return out
 
 
@@ -1190,11 +1196,11 @@ def _raters_see_their_submission(flow: dict[str, Any], case: Case) -> None:
                 seen["eingaben"] = sorted(seen["eingaben"])
 
 
-def _project_proof_not_an_input(flow: dict[str, Any], case: Case) -> None:
-    for name, visit, agents in flow["sight"]:
-        if visit == 1 and name in ("diskussion", "revision"):
-            for seen in agents.values():
-                seen["eingaben"] = [e for e in seen["eingaben"] if e != "beweis"]
+def _explorers_see_the_list(flow: dict[str, Any], case: Case) -> None:
+    for _name, _visit, agents in flow["sight"]:
+        for agent, seen in agents.items():
+            if agent.startswith("explorer"):
+                seen["eingaben"] = sorted({*seen["eingaben"], "ideen"})
 
 
 def _same(flow: dict[str, Any], case: Case) -> None:
@@ -1293,14 +1299,14 @@ DEVIATIONS: tuple[Deviation, ...] = (
         _raters_see_their_submission,
     ),
     Deviation(
-        "befund-beweis-aus-projekt-ohne-eingabe",
-        "proof-review",
-        "Befund: Kommt der Beweis aus dem Projekt (`artifact`), bekommen `diskussion` und "
-        "`revision` im ersten Durchlauf nur die Gutachten als Eingabe, nicht den Beweis (der "
-        "Seed ist keine Abgabe einer Phase; die Standard-Eingaben nennen ihn nicht). Die Judges "
-        "hatten ihn in `pruefung`, der Autor hat ihn in seiner Kopie des Projekts",
-        lambda c: bool(c.params.get("artifact")),
-        _project_proof_not_an_input,
+        "befund-explorer-sehen-die-liste",
+        "exploration",
+        "Befund: Schlägt der Ideator die Ansätze vor, bekommen die Explorer die ganze Liste "
+        "`ideen` als Standard-Eingabe (Abgabe der Phase `ideen`), die alte Topologie nur ihre "
+        "eigene Idee. Nicht bei vorgegebenen Ideen (der Seed ist keine Abgabe einer Phase) und "
+        "nicht bei `exchange: digest` (die Phase nennt ihre Eingaben selbst)",
+        lambda c: "ideas" not in c.params and c.params.get("exchange") != "digest",
+        _explorers_see_the_list,
     ),
     Deviation(
         "abgabe-ueber-submit",
@@ -1360,6 +1366,27 @@ FIXTURE_OF = {
 """Start skill → its phases in `tests/fixtures/phases/` (W4b-02a)."""
 
 
+INPUTS_BEYOND_TEST_DATA: dict[tuple[str, str], list[dict[str, Any]]] = {
+    ("proof-review", "diskussion"): [{"name": "beweis", "content": "full"}, {"from": "pruefung"}],
+    ("proof-review", "revision"): [
+        {"name": "beweis", "content": "full"},
+        {"from": "pruefung"},
+        {"from": "pruefung-allein"},
+        {"from": "diskussion"},
+    ],
+    ("exploration", "zusammenfassung"): [
+        {"name": "ideen", "content": "full"},
+        {"from": "exploration"},
+        {"from": "exploration-digest"},
+        {"from": "exploration-kanal"},
+    ],
+}
+"""`inputs` the templates have beyond the test data of W4b-02a (W4b-06a.2): a seed (the
+proof from the project, the given ideas) is no submission of a phase, so the standard inputs
+would not reach the phases the old topologies fed with it. The test data stay as they are
+(other tests read them)."""
+
+
 def structure_issues(name: str, files: Mapping[str, bytes] | None = None) -> list[str]:
     """What a template does differently from the agreed structure: its phases are those of the
     test data of W4b-02a (actions, tasks, `inputs`, channels, gates, routes, `turns`), every
@@ -1369,6 +1396,10 @@ def structure_issues(name: str, files: Mapping[str, bytes] | None = None) -> lis
     group, _ = parse_yaml_text(files["group.yaml"].decode("utf-8"), "group.yaml")
     fixture_text = (TESTS / "fixtures" / "phases" / f"{FIXTURE_OF[name]}.yaml").read_text("utf-8")
     fixture, _ = parse_yaml_text(fixture_text, "fixture.yaml")
+    for phase in fixture.get("phases") or []:  # what the templates add on purpose
+        added = INPUTS_BEYOND_TEST_DATA.get((name, phase["name"]))
+        if added is not None:
+            phase["inputs"] = added
     issues = []
     if group.get("phases") != fixture.get("phases"):
         issues.append("phases weichen von den Testdaten ab")

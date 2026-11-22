@@ -1,6 +1,8 @@
 # Start skill `proof-review` as phases (W4b-06a). Without a discussion the verdict of the
 # check counts, so the check comes twice, switched by `discussion_rounds`; a route to the one
-# that is dropped leads to the next one that stays (Entscheidung 37).
+# that is dropped leads to the next one that stays (Entscheidung 37). `diskussion` and
+# `revision` name the proof as an input: a proof from the project (seed) is no submission of a
+# phase, the standard inputs would not reach it (W4b-06a.2).
 kind: research-group
 version: 1
 description: Beweis von unabhängigen Judges prüfen lassen, mit Diskussion und Revision
@@ -109,6 +111,9 @@ phases:
     when: { param: discussion_rounds, equals: 1 }
     channels: [judges]
     rounds: "{{ params.discussion_rounds }}"
+    inputs:
+      - { name: beweis, content: full }
+      - { from: pruefung }
     actions:
       judge-*: { task: tasks/besprechen.md, submission: { format: review }, turns: 1 }
     gate:
@@ -125,6 +130,11 @@ phases:
     topology: solo
     max_visits: "{{ params.max_revisions }}"
     on_exhausted: stop
+    inputs:
+      - { name: beweis, content: full }
+      - { from: pruefung }
+      - { from: pruefung-allein }
+      - { from: diskussion }
     actions:
       author: { task: tasks/ueberarbeiten.md, submission: { format: artifact, name: beweis }, turns: 1 }
     gate: { type: done, routes: { done: { goto: pruefung } } }
