@@ -15,6 +15,14 @@ standby. The upper bound counts every pass `max_visits` allows, also for phases 
 through a loop with another bounded phase, and is never below a possible run (`arr.plan.graph`).
 With a gate `user` or a route `escalate`, the user may repeat beyond `max_visits` (Entscheidung
 31): the upper bound is open. The lower bound is the cheapest way from the start to the end.
+
+`moderated` (W4b-04): the lead at most `turns` plus one asking again, and per assignment
+(`max_assignments`) its turns (`ASSIGNMENT_TURNS`) and one return turn of the lead.
+
+Not counted (W4b-03 §7.2, W4b-04 §6.8): the note turn of auto-compact, the turns after an answer
+of the user (B3) and wake-ups through an agent's private channel to the user. They count for
+`turns_per_agent`, which stays the hard limit, so a run may use more turns than the upper bound
+says.
 """
 
 import fnmatch
@@ -22,6 +30,7 @@ import heapq
 from typing import Any
 
 from arr.models import (
+    DEFAULT_TURNS,
     ChannelMode,
     GateType,
     PhaseTopology,
@@ -34,8 +43,9 @@ from arr.submissions.formats import DEFAULT_LIST_ITEMS
 
 __all__ = ["phase_turns", "turn_range"]
 
-ASSIGNMENT_TURNS = 2
-"""Most turns of one assignment of a lead in `moderated`: one turn and one asking again."""
+ASSIGNMENT_TURNS = DEFAULT_TURNS + 1
+"""Most turns of one assignment of a lead in `moderated`: like every action `DEFAULT_TURNS`
+turns and one asking again (Entscheidung 46, W4b-04 §6.8)."""
 
 
 def _int(value: Any, default: int) -> int:
@@ -185,7 +195,7 @@ def phase_turns(resolved: ResolvedRun, phase: ResolvedPhase) -> tuple[int, int, 
     elif phase.topology is PhaseTopology.MODERATED:
         lead = max(turns.values(), default=1) + 1
         least = 1
-        most = lead + (phase.max_assignments or 0) * ASSIGNMENT_TURNS
+        most = lead + (phase.max_assignments or 0) * (ASSIGNMENT_TURNS + 1)
     elif phase.over is not None:
         seed = resolved.seed.get(phase.over)
         known = seed.items if seed is not None and isinstance(seed.items, list) else None

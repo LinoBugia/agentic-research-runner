@@ -89,7 +89,8 @@ async def test_phases_offers_submit_instead(tmp_path: Path) -> None:
     fields = schema["properties"]["fields"]["anyOf"][0]
     assert fields["type"] == "object" and fields.get("additionalProperties", True) is True
     old = await tool_list(make_store(tmp_path, "solo"))
-    assert set(tools) - {"submit"} == set(old) - {"submit_result", "submit_rating"}
+    assert set(tools) - {"submit", "assign"} == set(old) - {"submit_result", "submit_rating"}
+    assert "assign" not in old  # W4b-04: only a phases run offers it
 
 
 def test_phases_is_a_topology_kind_and_available() -> None:

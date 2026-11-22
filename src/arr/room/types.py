@@ -228,6 +228,51 @@ class Assignment(Record):
     ts: float
 
 
+class DelegationStatus(StrEnum):
+    """State of an assignment a lead gave with `assign` (W4b-04, docs/10 §4.5):
+    `queued` → `running` → `returned` (with a submission) | `missing` (without) | `cancelled`;
+    `queued` may also become `cancelled`. A `cancelled` one never runs again."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    RETURNED = "returned"
+    MISSING = "missing"
+    CANCELLED = "cancelled"
+
+
+class Delegation(Record):
+    """Row of table `delegation` (W4b-04): one assignment of the lead of a phase `moderated`
+    to an agent on standby. `number` counts 1, 2, … per pass (`stage`, `attempt`); `task` is
+    the lead's text, cleaned (text of an agent: data, never instructions of arr); `agent` the
+    real ID of the recipient; `named` is true once arr named it to the lead at a `submit`
+    (Entscheidung 79); `submission_id` the submission it returned with."""
+
+    id: int
+    ts: float
+    stage: str
+    attempt: int = Field(ge=1)
+    number: int = Field(ge=1)
+    lead: str
+    agent: str
+    format: str
+    task: str
+    status: DelegationStatus = DelegationStatus.QUEUED
+    named: bool = False
+    submission_id: int | None = None
+    started: float | None = None
+    ended: float | None = None
+
+    @property
+    def action(self) -> str:
+        """`Expectation.action` of its submissions: `assign-<number>`."""
+        return f"assign-{self.number}"
+
+    @property
+    def open(self) -> bool:
+        """Queued or running: it may still begin or hand in."""
+        return self.status in (DelegationStatus.QUEUED, DelegationStatus.RUNNING)
+
+
 class AgentStatusRecord(Record):
     """Row of table `agent_state`: status, wake-ups and note of one agent (docs/02 §5)."""
 
@@ -398,4 +443,19 @@ class SubmitAPI(Protocol):
     ) -> Submission:
         """Hand in the submission the newest assignment expects (`context["submission"]`);
         `RoomError` with every problem in German if it does not fit."""
+        ...
+
+
+@runtime_checkable
+class AssignAPI(Protocol):
+    """The room tool `assign` of a phase `moderated` (W4b-04, docs/10 §4.5), bound to one agent.
+
+    Kept apart from `RoomAPI` and `SubmitAPI`: every agent of a `phases` run is offered it (the
+    tool list is fixed per room server process), the room refuses it for anyone but the lead of
+    a running phase `moderated`.
+    """
+
+    def assign(self, agent: str, task: str, format: str) -> Delegation:
+        """Give `agent` (on standby in my phase) the assignment `task`, to be handed in as
+        `format`; `RoomError` in German when I may not or the arguments do not fit."""
         ...

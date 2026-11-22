@@ -37,10 +37,13 @@ from pydantic import ValidationError
 
 from arr.errors import ArrError
 from arr.models import (
+    MAX_ASSIGNMENTS,
     RESERVED_SENDERS,
     AgentStatus,
     ChannelMode,
     GroupChatConfig,
+    PhaseTopology,
+    ResolvedPhase,
     ResolvedRun,
     Rubric,
     TopologyKind,
@@ -53,6 +56,8 @@ from arr.room.types import (
     Attachment,
     ChannelInfo,
     ChannelMember,
+    Delegation,
+    DelegationStatus,
     Delivery,
     DeliveryStatus,
     Inbox,
@@ -67,10 +72,12 @@ from arr.room.types import (
     WaitKind,
     WaitState,
 )
+from arr.runs.phases.text import MAX_ENTRY_TEXT_CHARS
 from arr.runs.prepare import load_agent_file
 from arr.submissions.check import Checked, SubmissionError, check_submission
 from arr.submissions.diff import diff_pairs
-from arr.submissions.formats import _SLUG_RE, Expectation, SubmissionStatus
+from arr.submissions.formats import _SLUG_RE, BUILTIN, Expectation, SubmissionStatus
+from arr.submissions.text import clean_text
 
 log = logging.getLogger(__name__)
 
@@ -170,6 +177,11 @@ CREATE TABLE IF NOT EXISTS submission(id INTEGER PRIMARY KEY, ts REAL, agent TEX
 CREATE UNIQUE INDEX IF NOT EXISTS submission_version ON submission(name, version);
 CREATE TABLE IF NOT EXISTS sealed_submission(submission_id INTEGER PRIMARY KEY, stage TEXT);
 CREATE TABLE IF NOT EXISTS note_turn(agent TEXT PRIMARY KEY, since REAL);
+CREATE TABLE IF NOT EXISTS delegation(id INTEGER PRIMARY KEY, ts REAL, stage TEXT,
+    attempt INTEGER, number INTEGER, lead TEXT, agent TEXT, format TEXT, task TEXT,
+    status TEXT NOT NULL DEFAULT 'queued', named INTEGER NOT NULL DEFAULT 0,
+    submission_id INTEGER, started REAL, ended REAL);
+CREATE UNIQUE INDEX IF NOT EXISTS delegation_number ON delegation(stage, attempt, number);
 """
 """Tables of docs/02 §5 plus `channel.state`, `msg.via`/`msg.delivery`, `poll`, `floor` (both
 unused since W4b-03 removed the moderator tools; old rooms keep them readable),
@@ -182,7 +194,9 @@ before W4-03 lack them, which means „nothing sealed“. Since W4b-01: `submiss
 submission of `submit`, head and fields as JSON in `data`; `path` where its folder lies now,
 `final_path` where it lies after `release`) and `sealed_submission`; rooms before W4b-01 lack
 them, which means „no submissions“. Since W4b-05b.1: `note_turn` (agents in the note turn of
-auto-compact, whose room tools refuse); rooms before lack it, which means „nobody“."""
+auto-compact, whose room tools refuse); rooms before lack it, which means „nobody“. Since W4b-04:
+`delegation` (the assignments a lead of a phase `moderated` gives with `assign`, one row each,
+`number` unique per stage and attempt); rooms before lack it, which means „no assignments“."""
 
 NOTE_TURN_REFUSED = (
     "In diesem Turn schreibst du nur die Übergabe-Notiz als Antworttext. Die Werkzeuge des "
@@ -432,6 +446,46 @@ def _row_to_assignment(row: sqlite3.Row) -> Assignment:
     )
 
 
+def _row_to_delegation(row: sqlite3.Row) -> Delegation:
+    return Delegation(
+        id=row["id"],
+        ts=row["ts"],
+        stage=row["stage"],
+        attempt=row["attempt"],
+        number=row["number"],
+        lead=row["lead"],
+        agent=row["agent"],
+        format=row["format"],
+        task=row["task"],
+        status=DelegationStatus(row["status"]),
+        named=bool(row["named"]),
+        submission_id=row["submission_id"],
+        started=row["started"],
+        ended=row["ended"],
+    )
+
+
+_DELEGATION_TABLE = (
+    "CREATE TABLE IF NOT EXISTS delegation(id INTEGER PRIMARY KEY, ts REAL, stage TEXT, "
+    "attempt INTEGER, number INTEGER, lead TEXT, agent TEXT, format TEXT, task TEXT, "
+    "status TEXT NOT NULL DEFAULT 'queued', named INTEGER NOT NULL DEFAULT 0, "
+    "submission_id INTEGER, started REAL, ended REAL)"
+)
+"""The table `delegation` of `SCHEMA` alone: `assign` makes sure it is there (W4b-04)."""
+_DELEGATION_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS delegation_number ON delegation(stage, attempt, number)"
+)
+_OPEN_STATUSES = (DelegationStatus.QUEUED.value, DelegationStatus.RUNNING.value)
+LEAD_ACTION = "work"
+"""`Expectation.action` of the action of an agent in a phase (`arr.plan.read.ACTION_WORK`)."""
+_ASSIGN_ACTION = re.compile(r"assign-([1-9][0-9]{0,5})")
+"""`Expectation.action` of an assignment of `assign`: `assign-<number>` (W4b-04)."""
+MAX_ASSIGN_TASK_CHARS = MAX_ENTRY_TEXT_CHARS
+"""The text of one assignment of `assign`, after cleaning (W4b-04 §6.2): longer is an error."""
+ASSIGN_FORMATS = ("text", "artifact", "review", "list")
+"""Built-in formats an assignment of `assign` may ask for; the group's own formats come on top.
+`rating` belongs to a gate `judge` (Entscheidung 45), `decision` needs `choices`."""
+
 _SUBMISSION_SELECT = (
     "SELECT s.*, (ss.submission_id IS NOT NULL) AS sealed FROM submission s "
     "LEFT JOIN sealed_submission ss ON ss.submission_id = s.id"
@@ -600,6 +654,10 @@ def version_diff(
 
 _COPY_VIEW = "arr-copy"
 """Agent ID of the view `add_version` copies files with; it writes nothing to the room."""
+
+
+class _NewDelegation(RoomError):
+    """`submit` of a lead: an assignment came in after arr named the open ones (W4b-04 §6.6)."""
 
 
 class _Stale(Exception):
@@ -1442,6 +1500,118 @@ class RoomStore:
             sql, args = sql + " WHERE result_id=?", (result_id,)
         with self._read() as con:
             return [_row_to_rating(r) for r in con.execute(sql + " ORDER BY id", args)]
+
+    # ----------------------------------------------------------------------------------------
+    # Assignments of a lead in a phase `moderated` (W4b-04, docs/10 §4.5)
+    # ----------------------------------------------------------------------------------------
+
+    def delegations(
+        self,
+        *,
+        stage: str | None = None,
+        attempt: int | None = None,
+        agent: str | None = None,
+    ) -> list[Delegation]:
+        """Assignments given with `assign`, oldest first (within a pass in the order of their
+        number), filtered by phase, pass and recipient. A room without the table (a run from
+        before W4b-04) has none; reading never raises for that."""
+        sql, args = "SELECT * FROM delegation WHERE 1=1", []
+        for column, value in (("stage", stage), ("attempt", attempt), ("agent", agent)):
+            if value is not None:
+                sql += f" AND {column}=?"
+                args.append(value)
+        try:
+            with self._read() as con:
+                rows = con.execute(sql + " ORDER BY id", args).fetchall()
+        except sqlite3.OperationalError as exc:
+            if _no_table(exc):
+                return []
+            raise
+        return [_row_to_delegation(r) for r in rows]
+
+    def delegation(self, delegation_id: int) -> Delegation | None:
+        """One assignment by its `id`, None if there is none (or no table)."""
+        try:
+            with self._read() as con:
+                row = con.execute(
+                    "SELECT * FROM delegation WHERE id=?", (delegation_id,)
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if _no_table(exc):
+                return None
+            raise
+        return _row_to_delegation(row) if row is not None else None
+
+    def _move_delegation(
+        self,
+        delegation_id: int,
+        before: Sequence[DelegationStatus],
+        after: DelegationStatus,
+        **columns: Any,
+    ) -> bool:
+        """Set the status of one assignment, only from one of `before`; False otherwise."""
+        names = sorted(columns)
+        sets = "".join(f", {n}=?" for n in names)
+        marks = ", ".join("?" for _ in before)
+        with self._write() as con:
+            cur = con.execute(
+                f"UPDATE delegation SET status=?{sets} WHERE id=? AND status IN ({marks})",
+                (
+                    after.value,
+                    *(columns[n] for n in names),
+                    delegation_id,
+                    *(b.value for b in before),
+                ),
+            )
+            return cur.rowcount == 1
+
+    def start_delegation(self, delegation_id: int) -> bool:
+        """The runner begins the assignment: `queued` → `running`; False if it is not queued
+        any more (cancelled meanwhile)."""
+        return self._move_delegation(
+            delegation_id, [DelegationStatus.QUEUED], DelegationStatus.RUNNING, started=_now()
+        )
+
+    def end_delegation(self, delegation_id: int, submission_id: int | None) -> bool:
+        """The turns of a running assignment are over: `returned` with its submission or
+        `missing` without; False if it is not running (cancelled meanwhile)."""
+        status = DelegationStatus.MISSING if submission_id is None else DelegationStatus.RETURNED
+        return self._move_delegation(
+            delegation_id,
+            [DelegationStatus.RUNNING],
+            status,
+            submission_id=submission_id,
+            ended=_now(),
+        )
+
+    @staticmethod
+    def _cancel_open(con: sqlite3.Connection, stage: str, attempt: int) -> list[int]:
+        rows = con.execute(
+            "SELECT id FROM delegation WHERE stage=? AND attempt=? AND status IN (?, ?) "
+            "ORDER BY number",
+            (stage, attempt, *_OPEN_STATUSES),
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        if ids:
+            marks = ", ".join("?" * len(ids))
+            con.execute(
+                f"UPDATE delegation SET status=?, ended=? WHERE id IN ({marks})",
+                (DelegationStatus.CANCELLED.value, _now(), *ids),
+            )
+        return ids
+
+    def cancel_delegations(self, stage: str, attempt: int) -> list[Delegation]:
+        """Cancel every queued and running assignment of the pass (the phase ends, §6.6);
+        returns them as they are now. A queued one never begins, a running one gets no further
+        turn; a later submission for it is refused (`AgentRoom.submit`)."""
+        try:
+            with self._write() as con:
+                ids = self._cancel_open(con, stage, attempt)
+        except sqlite3.OperationalError as exc:
+            if _no_table(exc):
+                return []
+            raise
+        return [d for d in self.delegations(stage=stage, attempt=attempt) if d.id in set(ids)]
 
     # ----------------------------------------------------------------------------------------
     # Submissions (docs/10 §4.3, §4.12; W4b-01)
@@ -2944,6 +3114,235 @@ class AgentRoom:
                 "in arr, nicht bei dir: Beende den Turn mit einer kurzen Notiz."
             ) from None
 
+    # -- W4b-04: `assign` of the lead of a phase `moderated` (docs/10 §4.5) --------------------
+
+    def _lead_of(self, assignment: Assignment | None) -> tuple[ResolvedPhase, int] | None:
+        """Phase and pass if `assignment` is my action as the lead of a phase `moderated`
+        (W4b-04 §6.2): its phase is `moderated` in `run.yaml`, I am the agent with the action
+        there and it expects the action's submission (`work`). Not a lead: a sleeper's wake-up
+        turn (no submission), a recipient in its assignment (`assign-<n>`), a rater (`gate`),
+        an agent of another topology. None otherwise."""
+        run = self.store._resolved()
+        if run is None or assignment is None or not isinstance(assignment.stage, str):
+            return None
+        expected = assignment.context.get("submission")
+        if not isinstance(expected, dict) or expected.get("action") != LEAD_ACTION:
+            return None
+        try:
+            phase = run.phase(assignment.stage)
+        except KeyError:
+            return None
+        if phase.topology is not PhaseTopology.MODERATED or phase.agents != [self.agent_id]:
+            return None
+        attempt = assignment.context.get("attempt")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            attempt = 1
+        return phase, attempt
+
+    def _shown_in(self, con: sqlite3.Connection, agent: str) -> str:
+        """`shown_name` inside an open transaction."""
+        for ch in self._my_channels(con):
+            if ch.anonymous and agent in ch.members:
+                return ch.display(agent)
+        return agent
+
+    def _recipient(self, con: sqlite3.Connection, phase: ResolvedPhase, name: Any) -> str:
+        """The real ID of the recipient named by the lead (as in `_check_result_from`: `@`
+        in front allowed, aliases of anonymous channels); only an agent on standby of the
+        phase. Errors name the agents on standby as the lead sees them, never a hidden ID."""
+        standby = [a for a in phase.standby if a not in phase.agents and a != self.agent_id]
+        names = ", ".join(self._shown_in(con, a) for a in standby) or "niemanden"
+        wanted = " ".join(clean_text(name).split()).removeprefix("@").strip()
+        shown = wanted if len(wanted) <= 100 else wanted[:99] + "…"
+        if not wanted:
+            raise RoomError(f"„agent“ nennt keinen Agenten. Aufträge gehen an: {names}.")
+        hidden = {a for ch in self._my_channels(con) if ch.anonymous for a in ch.members}
+        agent = next(
+            (a for ch in self._readable(con) if (a := ch.resolve(wanted)) is not None), None
+        )
+        if agent is None and wanted in self.store.agent_ids() and wanted not in hidden:
+            agent = wanted
+        if agent == self.agent_id:
+            raise RoomError(
+                f"Dir selbst gibst du keinen Auftrag: Deine Action erledigst du selbst. "
+                f"Aufträge gehen an: {names}."
+            )
+        if agent is None or agent not in standby:
+            raise RoomError(
+                f"„{shown}“ ist in dieser Phase kein Agent auf Abruf. Aufträge gehen an: {names}."
+            )
+        return agent
+
+    def _assign_format(self, value: Any) -> str:
+        run = self.store._resolved()
+        own = [f for f in (run.formats if run is not None else {}) if f not in BUILTIN]
+        allowed = [*ASSIGN_FORMATS, *own]
+        fmt = str(value or "").strip()
+        if fmt in allowed:
+            return fmt
+        listed = ", ".join(allowed)
+        if fmt == "rating":
+            why = "„rating“ gibt es nur als Bewertung an einem Gate „judge“."
+        elif fmt == "decision":
+            why = "„decision“ braucht Wahlmöglichkeiten, die `assign` nicht trägt."
+        else:
+            text = " ".join(clean_text(fmt).split())
+            why = f"Das Format „{text[:60]}“ gibt es für Aufträge nicht."
+        raise RoomError(f"{why} Erlaubt sind: {listed}.")
+
+    @staticmethod
+    def _lead_done(con: sqlite3.Connection, agent: str, stage: str, attempt: int) -> bool:
+        row = con.execute(
+            "SELECT 1 FROM submission WHERE agent=? AND stage=? AND attempt=? AND action=? LIMIT 1",
+            (agent, stage, attempt, LEAD_ACTION),
+        ).fetchone()
+        return row is not None
+
+    def assign(self, agent: str, task: str, format: str) -> Delegation:
+        """Give an agent on standby of my phase an assignment (W4b-04 §6.2, docs/10 §4.5).
+
+        Only the lead of a running phase `moderated` may, and only until it has handed in in
+        this pass; never in the note turn. `task` is cleaned (`clean_text`) and trimmed: empty
+        or longer than `MAX_ASSIGN_TASK_CHARS` is an error, never cut. `format` is one of
+        `ASSIGN_FORMATS` or an own format of the group. Counting against `max_assignments`
+        (every assignment of the pass, cancelled ones too) and the row are one write
+        transaction, so calls at the same time never pass the limit. Every refusal is a
+        `RoomError` in German and writes nothing.
+        """
+        self.not_in_note_turn()
+        with self.store._write() as con:
+            con.execute(_DELEGATION_TABLE)  # a room created before W4b-04
+            con.execute(_DELEGATION_INDEX)
+            lead = self._lead_of(self.store._latest_assignment(con, self.agent_id))
+            if lead is None:
+                raise RoomError(
+                    "„assign“ vergibt nur der Lead einer Phase „moderated“ während seiner "
+                    "Action. Das bist du gerade nicht: Arbeite an deinem Auftrag "
+                    "(`get_assignment`) und gib ihn mit `submit` ab."
+                )
+            phase, attempt = lead
+            if self._lead_done(con, self.agent_id, phase.name, attempt):
+                raise RoomError(
+                    "Du hast in diesem Durchlauf schon abgegeben; damit ist die Phase zu Ende. "
+                    "Neue Aufträge vergibt arr jetzt nicht mehr."
+                )
+            recipient = self._recipient(con, phase, agent)
+            fmt = self._assign_format(format)
+            text = clean_text(task).strip()
+            if not text:
+                raise RoomError("„task“ ist leer. Schreib den Auftrag als Text.")
+            if len(text) > MAX_ASSIGN_TASK_CHARS:
+                raise RoomError(
+                    f"„task“ hat {len(text)} Zeichen, höchstens {MAX_ASSIGN_TASK_CHARS} sind "
+                    "erlaubt. Kürze den Auftrag oder leg Einzelheiten in eine Datei, die der "
+                    "Agent lesen kann."
+                )
+            limit = phase.max_assignments or MAX_ASSIGNMENTS
+            count = con.execute(
+                "SELECT COUNT(*) FROM delegation WHERE stage=? AND attempt=?",
+                (phase.name, attempt),
+            ).fetchone()[0]
+            if count >= limit:
+                raise RoomError(
+                    f"Du hast in diesem Durchlauf schon {count} von höchstens {limit} Aufträgen "
+                    "vergeben (max_assignments). Arbeite mit den Rückgaben weiter und gib ab."
+                )
+            ts = _now()
+            cur = con.execute(
+                "INSERT INTO delegation(ts, stage, attempt, number, lead, agent, format, task, "
+                "status, named) VALUES(?,?,?,?,?,?,?,?,?,0)",
+                (
+                    ts,
+                    phase.name,
+                    attempt,
+                    count + 1,
+                    self.agent_id,
+                    recipient,
+                    fmt,
+                    text,
+                    DelegationStatus.QUEUED.value,
+                ),
+            )
+            row = con.execute("SELECT * FROM delegation WHERE id=?", (cur.lastrowid,)).fetchone()
+        return _row_to_delegation(row)
+
+    @staticmethod
+    def _open_of(con: sqlite3.Connection, stage: str, attempt: int) -> list[Delegation]:
+        rows = con.execute(
+            "SELECT * FROM delegation WHERE stage=? AND attempt=? AND status IN (?, ?) "
+            "ORDER BY number",
+            (stage, attempt, *_OPEN_STATUSES),
+        ).fetchall()
+        return [_row_to_delegation(r) for r in rows]
+
+    def _name_open(self, stage: str, attempt: int) -> None:
+        """First `submit` of a lead with open assignments it has not been told of (Entscheidung
+        79): mark every open one as named, in a write transaction of its own, and refuse
+        with all of them. Nothing to name: return."""
+        with self.store._write() as con:
+            con.execute(_DELEGATION_TABLE)
+            con.execute(_DELEGATION_INDEX)
+            open_ = self._open_of(con, stage, attempt)
+            if all(d.named for d in open_):
+                return
+            con.execute(
+                f"UPDATE delegation SET named=1 WHERE id IN ({', '.join('?' * len(open_))})",
+                [d.id for d in open_],
+            )
+            listed = ", ".join(
+                f"#{d.number} an {self._shown_in(con, d.agent)} (Format „{d.format}“, "
+                f"{'läuft' if d.status is DelegationStatus.RUNNING else 'wartet'})"
+                for d in open_
+            )
+        raise RoomError(
+            f"Deine Abgabe ist noch nicht angenommen. Diese Aufträge laufen noch oder warten: "
+            f"{listed}. Ihre Abgaben kommen zu dir zurück, und arr gibt dir dann einen Turn. "
+            "Willst du trotzdem jetzt abgeben, rufe `submit` noch einmal auf: Dann bricht arr "
+            "diese Aufträge ab und beendet die Phase."
+        )
+
+    def _close_open(self, con: sqlite3.Connection, stage: str, attempt: int) -> None:
+        """In the transaction of the lead's accepted submission: every open assignment of the
+        pass becomes `cancelled`; one arr has not named yet refuses the submission."""
+        open_ = self._open_of(con, stage, attempt)
+        if any(not d.named for d in open_):
+            raise _NewDelegation(
+                "Seit arr dir deine offenen Aufträge genannt hat, ist ein neuer dazugekommen."
+            )
+        RoomStore._cancel_open(con, stage, attempt)
+
+    def _still_running(
+        self, con: sqlite3.Connection, stage: str | None, attempt: int, number: int
+    ) -> None:
+        """A submission for the assignment `number` is accepted only while it runs (§6.6)."""
+        try:
+            row = con.execute(
+                "SELECT status FROM delegation WHERE stage IS ? AND attempt=? AND number=? "
+                "AND agent=?",
+                (stage, attempt, number, self.agent_id),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if not _no_table(exc):
+                raise
+            row = None
+        status = DelegationStatus(row["status"]) if row is not None else None
+        if status is DelegationStatus.RUNNING:
+            return
+        if status is DelegationStatus.CANCELLED:
+            raise RoomError(
+                f"Dein Auftrag #{number} ist abgebrochen: Der Lead hat die Phase beendet. arr "
+                "nimmt dafür keine Abgabe mehr an. Beende deinen Turn."
+            )
+        if status in (DelegationStatus.RETURNED, DelegationStatus.MISSING):
+            raise RoomError(
+                f"Dein Auftrag #{number} ist schon beendet; arr nimmt dafür keine Abgabe mehr "
+                "an. Beende deinen Turn."
+            )
+        raise RoomError(
+            f"Dein Auftrag #{number} läuft gerade nicht; arr nimmt dafür keine Abgabe an. Lies "
+            "deinen Auftrag mit `get_assignment`."
+        )
+
     def submit(
         self,
         status: str,
@@ -2984,6 +3383,12 @@ class AgentRoom:
             max(1, attempt) if isinstance(attempt, int) and not isinstance(attempt, bool) else 1
         )
 
+        # W4b-04 §6.6: the lead of a phase `moderated` is told of its open assignments first
+        lead = self._lead_of(assignment)
+        if lead is not None:
+            self._name_open(lead[0].name, attempt)
+        given = _ASSIGN_ACTION.fullmatch(expectation.action or "")
+
         def current(con: sqlite3.Connection) -> None:
             latest = self.store._latest_assignment(con, self.agent_id)
             if latest is None or (latest.turn, latest.ts) != (assignment.turn, assignment.ts):
@@ -2991,14 +3396,26 @@ class AgentRoom:
                     "Dein Auftrag hat sich während der Abgabe geändert. Lies ihn mit "
                     "`get_assignment` und gib passend dazu ab."
                 )
+            if lead is not None:  # accepted: every open assignment is cancelled with it
+                self._close_open(con, lead[0].name, attempt)
+            if given is not None:
+                self._still_running(con, assignment.stage, attempt, int(given.group(1)))
 
-        return self.store._publish(
-            agent=self.agent_id,
-            expectation=expectation,
-            checked=checked,
-            stage=assignment.stage,
-            attempt=attempt,
-            copy=self._copy_source,
-            shown=self._shown_label,
-            current=current,
-        )
+        try:
+            return self.store._publish(
+                agent=self.agent_id,
+                expectation=expectation,
+                checked=checked,
+                stage=assignment.stage,
+                attempt=attempt,
+                copy=self._copy_source,
+                shown=self._shown_label,
+                current=current,
+            )
+        except _NewDelegation:
+            assert lead is not None
+            self._name_open(lead[0].name, attempt)  # names the new one and refuses
+            raise RoomError(
+                "Während deiner Abgabe hat sich der Stand deiner Aufträge geändert. Gib noch "
+                "einmal ab."
+            ) from None

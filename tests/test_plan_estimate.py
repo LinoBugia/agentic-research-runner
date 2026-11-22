@@ -12,7 +12,7 @@ from typing import Any
 
 from plan_kit import findings, load, resolve
 
-from arr.models import Goto, ResolvedRun
+from arr.models import DEFAULT_TURNS, Goto, ResolvedRun
 from arr.plan.estimate import phase_turns, turn_range
 from arr.plan.graph import END
 from arr.service.real_api.runs import estimate_run
@@ -133,7 +133,8 @@ def _make(rng: random.Random) -> tuple[dict[str, Any], list[tuple[int, int]]]:
             entry["actions"] = {"a": _act(turns)}
             entry["standby"] = ["b"]
             entry["max_assignments"] = jobs
-            least, most = 1, turns + 1 + 2 * jobs
+            # W4b-04 §6.8: per assignment its turns (DEFAULT_TURNS + 1) and a return turn
+            least, most = 1, turns + 1 + jobs * (DEFAULT_TURNS + 1 + 1)
         if topo != "chat" and rng.random() < 0.3:
             entry["channels"] = [rng.choice(["rund", "los"])]
             if topo != "moderated":

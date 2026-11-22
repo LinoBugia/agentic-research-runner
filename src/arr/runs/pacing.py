@@ -35,6 +35,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -1089,8 +1090,20 @@ class _EventDiscussion:
         return self.outcome
 
 
-_QUOTES = str.maketrans({"„": "'", "“": "'", "”": "'", '"': "'"})
-"""Quotation marks in a summary become `'`: only arr's „…“ delimit it."""
+_QUOTE_LOOKALIKES = "„‚\"＂″‶〝〞〟ˮ「」『』"
+"""Quotation marks outside the categories `Pi`/`Pf`: low-9 marks, the ASCII and full-width
+double quote, double prime, the look-alikes of “ and the corner brackets (W4b-04, NR3)."""
+_QUOTES = str.maketrans(
+    {
+        char: "'"
+        for char in {
+            *(chr(c) for c in range(0x10000) if unicodedata.category(chr(c)) in ("Pi", "Pf")),
+            *_QUOTE_LOOKALIKES,
+        }
+    }
+)
+"""Quotation marks in a summary become `'`: every character of the Unicode categories `Pi`
+and `Pf` (« » ‘ ’ “ ” ‹ › …) and the look-alikes above, so only arr's „…“ delimit it."""
 
 SUBMISSION_SUMMARY_CHARS = MAX_SUMMARY_CHARS
 """How much of the summary of a submission the wake-up of `until_result_from` shows (W4b-03)."""

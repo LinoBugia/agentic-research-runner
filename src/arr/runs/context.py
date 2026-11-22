@@ -23,7 +23,7 @@ from typing import Any
 from arr.backends.base import TurnOutcome
 from arr.models import AgentConfig, AgentStatus, ChannelMode, ResolvedRun
 from arr.permissions.types import EscalationOption
-from arr.room.types import Message, MessageKind, Rating, Result, Submission
+from arr.room.types import Delegation, Message, MessageKind, Rating, Result, Submission
 
 
 @dataclass(slots=True)
@@ -405,4 +405,44 @@ class RunContext(ABC):
     def set_participants(self, agents: Sequence[str] | None) -> None:
         """The participants of the pass that begins (with an action, on standby, raters): only
         they hear of messages, as a hint or a wake-up (Entscheidung 64). None ends that."""
+        return None
+
+    # -- W4b-04: the assignments of a lead in a phase `moderated` --------------------------
+    #
+    # Not abstract: a context without a room (the test contexts) has no assignments. The
+    # `Orchestrator` implements them; `arr.runs.phases.start` refuses `moderated` for a context
+    # class that does not.
+
+    def delegations(
+        self,
+        *,
+        stage: str | None = None,
+        attempt: int | None = None,
+        agent: str | None = None,
+    ) -> list[Delegation]:
+        """The assignments given with `assign` (table `delegation`), oldest first, filtered
+        by phase, pass and recipient. The default knows none."""
+        return []
+
+    def delegation(self, delegation_id: int) -> Delegation | None:
+        """One assignment by its `id`; None without one."""
+        return None
+
+    def start_delegation(self, delegation_id: int) -> bool:
+        """`queued` → `running`; False if it is not queued any more. The default: False."""
+        return False
+
+    def end_delegation(self, delegation_id: int, submission_id: int | None) -> bool:
+        """`running` → `returned` (with `submission_id`) or `missing`; False if it is not
+        running any more. The default: False."""
+        return False
+
+    def cancel_delegations(self, stage: str, attempt: int) -> list[Delegation]:
+        """Cancel every queued and running assignment of the pass; returns them."""
+        return []
+
+    def end_turn(self, agent_id: str, reason: str) -> None:
+        """End the running turn of `agent_id` the way arr ends a turn itself (interrupt, a
+        second one, then cancel the reading; `wait_guard.end_turn`). No turn running: nothing.
+        The default does nothing."""
         return None

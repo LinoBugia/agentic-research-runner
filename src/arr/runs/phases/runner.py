@@ -58,7 +58,7 @@ from arr.permissions.types import EscalationOption
 from arr.plan.read import ACTION_GATE, build_expectation, enter, follow
 from arr.room.types import Submission
 from arr.runs.context import RunContext
-from arr.runs.phases import chat, work
+from arr.runs.phases import chat, moderated, work
 from arr.runs.phases.gates import NO_RATING, GateOutcome, judge_mean, judge_rank, signal
 from arr.runs.phases.inputs import (
     build_feedback,
@@ -93,8 +93,9 @@ PASSES: dict[PhaseTopology, PassFunction] = {
     PhaseTopology.SOLO: work.run_pass,
     PhaseTopology.PARALLEL: work.run_pass,
     PhaseTopology.CHAT: chat.run_pass,
+    PhaseTopology.MODERATED: moderated.run_pass,
 }
-"""The topology of a phase → the function that runs one pass of it (W4b-04 adds `moderated`)."""
+"""The topology of a phase → the function that runs one pass of it (`moderated` since W4b-04)."""
 
 OPTIONS = (EscalationOption.CONTINUE, EscalationOption.RETRY, EscalationOption.END)
 """What the user may choose at a gate `user`, after `escalate` and without a result."""
@@ -687,12 +688,19 @@ class PhaseRunner:
         return newer[-1] if newer else None
 
     async def act(
-        self, slot: Slot, stage: str, attempt: int, context: Mapping[str, Any]
+        self,
+        slot: Slot,
+        stage: str,
+        attempt: int,
+        context: Mapping[str, Any],
+        abort: Callable[[], bool] | None = None,
     ) -> Submission | None:
         """Turns of one action until its submission is there (W4b-02b §6.4): at most `turns`
         turns, then one follow-up question; a turn with status `limit` ends the action, one
         with `error` counts as a turn without submission. After `wait_until` the next turn
-        starts when the wait ends. A stop ends it at once. None: the submission is missing."""
+        starts when the wait ends. A stop ends it at once; so does `abort` when it turns true
+        before a turn or during the wait (W4b-04: a cancelled assignment; without it nothing
+        changes). None: the submission is missing."""
         ctx = self.ctx
         turns = slot.task.turns
         self.acted.add(slot.agent)
@@ -700,7 +708,7 @@ class PhaseRunner:
         used, asked = 0, False
         why: str | None = None
         detail = ""
-        while not ctx.stop_requested:
+        while not ctx.stop_requested and not (abort is not None and abort()):
             if used == 0:
                 prompt = render_assignment(context)
             elif used < turns:
@@ -718,15 +726,18 @@ class PhaseRunner:
                 return found
             if outcome.status is TurnStatus.LIMIT or asked:
                 break
-            why, detail = await self.wait(slot.agent)
+            why, detail = await self.wait(slot.agent, abort)
         return None
 
-    async def wait(self, agent: str) -> tuple[str | None, str]:
+    async def wait(
+        self, agent: str, abort: Callable[[], bool] | None = None
+    ) -> tuple[str | None, str]:
         """After `wait_until`: wait for the deadline, the file, a submission of the awaited
         agent that `agent` may read (a sealed one does not count) or (W4b-03 §6.4) a direct
         message to it in an open channel of the phase or its private channel, which the waker
         of the pass hands over (no second read of the room); a stop ends the wait. Uses
-        `long_wait`, `until_file_exists` and `end_long_wait` of the orchestrator."""
+        `long_wait`, `until_file_exists` and `end_long_wait` of the orchestrator. `abort`
+        (W4b-04) ends the wait as well when it turns true; without it nothing changes."""
         ctx = self.ctx
         waker = self.waker
         get = getattr(ctx, "long_wait", None)
@@ -738,7 +749,7 @@ class PhaseRunner:
         why: str | None = None
         detail = ""
         try:
-            while not ctx.stop_requested:
+            while not ctx.stop_requested and not (abort is not None and abort()):
                 if waker is not None and waker.take_message(agent) is not None:
                     why = "message"
                     break

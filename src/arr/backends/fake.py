@@ -96,7 +96,7 @@ from arr.errors import ArrError
 from arr.models import AgentConfig, AgentStatus, Provider, StrictModel
 from arr.resolve import load_yaml_model, validate_model
 from arr.room.store import AgentRoom
-from arr.room.types import MessageKind, RoomAPI, RoomError, SubmitAPI
+from arr.room.types import AssignAPI, MessageKind, RoomAPI, RoomError, SubmitAPI
 from arr.room.waiting import WAIT_MAX_S, wait_for_messages
 from arr.runs.compact import NOTE_HEADING
 
@@ -155,6 +155,7 @@ class RoomAction(StrEnum):
     SUBMIT_RESULT = "submit_result"
     SUBMIT_RATING = "submit_rating"
     SUBMIT = "submit"  # W4b-01: `SubmitAPI`, the tool of the phase toolkit
+    ASSIGN = "assign"  # W4b-04: `AssignAPI`, the tool of the lead of a phase `moderated`
     GET_ASSIGNMENT = "get_assignment"
     WAIT_UNTIL = "wait_until"
     WAIT_FOR_MESSAGES = "wait_for_messages"  # blocks like the MCP tool (`arr.room.waiting`)
@@ -707,6 +708,13 @@ class FakeBackend:
                 raise FakeScriptError(
                     f"Das Skript ruft „submit“ auf, aber das Room von „{self.config.id}“ kennt "
                     "es nicht (SubmitAPI)."
+                )
+        if step.action is RoomAction.ASSIGN:
+            api = AssignAPI
+            if not isinstance(self.room, AssignAPI):
+                raise FakeScriptError(
+                    f"Das Skript ruft „assign“ auf, aber das Room von „{self.config.id}“ kennt "
+                    "es nicht (AssignAPI)."
                 )
         method = getattr(self.room, step.action.value)
         try:

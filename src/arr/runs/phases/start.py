@@ -4,7 +4,11 @@
 stop a start; the same error of every agent of a pattern is reported once) and what this
 version of the runner cannot run yet, each with its path and a German sentence:
 
-- phases with `topology: moderated` (`NOT_YET`; W4b-04); `chat` and `standby` run since W4b-03,
+- topologies listed in `NOT_YET` (empty since W4b-04: `moderated` runs; `chat` and `standby`
+  run since W4b-03),
+- `topology: moderated` with a context class that does not implement the methods of the
+  assignments (`DELEGATION_METHODS`, W4b-04): the `Orchestrator` does, so a real run is never
+  refused for it,
 - `folder: fresh` and `context: compact` only with a context class that does not implement
   `fresh_folder` or `compact_session` (a test context). The `Orchestrator` implements both
   (W4b-05a, W4b-05b), so a real run is never refused for them (W4b-02b.1 Teil 2). The check
@@ -25,22 +29,33 @@ from arr.plan.check import check
 from arr.runs.context import RunContext
 
 __all__ = [
+    "DELEGATION_METHODS",
     "NOT_YET",
+    "READY",
     "STANDBY_READY",
     "implements",
     "merge_issues",
     "start_issues",
 ]
 
-NOT_YET: dict[PhaseTopology, str] = {
-    PhaseTopology.MODERATED: "moderated",
-}
-"""Topologies of a phase this version refuses at the start (W4b-04 removes `moderated`)."""
+NOT_YET: dict[PhaseTopology, str] = {}
+"""Topologies of a phase this version refuses at the start (empty since W4b-04)."""
 
 STANDBY_READY = True
 """Agents on standby (`standby`) can run (since W4b-03)."""
 
-READY = "solo, parallel, chat"
+READY = "solo, parallel, chat, moderated"
+
+DELEGATION_METHODS = (
+    "delegations",
+    "delegation",
+    "start_delegation",
+    "end_delegation",
+    "cancel_delegations",
+    "end_turn",
+)
+"""What a phase `moderated` needs of its context (W4b-04): the table of the assignments and
+the end of a turn. A context class without its own methods refuses `moderated` at the start."""
 
 
 def implements(context_type: type, method: str) -> bool:
@@ -86,6 +101,7 @@ def start_issues(resolved: ResolvedRun, context_type: type) -> list[ConfigIssue]
     issues = merge_issues(found.errors, [a.id for a in resolved.agents])
     fresh = implements(context_type, "fresh_folder")
     compact = implements(context_type, "compact_session")
+    delegates = all(implements(context_type, m) for m in DELEGATION_METHODS)
     for phase in resolved.phases:
         at = f"phases[{phase.index}]"
         if phase.topology in NOT_YET:
@@ -94,6 +110,15 @@ def start_issues(resolved: ResolvedRun, context_type: type) -> list[ConfigIssue]
                     f"{at}.topology",
                     f"Die Topologie „{NOT_YET[phase.topology]}“ (Phase „{phase.name}“) ist in "
                     f"dieser Version noch nicht verfügbar. Verfügbar sind: {READY}.",
+                )
+            )
+        elif phase.topology is PhaseTopology.MODERATED and not delegates:
+            issues.append(
+                ConfigIssue(
+                    f"{at}.topology",
+                    f"Die Topologie „moderated“ (Phase „{phase.name}“) braucht Aufträge des "
+                    "Leads, und dieser Ablauf kann sie nicht vergeben. Nimm „solo“, "
+                    "„parallel“ oder „chat“.",
                 )
             )
         if phase.standby and not STANDBY_READY:

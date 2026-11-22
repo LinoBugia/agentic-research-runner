@@ -582,3 +582,37 @@ class Hooks:
 def gate() -> dict[str, Any]:
     """A step that waits until the test opens the gate of the agent (`Hooks.open`)."""
     return {"do": "delay", "seconds": GATE}
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-04: `moderated`
+# --------------------------------------------------------------------------------------------
+
+
+def give(agent: str, task: str = "Rechne Teil 1.", format: str = "text") -> dict[str, Any]:
+    """A step of the lead: `assign(agent, task, format)`."""
+    return room("assign", agent=agent, task=task, format=format)
+
+
+def delegations(mgr: RunManager, **match: Any) -> list[Any]:
+    """The rows of the table `delegation` of the run (`RoomStore.delegations`)."""
+    return RoomStore(mgr.run_dir).delegations(**match)
+
+
+def is_return(view: TurnView) -> bool:
+    """A return turn of the lead (W4b-04 §6.5)."""
+    return view.prompt.startswith("Rückgabe")
+
+
+def is_assignment(view: TurnView) -> bool:
+    """A turn of an assignment of a lead (its action is `assign-<n>`)."""
+    return str(view.action or "").startswith("assign-")
+
+
+def moderated_phase(
+    lead: str = "a", standby: list[str] | None = None, *, jobs: int = 3, **extra: Any
+) -> dict[str, Any]:
+    """A phase `moderated` „m“ with the lead's action (`tasks/m.md`, text)."""
+    phase = {**solo("m", lead, **extra), "topology": "moderated", "max_assignments": jobs}
+    phase["standby"] = standby if standby is not None else ["b", "c"]
+    return phase

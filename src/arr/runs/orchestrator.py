@@ -68,6 +68,7 @@ from arr.room.store import (
     private_channel,
 )
 from arr.room.types import (
+    Delegation,
     DeliveryStatus,
     Message,
     MessageKind,
@@ -2355,6 +2356,42 @@ class Orchestrator(RunContext):
             **extra,
         )
 
+
+    # -- W4b-04: the assignments of a lead in a phase `moderated` (table `delegation`) ------
+
+    def delegations(
+        self,
+        *,
+        stage: str | None = None,
+        attempt: int | None = None,
+        agent: str | None = None,
+    ) -> list[Delegation]:
+        """The assignments of the room (`RoomStore.delegations`)."""
+        return self.room.delegations(stage=stage, attempt=attempt, agent=agent)
+
+    def delegation(self, delegation_id: int) -> Delegation | None:
+        """One assignment of the room (`RoomStore.delegation`)."""
+        return self.room.delegation(delegation_id)
+
+    def start_delegation(self, delegation_id: int) -> bool:
+        """`RoomStore.start_delegation`."""
+        return self.room.start_delegation(delegation_id)
+
+    def end_delegation(self, delegation_id: int, submission_id: int | None) -> bool:
+        """`RoomStore.end_delegation`."""
+        return self.room.end_delegation(delegation_id, submission_id)
+
+    def cancel_delegations(self, stage: str, attempt: int) -> list[Delegation]:
+        """`RoomStore.cancel_delegations`."""
+        return self.room.cancel_delegations(stage, attempt)
+
+    def end_turn(self, agent_id: str, reason: str) -> None:
+        """Ask the running turn of `agent_id` to end (`wait_guard.end_turn`): the watcher then
+        interrupts it, a second time after `END_TURN_RETRY_S`, and cancels the reading after
+        `END_TURN_HARD_S` (`_end_requested_turns`); the next turn resets the request. Without
+        a running turn nothing happens."""
+        if agent_id in self._active:
+            self.room.set_wait_guard(agent_id, end_turn=reason)
 
 class _Slot:
     """A slot of an auth profile that one turn may hold (W4b-05b.2): `held` says whether it
