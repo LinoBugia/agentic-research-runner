@@ -11,6 +11,7 @@ from arr.service.api_models import AgentDisplayState, AgentState, Message, Resul
 from arr.service.gui import format as fmt
 from arr.service.gui.components.base import esc
 from arr.service.gui.pages.run_detail_results import RESULT_STATUS
+from arr.service.gui.texts import channel_label
 
 _STATE_WORDS = {
     AgentDisplayState.WORKING: ("arbeitet", "arbeiten"),
@@ -52,8 +53,8 @@ def questions_to_user_html(questions: list[Message], count: int) -> str:
     items = "".join(
         _msg_link(
             m,
-            f'<span class="mono">{esc(m.sender)}</span> → du · <span class="mono">#'
-            f"{esc(m.channel)}</span>",
+            f'<span class="mono">{esc(m.sender)}</span> → du · <span class="mono">'
+            f"{esc(channel_label(m.channel))}</span>",
             since=False,
         )
         for m in questions

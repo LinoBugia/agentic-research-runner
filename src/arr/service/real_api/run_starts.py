@@ -63,6 +63,7 @@ from arr.permissions.types import (
     DecisionAction,
     DecisionScope,
 )
+from arr.plan.check import check as check_plan
 from arr.runs.inspect import RunLock, run_lock_held
 from arr.runs.launch import Launch
 from arr.runs.manager import set_run_status
@@ -84,6 +85,7 @@ from arr.service.api_models import (
     StartRunResponse,
     Vendor,
 )
+from arr.service.real_api.phase_plan import one_line, phase_plan
 
 log = logging.getLogger("arr.service.run_starts")
 
@@ -389,6 +391,61 @@ def deviations(
     return out
 
 
+def _user_phases(run: ResolvedRun | None) -> set[str]:
+    return {p.name for p in run.phases if p.decider == "user"} if run is not None else set()
+
+
+def _user_agents(run: ResolvedRun | None) -> set[str]:
+    return {a.id for a in run.agents if a.decider == "user"} if run is not None else set()
+
+
+def tightening_deviations(
+    requested: ResolvedRun, standard: ResolvedRun | None, defaults: ResolvedRun | None = None
+) -> list[Deviation]:
+    """`decider: user` at a phase or agent (P14, docs/10 §4.11) the request takes away from the
+    skill (`sensitive`: the supervising agent decides there again) or adds (not sensitive, but a
+    deviation: another decider always stands on the card). Cases of Codeplan §8: `defaults:
+    {decider: null}`, own `agents`, own `phases`, a dropped phase (W4b-07 §6.10).
+
+    `standard` is the skill with the request's parameters, `defaults` the skill with the
+    defaults of its parameters: a phase counts as taken away only if it stands in one of them
+    with `decider: user` and not in the request. A phase the defaults drop never does
+    (W4b-07.1, B1)."""
+    out: list[Deviation] = []
+    std_phases = _user_phases(standard) | _user_phases(defaults)
+    req_phases = _user_phases(requested)
+    std_agents, req_agents = _user_agents(standard), _user_agents(requested)
+    removed = [f"Phase {n}" for n in sorted(std_phases - req_phases)]
+    removed += [f"Agent {a}" for a in sorted(std_agents - req_agents)]
+    added = [f"Phase {n}" for n in sorted(req_phases - std_phases)]
+    added += [f"Agent {a}" for a in sorted(req_agents - std_agents)]
+    if removed:
+        out.append(
+            Deviation(
+                path="tightening.removed",
+                label="Verschärfung aufgehoben (decider: user)",
+                value_text="für " + ", ".join(removed),
+                default_text="du entscheidest dort jede Anfrage",
+                default=sorted(std_phases | std_agents),
+                value=sorted(req_phases | req_agents),
+                sensitive=True,
+            )
+        )
+    if added:
+        out.append(
+            Deviation(
+                path="tightening.added",
+                label="Verschärfung hinzugefügt (decider: user)",
+                value_text="für " + ", ".join(added),
+                default_text="Entscheider des Runs",
+                default=sorted(std_phases | std_agents),
+                value=sorted(req_phases | req_agents),
+                sensitive=False,
+            )
+        )
+    return out
+
+
 def standard_notes(requested: ResolvedRun, devs: Sequence[Deviation]) -> list[str]:
     """„Wie Standard: …“ lines of the card (docs/08 §5.2), with the vendors of a copy (E19)."""
     notes = []
@@ -637,7 +694,19 @@ class RunStartsArea:
 
         resolved = launch.resolved
         standard = self.runs.standard_of(spec, adjust)
+        bare = {k: v for k, v in spec.items() if k != "params"}  # the skill's defaults (B1)
+        defaults = self.runs.standard_of(bare, adjust) if spec.get("params") else standard
         devs = deviations(resolved, standard, launch.settings)
+        devs += tightening_deviations(resolved, standard, defaults)
+        plan = None
+        warnings: list[str] = []
+        if resolved.phases:
+            source = launch.run_input.phases or (
+                launch.group_spec.phases if launch.group_spec is not None else []
+            )
+            built = phase_plan(resolved, names=[p.name for p in source])
+            plan = built.model_dump(mode="json") if built is not None else None
+            warnings = [one_line(w.message, 400) for w in check_plan(resolved).warnings][:20]
         limits = _limits_values(resolved.limits)
         agents = [
             RunStartAgent(
@@ -686,6 +755,8 @@ class RunStartsArea:
             "capacity": [c.model_dump(mode="json") for c in capacity],
             "deviations": [d.model_dump(mode="json") for d in devs],
             "standard_notes": standard_notes(resolved, devs),
+            "phase_plan": plan,
+            "warnings": warnings,
         }
 
     # -- the decision (GUI only) -------------------------------------------------------------
@@ -837,11 +908,9 @@ class RunStartsArea:
             if run_lock_held(run_dir):
                 continue
             try:
-                entries = [
-                    json.loads(line)
-                    for line in read_regular(run_dir / APPROVALS_FILE).splitlines()
-                    if line.strip()
-                ]
+                text = read_regular(run_dir / APPROVALS_FILE)
+                # at "\n" only: `splitlines` also splits at U+2028 in agent text (E68)
+                entries = [json.loads(line) for line in text.split("\n") if line.strip()]
             except (OSError, ValueError):
                 entries = []
             opened = {

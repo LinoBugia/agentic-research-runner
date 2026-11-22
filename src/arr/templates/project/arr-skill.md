@@ -35,6 +35,15 @@ Ein Run kostet Zeit (oft 10 bis 60 Minuten) und Geld oder Kontingent. Schlag ihn
 
 Weitere Tools: `list_runs` (Runs dieses Projekts), `post_to_run` (Hinweis in einen Kanal), `control_run` (`pause`, `resume`, `stop`), `list_approvals` (offene Freigaben, nur lesend).
 
+Während einer isolierten Phase arbeiten die Teilnehmer unabhängig: Gib nichts aus dem Transkript oder der Abgabe eines Teilnehmers an andere Teilnehmer weiter, auch nicht mit `post_to_run`.
+
+## Eigene Group
+
+Passt kein Skill, beschreibst du die Group selbst als `config` (Agenten, Kanäle, Phasen), nach dem Schema aus `group_schema`. Nur wenn der User es will.
+
+- Prüf jede `config` zuerst mit `estimate_run(config)`. Was nicht passt, nennt arr dort mit dem Feld; korrigiere und prüf erneut.
+- Nenne dem User vor dem Start den Phasenplan (`phase_plan`: Phasen, wer was abgibt, Gates, wer Anfragen entscheidet) und jede Abweichung (`deviations`), auch eine aufgehobene Verschärfung. Dann `start_run(task, config)`.
+
 ## Eine gute task.md
 
 - **Die Aussage oder Frage**, genau formuliert, mit allen Voraussetzungen und der Notation.

@@ -9,6 +9,7 @@ sizes come with W5-01.
 import asyncio
 
 from arr.errors import ArrError
+from arr.permissions.policy import RETIRED_DIR, SCRATCH_DIR
 from arr.runs.slim import SlimPlan, check_slimmable, plan_slim, slim_run
 from arr.service.api_models import ActionResult, ApiException, RunAction, StorageReport
 from arr.service.gui import format as fmt
@@ -30,8 +31,21 @@ SLIM_CLONE_HINT = (
 )
 
 
+_EXTRA_PARTS = (
+    (RETIRED_DIR, "abgelegte Arbeitsordner"),
+    (SCRATCH_DIR, "Scratch-Ordner"),
+    ("tmp", "Run-tmp"),
+)
+"""Folders of a phases run that slimming removes too, named when they are there (W4b-07)."""
+
+
 def _removes(plan: SlimPlan) -> str:
-    return "Arbeitskopien, Snapshot und Run-venv" if plan.venv else "Arbeitskopien und Snapshot"
+    names = {t.name for t in plan.targets if t.parent.name != "agents"}
+    parts = ["Arbeitskopien", "Snapshot"]
+    parts += [label for name, label in _EXTRA_PARTS if name in names]
+    if plan.venv:
+        parts.append("Run-venv")
+    return fmt.join_de(parts)
 
 
 def _preview(plan: SlimPlan) -> str:

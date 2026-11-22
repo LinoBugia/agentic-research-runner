@@ -2185,7 +2185,9 @@ class ApprovalLog:
         """Read all entries as plain dicts (empty if the file does not exist)."""
         if not self.path.exists():
             return []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
+        # not splitlines(): `json.dumps(ensure_ascii=False)` writes U+2028, U+2029 and NEL raw,
+        # inside a JSON string; only "\n" ends a line (E68)
+        lines = self.path.read_text(encoding="utf-8").split("\n")
         return [json.loads(line) for line in lines if line.strip()]
 
 

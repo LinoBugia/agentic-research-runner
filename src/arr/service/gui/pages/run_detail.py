@@ -31,7 +31,7 @@ from urllib.parse import urlencode
 
 from nicegui import ui
 
-from arr.models import RunStatus
+from arr.models import RunStatus, TopologyKind
 from arr.permissions.types import ApprovalStatus, ApprovalType, DecisionAction
 from arr.room.types import MessageKind
 from arr.service.api_models import (
@@ -64,7 +64,7 @@ from arr.service.gui.components.agent_card import AgentCard, sort_key
 from arr.service.gui.components.approval_card import compact_card
 from arr.service.gui.components.badge import badge_html
 from arr.service.gui.components.banner import banner, banner_html, empty_state_html
-from arr.service.gui.components.base import esc, icon, raw, set_disabled
+from arr.service.gui.components.base import esc, icon, query_int, raw, set_disabled
 from arr.service.gui.components.copy_field import copy_html
 from arr.service.gui.components.dialog import ConfirmDialog
 from arr.service.gui.components.message import message_dom_id, question_hint_html
@@ -82,9 +82,19 @@ from arr.service.gui.pages.run_detail_overview import (
     questions_to_user_html,
     results_short_html,
 )
-from arr.service.gui.pages.run_detail_results import ResultsView, result_dom_id
+from arr.service.gui.pages.run_detail_results import (
+    ResultsView,
+    result_dom_id,
+    submission_dom_id,
+)
 from arr.service.gui.pages.run_detail_transcript import TranscriptView
-from arr.service.gui.texts import RISK, STARTER_PHRASE, WAITING_FOR_YOU, run_status
+from arr.service.gui.texts import (
+    RISK,
+    STARTER_PHRASE,
+    WAITING_FOR_YOU,
+    channel_label,
+    run_status,
+)
 
 log = logging.getLogger("arr.service.gui")
 
@@ -146,6 +156,8 @@ class RunDetailPage:
         self.selected: tuple[str, str] = ("kanal", "")
         self.tab = "verlauf"
         self._last_verlauf: tuple[str, str] | None = None
+        self._submission: int | None = None
+        """Submission of the deep link `?abgabe=` (W4b-07), used once by the results view."""
         self.deciding: set[str] = set()
         self.compact_elements: dict[str, list[ui.element]] = {}
         self.rendered_items: tuple[tuple[str, int], ...] | None = None
@@ -502,9 +514,10 @@ class RunDetailPage:
                 (s.index for s in self.detail.stages if s.label == info.opens_at_stage), None
             )
             label = str(stage) if stage else (info.opens_at_stage or "später")
+            word = "Phase" if self.detail.run.topology is TopologyKind.PHASES else "Stufe"
             right = (
-                f'<span class="faint small right-note" title="öffnet in Stufe '
-                f'„{esc(info.opens_at_stage or "")}“">ab Stufe {esc(label)}</span>'
+                f'<span class="faint small right-note" title="öffnet in {word} '
+                f'„{esc(info.opens_at_stage or "")}“">ab {word} {esc(label)}</span>'
             )
         else:
             n = self.channel_unread_shown.get(name) if selected else None
@@ -516,7 +529,9 @@ class RunDetailPage:
             item._props["aria-current"] = "true"
         else:
             item._props.pop("aria-current", None)
-        item.set_content(f'<span class="mono">#{esc(name)}</span>{right}')
+        label = channel_label(name)
+        css = "mono private" if info.private_of else "mono"
+        item.set_content(f'<span class="{css}">{esc(label)}</span>{right}')
         item.update()
 
     async def _sync_structure(self) -> None:
@@ -565,7 +580,7 @@ class RunDetailPage:
     async def _select_initial(self) -> None:
         p = self.params
         if p.get("agent") in self.agents:
-            seq = int(p["seq"]) if p.get("seq", "").isdigit() else None
+            seq = query_int(p.get("seq"))
             await self.select(
                 "seq" if seq is not None else "agent", p["agent"], seq=seq, push=False
             )
@@ -584,16 +599,20 @@ class RunDetailPage:
         ):
             self._last_verlauf = ("kanal", self._default_channel())
             await self.select("ansicht", "ablauf", push=False)
-        elif p.get("ansicht") == "ergebnisse" or (
-            self.status.is_final and not p.get("kanal") and not p.get("nachricht")
+        elif (
+            p.get("ansicht") == "ergebnisse"
+            or p.get("abgabe")
+            or (self.status.is_final and not p.get("kanal") and not p.get("nachricht"))
         ):
-            ergebnis = int(p["ergebnis"]) if p.get("ergebnis", "").isdigit() else None
+            ergebnis = query_int(p.get("ergebnis"))
+            abgabe = p.get("abgabe", "")
+            self._submission = query_int(abgabe)
             self._last_verlauf = ("kanal", self._default_channel())
             await self.select(
                 "ergebnis" if ergebnis else "ansicht", "ergebnisse", result_id=ergebnis, push=False
             )
         elif p.get("kanal") in self.channels:
-            msg = int(p["nachricht"]) if p.get("nachricht", "").isdigit() else None
+            msg = query_int(p.get("nachricht"))
             await self.select("msg" if msg else "kanal", p["kanal"], msg_id=msg, push=False)
         else:
             await self._select_default()
@@ -699,7 +718,8 @@ class RunDetailPage:
         self.view_box.clear()
         with self.view_box:
             if self.tab == "ergebnisse":
-                self.view = ResultsView(self, result_id=result_id)
+                self.view = ResultsView(self, result_id=result_id, submission_id=self._submission)
+                self._submission = None
             elif self.tab == "ablauf":
                 self.view = LogView(self)
             elif self.tab == "eingaben":
@@ -718,7 +738,7 @@ class RunDetailPage:
             self.frame.js(f"arr.rd.pushUrl({_js(urlencode(query))})")
 
     def _render_tabs(self) -> None:
-        n = len(self.results.items)
+        n = len(self.results.items) + len(self.results.submissions)
         count = f' <span class="n">{n}</span>' if n else ""
 
         def tab(key: str, label: str) -> str:
@@ -740,14 +760,12 @@ class RunDetailPage:
         kind, _, rest = target.partition(":")
         if kind == "msg":
             channel, _, msg = rest.rpartition(":")
-            await self.select("msg", channel, msg_id=int(msg) if msg.isdigit() else None)
+            await self.select("msg", channel, msg_id=query_int(msg))
         elif kind == "seq":
             agent, _, seq = rest.rpartition(":")
-            await self.select("seq", agent, seq=int(seq) if seq.isdigit() else None)
+            await self.select("seq", agent, seq=query_int(seq))
         elif kind == "ergebnis":
-            await self.select(
-                "ergebnis", "ergebnisse", result_id=int(rest) if rest.isdigit() else None
-            )
+            await self.select("ergebnis", "ergebnisse", result_id=query_int(rest))
         elif kind in ("kanal", "agent", "ansicht"):
             await self.select(kind, rest)
         # tab links are drawn anew: the focus goes where the new view starts (W1-07.1)
@@ -1319,6 +1337,7 @@ def register() -> None:
         nachricht: str = "",
         ansicht: str = "",
         ergebnis: str = "",
+        abgabe: str = "",
         zustand: str = "",
     ) -> None:
         api = get_api()
@@ -1373,7 +1392,7 @@ def register() -> None:
             active="runs",
             title=detail.run.name,
             crumbs=[("Runs", "/runs"), (detail.run.name, None)],
-            focus=_deep_link_focus(agent, seq, kanal, nachricht, ergebnis),
+            focus=_deep_link_focus(agent, seq, kanal, nachricht, ergebnis, abgabe),
         )
         await frame.start()
         params = {
@@ -1383,6 +1402,7 @@ def register() -> None:
             "nachricht": nachricht,
             "ansicht": ansicht,
             "ergebnis": ergebnis,
+            "abgabe": abgabe,
         }
         with frame.content:
             page = RunDetailPage(frame, detail, params)
@@ -1396,13 +1416,17 @@ def register() -> None:
             )
 
 
-def _deep_link_focus(agent: str, seq: str, kanal: str, nachricht: str, ergebnis: str) -> str:
+def _deep_link_focus(
+    agent: str, seq: str, kanal: str, nachricht: str, ergebnis: str, abgabe: str = ""
+) -> str:
     """Focus target of a deep link (docs/08 §4.3): the marked line, the message, the result
     title, else the run title; never a button. The agent card is focused after the build."""
-    if agent and seq.isdigit():
-        return f"#{event_dom_id(int(seq))}"
-    if kanal and nachricht.isdigit():
-        return f"#{message_dom_id(kanal, int(nachricht))}"
-    if ergebnis.isdigit():
-        return f"#{result_dom_id(int(ergebnis))}-h"
+    if agent and (n := query_int(seq)) is not None:
+        return f"#{event_dom_id(n)}"
+    if kanal and (n := query_int(nachricht)) is not None:
+        return f"#{message_dom_id(kanal, n)}"
+    if (n := query_int(ergebnis)) is not None:
+        return f"#{result_dom_id(n)}-h"
+    if (n := query_int(abgabe)) is not None:
+        return f"#{submission_dom_id(n)}-h"
     return "#run-title"

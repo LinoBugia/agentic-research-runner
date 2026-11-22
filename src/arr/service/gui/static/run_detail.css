@@ -59,6 +59,8 @@ a.qchip:hover { text-decoration: underline; }
 .stagebar .stage.sum { display: none; }
 .stagebar.collapsed .stage.sum { display: flex; border-radius: var(--radius) 0 0 var(--radius); }
 .stagebar.collapsed .stage.done:not(.sum) { display: none; }
+.stagebar.collapsed .stage.skipped { display: none; } /* W4b-07.1 B8: counted in „6 von 7“ */
+.stage.skipped .nm { opacity: .7; }
 .stagebar.collapsed .stage.sum + .stage { border-left: 0; }
 
 /* ---------- body: three columns ---------- */
