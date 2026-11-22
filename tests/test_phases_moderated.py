@@ -734,3 +734,36 @@ async def test_a24_the_fixture_runs_from_start_to_end(
     ids = [i["id"] for i in writer.context.get("inputs") or []]
     lead = [s.id for s in mgr.orchestrator.submissions(agent="coordinator")]
     assert ids == lead[-1:]
+
+
+# --------------------------------------------------------------------------------------------
+# A23: the service reads a finished run with `moderated` unchanged
+# --------------------------------------------------------------------------------------------
+
+
+async def test_a23_the_service_reads_a_finished_moderated_run(
+    workfolder: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from run_kit import write_profiles
+
+    from arr.service.real_api import RealApi
+
+    def a(view: TurnView) -> list[dict[str, Any]]:
+        if first(view):
+            return [give("b", "1"), give("c", "2", "list"), give("b", "3")]
+        steps = hand_in(view)
+        return [*steps, *steps]  # warning, then cancel of what is still open
+
+    mgr, log = manager(workfolder, group(phase()), {"a": a, "b": answer(), "c": answer()})
+    assert await run(mgr) is RunStatus.DONE, errors(mgr)
+    write_profiles(arr_home, {"fake-auth": "claude_oauth"})
+    monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
+    api = RealApi(workfolder, base_url="http://127.0.0.1:8765", scan=False)
+    run_id = mgr.prepared.run_id
+    assert run_id in [r.id for r in (await api.list_runs()).items]
+    detail = await api.get_run(run_id)
+    assert detail.run.id == run_id
+    results = await api.get_results(run_id)
+    assert results is not None
+    assert await api.get_log(run_id)
+    assert [x.id for x in await api.list_agents(run_id)] == ["a", "b", "c", "d"]
