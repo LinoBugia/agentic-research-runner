@@ -28,8 +28,16 @@ channel, until the user answers or `pacing.user_question_hold_s()` after the que
 An answer gives the asker exactly one turn with the context of its action (a wake-up of the
 channel; none above its limit). A stop or limit ends the wait at once.
 
+W4b-04: a sleeper with an assignment of the lead (`moderated`) leaves the sleepers for its
+duration (`take_out`: a running wake-up turn ends first, a due one lapses with the reason
+`assignment`) and is woken like an agent with an action; `put_back` returns it after the turns
+of its assignments, and a direct message it did not see in its last turn wakes it then, once.
+`hold` takes an optional `abort` (a cancelled assignment ends the holding at once). In its
+private channel a question of the user without `@name` is a question to its owner (NR2).
+
 Log entries: `wake_scheduled`, `wake`, `wake_skipped` (reasons `max_wakeups_per_agent`,
-`ping_pong`, `phase_end`, `turns_per_agent`), `ping_pong`, `wait_end` (reason `phase_end`) and
+`ping_pong`, `phase_end`, `turns_per_agent`, `assignment`), `ping_pong`, `wait_end` (reason
+`phase_end`) and
 `waiting` (`channel`, `reason: user`, `until`, `stage`; `reason: none` at the end); every entry
 of the waker has `stage` (the phase) and `attempt`.
 """

@@ -767,3 +767,27 @@ async def test_a23_the_service_reads_a_finished_moderated_run(
     assert results is not None
     assert await api.get_log(run_id)
     assert [x.id for x in await api.list_agents(run_id)] == ["a", "b", "c", "d"]
+
+
+async def test_a13_a_cancel_ends_the_wait_until_of_the_recipient(workfolder: Path) -> None:
+    """b ends its turn with `wait_until` (30 min); the lead's second `submit` cancels #1: b's
+    wait ends at once, it gets no further turn."""
+
+    async def helper(mgr: Any) -> None:
+        await eventually(
+            lambda: bool(of_kind(mgr, "waiting", agent="b", reason="wait_until")), within=30
+        )
+        user_post(mgr, private("a"), "Gib jetzt ab.")
+
+    def a(view: TurnView) -> list[dict[str, Any]]:
+        if first(view):
+            return [give("b", "1")]
+        return [*hand_in(view), *hand_in(view)]
+
+    b = lambda v: [room("wait_until", minutes=30)]  # noqa: E731
+    mgr, log = manager(workfolder, group(phase()), {"a": a, "b": b})
+    assert await run_with(mgr, helper) is RunStatus.DONE, errors(mgr)
+    assert len(log.of("b")) == 1
+    [end] = of_kind(mgr, "assign_end")
+    assert (end["status"], end["turns"]) == ("cancelled", 1)
+    assert mgr.orchestrator.long_wait("b") is None
