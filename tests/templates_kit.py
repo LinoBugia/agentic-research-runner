@@ -341,7 +341,12 @@ class _Sight:
         )
         if view is not None:
             here["eingaben"] |= set(tags(view))
-        here["kanaele"] |= {c for c in self.open if agent in self.members.get(c, set())}
+        # a channel counts if the agent shares it with another one (alone it carries nothing)
+        here["kanaele"] |= {
+            c
+            for c in self.open
+            if self.members.get(c, set()) - {agent} and agent in self.members[c]
+        }
         here["versiegelt"] = here["versiegelt"] or phase in self.sealed
 
     def skip(self, agent: str) -> None:
@@ -826,6 +831,7 @@ CASES: tuple[Case, ...] = (
     ),
     Case("exploration", "ideator", {}, {"items": 3}),
     Case("exploration", "zwei-ranker", {"n_rankers": 2}, {"items": 3}),
+    Case("exploration", "ein-explorer", {"n_explorers": 1, "n_ideas": 2}, {"items": 2}),
     Case("exploration", "mehr-ideen", {"n_ideas": 2, "turns_per_idea": 1}, {"items": 4}),
     Case("exploration", "vorgegeben", {"ideas": ["Modulo 4", "Gaußsche Zahlen"]}, {}),
     Case("exploration", "digest", {"exchange": "digest"}, {"items": 3}),
@@ -1154,7 +1160,7 @@ def _one_judge_discusses(flow: dict[str, Any], case: Case) -> None:
         if name == "pruefung":
             turns.append(["diskussion", visit, {"judge-1": 1}])
     flow["turns"] = turns
-    seen = {"eingaben": ["beweis", "einwaende", "gutachten"], "kanaele": ["judges"]}
+    seen = {"eingaben": ["beweis", "einwaende", "gutachten"], "kanaele": []}  # alone in #judges
     sight = []
     for name, visit, agents in flow["sight"]:
         sight.append([name, visit, agents])
