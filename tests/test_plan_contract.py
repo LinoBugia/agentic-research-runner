@@ -24,7 +24,7 @@ from arr.models import (
     WorkfolderSettings,
 )
 from arr.plan import graph as graphs
-from arr.plan.estimate import phase_turns
+from arr.plan.estimate import ASSIGNMENT_TURNS, phase_turns
 from arr.plan.read import ACTION_GATE, ACTION_WORK, Entry, enter, expectation, follow
 from arr.plan.schema import json_schema
 from arr.resolve import load_run_input, validate_model
@@ -642,7 +642,8 @@ def test_m39_m42_m44_m46_m41_parts_of_the_upper_bound() -> None:
     assert phase_turns(run, run.phase("rep"))[:2] == (2, 2 * 3)  # M39: repeat × (turns + 1)
     assert phase_turns(run, run.phase("schlaf"))[:2] == (1, 2 + 2 + 2)  # M42: wake-ups per channel
     assert phase_turns(run, run.phase("rede"))[:2] == (2, 2 * (1 + 2 + 2) + 2)  # M44: event
-    assert phase_turns(run, run.phase("lead"))[:2] == (1, 2 + 3 * 2)  # M46: assignments
+    # M46: assignments (W4b-04 §6.8: per assignment its turns and one return turn of the lead)
+    assert phase_turns(run, run.phase("lead"))[:2] == (1, 2 + 3 * (ASSIGNMENT_TURNS + 1))
     least, most, notes = phase_turns(run, run.phase("liste"))
     assert (least, most) == (1, 50 * 2) and "höchstens 50" in notes[0]  # M41
 
