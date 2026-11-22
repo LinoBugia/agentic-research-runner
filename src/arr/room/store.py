@@ -182,6 +182,8 @@ CREATE TABLE IF NOT EXISTS delegation(id INTEGER PRIMARY KEY, ts REAL, stage TEX
     status TEXT NOT NULL DEFAULT 'queued', named INTEGER NOT NULL DEFAULT 0,
     submission_id INTEGER, started REAL, ended REAL);
 CREATE UNIQUE INDEX IF NOT EXISTS delegation_number ON delegation(stage, attempt, number);
+CREATE TABLE IF NOT EXISTS delegation_closed(stage TEXT, attempt INTEGER, ts REAL,
+    PRIMARY KEY (stage, attempt));
 """
 """Tables of docs/02 §5 plus `channel.state`, `msg.via`/`msg.delivery`, `poll`, `floor` (both
 unused since W4b-03 removed the moderator tools; old rooms keep them readable),
@@ -196,7 +198,8 @@ submission of `submit`, head and fields as JSON in `data`; `path` where its fold
 them, which means „no submissions“. Since W4b-05b.1: `note_turn` (agents in the note turn of
 auto-compact, whose room tools refuse); rooms before lack it, which means „nobody“. Since W4b-04:
 `delegation` (the assignments a lead of a phase `moderated` gives with `assign`, one row each,
-`number` unique per stage and attempt); rooms before lack it, which means „no assignments“."""
+`number` unique per stage and attempt) and `delegation_closed` (passes whose moderation ended:
+`assign` refuses there, W4b-04.1); rooms before lack them, which means „no assignments“."""
 
 NOTE_TURN_REFUSED = (
     "In diesem Turn schreibst du nur die Übergabe-Notiz als Antworttext. Die Werkzeuge des "
@@ -475,6 +478,11 @@ _DELEGATION_TABLE = (
 _DELEGATION_INDEX = (
     "CREATE UNIQUE INDEX IF NOT EXISTS delegation_number ON delegation(stage, attempt, number)"
 )
+_CLOSED_TABLE = (
+    "CREATE TABLE IF NOT EXISTS delegation_closed(stage TEXT, attempt INTEGER, ts REAL, "
+    "PRIMARY KEY (stage, attempt))"
+)
+"""The table `delegation_closed` of `SCHEMA` alone (W4b-04.1)."""
 _OPEN_STATUSES = (DelegationStatus.QUEUED.value, DelegationStatus.RUNNING.value)
 LEAD_ACTION = "work"
 """`Expectation.action` of the action of an agent in a phase (`arr.plan.read.ACTION_WORK`)."""
@@ -1601,17 +1609,37 @@ class RoomStore:
         return ids
 
     def cancel_delegations(self, stage: str, attempt: int) -> list[Delegation]:
-        """Cancel every queued and running assignment of the pass (the phase ends, §6.6);
-        returns them as they are now. A queued one never begins, a running one gets no further
-        turn; a later submission for it is refused (`AgentRoom.submit`)."""
+        """The moderation of the pass ends (§6.6): mark the pass closed, so `assign` refuses
+        from now on (W4b-04.1), and cancel every queued and running assignment in the same
+        transaction; returns them as they are now. A queued one never begins, a running one
+        gets no further turn; a later submission for it is refused (`AgentRoom.submit`)."""
+        with self._write() as con:
+            con.execute(_DELEGATION_TABLE)  # a room created before W4b-04
+            con.execute(_CLOSED_TABLE)
+            con.execute(
+                "INSERT INTO delegation_closed(stage, attempt, ts) VALUES(?,?,?) "
+                "ON CONFLICT(stage, attempt) DO NOTHING",
+                (stage, attempt, _now()),
+            )
+            ids = self._cancel_open(con, stage, attempt)
+        if not ids:
+            return []
+        return [d for d in self.delegations(stage=stage, attempt=attempt) if d.id in set(ids)]
+
+    def delegations_closed(self, stage: str, attempt: int) -> bool:
+        """True once the moderation of the pass ended (`cancel_delegations`); a room without
+        the table (before W4b-04.1) has no closed pass."""
         try:
-            with self._write() as con:
-                ids = self._cancel_open(con, stage, attempt)
+            with self._read() as con:
+                row = con.execute(
+                    "SELECT 1 FROM delegation_closed WHERE stage=? AND attempt=?",
+                    (stage, attempt),
+                ).fetchone()
         except sqlite3.OperationalError as exc:
             if _no_table(exc):
-                return []
+                return False
             raise
-        return [d for d in self.delegations(stage=stage, attempt=attempt) if d.id in set(ids)]
+        return row is not None
 
     # ----------------------------------------------------------------------------------------
     # Submissions (docs/10 §4.3, §4.12; W4b-01)
@@ -3140,38 +3168,71 @@ class AgentRoom:
         return phase, attempt
 
     def _shown_in(self, con: sqlite3.Connection, agent: str) -> str:
-        """`shown_name` inside an open transaction."""
+        """How I see `agent` in an open transaction, by the rule of `inputs.shown` (W4b-04.1,
+        M1; W4b-02b.1 N-M1): its alias in an anonymous channel of mine; else the alias it has
+        for itself (its first anonymous channel), also when I am not in that channel; else its
+        ID. An agent with an alias is never shown by its ID."""
         for ch in self._my_channels(con):
             if ch.anonymous and agent in ch.members:
                 return ch.display(agent)
+        if agent != self.agent_id:
+            names = [
+                r[0]
+                for r in con.execute(
+                    "SELECT m.channel FROM member m JOIN channel c ON c.name=m.channel "
+                    "WHERE m.agent=? ORDER BY c.created, c.name",
+                    (agent,),
+                )
+            ]
+            for name in names:
+                ch = self.store._load_channel(con, name)
+                if ch is not None and ch.anonymous and ch.members.get(agent):
+                    return ch.display(agent)
         return agent
 
+    def seen_as(self, agent: str) -> str:
+        """How I see `agent` (`_shown_in`): the name of `assign`, its answers and errors."""
+        with self.store._read() as con:
+            return self._shown_in(con, agent)
+
     def _recipient(self, con: sqlite3.Connection, phase: ResolvedPhase, name: Any) -> str:
-        """The real ID of the recipient named by the lead (as in `_check_result_from`: `@`
-        in front allowed, aliases of anonymous channels); only an agent on standby of the
-        phase. Errors name the agents on standby as the lead sees them, never a hidden ID."""
+        """The real ID of the recipient named by the lead, by one rule with the lead's package
+        (`_shown_in`, as `inputs.shown`; W4b-04.1 M1): `@` in front allowed; an agent shown by
+        an alias is named by it (or its last word, „A“ for „Mitglied A“), never by its ID;
+        only an agent on standby of the phase. Errors name the agents on standby as the lead
+        sees them, never an ID behind an alias."""
         standby = [a for a in phase.standby if a not in phase.agents and a != self.agent_id]
-        names = ", ".join(self._shown_in(con, a) for a in standby) or "niemanden"
+        seen = {a: self._shown_in(con, a) for a in standby}
+        names = ", ".join(seen.values()) or "niemanden"
         wanted = " ".join(clean_text(name).split()).removeprefix("@").strip()
         shown = wanted if len(wanted) <= 100 else wanted[:99] + "…"
         if not wanted:
             raise RoomError(f"„agent“ nennt keinen Agenten. Aufträge gehen an: {names}.")
-        hidden = {a for ch in self._my_channels(con) if ch.anonymous for a in ch.members}
-        agent = next(
-            (a for ch in self._readable(con) if (a := ch.resolve(wanted)) is not None), None
-        )
-        if agent is None and wanted in self.store.agent_ids() and wanted not in hidden:
-            agent = wanted
-        if agent == self.agent_id:
+        key = wanted.casefold()
+        me = self._shown_in(con, self.agent_id)
+        if key in (self.agent_id.casefold(), me.casefold()):
             raise RoomError(
                 f"Dir selbst gibst du keinen Auftrag: Deine Action erledigst du selbst. "
                 f"Aufträge gehen an: {names}."
             )
-        if agent is None or agent not in standby:
+        found = []
+        for agent, label in seen.items():
+            if label == agent:
+                ok = key == agent.casefold()
+            else:
+                ok = key in (label.casefold(), label.split()[-1].casefold())
+            if ok:
+                found.append(agent)
+        if len(found) > 1:
+            raise RoomError(
+                f"„{shown}“ ist nicht eindeutig. Nenne den Agenten mit seinem vollen Namen: "
+                f"{names}."
+            )
+        if not found:
             raise RoomError(
                 f"„{shown}“ ist in dieser Phase kein Agent auf Abruf. Aufträge gehen an: {names}."
             )
-        return agent
+        return found[0]
 
     def _assign_format(self, value: Any) -> str:
         run = self.store._resolved()
@@ -3221,6 +3282,16 @@ class AgentRoom:
                     "(`get_assignment`) und gib ihn mit `submit` ab."
                 )
             phase, attempt = lead
+            con.execute(_CLOSED_TABLE)
+            closed = con.execute(
+                "SELECT 1 FROM delegation_closed WHERE stage=? AND attempt=?",
+                (phase.name, attempt),
+            ).fetchone()
+            if closed is not None:
+                raise RoomError(
+                    f"Die Phase „{phase.name}“ endet; in diesem Durchlauf laufen keine Aufträge "
+                    "mehr, und arr vergibt keine neuen. Gib mit `submit` ab."
+                )
             if self._lead_done(con, self.agent_id, phase.name, attempt):
                 raise RoomError(
                     "Du hast in diesem Durchlauf schon abgegeben; damit ist die Phase zu Ende. "

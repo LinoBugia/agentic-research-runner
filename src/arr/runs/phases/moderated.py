@@ -25,10 +25,18 @@
   return for the lead, and the recipient goes back to the sleepers (`Waker.put_back`) when its
   queue is empty.
 - **The end of the phase**: an accepted submission of the lead, or its turns and the follow-up
-  are used up and nothing runs, or the stop. Then every queued and running assignment is
-  cancelled (a running turn ends through `RunContext.end_turn`), the waking ends, the runner
-  waits for the end of the turns of the assignments, and `runner.after_actions` holds B3 for
-  the lead. The second `submit` of the lead (`AgentRoom.submit`) cancels in the room itself.
+  are used up and nothing runs, or the stop. Has the lead then an open question to the user,
+  the moderation does not close yet (W4b-04.1 H1, Entscheidung 82): it holds by the rule of B3,
+  the answer gives the lead a turn, and assignments from it run as usual. Then the pass is
+  closed in the room (`cancel_delegations`: `assign` refuses from now on) and every queued and
+  running assignment cancelled (a running turn ends through `RunContext.end_turn`), the
+  waking ends, the runner waits for the end of the turns of the assignments, and
+  `runner.after_actions` holds B3 for the lead. The second `submit` of the lead
+  (`AgentRoom.submit`) cancels in the room itself.
+- Names: the lead sees every recipient as `inputs.shown` shows it (an alias where there is
+  one), in its package, the return turns and every answer of `assign` (W4b-04.1 M1). The
+  packages keep their limit (`fit_package`; the list of the lead and the returned ones are cut
+  with a note, N3).
 
 Log entries (all with `stage` and `attempt`; the text of an assignment is never logged):
 `assign {number, lead, agent, format}` (seen in the table), `assign_start {number, agent}`,
@@ -39,6 +47,7 @@ a refused `submit`), and from the waker `wake_skipped {reason: assignment, messa
 
 import asyncio
 import contextlib
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -49,7 +58,13 @@ from arr.room.store import ASSIGN_FORMATS
 from arr.room.types import Delegation, DelegationStatus, Submission
 from arr.runs.phases.inputs import item, shown
 from arr.runs.phases.state import HOW_NORMAL, Pass, Slot
-from arr.runs.phases.text import MAX_INBOX_LINE, line
+from arr.runs.phases.text import (
+    MAX_INBOX_LINE,
+    MAX_PACKAGE_CHARS,
+    fit_package,
+    line,
+    package_size,
+)
 from arr.runs.phases.view import (
     ask_again_prompt,
     assignment_frame,
@@ -66,6 +81,10 @@ if TYPE_CHECKING:
 __all__ = ["END_REASON", "run_pass"]
 
 logger = logging.getLogger(__name__)
+
+MAX_RETURN_CHARS = 20_000
+"""The returned assignments of one return turn as JSON (W4b-04.1, N3): above it the summaries
+are cut to one inbox line, files are dropped, then the oldest entries; the turn says so."""
 
 END_REASON = "assignment_cancelled"
 """`wait_guard.end_turn` (log `end_turn`) when arr ends the turn of a cancelled assignment."""
@@ -265,6 +284,23 @@ class _Moderation:
             "standby": [shown(self.ctx, lead.agent, a) for a in self.recipients],
             "formats": self._formats(),
         }
+        return self._fit_lead(package)
+
+    @staticmethod
+    def _fit_lead(package: dict[str, Any]) -> dict[str, Any]:
+        """Keep the lead's package within `MAX_PACKAGE_CHARS` (W4b-04.1, N3): first the cuts
+        of `fit_package`, then the summaries of the oldest assignments, then the oldest
+        entries of the list (`assignments_cut`)."""
+        package = fit_package(package)
+        items = package["assignments"]
+        for entry in items:
+            if package_size(package) <= MAX_PACKAGE_CHARS:
+                return package
+            if entry.pop("summary", None) is not None:
+                package["assignments_cut"] = True
+        while package_size(package) > MAX_PACKAGE_CHARS and items:
+            items.pop(0)
+            package["assignments_cut"] = True
         return package
 
     def _returned(self, ids: list[int], rows: list[Delegation]) -> list[dict[str, Any]]:
@@ -288,6 +324,23 @@ class _Moderation:
             out.append(entry)
         return out
 
+    @staticmethod
+    def _fit_returned(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+        """The returned assignments within `MAX_RETURN_CHARS` (see there); True if cut."""
+
+        def size() -> int:  # as `view.return_prompt` writes the block
+            return len(json.dumps({"returned": items}, ensure_ascii=False, indent=1))
+
+        if size() <= MAX_RETURN_CHARS:
+            return items, False
+        for entry in items:
+            if isinstance(entry.get("summary"), str):
+                entry["summary"] = line(entry["summary"], MAX_INBOX_LINE)
+            entry.pop("files", None)
+        while size() > MAX_RETURN_CHARS and len(items) > 1:
+            items.pop(0)
+        return items, True
+
     async def _lead_turns(self) -> None:
         """The turns of the lead until its submission, its turns used up with nothing running,
         a turn with status `limit` or the stop (see the module docstring)."""
@@ -310,7 +363,8 @@ class _Moderation:
                 self.returned.clear()
                 running = [d.number for d in rows if d.status is DelegationStatus.RUNNING]
                 waiting = [d.number for d in rows if d.status is DelegationStatus.QUEUED]
-                prompt = return_prompt(context, self._returned(back, rows), running, waiting)
+                items, cut = self._fit_returned(self._returned(back, rows))
+                prompt = return_prompt(context, items, running, waiting, cut=cut)
             elif kind == "ask":
                 asked = True
                 prompt = ask_again_prompt(context, why, detail)
@@ -334,6 +388,8 @@ class _Moderation:
         ctx, lead, waker = self.ctx, self.lead, self.runner.waker
         while not ctx.stop_requested:
             self._raise()
+            if lead.found is not None:
+                return None  # handed in in an answer turn (B3)
             rows = self._sync()
             if self.returns:
                 return "return", None, ""
@@ -347,10 +403,30 @@ class _Moderation:
                     await asyncio.wait_for(self.returned.wait(), _poll_s())
                 continue
             if used >= turns and asked:
+                if await self._hold_for_answer():
+                    continue  # the answer turn gave assignments or a submission
                 return None
             why, detail = await self.runner.wait(lead.agent)  # its `wait_until`
             return ("continue" if used < turns else "ask"), why, detail
         return None
+
+    async def _hold_for_answer(self) -> bool:
+        """B3 inside the moderation (W4b-04.1 H1, Entscheidung 82, Variante a): the lead's
+        turns and its follow-up are used up, nothing runs, and it has an open question to the
+        user. The moderation does not close: `hold` keeps the phase by the rule of B3 (at most
+        `user_question_hold_s()` after the question, a stop ends it at once), and the answer
+        gives the lead one turn with its package as it is now. Assignments of that turn run
+        as usual (return turns, Entscheidung 79, `max_assignments`): the holding ends as soon
+        as one is open or back. True if the answer turn left something to do (an assignment
+        or a submission), False if the phase ends."""
+        lead = self.lead
+        lead.context = self._lead_package(self._rows())
+
+        def busy() -> bool:
+            return bool(self.returns) or any(d.open for d in self._rows())
+
+        await hold(self.runner, self.phase, self.pass_, [lead], abort=busy)
+        return lead.found is not None or busy()
 
     def _end_lead_wait(self) -> None:
         """While assignments run the lead waits for their returns, not for its `wait_until`."""
@@ -425,7 +501,7 @@ class _Moderation:
             "from": shown(self.ctx, d.agent, d.lead),
             "text": d.task,
         }
-        return package
+        return fit_package(package)  # the text of the lead counts within the limit (N3)
 
     def _end(self, d: Delegation, slot: Slot, found: Submission | None) -> None:
         """`returned`/`missing` and a return for the lead; on a stop or a cancel the pass

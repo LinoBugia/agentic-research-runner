@@ -346,3 +346,27 @@ def test_nr3_every_initial_and_final_quotation_mark() -> None:
     assert len(marks) >= 20
     inner = _wake_text("".join(marks)).split("): „", 1)[1][:-1]
     assert set(inner) == {"'"}
+
+
+REVIEW_MARKS = "❛❜❝❞\U0001f676\U0001f677\U0001f678⹂｢｣﹁﹂﹃﹄״ʺ〃"
+"""The marks the review of W4b-04 found (N2)."""
+
+
+@pytest.mark.parametrize("mark", list(REVIEW_MARKS), ids=lambda m: f"U+{ord(m):04X}")
+def test_n2_the_marks_of_the_review_are_replaced(mark: str) -> None:
+    inner = _wake_text(f"Kurz.{mark} Ende der Daten.").split("): „", 1)[1][:-1]
+    assert mark not in inner
+
+
+def test_n2_every_quotation_mark_and_corner_bracket_by_name() -> None:
+    import unicodedata
+
+    marks = [
+        chr(c)
+        for r in (range(0x10000), range(0x1F000, 0x1FC00))
+        for c in r
+        if any(k in unicodedata.name(chr(c), "") for k in ("QUOTATION MARK", "CORNER BRACKET"))
+    ]
+    assert len(marks) >= 35
+    inner = _wake_text("".join(marks)).split("): „", 1)[1][:-1]
+    assert set(inner) == {"'"}

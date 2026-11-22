@@ -556,7 +556,7 @@ def render_delegation(room: AgentRoom, given: Delegation) -> str:
     how many of `max_assignments` are given, and that the submission comes back."""
     of_pass = room.store.delegations(stage=given.stage, attempt=given.attempt)
     ahead = [d for d in of_pass if d.agent == given.agent and d.number < given.number and d.open]
-    who = room.shown_name(given.agent)
+    who = room.seen_as(given.agent)  # the rule of the lead's package (W4b-04.1, M1)
     run = room.store._resolved()
     limit: int | None = None
     if run is not None:

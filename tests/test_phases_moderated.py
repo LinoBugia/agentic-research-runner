@@ -265,6 +265,9 @@ async def test_a11_a_message_while_waiting_gives_a_counted_turn(
         await eventually(lambda: len(of_kind(mgr, "turn_end", agent="a")) == 2, within=30)
         m = user_post(mgr, private("a"), "Und jetzt?")
         await eventually(lambda: mgr.orchestrator._last_seen >= m, within=30)
+        # W4b-04.1 N7: open the gate only when the runner took the note (`take_message`), so
+        # the branch „no turn left: wait on for the returns“ really runs
+        await eventually(lambda: not waker_of(mgr).messages.get("a"), within=30)
         hooks.open("b")
 
     def a(view: TurnView) -> list[dict[str, Any]]:
@@ -723,24 +726,21 @@ async def test_a24_the_fixture_runs_from_start_to_end(
     assert await run_with(mgr, helper) is RunStatus.DONE, errors(mgr)
     assert entered(mgr) == ["zerlegung", "zusammenfassung"]
     flow = [(t[0], t[1], t[3]) for t in log.turns]
+    helpers = [("helper-1", "zerlegung", "assign-1"), ("helper-2", "zerlegung", "assign-2")]
+    lead = ("coordinator", "zerlegung", "work")
+    writer_turn = ("writer", "zusammenfassung", "work")
+    # #1 and #2 begin at the same time: both orders of their first turns are allowed (N4)
+    orders = [[lead, *helpers], [lead, *reversed(helpers)]]
     if cancel:
-        assert (
-            flow
-            == [
-                ("coordinator", "zerlegung", "work"),
-                ("helper-1", "zerlegung", "assign-1"),
-                ("helper-2", "zerlegung", "assign-2"),
-                ("coordinator", "zerlegung", "work"),  # return #2: warning, then submit
-                ("writer", "zusammenfassung", "work"),
-            ]
-            or sorted(flow[1:3])
-            == sorted(
-                [("helper-1", "zerlegung", "assign-1"), ("helper-2", "zerlegung", "assign-2")]
-            )
-        )
+        # one return turn (for #2): warning, then the accepted submission; #1 is cancelled
+        assert flow in [[*o, lead, writer_turn] for o in orders], flow
         assert of_kind(mgr, "submit_held")[0]["named"] == [1]
         assert [d.status.value for d in delegations(mgr)] == ["cancelled", "returned"]
+        assert turn_kinds(log, "coordinator") == ["first", "return"]
     else:
+        # one return turn for both or one each, then the writer
+        allowed = [[*o, *[lead] * n, writer_turn] for o in orders for n in (1, 2)]
+        assert flow in allowed, flow
         assert [d.status.value for d in delegations(mgr)] == ["returned", "returned"]
         assert turn_kinds(log, "coordinator")[0] == "first"
         assert set(turn_kinds(log, "coordinator")[1:]) == {"return"}

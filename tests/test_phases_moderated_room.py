@@ -329,7 +329,8 @@ def test_a7_above_the_limit_is_an_error_and_a_new_pass_counts_anew(tmp_path: Pat
     lead = store.for_agent("lead")
     lead.assign("sx", "1", "text")
     lead.assign("sy", "2", "text")
-    store.cancel_delegations("m", 1)  # cancelled ones count as well
+    with sqlite3.connect(store.db_path) as con:  # cancelled ones count as well
+        con.execute("UPDATE delegation SET status='cancelled'")
     refused(store, "lead", "sx", "3", "text", match="2 von höchstens 2")
     turn(store, "lead", attempt=2, number=2)
     assert [lead.assign("sx", str(i), "text").number for i in range(2)] == [1, 2]

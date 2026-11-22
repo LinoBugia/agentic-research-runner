@@ -23,7 +23,8 @@ W4b-04 (`moderated`):
 - the lead's package: `assignments` (every assignment of the pass: `number`, `agent` as the
   lead sees it, `format`, `status`, `summary` and `path` of a returned one) and `assign_rules`
   (`max_assignments`, `given`, `standby` as the lead sees them, `formats`); both in the JSON
-  block, the summaries are text of agents,
+  block, the summaries are text of agents; `assignments_cut` when the list had to be cut to
+  keep the package within its limit (W4b-04.1),
 - a recipient's package: `task` is arr's frame (`assignment_frame`), `assigned` (`number`,
   `from`: the lead as the recipient sees it, `text`: the lead's text). The text is shown in
   a section of its own, inside a fence longer than any run of backticks in it, never in the
@@ -214,7 +215,7 @@ def render_assignment(context: Mapping[str, Any]) -> str:
             "`@user`; nur der User liest ihn.",
             "",
         ]
-    cuts = ("inputs_cut", "peers_cut", "objections_cut", "feedback_cut")
+    cuts = ("inputs_cut", "peers_cut", "objections_cut", "feedback_cut", "assignments_cut")
     data = {key: context[key] for key in (*DATA_KEYS, *cuts) if context.get(key)}
     if data:
         text = json.dumps(data, ensure_ascii=False, indent=1)
@@ -284,6 +285,8 @@ def return_prompt(
     returned: list[dict[str, Any]],
     running: list[int],
     waiting: list[int],
+    *,
+    cut: bool = False,
 ) -> str:
     """The turn of the lead after assignments came back (W4b-04 §6.5): arr's sentence with
     phase and pass, which numbers are back and which still run or wait; the returned ones as
@@ -308,6 +311,14 @@ def return_prompt(
         "Vergib weitere Aufträge mit `assign` oder gib mit `submit` ab; `get_assignment` zeigt "
         "dir den Stand aller Aufträge."
     )
-    text = json.dumps({"returned": returned}, ensure_ascii=False, indent=1)
+    if cut:
+        rest.append(
+            "Die Liste ist gekürzt (Kurzfassungen auf eine Zeile, die ältesten Einträge "
+            "weggelassen); den Stand aller Aufträge zeigt `get_assignment`."
+        )
+    data: dict[str, Any] = {"returned": returned}
+    if cut:
+        data["returned_cut"] = True
+    text = json.dumps(data, ensure_ascii=False, indent=1)
     fence = _fence(text)
     return " ".join([head, *rest]) + f"\n\n{fence}json\n{text}\n{fence}\n"
