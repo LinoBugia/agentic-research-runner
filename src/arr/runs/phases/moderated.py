@@ -161,29 +161,29 @@ class _Moderation:
         the turn of a cancelled running one, start a worker for every recipient with a queued
         one (not while the pass closes)."""
         rows = self._rows()
-        named: list[int] = []
         for d in rows:
             if d.id not in self.seen:
                 self.seen.add(d.id)
                 self._log("assign", number=d.number, lead=d.lead, agent=d.agent, format=d.format)
-            if d.named and d.id not in self.named:
-                self.named.add(d.id)
-                named.append(d.number)
-            if d.status is DelegationStatus.CANCELLED:
-                if self.current.get(d.agent) == d.id:
-                    self.ctx.end_turn(d.agent, END_REASON)
-                elif d.started is None and d.id not in self.logged_end:
-                    self.logged_end.add(d.id)
-                    self._log(
-                        "assign_end",
-                        number=d.number,
-                        agent=d.agent,
-                        status=d.status.value,
-                        submission=None,
-                        turns=0,
-                    )
+        named = [d.number for d in rows if d.named and d.id not in self.named]
         if named:
+            self.named.update(d.id for d in rows if d.named)
             self._log("submit_held", agent=self.lead.agent, named=named)
+        for d in rows:
+            if d.status is not DelegationStatus.CANCELLED:
+                continue
+            if self.current.get(d.agent) == d.id:
+                self.ctx.end_turn(d.agent, END_REASON)
+            elif d.started is None and d.id not in self.logged_end:
+                self.logged_end.add(d.id)
+                self._log(
+                    "assign_end",
+                    number=d.number,
+                    agent=d.agent,
+                    status=d.status.value,
+                    submission=None,
+                    turns=0,
+                )
         if not self.closing and not self.ctx.stop_requested:
             queued = [d.agent for d in rows if d.status is DelegationStatus.QUEUED]
             for agent in dict.fromkeys(queued):

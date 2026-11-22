@@ -393,38 +393,46 @@ async def test_k2_in_an_isolated_phase_b3_holds_before_the_release(
 
 
 async def test_w12_b3_does_not_hold_for_a_question_of_an_earlier_pass(
-    workfolder: Path, hold: dict[str, float]
+    workfolder: Path, hooks: Hooks, hold: dict[str, float]
 ) -> None:
-    """Pass 1: `a` asks, the deadline passes. Pass 2 (`retry`): `a` neither asks nor hands in
-    (a submission would close the old question, L18); the old, still open question does not
-    hold pass 2 (mutation W12)."""
+    """`a` asks the user in a pass before (phase `vorher`, as a sleeper woken there, so nothing
+    holds that pass) and neither hands in nor gets an answer; in the pass of `p` it has the
+    action and does not hand in. The old, still open question does not hold `p` (mutation
+    W12). W4b-04 (NR5): the deadline stays at 600 s from the start, and the pass of `vorher`
+    is held by a gate until the question is there; a wrong hold of `p` stops the run."""
 
-    def a(view: TurnView) -> list[dict[str, Any]]:
-        if view.attempt == 2:
-            return []
-        return asks(view)
-
-    async def user(mgr: Any) -> None:
-        await eventually(lambda: waits_for_user(mgr, 1), within=30)
-        hold["s"] = 0.0  # the deadline of pass 1 passes
-        await eventually(
-            lambda: bool(of_kind(mgr, "checkpoint", phase="pass_start", attempt=2)), 30
-        )
-        hold["s"] = 600.0  # an old question would hold pass 2 now
+    async def helper(mgr: Any) -> None:
+        await eventually(lambda: bool(of_kind(mgr, "user_question", agent="a")), within=30)
+        hooks.open("b")
         await eventually(
             lambda: (
-                waits_for_user(mgr, 2) or bool(of_kind(mgr, "checkpoint", phase="gate", attempt=2))
+                waits_for_user(mgr) or bool(of_kind(mgr, "checkpoint", phase="gate", stage="p"))
             ),
             30,
         )
-        hold["s"] = 0.0  # let a wrong hold end, the assertion tells
+        if waits_for_user(mgr):
+            mgr.stop()  # a wrong hold: end it, the assertion tells
 
-    phase = {**solo("p", "a", turns=1), "max_visits": 2, "on_exhausted": "next"}
-    phase["gate"] = {"type": "done", "routes": {"done": "retry"}}
-    mgr, log = manager(workfolder, {**AGENTS, "phases": [phase]}, {"a": a})
-    assert await run_with(mgr, user) is RunStatus.DONE, errors(mgr)
-    assert not waits_for_user(mgr, 2)
-    assert [d["state"] for d in of_kind(mgr, "user_question")] == ["open", "closed"]
+    def a(view: TurnView) -> list[dict[str, Any]]:
+        if view.context.get("standby"):
+            return [say(private("a"), ASK, kind="question")]
+        return []  # its action in `p`: no submission (that would close the question, L18)
+
+    def b(view: TurnView) -> list[dict[str, Any]]:
+        return [say("k", "@a Wie fängst du an?", kind="question"), gate(), *hand_in(view)]
+
+    vorher = {**solo("vorher", "b"), "standby": ["a"], "channels": ["k"]}
+    group = {**AGENTS, "channels": [k("a", "b")], "phases": [vorher, solo("p", "a", turns=1)]}
+    mgr, log = manager(workfolder, group, {"a": a, "b": b})
+    assert await run_with(mgr, helper) is RunStatus.DONE, errors(mgr)
+    assert not waits_for_user(mgr)
+    order = [
+        d.get("state") or d.get("phase")
+        for k_, d in entries(mgr, "user_question", "checkpoint")
+        if k_ == "user_question" or d.get("phase") == "gate"
+    ]
+    assert order == ["open", "gate", "gate", "closed"]  # still open in `p`, closed at the end
+    assert [v.stage for v in log.of("a")] == ["vorher", "p", "p"]
 
 
 async def test_w13_no_answer_turn_above_the_wake_up_limit(
@@ -602,12 +610,15 @@ async def test_p6_a_question_of_a_sleeper_does_not_hold_the_discussion(
     for it (mutation P6: the discussion holds for it)."""
 
     async def helper(mgr: Any) -> None:
+        # W4b-04 (NR5): the deadline stays at 600 s from the start; the discussion is held by
+        # the gate of `d2` until the sleeper asked, and a wrong hold stops the run
         await eventually(lambda: bool(of_kind(mgr, "user_question", agent="s")), within=30)
         hooks.open("d2")
         await eventually(
             lambda: waits_for_user_in("k", mgr) or bool(of_kind(mgr, "discussion_end")), 30
         )
-        hold["s"] = 0.0  # let a wrong hold end, the assertion tells
+        if waits_for_user_in("k", mgr):
+            mgr.stop()
 
     def d1(view: TurnView) -> list[dict[str, Any]]:
         return [say("k", "@s Welcher Ansatz?", kind="question"), *hand_in(view)]
@@ -624,6 +635,7 @@ async def test_p6_a_question_of_a_sleeper_does_not_hold_the_discussion(
     }
     s = lambda v: [say("k", ASK, kind="question")]  # noqa: E731
     mgr, log = manager(workfolder, group, {"d1": d1, "d2": d2, "s": s})
+    assert hold["s"] == 600.0
     assert await run_with(mgr, helper) is RunStatus.DONE, errors(mgr)
     assert not waits_for_user_in("k", mgr)
 
@@ -678,6 +690,36 @@ async def test_n2_a_note_of_the_user_ends_wait_until(workfolder: Path) -> None:
     mgr, log = manager(workfolder, {**AGENTS, "phases": [solo("p", "a")]}, {"a": a})
     assert await run_with(mgr, helper) is RunStatus.DONE, errors(mgr)
     assert "Eine Nachricht an dich ist da" in log.of("a")[1].prompt
+
+
+@pytest.mark.parametrize("where", ["private", "group"])
+async def test_nr2_a_question_of_the_user_without_name_wakes_the_owner_once(
+    workfolder: Path, hooks: Hooks, where: str
+) -> None:
+    """W4b-04 (NR2): a question of the user without `@s` in the private channel of `s` is a
+    question to its owner and wakes it exactly once (reason `question`); the same question in
+    a group channel is a question to all and wakes nobody (counter-check)."""
+
+    async def helper(mgr: Any) -> None:
+        await eventually(lambda: waker_of(mgr) is not None, within=30)
+        channel = private("s") if where == "private" else "k"
+        m = user_post(mgr, channel, "Welcher Ansatz trägt?", kind=MessageKind.QUESTION)
+        await polled(mgr, m)
+        if where == "private":
+            await eventually(lambda: count(mgr, "turn_end", agent="s") == 1, within=30)
+        hooks.open("a")
+
+    policies = {"a": lambda v: [gate(), *hand_in(v)], "s": silent}
+    mgr, log = manager(
+        workfolder, {**AGENTS, "channels": [k("a", "s")], "phases": [beweis()]}, policies
+    )
+    assert await run_with(mgr, helper) is RunStatus.DONE, errors(mgr)
+    wakes = of_kind(mgr, "wake", agent="s")
+    if where == "private":
+        assert [(w["channel"], w["reasons"]) for w in wakes] == [(private("s"), ["question"])]
+        assert len(woken(log, "s")) == 1
+    else:
+        assert wakes == [] and count(mgr, "wake_scheduled", agent="s") == 0
 
 
 @pytest.mark.parametrize("with_sleeper", [False, True], ids=["discussants", "sleeper"])

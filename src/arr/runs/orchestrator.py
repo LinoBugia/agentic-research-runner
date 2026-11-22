@@ -2356,7 +2356,6 @@ class Orchestrator(RunContext):
             **extra,
         )
 
-
     # -- W4b-04: the assignments of a lead in a phase `moderated` (table `delegation`) ------
 
     def delegations(
@@ -2392,6 +2391,7 @@ class Orchestrator(RunContext):
         a running turn nothing happens."""
         if agent_id in self._active:
             self.room.set_wait_guard(agent_id, end_turn=reason)
+
 
 class _Slot:
     """A slot of an auth profile that one turn may hold (W4b-05b.2): `held` says whether it

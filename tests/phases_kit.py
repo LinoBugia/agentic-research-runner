@@ -600,8 +600,8 @@ def delegations(mgr: RunManager, **match: Any) -> list[Any]:
 
 
 def is_return(view: TurnView) -> bool:
-    """A return turn of the lead (W4b-04 §6.5)."""
-    return view.prompt.startswith("Rückgabe")
+    """A return turn of the lead (W4b-04 §6.5); the inbox may stand in front of the text."""
+    return "Rückgabe (Phase" in view.prompt
 
 
 def is_assignment(view: TurnView) -> bool:

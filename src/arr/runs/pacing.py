@@ -1090,7 +1090,7 @@ class _EventDiscussion:
         return self.outcome
 
 
-_QUOTE_LOOKALIKES = "„‚\"＂″‶〝〞〟ˮ「」『』"
+_QUOTE_LOOKALIKES = '„‚"＂″‶〝〞〟ˮ「」『』'
 """Quotation marks outside the categories `Pi`/`Pf`: low-9 marks, the ASCII and full-width
 double quote, double prime, the look-alikes of “ and the corner brackets (W4b-04, NR3)."""
 _QUOTES = str.maketrans(

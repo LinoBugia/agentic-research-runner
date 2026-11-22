@@ -134,6 +134,9 @@ class Waker:
         self.waking = True
         self.assigned: set[str] = set()
         """Sleepers taken out for an assignment of the lead (W4b-04, `take_out`)."""
+        self.held: dict[str, list[Message]] = {}
+        """Direct messages to an agent while it works on assignments: what it did not see in
+        its last turn wakes it when it is put back (`put_back`)."""
         self.due: dict[str, _Due] = {}
         self.woken: set[tuple[str, int]] = set()
         self.turns: dict[str, asyncio.Task[Any]] = {}
@@ -248,6 +251,8 @@ class Waker:
             self._schedule(agent, msg, reason)
         else:
             self.messages.setdefault(agent, []).append(msg)
+            if agent in self.assigned:  # kept apart: `clear` of a wait does not drop them
+                self.held.setdefault(agent, []).append(msg)
 
     def _schedule(self, agent: str, msg: Message, reason: str) -> None:
         if (agent, msg.id) in self.woken or self.orch.exhausted(agent):
@@ -332,7 +337,8 @@ class Waker:
         if agent not in self.sleepers:
             self.sleepers.append(agent)
         seen = self.orch.turn_mark(agent)
-        for msg in self.messages.pop(agent, []):
+        self.messages.pop(agent, None)
+        for msg in self.held.pop(agent, []):
             entry = self.channels.get(msg.channel)
             if entry is None or msg.id <= seen:
                 continue
