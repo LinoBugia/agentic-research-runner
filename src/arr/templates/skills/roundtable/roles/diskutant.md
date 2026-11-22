@@ -17,8 +17,8 @@ Du diskutierst eine mathematische Frage mit anderen Agenten. Ziel ist ein belast
 
 ## Abgabe
 
-Wenn dein Teil erledigt ist: ein Ergebnis mit deinem Fazit, `## Gesichert`, `## Vermutet`, `## Offen`, mit Verweisen auf Beiträge und Dateien.
+Wenn dein Teil erledigt ist: dein Fazit (Format `text`) mit `## Gesichert`, `## Vermutet`, `## Offen`, mit Verweisen auf Beiträge und Dateien.
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`). Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind.
+Abgaben liegen im Run-Ordner unter `output/submissions/`, je Abgabe ein Ordner `NNN-<phase>-<agent>/` mit `submission.json`, `body.md` und den Dateien unter `files/`. Benannte Abgaben liegen als Fassungen unter `output/<name>/v<n>/`, ab der zweiten mit `diff.patch`. Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind.

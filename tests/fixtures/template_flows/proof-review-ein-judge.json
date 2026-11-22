@@ -1,0 +1,97 @@
+{
+ "template": "proof-review",
+ "case": "ein-judge",
+ "params": {
+  "judges": 1
+ },
+ "turns": [
+  [
+   "fassung",
+   1,
+   {
+    "author": 1
+   }
+  ],
+  [
+   "pruefung",
+   1,
+   {
+    "judge-1": 1
+   }
+  ],
+  [
+   "revision",
+   1,
+   {
+    "author": 1
+   }
+  ],
+  [
+   "pruefung",
+   2,
+   {
+    "judge-1": 1
+   }
+  ]
+ ],
+ "submissions": {
+  "fassung/author": {
+   "format": "artifact",
+   "count": 1
+  },
+  "pruefung/judge-1": {
+   "format": "review",
+   "count": 2
+  },
+  "revision/author": {
+   "format": "artifact",
+   "count": 1
+  }
+ },
+ "items": {
+  "beweis": {
+   "versions": 2,
+   "last_by": "author"
+  }
+ },
+ "gates": [
+  [
+   "diskussion",
+   "minor"
+  ],
+  [
+   "diskussion",
+   "accept"
+  ]
+ ],
+ "stage_ends": [],
+ "ranking": [],
+ "end": {
+  "status": "done",
+  "how": "stopp"
+ },
+ "resets": {
+  "judge-1": 1
+ },
+ "fresh_folders": {},
+ "files": [
+  [
+   "fassung",
+   "author",
+   "artifact"
+  ],
+  [
+   "pruefung",
+   "judge-1",
+   "review"
+  ],
+  [
+   "revision",
+   "author",
+   "artifact"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}

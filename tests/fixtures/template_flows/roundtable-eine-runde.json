@@ -1,0 +1,51 @@
+{
+ "template": "roundtable",
+ "case": "eine-runde",
+ "params": {
+  "rounds": 1
+ },
+ "turns": [
+  [
+   "diskussion",
+   1,
+   {
+    "diskutant-1": 1,
+    "diskutant-2": 1,
+    "summarizer": 1
+   }
+  ],
+  [
+   "zusammenfassung",
+   1,
+   {
+    "summarizer": 1
+   }
+  ]
+ ],
+ "submissions": {
+  "zusammenfassung/summarizer": {
+   "format": "text",
+   "count": 1
+  }
+ },
+ "items": {},
+ "gates": [],
+ "stage_ends": [],
+ "ranking": [],
+ "end": {
+  "status": "done",
+  "how": "ende"
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "zusammenfassung",
+   "summarizer",
+   "text"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}

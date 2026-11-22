@@ -204,12 +204,29 @@ USER_WAITED_LONG = (
 """The answer to a `wait_until` while the agent's question to the user is open (V10): the
 wait stands, the turn ends as usual, and the advice is for the turn after it."""
 
+USER_MAY_NOT_ANSWER_PHASES = (
+    "Deine Frage an den User ist noch offen, und er antwortet vielleicht lange nicht. Brauchst "
+    "du die Antwort, warte einmal mit `wait_until` bis zu fünf Minuten; eine Antwort oder Notiz "
+    "des Users beendet das Warten. Antwortet er bis dahin nicht, arbeite mit einer begründeten "
+    "Annahme weiter und nenne sie in deiner Abgabe."
+)
+"""`USER_MAY_NOT_ANSWER` in a run with phases (W4b-06a, Entscheidung 69): there the agent may
+wait for the user once with `wait_until`, at most five minutes."""
 
-def render_wait(outcome: WaitOutcome, *, asked_user: bool = False) -> str:
+USER_WAITED_LONG_PHASES = (
+    "Beachte: Deine Frage an den User ist noch offen. Warte auf ihn höchstens fünf Minuten und "
+    "nur einmal: Antwortet er bis dahin nicht, arbeite mit einer begründeten Annahme weiter und "
+    "nenne sie in deiner Abgabe. Gibst du ab, gilt deine Frage als erledigt."
+)
+"""`USER_WAITED_LONG` in a run with phases (W4b-06a, Entscheidungen 67 and 69)."""
+
+
+def render_wait(outcome: WaitOutcome, *, asked_user: bool = False, phases: bool = False) -> str:
     """Result of `wait_for_messages`: why it ended, how long it waited, the new messages.
 
     `asked_user`: a question of the agent to the user is open; then „nobody answers“ advises
-    a reasoned assumption instead of `wait_until` (V10).
+    a reasoned assumption instead of `wait_until` (V10); in a run with `phases` one wait with
+    `wait_until` of at most five minutes first (Entscheidung 69).
     """
     waited = f"nach {outcome.waited_s:.0f} s"
     if outcome.ended_by is WaitEnd.MESSAGE:
@@ -221,8 +238,8 @@ def render_wait(outcome: WaitOutcome, *, asked_user: bool = False) -> str:
         return (
             f"Warten beendet {waited}: Niemand antwortet, du hast in diesem Turn "
             f"{STREAK_MAX_S / 60:.0f} min ohne neue Nachricht an dich gewartet. "
-            f"{USER_MAY_NOT_ANSWER} Rufst du `wait_for_messages` noch einmal auf, beendet arr "
-            "deinen Turn."
+            f"{USER_MAY_NOT_ANSWER_PHASES if phases else USER_MAY_NOT_ANSWER} Rufst du "
+            "`wait_for_messages` noch einmal auf, beendet arr deinen Turn."
         )
     if outcome.ended_by is WaitEnd.NOBODY:
         return (
@@ -251,10 +268,16 @@ def render_wait(outcome: WaitOutcome, *, asked_user: bool = False) -> str:
 
 
 def render_wait_until(
-    until: float, file: str | None, result_from: str | None = None, *, asked_user: bool = False
+    until: float,
+    file: str | None,
+    result_from: str | None = None,
+    *,
+    asked_user: bool = False,
+    phases: bool = False,
 ) -> str:
     """Answer of `wait_until`: end the turn now, arr wakes the agent. With a question of the
-    agent to the user open, the wait is accepted, but the answer advises against it (V10)."""
+    agent to the user open, the wait is accepted, but the answer advises against a long one
+    (V10); in a run with `phases` it allows one of at most five minutes (Entscheidung 69)."""
     minutes = max(1, round((until - time.time()) / 60))
     reasons = ["eine Nachricht an dich kommt"]
     if file:
@@ -266,7 +289,7 @@ def render_wait_until(
         f"sobald {' oder '.join(reasons)}, spätestens um {_clock(until)} (in {minutes} min)."
     )
     if asked_user:
-        text += f" {USER_WAITED_LONG}"
+        text += f" {USER_WAITED_LONG_PHASES if phases else USER_WAITED_LONG}"
     return text
 
 

@@ -1,0 +1,32 @@
+{
+ "template": "solo",
+ "case": "ohne-abgabe",
+ "params": {
+  "max_turns": 3
+ },
+ "turns": [
+  [
+   "arbeit",
+   1,
+   {
+    "worker": 3
+   }
+  ]
+ ],
+ "submissions": {},
+ "items": {},
+ "gates": [],
+ "stage_ends": [],
+ "ranking": [],
+ "end": {
+  "status": "done",
+  "how": "ende"
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "summary.md"
+  ]
+ ]
+}

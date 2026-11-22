@@ -1,0 +1,103 @@
+{
+ "template": "exploration",
+ "case": "mehr-ideen",
+ "params": {
+  "n_ideas": 2,
+  "turns_per_idea": 1
+ },
+ "turns": [
+  [
+   "ideen",
+   1,
+   {
+    "ideator": 1
+   }
+  ],
+  [
+   "exploration",
+   1,
+   {
+    "explorer-1": 1,
+    "explorer-2": 1,
+    "ranker-1": 1
+   }
+  ],
+  [
+   "zusammenfassung",
+   1,
+   {
+    "summarizer": 1
+   }
+  ]
+ ],
+ "submissions": {
+  "exploration/explorer-1": {
+   "format": "text",
+   "count": 1
+  },
+  "exploration/explorer-2": {
+   "format": "text",
+   "count": 1
+  },
+  "exploration/ranker-1": {
+   "format": "rating",
+   "count": 2
+  },
+  "ideen/ideator": {
+   "format": "list",
+   "count": 4
+  },
+  "zusammenfassung/summarizer": {
+   "format": "text",
+   "count": 1
+  }
+ },
+ "items": {},
+ "gates": [
+  [
+   "exploration",
+   "ranked"
+  ]
+ ],
+ "stage_ends": [],
+ "ranking": [
+  1,
+  2
+ ],
+ "end": {
+  "status": "done",
+  "how": "ende"
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "exploration",
+   "explorer-1",
+   "text"
+  ],
+  [
+   "exploration",
+   "explorer-2",
+   "text"
+  ],
+  [
+   "exploration",
+   "ranker-1",
+   "rating"
+  ],
+  [
+   "ideen",
+   "ideator",
+   "list"
+  ],
+  [
+   "zusammenfassung",
+   "summarizer",
+   "text"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}

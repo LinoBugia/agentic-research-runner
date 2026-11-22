@@ -13,13 +13,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from run_kit import FAST, done, fake_builders, log_entries, post, room, write_profiles
-from test_topologies import stage, staged, submit
+from phases_kit import Log, PolicyBackend, TurnView, answer, hand_in
+from run_kit import FAST, log_entries, room, write_profiles
 
-from arr.models import RunInput, RunStatus, WorkfolderSettings
+from arr.models import RunInput, RunStatus, TopologyKind, WorkfolderSettings
+from arr.plan.check import check
+from arr.plan.legacy import TEMPLATES
 from arr.resolve import load_group_spec, resolve_run
+from arr.room.store import RoomStore
 from arr.runs.launch import build_manager, plan_launch
-from arr.runs.topologies import check_topology
 from arr.service.api_models import SkillKind
 from arr.service.mock_api import MockApi
 from arr.service.real_api import RealApi
@@ -90,6 +92,21 @@ RUN_FOLDER_SENTENCE = (
 )
 PROTOCOL_WORDS = ("wait_for_messages", "wait_until", "inbox(", "read_messages", "set_status")
 """The fixed protocol explains these; roles do not repeat it (docs/03 §5, docs/09 §4.7)."""
+OLD_SUBMIT = ("submit_result", "submit_rating", "Urteil:", "Für die nächste Runde")
+"""Gone with the phases (P1, Entscheidung 28): no role, task or SKILL.md names them."""
+PHASES = {
+    "proof-review": {"fassung", "pruefung", "pruefung-allein", "diskussion", "revision"},
+    "proof": {"strategie", "skizze", "beweis"},
+    "exploration": {
+        "ideen",
+        "exploration",
+        "exploration-digest",
+        "exploration-kanal",
+        "zusammenfassung",
+    },
+    "roundtable": {"diskussion", "zusammenfassung"},
+}
+"""The phases of each template (W4b-06a §6.1), named as in `arr.plan.legacy.TEMPLATES`."""
 
 
 @pytest.fixture
@@ -157,9 +174,7 @@ async def test_a1_every_start_skill_passes_the_check(wf: Path) -> None:
     for name in GROUP_SKILLS:
         skill = skills[name]
         assert skill.params and all(p.doc for p in skill.params), name  # every param has doc
-        assert skill.topology is not None and skill.topology.value == name.replace(
-            "proof-review", "review"
-        ).replace("proof", "waterfall")
+        assert skill.topology is not None and skill.topology.value == "phases"
 
 
 @pytest.mark.parametrize("name", GROUP_SKILLS)
@@ -172,7 +187,14 @@ def test_a1_check_topology_with_the_defaults_and_the_agreed_standards(name: str)
         spec,
         _check_settings(WorkfolderSettings()),
     )
-    check_topology(resolved)  # raises on any issue
+    assert resolved.topology.kind is TopologyKind.PHASES
+    assert check(resolved).errors == []
+    assert {p.name for p in spec.phases or []} == PHASES[name]
+    # the phases the message for old groups names (W4b-02a §5.7) are those of the template
+    [kind] = [k for k, (skill, _) in TEMPLATES.items() if skill == name]
+    named = TEMPLATES[kind][1]
+    if name != "proof":  # its message speaks of „je Stufe eine Phase“
+        assert all(p in named for p in PHASES[name] if "-" not in p), (name, named)
     assert spec.limits is not None
     assert spec.limits.wall_time and spec.limits.budget_usd and spec.limits.turns_per_agent
     providers = {a.provider.value for a in resolved.agents}
@@ -182,10 +204,10 @@ def test_a1_check_topology_with_the_defaults_and_the_agreed_standards(name: str)
         if agent.base_id == "summarizer":
             assert agent.model == "claude-haiku-5-5"
     if name == "proof-review":
-        assert resolved.params["judge_memory"] == "fresh"
+        assert resolved.params["judge_memory"] == "reset"
         assert resolved.params["verdict"] == "majority"
         [chat] = resolved.groupchats
-        assert chat.anonymous and chat.open_from == "diskussion"
+        assert chat.anonymous and chat.open_from is None  # the phase names its channels
         params = {p for p in spec.params}
         assert "meta_judge" not in str(spec.params["verdict"].choices), "comes with wave 5"
         assert params >= {"judges", "max_revisions", "discussion_rounds", "artifact"}
@@ -196,117 +218,90 @@ def test_a1_check_topology_with_the_defaults_and_the_agreed_standards(name: str)
 # --------------------------------------------------------------------------------------------
 
 
-def a_review(verdict: str) -> dict[str, Any]:
-    body = f"Urteil: {verdict}\n\n## Einwände\n\n## Für die nächste Runde\nnichts\n"
-    return submit("Gutachten", "review", body)
+def policy_builders(policies: dict[str, Any], log: Log) -> dict[Any, Any]:
+    """Replacement for `arr.runs.launch.BACKEND_BUILDERS`: a `PolicyBackend` per agent (W4b-06a
+    A7); every call is recorded under `"calls"` as `(provider, agent_id)`."""
+    from arr.models import Provider
 
+    calls: list[tuple[str, str]] = []
 
-def ratings(*result_ids: str, **criteria: float) -> list[dict[str, Any]]:
-    steps: list[dict[str, Any]] = [room("get_assignment", save_as="job")]
-    for result_id in result_ids:
-        steps.append(
-            room(
-                "submit_rating",
-                result_id=result_id,
-                score=8,
-                comment="belegt",
-                criteria=criteria,
+    def builder_for(provider: Provider) -> Any:
+        def build(prepared: Any, **kwargs: Any) -> PolicyBackend:
+            calls.append((provider.value, prepared.id))
+            view = RoomStore(prepared.run_dir).for_agent(prepared.id, prepared.work_dir)
+            return PolicyBackend(
+                prepared.file.config,
+                {"turns": []},
+                run_id=kwargs.get("run_id", prepared.run_dir.name),
+                room=view,
+                policy=policies[prepared.id],
+                log=log,
             )
-        )
-    return steps
+
+        return build
+
+    builders: dict[Any, Any] = {p: builder_for(p) for p in Provider}
+    builders["calls"] = calls
+    return builders
 
 
-DISCUSS = stage([post("runde", "Mein Beitrag."), done()], repeat_last=True)
+def discussing(view: TurnView) -> list[dict[str, Any]]:
+    """Posts in #runde, hands in in the last round."""
+    if view.turn < 2:
+        return [room("post_message", channel="runde", body=f"Beitrag von {view.agent}.")]
+    return hand_in(view)
+
 
 CASES: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
     "proof-review": (
         {"judges": 2, "max_revisions": 0, "discussion_rounds": 1},
-        {
-            "author": staged(artefakt=stage([submit("Beweis", "artifact", "Beweis v1")])),
-            "judge-1": staged(
-                pruefung=stage([a_review("accept")]),
-                diskussion=stage([post("judges", "Gelesen."), done()], repeat_last=True),
-            ),
-            "judge-2": staged(
-                pruefung=stage([a_review("accept")]),
-                diskussion=stage([post("judges", "Einverstanden."), done()], repeat_last=True),
-            ),
-        },
+        {"author": answer(), "judge-1": answer(), "judge-2": answer()},
     ),
     "proof": (
-        {"n_raters": 1, "max_rework": 0},
-        {
-            "strategist": staged(strategie=stage([submit("Strategie", "note", "Induktion")])),
-            "prover": staged(
-                skizze=stage([submit("Skizze", "note", "Schritte")]),
-                beweis=stage([submit("Beweis", "note", "Beweis")]),
-            ),
-            "rater-1": {
-                "turns": [
-                    {
-                        "steps": ratings(
-                            "${job.context.result_id}", korrektheit=8, strenge=8, klarheit=8
-                        )
-                    }
-                ],
-                "repeat_last": True,
-            },
-        },
+        {"n_raters": 1, "max_attempts": 1},
+        {"strategist": answer(), "prover": answer(), "rater-1": answer(score=8)},
     ),
     "exploration": (
         {"n_ideas": 1, "n_explorers": 1, "n_rankers": 1, "turns_per_idea": 1},
         {
-            "ideator": staged(ideen=stage([submit("Idee A", "idea", "Ansatz über Parität")])),
-            "explorer-1": staged(
-                exploration=stage(
-                    [submit("Stand", "exploration", "## Stand\nträgt")], repeat_last=True
-                )
-            ),
-            "ranker-1": staged(
-                bewertung=stage(
-                    ratings("${job.context.result_ids.0}", tragfaehigkeit=8, belege=7, aufwand=6)
-                )
-            ),
-            "summarizer": staged(
-                zusammenfassung=stage([submit("Zusammenfassung", "summary", "## Gesichert")])
-            ),
+            "ideator": answer(items=1),
+            "explorer-1": answer(),
+            "ranker-1": answer(score=8),
+            "summarizer": answer(),
         },
     ),
     "roundtable": (
-        {"rounds": 1, "n_diskutanten": 2},
-        {
-            "diskutant-1": staged(diskussion=DISCUSS),
-            "diskutant-2": staged(diskussion=DISCUSS),
-            "summarizer": staged(
-                diskussion=stage([done()], repeat_last=True),
-                zusammenfassung=stage([submit("Zusammenfassung", "summary", "## Gesichert")]),
-            ),
-        },
+        {"rounds": 2, "n_diskutanten": 2},
+        {"diskutant-1": discussing, "diskutant-2": discussing, "summarizer": answer()},
     ),
 }
 
 
 @pytest.mark.parametrize("name", GROUP_SKILLS)
 async def test_a2_fake_run_of_each_group_skill_ends_done(wf: Path, name: str) -> None:
-    params, scripts = CASES[name]
+    """W4b-06a A7: each start skill runs as phases through `plan_launch` and `build_manager`
+    (the way `arr run` starts it) until `done`, with both providers of its `mix`."""
+    params, policies = CASES[name]
     run_file = wf / f"{name}.yaml"
     run_file.write_text(
         f"version: 1\nproject: demo\nskill: {name}\ntask: Zeige, dass 1 + 1 = 2.\n", "utf-8"
     )
     launch = plan_launch(run_file, params=params, cwd=wf)
-    builders = fake_builders(scripts)
+    assert launch.resolved.topology.kind is TopologyKind.PHASES
+    log = Log()
+    builders = policy_builders(policies, log)
     manager = build_manager(launch, decider=None, builders=builders, pacing=FAST)
     assert await manager.run() is RunStatus.DONE
-    built = {(provider, agent) for provider, agent, _kwargs in builders["calls"]}
+    built = set(builders["calls"])
     assert built == {(a.provider.value, a.id) for a in launch.resolved.agents}
     if name in ("proof-review", "roundtable"):  # two replicas: Claude and ChatGPT
         assert {provider for provider, _agent in built} == {"claude", "codex"}
     checkpoints = [e["data"] for e in log_entries(manager.run_dir, "checkpoint")]
-    stages = {c["stage"] for c in checkpoints}
+    entered = [c["stage"] for c in checkpoints if c.get("phase") == "pass_start"]
+    gates = {c["stage"]: c["value"] for c in checkpoints if c.get("phase") == "gate"}
     if name == "proof-review":
-        [verdict] = [c for c in checkpoints if c["stage"] == "urteil"]
-        assert verdict["verdict"] == "accept"
-        assert "diskussion" in stages
+        assert entered == ["fassung", "pruefung", "diskussion"]
+        assert gates["diskussion"] == "accept"
     elif name == "proof":
         ends = [c for c in checkpoints if c.get("phase") == "stage_end"]
         assert [(c["stage"], c["outcome"]) for c in ends] == [
@@ -315,13 +310,13 @@ async def test_a2_fake_run_of_each_group_skill_ends_done(wf: Path, name: str) ->
             ("beweis", "passed"),
         ]
     elif name == "exploration":
-        [summary] = [c for c in checkpoints if c["stage"] == "zusammenfassung"]
-        assert summary["ranking"][0]["score"] == pytest.approx(8.0)
+        assert entered == ["ideen", "exploration", "zusammenfassung"]
+        assert gates["exploration"] == "ranked"
     else:
-        assert "diskussion" in stages
+        assert entered == ["diskussion", "zusammenfassung"]
     if name in ("exploration", "roundtable"):  # the summarizer wrote its summary
-        results = [p.name for p in (manager.run_dir / "output" / "results").iterdir()]
-        assert any("summarizer-summary" in r for r in results), results
+        store = RoomStore(manager.run_dir)
+        assert store.submissions(agent="summarizer", stage="zusammenfassung")
     # the roles say: with `copy` the run folder is three levels above the work folder
     for prepared in manager.prepared.agents.values():
         assert prepared.work_dir.parent.parent.parent == manager.run_dir, prepared.id
@@ -400,7 +395,10 @@ def test_a5_roles_name_the_result_path_and_the_standard(name: str) -> None:
     for path, text in files.items():
         if not path.startswith("roles/"):
             continue
-        assert "output/results/" in text, path
+        # W4b-06a: submissions lie in `output/submissions/` (`SUBMISSIONS_DIR`), named ones as
+        # versions in `output/<name>/v<n>/`, no longer in `output/results/`
+        assert "`output/submissions/`" in text and "`output/<name>/v<n>/`" in text, path
+        assert "output/results/" not in text and "output/artifacts/" not in text, path
         # the run folder for `copy`/`empty` (agents/<id>/work) and `shared` (shared/<name>),
         # see prepare.py; tasks name paths from `output/` or absolute ones (W4-05.2 N1)
         assert RUN_FOLDER_SENTENCE in " ".join(text.split()), path
@@ -415,11 +413,30 @@ def test_a5_roles_name_the_result_path_and_the_standard(name: str) -> None:
             for criterion in rubric.group(1).split(", "):
                 assert f"`{criterion}`" in text, (path, criterion)
     judge = files.get("roles/judge.md", "")
-    if judge:
-        assert "`Urteil: accept`" in judge and "`## Für die nächste Runde`" in judge
-        assert "`## Einwände`" in judge
+    if judge:  # the review as fields (P1); W4-06.1: „## Änderungen“ is no flaw
+        assert "`verdict`" in judge and "`objections`" in judge
+        for verdict in ("accept", "minor", "major", "reject"):
+            assert f"`{verdict}`" in judge
+        assert "`## Änderungen`" in judge and "nur echte Mängel" in judge
     honest = [t for p, t in files.items() if p.startswith("roles/")]
     assert all("ültig" in t for t in honest), "„nicht gelöst“ is a valid result"
+
+
+@pytest.mark.parametrize("name", GROUP_SKILLS)
+def test_w4b06a_a3_no_old_submission_and_no_protocol(name: str) -> None:
+    """Roles, tasks and `SKILL.md` name no old submission tool, no line `Urteil:`, no section
+    „Für die nächste Runde“ (P1, Entscheidung 28); roles and tasks no protocol word."""
+    files = template_texts(name)
+    for path, text in files.items():
+        if not path.endswith(".md"):
+            continue
+        assert not any(word in text for word in OLD_SUBMIT), path
+        if path.startswith(("roles/", "tasks/")):
+            assert not any(word in text for word in PROTOCOL_WORDS), path
+    tasks = {p for p in files if p.startswith("tasks/")}
+    group = files["group.yaml"]
+    named = set(re.findall(r"task: (tasks/[a-z-]+\.md)", group))
+    assert named == tasks, "every task file is used, every used one is there"
 
 
 # --------------------------------------------------------------------------------------------
@@ -656,36 +673,38 @@ def test_w4_05_1_sympy_check_assumptions_and_constants(tmp_path: Path) -> None:
 
 
 def most_turns(name: str, params: dict[str, Any], agents: list[str]) -> dict[str, int]:
-    """Turns per agent in the worst case, one ask-again per step, no wake-ups (rounds mode).
-
-    The formulas follow the topologies (review §4.5, waterfall §4.4, exploration §4.3,
-    roundtable §4.2) like `W4-05_Review_Skripte/pruefe_standards.py`.
+    """Turns per agent in the worst case of the phase templates (W4b-06a A4), computed here
+    from the phases, independent of `arr.plan.estimate`: every action has `turns: 1` and one
+    ask-again; a `chat` phase gives `rounds` turns and one ask-again; no wake-ups, no answers
+    of the user (B3), no note turns of Auto-Compact.
     """
     out: dict[str, int] = {}
+    action = 1 + 1  # `turns: 1` and the ask-again
     if name == "proof-review":
         rev, rounds = int(params["max_revisions"]), int(params["discussion_rounds"])
-        judges = [a for a in agents if a.startswith("judge")]
-        talk = rounds if len(judges) > 1 else 0
+        visits = 1 + rev  # pruefung (or pruefung-allein) and diskussion per round
+        talk = rounds + 1 if rounds else 0  # Entscheidung 47: also a single judge talks
         writes = 0 if params.get("artifact") else 1
-        out["author"] = 2 * writes + 2 * rev
-        out |= {j: (1 + rev) * (2 + talk) for j in judges}
+        out["author"] = action * writes + action * rev
+        out |= {a: visits * (action + talk) for a in agents if a.startswith("judge")}
     elif name == "proof":
-        rework = int(params["max_rework"])
-        per_stage = (1 + rework) * 2
-        out["strategist"] = per_stage
-        out["prover"] = 2 * per_stage
-        out |= {r: 3 * per_stage for r in agents if r.startswith("rater")}
+        attempts = int(params["max_attempts"])
+        out["strategist"] = attempts * action
+        out["prover"] = 2 * attempts * action
+        out |= {a: 3 * attempts * action for a in agents if a.startswith("rater")}
     elif name == "exploration":
-        n_ideas, per_idea = int(params["n_ideas"]), int(params["turns_per_idea"])
+        n_ideas, repeat = int(params["n_ideas"]), int(params["turns_per_idea"])
         explorers = [a for a in agents if a.startswith("explorer")]
         for k, explorer in enumerate(explorers):
-            out[explorer] = len(range(k, n_ideas, len(explorers))) * (per_idea + 1)
-        out |= {a: 2 for a in agents if a.startswith(("ideator", "ranker"))}
-        out["summarizer"] = 1
+            entries = len(range(k, n_ideas, len(explorers)))
+            out[explorer] = entries * repeat * action  # Entscheidung 58: ask-again per repeat
+        out["ideator"] = action
+        out |= {a: action for a in agents if a.startswith("ranker")}
+        out["summarizer"] = action
     elif name == "roundtable":
         rounds = int(params["rounds"])
-        out |= {a: rounds for a in agents if a.startswith("diskutant")}
-        out["summarizer"] = rounds + 1
+        out |= {a: rounds + 1 for a in agents if a.startswith("diskutant")}
+        out["summarizer"] = action
     return out
 
 
@@ -701,35 +720,56 @@ def corner_cases(spec: Any) -> list[dict[str, Any]]:
     ]
 
 
-@pytest.mark.parametrize("name", GROUP_SKILLS)
-def test_w4_05_1_turns_per_agent_suffice_at_all_parameter_limits(name: str) -> None:
+def worst_case_over(name: str, limit: int | None = None) -> dict[str, Any]:
+    """The corners where an agent needs more than `limit` (default: the template's own)."""
     path = resources.files("arr").joinpath("templates/skills", name, "group.yaml")
     spec = load_group_spec(Path(str(path)))
-    limit = spec.limits.turns_per_agent
+    limit = limit if limit is not None else spec.limits.turns_per_agent
     settings = _check_settings(WorkfolderSettings())
+    found: dict[str, Any] = {}
     for params in corner_cases(spec):
         resolved = resolve_run(RunInput(project="p", skill=name, task="x"), spec, settings, params)
-        check_topology(resolved)
+        assert check(resolved).errors == [], (name, params)
         worst = most_turns(name, resolved.params, [a.id for a in resolved.agents])
-        too_many = {a: t for a, t in worst.items() if t > limit}
-        assert not too_many, f"{name} {params}: {too_many} > turns_per_agent {limit}"
+        too_many = {a: n for a, n in worst.items() if n > limit}
+        if too_many:
+            found[str(params)] = too_many
+    return found
+
+
+@pytest.mark.parametrize("name", GROUP_SKILLS)
+def test_w4_05_1_turns_per_agent_suffice_at_all_parameter_limits(name: str) -> None:
+    found = worst_case_over(name)
+    assert not found, f"{name}: zu wenige turns_per_agent: {found}"
     text = template_texts(name)["SKILL.md"]
     assert 'overrides={"limits": {"turns_per_agent":' in text
-
-
-def test_w4_05_1_the_turn_check_finds_the_old_maxima() -> None:
-    """Counter-check: the maxima of W4-05 would have run out of turns (review: 15, 24, 15)."""
-    judges = ["author", "judge-1", "judge-2"]
-    assert (
-        most_turns("proof-review", {"max_revisions": 2, "discussion_rounds": 3}, judges)["judge-1"]
-        == 15
+    spec = load_group_spec(
+        Path(str(resources.files("arr").joinpath("templates/skills", name, "group.yaml")))
     )
+    assert f"{spec.limits.turns_per_agent} Turns je Agent" in text, "SKILL.md names the limit"
+
+
+@pytest.mark.parametrize(
+    ("name", "limit"), [("proof-review", 11), ("proof", 11), ("exploration", 15), ("roundtable", 6)]
+)
+def test_w4_05_1_the_turn_check_finds_too_tight_limits(name: str, limit: int) -> None:
+    """Counter-check: a limit below the worst case runs out at a corner (the old
+    limits of proof-review, 10, and exploration, 12, would too)."""
+    assert worst_case_over(name, limit)
+
+
+def test_w4_05_1_the_turn_check_counts_the_phases() -> None:
+    judges = ["author", "judge-1", "judge-2"]
+    worst = most_turns("proof-review", {"max_revisions": 2, "discussion_rounds": 1}, judges)
+    assert worst == {"author": 6, "judge-1": 12, "judge-2": 12}
+    worst = most_turns("proof-review", {"max_revisions": 2, "discussion_rounds": 0}, judges)
+    assert worst["judge-1"] == 6
     raters = ["strategist", "prover", "rater-1"]
-    assert most_turns("proof", {"max_rework": 3}, raters)["rater-1"] == 24
+    assert most_turns("proof", {"max_attempts": 2}, raters)["rater-1"] == 12
     explorers = ["ideator", "explorer-1", "summarizer"]
     assert (
-        most_turns("exploration", {"n_ideas": 3, "turns_per_idea": 5}, explorers)["explorer-1"]
-        == 18
+        most_turns("exploration", {"n_ideas": 4, "turns_per_idea": 2}, explorers)["explorer-1"]
+        == 16
     )
 
 
@@ -937,6 +977,10 @@ def test_w4b_01_1_sympy_check_bits_are_tight_and_count_small_bases(
         ("(0.3+0.4)^15000", True),
         ("pi^100", False),  # a single constant counts with its own size
         ("I^(10^9)", False),
+        # W4b-01.2 N5 (W4b-06a A15): they kill three surviving mutations of `_part_bits`
+        ("((3+4*I)^100/(4+3*I)^100)^200", True),
+        ("(3*I*5/7)^4000", True),
+        ("(pi/7)^6000", True),
     ],
 )
 def test_n2_bases_of_modulus_one_are_bounded_too(text: str, refused: bool) -> None:

@@ -1,0 +1,89 @@
+{
+ "template": "exploration",
+ "case": "vorgegeben",
+ "params": {
+  "ideas": [
+   "Modulo 4",
+   "Gaußsche Zahlen"
+  ]
+ },
+ "turns": [
+  [
+   "exploration",
+   1,
+   {
+    "explorer-1": 2,
+    "explorer-2": 2,
+    "ranker-1": 1
+   }
+  ],
+  [
+   "zusammenfassung",
+   1,
+   {
+    "summarizer": 1
+   }
+  ]
+ ],
+ "submissions": {
+  "exploration/explorer-1": {
+   "format": "text",
+   "count": 2
+  },
+  "exploration/explorer-2": {
+   "format": "text",
+   "count": 2
+  },
+  "exploration/ranker-1": {
+   "format": "rating",
+   "count": 2
+  },
+  "zusammenfassung/summarizer": {
+   "format": "text",
+   "count": 1
+  }
+ },
+ "items": {},
+ "gates": [
+  [
+   "exploration",
+   "ranked"
+  ]
+ ],
+ "stage_ends": [],
+ "ranking": [
+  1,
+  2
+ ],
+ "end": {
+  "status": "done",
+  "how": "ende"
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "exploration",
+   "explorer-1",
+   "text"
+  ],
+  [
+   "exploration",
+   "explorer-2",
+   "text"
+  ],
+  [
+   "exploration",
+   "ranker-1",
+   "rating"
+  ],
+  [
+   "zusammenfassung",
+   "summarizer",
+   "text"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}

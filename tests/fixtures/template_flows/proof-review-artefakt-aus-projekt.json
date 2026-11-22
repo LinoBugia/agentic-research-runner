@@ -1,0 +1,127 @@
+{
+ "template": "proof-review",
+ "case": "artefakt-aus-projekt",
+ "params": {
+  "artifact": "beweis.md"
+ },
+ "turns": [
+  [
+   "pruefung",
+   1,
+   {
+    "judge-1": 1,
+    "judge-2": 1
+   }
+  ],
+  [
+   "diskussion",
+   1,
+   {
+    "judge-1": 1,
+    "judge-2": 1
+   }
+  ],
+  [
+   "revision",
+   1,
+   {
+    "author": 1
+   }
+  ],
+  [
+   "pruefung",
+   2,
+   {
+    "judge-1": 1,
+    "judge-2": 1
+   }
+  ],
+  [
+   "diskussion",
+   2,
+   {
+    "judge-1": 1,
+    "judge-2": 1
+   }
+  ]
+ ],
+ "submissions": {
+  "diskussion/judge-1": {
+   "format": "review",
+   "count": 2
+  },
+  "diskussion/judge-2": {
+   "format": "review",
+   "count": 2
+  },
+  "pruefung/judge-1": {
+   "format": "review",
+   "count": 2
+  },
+  "pruefung/judge-2": {
+   "format": "review",
+   "count": 2
+  },
+  "revision/author": {
+   "format": "artifact",
+   "count": 1
+  }
+ },
+ "items": {
+  "beweis": {
+   "versions": 2,
+   "last_by": "author"
+  }
+ },
+ "gates": [
+  [
+   "diskussion",
+   "minor"
+  ],
+  [
+   "diskussion",
+   "accept"
+  ]
+ ],
+ "stage_ends": [],
+ "ranking": [],
+ "end": {
+  "status": "done",
+  "how": "stopp"
+ },
+ "resets": {
+  "judge-1": 1,
+  "judge-2": 1
+ },
+ "fresh_folders": {},
+ "files": [
+  [
+   "diskussion",
+   "judge-1",
+   "review"
+  ],
+  [
+   "diskussion",
+   "judge-2",
+   "review"
+  ],
+  [
+   "pruefung",
+   "judge-1",
+   "review"
+  ],
+  [
+   "pruefung",
+   "judge-2",
+   "review"
+  ],
+  [
+   "revision",
+   "author",
+   "artifact"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}

@@ -217,7 +217,25 @@ CONVERSATION_RULES = (
     "ansprechbar; jede Nachricht an dich weckt dich. Wartest du auf das Ergebnis eines anderen, "
     'warte mit `wait_until(minutes, until_result_from="<name>")`.',
 )
-"""Conversation rules of docs/06-gruppenchats.md §6 and docs/09 §4.7, in every channel brief."""
+"""Conversation rules of docs/06-gruppenchats.md §6 and docs/09 §4.7, in every channel brief of
+a run without phases (unchanged since W4b-03; W4b-06b drops them with the old topologies)."""
+
+PHASES_CONVERSATION_RULES = (
+    *CONVERSATION_RULES[:3],
+    "Wer jemanden fragt, schreibt `@name` (oder `to`); `@alle` fragt alle, `@user` den User "
+    "(nur er antwortet darauf). Auf einen Agenten wartest du mit `wait_for_messages`. Brauchst "
+    "du die Antwort des Users, warte mit `wait_until` bis zu fünf Minuten; eine Antwort oder "
+    "Notiz des Users beendet das Warten. Antwortet er nicht, arbeite mit einer begründeten "
+    "Annahme weiter und nenne sie in deiner Abgabe. Wer abgibt, ist fertig; seine offene Frage "
+    "gilt damit als erledigt.",
+    *CONVERSATION_RULES[4:7],
+    "Wer seinen Teil erledigt hat, gibt ab (`submit`). Fertig heißt: Du wartest nicht mehr, "
+    "bleibst aber ansprechbar; jede Nachricht an dich weckt dich. Wartest du auf die Abgabe "
+    'eines anderen, warte mit `wait_until(minutes, until_result_from="<name>")`.',
+)
+"""The rules in a run with phases (W4b-06a, Auflage W4b-03): rule 4 after Entscheidungen 67
+and 69 (waiting for the user with `wait_until`, at most five minutes; handing in closes the
+question), rule 8 names `submit` (G8: the room of a `phases` run offers no `submit_result`)."""
 
 _MODE_TEXT = {
     ChannelMode.ROUNDS: "Runden: Alle Mitglieder kommen pro Runde dran, sonst `pass`.",
@@ -294,6 +312,14 @@ def _alias(index: int) -> str:
     return f"Mitglied {label}"
 
 
+def channel_aliases(config: GroupChatConfig) -> dict[str, str | None]:
+    """Agent ID → its alias in the channel `config` („Mitglied A“ …), None for every member of
+    a channel that is not anonymous. The same order and names as `RoomStore.create_channel`
+    stores them (W4b-06a, B2: the project context tells each agent its own alias)."""
+    members = list(dict.fromkeys(config.members))
+    return {agent: (_alias(i) if config.anonymous else None) for i, agent in enumerate(members)}
+
+
 def _channel_name(name: str) -> str:
     return name.strip().removeprefix("#")
 
@@ -314,11 +340,14 @@ PRIVATE_BRIEF = (
     "Steckbrief #{name}\n"
     "Dein privater Kanal zum User: Hier fragst du ihn mit einer `question` an `@user`, in jeder "
     "Phase, auch in einer isolierten. Nur der User liest diesen Kanal; kein anderer Agent sieht "
-    "ihn. Brauchst du die Antwort, beende den Turn ohne Abgabe: Die Phase wartet bis zu fünf "
-    "Minuten. Gibst du ab, gilt deine Frage als erledigt."
+    "ihn. Brauchst du die Antwort, warte mit `wait_until` bis zu fünf Minuten; eine Antwort oder "
+    "Notiz des Users beendet das Warten. Gibst du ab, gilt deine Frage als erledigt. Die "
+    "Annahme, mit der du ohne Antwort weiterarbeitest, nennst du in deiner Abgabe."
 )
-"""The pinned brief of a private channel: what it is for, who reads it, and (W4b-03.1, E1 a,
-Entscheidung 67) that handing in closes an open question."""
+"""The pinned brief of a private channel: what it is for, who reads it, how to wait for the
+answer (W4b-06a, Entscheidung 69: `wait_until`, at most five minutes; an answer or a note of the
+user ends it) and that handing in closes an open question (Entscheidung 67). Not: „end the turn
+without handing in, the phase waits“ (W4b-03.1 NR1: the next turn starts at once)."""
 
 
 def private_channel(agent_id: str) -> str:
@@ -730,13 +759,16 @@ class RoomStore:
         """Create all channels of a resolved run (docs/02 §7 `preparing`); returns the briefs."""
         return [self.create_channel(gc, roles=roles) for gc in groupchats]
 
-    @staticmethod
     def _brief(
+        self,
         config: GroupChatConfig,
         members: list[str],
         aliases: Mapping[str, str | None],
         roles: Mapping[str, str],
     ) -> str:
+        """The generated brief; its rules follow the kind of run (`run.yaml`, written by
+        `prepare_run` before `setup_channels`): without `run.yaml` or phases the old ones."""
+        rules = PHASES_CONVERSATION_RULES if self.uses_phases() else CONVERSATION_RULES
         lines = [f"Steckbrief #{config.name}"]
         if config.purpose:
             lines.append(f"Zweck: {config.purpose}")
@@ -752,7 +784,7 @@ class RoomStore:
         lines.append(f"Taktung: {_MODE_TEXT[config.mode]}")
         lines.append(f"Länge einer Nachricht: höchstens {config.max_message_chars} Zeichen.")
         lines.append("Gesprächsregeln:")
-        lines += [f"{i}. {rule}" for i, rule in enumerate(CONVERSATION_RULES, 1)]
+        lines += [f"{i}. {rule}" for i, rule in enumerate(rules, 1)]
         lines.append(f"Ende: {_END_TEXT[config.mode]}")
         return "\n".join(lines)
 

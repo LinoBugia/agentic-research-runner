@@ -357,3 +357,26 @@ def mcp_command() -> None:
     from arr.service.mcp_bridge import run_bridge
 
     run_bridge()
+
+
+# --------------------------------------------------------------------------------------------
+# arr skills (W4b-06a)
+# --------------------------------------------------------------------------------------------
+
+skills_app = typer.Typer(help="Start-Skills des Workfolders pflegen.", no_args_is_help=True)
+app.add_typer(skills_app, name="skills")
+
+
+@skills_app.command("update")
+def skills_update(workfolder: WorkfolderOption = None) -> None:
+    """Unveränderte Start-Skills auf den Stand dieser arr-Version bringen. Von dir geänderte
+    Start-Skills bleiben, wie sie sind; fehlende legt der Befehl nicht an."""
+    from arr.skills import SkillFileError, update_lines, update_start_skills
+
+    root = _runs_workfolder(workfolder)
+    try:
+        results = update_start_skills(root)
+    except SkillFileError as exc:
+        _fail(str(exc))
+    for line in update_lines(results):
+        typer.echo(line)

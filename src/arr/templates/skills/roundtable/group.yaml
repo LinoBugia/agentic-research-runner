@@ -1,7 +1,9 @@
+# Start skill `roundtable` as phases (W4b-06a). The summarizer is a member of #runde but not in
+# the discussion; it reads the channel afterwards.
 kind: research-group
 version: 1
 description: Offene Diskussion mehrerer Agenten zu einer Frage, mit Zusammenfassung
-topology: roundtable
+topology: phases
 
 params:
   rounds:
@@ -16,7 +18,8 @@ params:
     doc: "Anzahl der Diskutanten, abwechselnd Claude und ChatGPT"
   summarizer:
     default: summarizer
-    doc: "Agent, der die Diskussion am Ende zusammenfasst"
+    choices: [summarizer, keine]
+    doc: "summarizer: der Agent summarizer fasst am Ende zusammen; keine: keine Zusammenfassung"
 
 limits:
   wall_time: 45m
@@ -42,8 +45,24 @@ agents:
     model: claude-haiku-5-5
     effort: medium
 
-groupchats:
+channels:
   - name: runde
     purpose: "Gemeinsame Diskussion der Frage"
     members: [diskutant-*, summarizer]
     mode: rounds
+
+phases:
+  - name: diskussion
+    topology: chat
+    channels: [runde]
+    rounds: "{{ params.rounds }}"
+    actions:
+      diskutant-*: { task: tasks/diskutieren.md, submission: { format: text }, turns: 1 }
+
+  - name: zusammenfassung
+    topology: solo
+    when: { param: summarizer, equals: summarizer }
+    inputs:
+      - { channel: runde, content: full }
+    actions:
+      summarizer: { task: tasks/zusammenfassen.md, submission: { format: text }, turns: 1 }

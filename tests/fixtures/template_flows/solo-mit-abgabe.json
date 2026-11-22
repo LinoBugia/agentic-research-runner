@@ -1,0 +1,42 @@
+{
+ "template": "solo",
+ "case": "mit-abgabe",
+ "params": {
+  "max_turns": 3
+ },
+ "turns": [
+  [
+   "arbeit",
+   1,
+   {
+    "worker": 1
+   }
+  ]
+ ],
+ "submissions": {
+  "arbeit/worker": {
+   "format": "text",
+   "count": 1
+  }
+ },
+ "items": {},
+ "gates": [],
+ "stage_ends": [],
+ "ranking": [],
+ "end": {
+  "status": "done",
+  "how": "ende"
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "arbeit",
+   "worker",
+   "text"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}

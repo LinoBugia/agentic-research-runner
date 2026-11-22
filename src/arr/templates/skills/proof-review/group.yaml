@@ -1,7 +1,10 @@
+# Start skill `proof-review` as phases (W4b-06a). Without a discussion the verdict of the
+# check counts, so the check comes twice, switched by `discussion_rounds`; a route to the one
+# that is dropped leads to the next one that stays (Entscheidung 37).
 kind: research-group
 version: 1
 description: Beweis von unabhängigen Judges prüfen lassen, mit Diskussion und Revision
-topology: review
+topology: phases
 
 params:
   judges:
@@ -24,16 +27,16 @@ params:
     choices: [majority, unanimous]
     doc: "majority: häufigstes Urteil, bei Gleichstand das strengere; unanimous: accept nur, wenn alle zustimmen"
   judge_memory:
-    default: fresh
-    choices: [fresh, continue]
-    doc: "fresh: Judges beginnen jede Prüfrunde mit neuer Sitzung; continue: sie behalten ihre Sitzung"
+    default: reset
+    choices: [reset, keep]
+    doc: "reset: Judges beginnen jede Prüfung mit neuer Sitzung und frischem Ordner; keep: sie behalten beides"
   artifact:
     default: null
     doc: "Pfad zum Beweis im Projekt, z. B. tex/beweis.tex; leer: der Autor schreibt ihn zuerst"
 
 limits:
   wall_time: 1h
-  turns_per_agent: 10
+  turns_per_agent: 12
   budget_usd: 5
 
 defaults:
@@ -55,10 +58,73 @@ agents:
       - { provider: claude, model: claude-sonnet-5-5 }
       - { provider: codex }
 
-groupchats:
+channels:
   - name: judges
     purpose: "Diskussion der Judges nach der unabhängigen Prüfung"
     members: [judge-*]
     mode: rounds
-    open_from: diskussion
     anonymous: true
+
+seed:
+  beweis: { file: "{{ params.artifact }}" }
+
+phases:
+  - name: fassung
+    topology: solo
+    when: { param: artifact, equals: null }
+    actions:
+      author: { task: tasks/fassung.md, submission: { format: artifact, name: beweis }, turns: 1 }
+
+  - name: pruefung
+    topology: parallel
+    when: { param: discussion_rounds, equals: 1 }
+    isolated: true
+    context: "{{ params.judge_memory }}"
+    inputs:
+      - { name: beweis, content: full }
+    actions:
+      judge-*: { task: tasks/pruefen.md, submission: { format: review }, turns: 1 }
+
+  - name: pruefung-allein
+    topology: parallel
+    when: { param: discussion_rounds, equals: 0 }
+    isolated: true
+    context: "{{ params.judge_memory }}"
+    inputs:
+      - { name: beweis, content: full }
+    actions:
+      judge-*: { task: tasks/pruefen.md, submission: { format: review }, turns: 1 }
+    gate:
+      type: signal
+      field: verdict
+      rule: "{{ params.verdict }}"
+      routes:
+        accept: stop
+        minor: { goto: revision }
+        major: { goto: revision }
+        reject: stop
+
+  - name: diskussion
+    topology: chat
+    when: { param: discussion_rounds, equals: 1 }
+    channels: [judges]
+    rounds: "{{ params.discussion_rounds }}"
+    actions:
+      judge-*: { task: tasks/besprechen.md, submission: { format: review }, turns: 1 }
+    gate:
+      type: signal
+      field: verdict
+      rule: "{{ params.verdict }}"
+      routes:
+        accept: stop
+        minor: { goto: revision }
+        major: { goto: revision }
+        reject: stop
+
+  - name: revision
+    topology: solo
+    max_visits: "{{ params.max_revisions }}"
+    on_exhausted: stop
+    actions:
+      author: { task: tasks/ueberarbeiten.md, submission: { format: artifact, name: beweis }, turns: 1 }
+    gate: { type: done, routes: { done: { goto: pruefung } } }

@@ -10,6 +10,7 @@ See docs/03-skills-und-research-groups.md §1-3 and docs/spikes/S1_claude.md §3
 import contextlib
 import difflib
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -41,6 +42,7 @@ __all__ = [
     "START_SKILLS",
     "SkillInfo",
     "StartSkills",
+    "SkillUpdate",
     "check_research_skills",
     "copy_skill_tree",
     "discover_skills",
@@ -56,6 +58,9 @@ __all__ = [
     "snapshot_skills",
     "start_skill_files",
     "start_skills_message",
+    "tree_digest",
+    "update_start_skills",
+    "update_lines",
     "write_claude_plugin",
 ]
 
@@ -833,3 +838,257 @@ def start_skills_message(created: Sequence[str], existing: Sequence[str]) -> str
             f"Alle Start-Skills sind schon da ({', '.join(existing)}). arr hat nichts verändert."
         )
     return " ".join(parts)
+
+
+# --------------------------------------------------------------------------------------------
+# Updating unchanged start skills (W4b-06a, B1 of W4-06)
+# --------------------------------------------------------------------------------------------
+
+
+def tree_digest(files: dict[str, bytes]) -> str:
+    """Checksum of a skill tree: sorted relative POSIX paths with their contents (the files of
+    `start_skill_files`; names starting with `.` or `_` are not part of a tree)."""
+    digest = hashlib.sha256()
+    for rel in sorted(files):
+        data = files[rel]
+        path = rel.encode("utf-8")
+        digest.update(len(path).to_bytes(8, "big") + path + len(data).to_bytes(8, "big") + data)
+    return digest.hexdigest()
+
+
+CURRENT_DIGESTS: dict[str, tuple[str, str]] = {
+    ARR_SKILL: ("fe2b0aa", "7bdf5f9ad35848d60c125d753211a0f46bb13a29c97e209a5261ce74790ed791"),
+    "exploration": (
+        "W4b-06a",
+        "2cf7194304bda17784bd1ae8798b6cf4923744593013cf558d774d562fd75d46",
+    ),
+    "latex-writeup": (
+        "81cb75e",
+        "44dcbbcbe1a996f725eb9651dd08fc636317eb1d2db965349471d73f957d1f36",
+    ),
+    "proof": ("W4b-06a", "7c0dd09501bf3cb5095262eb978888aa684baa2b96fde6b5b0375c46c76d202c"),
+    "proof-review": (
+        "W4b-06a",
+        "1570675770c1b2312c69b3664a7dbd16a06dc26fd131efa6c3516bfaac4916cc",
+    ),
+    "roundtable": ("W4b-06a", "3c1aedf708a10d07db6b8e502752f9923f5597bc78f8f44ad9a8abc1b61ce7b3"),
+    "sympy-check": (
+        "1fccb85",
+        "324a9f2a829f7c2d99a48935685fcd14fb70d67107713f07a8c2a8d396c1a342",
+    ),
+}
+"""The version of each start skill this arr ships: (where it came from, `tree_digest` of
+`start_skill_files`). `tests/test_templates_update.py` holds the checksums: whoever changes a
+start skill moves the old entry into `EARLIER_DIGESTS` and enters the new one here."""
+
+EARLIER_DIGESTS: dict[str, tuple[tuple[str, str], ...]] = {
+    ARR_SKILL: (("81cb75e", "1e6af18c02255b66e4341b2fab99056ca23f2be2454b6b6c068f82489df93d0e"),),
+    "exploration": (
+        ("81cb75e", "1e75c86906f2aa5df9ad048ec99061b7277e4adaf00e243bad6cbc00fb093fbc"),
+        ("fe2b0aa", "3e2b880fe8767073315bd617b94bf0d8b1ecbc5caa0352622756210ccb5772c1"),
+        ("5676589", "f764620e80d26be632aebf15d200c6969166b8332962b62c1185db79a4a49c25"),
+    ),
+    "latex-writeup": (),
+    "proof": (
+        ("81cb75e", "fdff9f91315ee4bf859a0430734b3ca57b6c69cb44db2b1cd57852d5e141c634"),
+        ("fe2b0aa", "e119ffc82f7c1a0d1e573b81fc91897f6faccbb9a73fab67aa6cc779e4a7d006"),
+        ("5676589", "f4e5a3693120877bd34f5f693aa71dc6862680cff7bb795cf5860aa77a4110d4"),
+    ),
+    "proof-review": (
+        ("81cb75e", "16d762f430ac361593eea3d330b18f02297ddc3c5c2639a0e0712ac823647a23"),
+        ("fe2b0aa", "bd11f3df4eac44d744a92dbb084c918c9cbb4e8fdb2ac9ffcdd9f52402477866"),
+        ("5676589", "c2f3f09a0f31bddee83a3ee35b2c949393ffcbf4c0849caebfc146c9286a5cd0"),
+        ("f12039f", "844329d6889123651a9ea400a1a523162695ff3fb6fd1842be0c7ea7fbf09891"),
+    ),
+    "roundtable": (
+        ("81cb75e", "b9c0ebd140a928e733c69d5108cfd3d0aa7dda597106023b538ced2ab2d2d772"),
+        ("fe2b0aa", "b2ada940d002bea12fa8443587a395bbe9225012bb4781ec9e704bbc776977d1"),
+        ("5676589", "b9584cdb638802d17c1395cb3bdde4890d925f02201f242f87327401a9e9a387"),
+    ),
+    "sympy-check": (
+        ("81cb75e", "9f1d68ac74189e3923a4b0b2f6e769ea2e55cc1646a96cc4bc7b68a9ccb949bc"),
+        ("fe2b0aa", "118aff87e23bf5a05ff80297a20305f1a897a81c825664768bd84f59353bc4cf"),
+        ("5676589", "e77e972f1a6ebd9f15172c097e830af41798c4ee5a34e612a3bd78667c29619c"),
+        ("34b7a1f", "2516e120b0a79bc6176d28c3437841fd605d8bfd56b04e0459293794b6ffec63"),
+    ),
+}
+"""Every earlier version of each start skill arr shipped since W4-05 (`81cb75e`): (commit,
+checksum), computed once from the Git history of `src/arr/templates/skills/<name>/` and
+`src/arr/templates/project/arr-skill.md` (each commit that changed them; the same checksum
+counts once, with its first commit). A folder equal to one of them was never changed by the
+user and is replaced by `update_start_skills`."""
+
+
+class SkillUpdate(StrEnum):
+    """What `update_start_skills` did with a start skill."""
+
+    UPDATED = "updated"
+    """It was an earlier version of arr; now it is the current one."""
+    CURRENT = "current"
+    """It is the current version already."""
+    CHANGED = "changed"
+    """It matches no version arr shipped (changed by the user, or not a plain folder): left."""
+    MISSING = "missing"
+    """There is none; it is not created (that is „Start-Skills anlegen“)."""
+
+
+_UPDATE_TEXT = {
+    SkillUpdate.UPDATED: "aktualisiert",
+    SkillUpdate.CURRENT: "schon aktuell",
+    SkillUpdate.CHANGED: "von dir geändert, bleibt unverändert",
+    SkillUpdate.MISSING: "fehlt, wird nicht angelegt (das geht über „Start-Skills anlegen“)",
+}
+
+
+class _Irregular(Exception):
+    """A link, a file instead of a folder, or anything but plain files and folders."""
+
+
+def _read_tree(parent: int, name: str) -> dict[str, bytes] | None:
+    """The counted files below `parent/name`, read through descriptors without following any
+    link; None if there is nothing. Raises `_Irregular` for anything but plain files and
+    folders (links included) and for a tree that is too big to be a skill."""
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        raise _Irregular(name)
+    files: dict[str, bytes] = {}
+    total = 0
+
+    def walk(folder: int, prefix: str) -> None:
+        nonlocal total
+        for entry in sorted(os.listdir(folder)):
+            if entry.startswith((".", "_")):
+                continue  # not part of a tree, as in `start_skill_files`
+            mode = os.stat(entry, dir_fd=folder, follow_symlinks=False).st_mode
+            if stat.S_ISDIR(mode):
+                sub = os.open(entry, _DIR_FLAGS, dir_fd=folder)
+                try:
+                    walk(sub, f"{prefix}{entry}/")
+                finally:
+                    os.close(sub)
+            elif stat.S_ISREG(mode):
+                fd = os.open(
+                    entry, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=folder
+                )
+                try:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        raise _Irregular(entry)
+                    chunks = []
+                    while chunk := os.read(fd, 1 << 16):
+                        total += len(chunk)
+                        if total > 8 * MAX_SKILL_FILE_BYTES:
+                            raise _Irregular(entry)  # no start skill is this big
+                        chunks.append(chunk)
+                finally:
+                    os.close(fd)
+                files[f"{prefix}{entry}"] = b"".join(chunks)
+            else:
+                raise _Irregular(entry)
+
+    try:
+        folder = os.open(name, _DIR_FLAGS, dir_fd=parent)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+            raise _Irregular(name) from None
+        raise
+    try:
+        walk(folder, "")
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+            raise _Irregular(name) from None
+        raise
+    finally:
+        os.close(folder)
+    return files
+
+
+def _digest_in(root: int, name: str) -> str | None:
+    """`tree_digest` of `skills/<name>`; None if missing; `""` if it is no plain tree."""
+    try:
+        files = _read_tree(root, name)
+    except _Irregular:
+        return ""
+    return None if files is None else tree_digest(files)
+
+
+def _swap(root: int, name: str, new: str) -> None:
+    """Put the folder `new` (hidden, below `root`) in place of `name`; the old one goes to a
+    hidden name first and is removed after. On a failure the old one is back in place."""
+    old = f".{name}.arr-{secrets.token_hex(6)}.old"
+    os.rename(name, old, src_dir_fd=root, dst_dir_fd=root)
+    try:
+        os.rename(new, name, src_dir_fd=root, dst_dir_fd=root)
+    except BaseException:
+        try:
+            os.rename(old, name, src_dir_fd=root, dst_dir_fd=root)
+        except OSError:
+            log.error("Start-Skill %s: alte Fassung liegt unter skills/%s", name, old)
+        raise
+    _remove_tree(root, old)
+
+
+def _update_one(root: int, name: str) -> SkillUpdate:
+    found = _digest_in(root, name)
+    if found is None:
+        return SkillUpdate.MISSING
+    files = start_skill_files(name)
+    if found == tree_digest(files):
+        return SkillUpdate.CURRENT
+    shipped = {digest for _commit, digest in EARLIER_DIGESTS.get(name, ())}
+    if found not in shipped:
+        return SkillUpdate.CHANGED
+    temp = f".{name}.arr-{secrets.token_hex(6)}.tmp"
+    os.mkdir(temp, 0o755, dir_fd=root)
+    try:
+        folder = os.open(temp, _DIR_FLAGS, dir_fd=root)
+        try:
+            _write_tree(folder, files)
+        finally:
+            os.close(folder)
+        if _digest_in(root, name) != found:  # changed meanwhile: never replaced
+            _remove_tree(root, temp)
+            return SkillUpdate.CHANGED
+        _swap(root, name, temp)
+    except BaseException:
+        _remove_tree(root, temp)
+        raise
+    return SkillUpdate.UPDATED
+
+
+def update_start_skills(
+    workfolder: str | Path, names: Sequence[str] = START_SKILLS
+) -> dict[str, SkillUpdate]:
+    """Bring unchanged start skills in `<workfolder>/skills/` to the version of this arr.
+
+    A start skill equal byte for byte to an earlier version arr shipped (`EARLIER_DIGESTS`) is
+    replaced by the current one: built in a hidden folder next to it, its checksum read once
+    more right before the swap, no link followed; on a failure the old version stays complete
+    and nothing half is left. One that matches no shipped version (changed by the user, a link,
+    a file) is never touched; a missing one is not created. Running it again changes nothing.
+    Raises `SkillFileError` with a German message if a folder cannot be read or written.
+    """
+    out: dict[str, SkillUpdate] = {}
+    root = _open_skills_root(workfolder)
+    try:
+        for name in names:
+            try:
+                out[name] = _update_one(root, name)
+            except OSError as exc:
+                raise SkillFileError(
+                    f"Der Start-Skill „{name}“ ließ sich nicht aktualisieren "
+                    f"({exc.strerror or exc}). Die bisherige Fassung ist unverändert."
+                ) from None
+    finally:
+        os.close(root)
+    updated = [n for n, r in out.items() if r is SkillUpdate.UPDATED]
+    if updated:
+        log.info("Start-Skills aktualisiert: %s", ", ".join(updated))
+    return out
+
+
+def update_lines(results: dict[str, SkillUpdate]) -> list[str]:
+    """One German line per start skill for `arr skills update`."""
+    return [f"{name}: {_UPDATE_TEXT[result]}" for name, result in results.items()]

@@ -1,0 +1,93 @@
+{
+ "template": "exploration",
+ "case": "stiller-explorer",
+ "params": {
+  "n_ideas": 2,
+  "turns_per_idea": 2
+ },
+ "turns": [
+  [
+   "ideen",
+   1,
+   {
+    "ideator": 1
+   }
+  ],
+  [
+   "exploration",
+   1,
+   {
+    "explorer-1": 2,
+    "explorer-2": 3,
+    "ranker-1": 1
+   }
+  ],
+  [
+   "zusammenfassung",
+   1,
+   {
+    "summarizer": 1
+   }
+  ]
+ ],
+ "submissions": {
+  "exploration/explorer-1": {
+   "format": "text",
+   "count": 2
+  },
+  "exploration/ranker-1": {
+   "format": "rating",
+   "count": 1
+  },
+  "ideen/ideator": {
+   "format": "list",
+   "count": 2
+  },
+  "zusammenfassung/summarizer": {
+   "format": "text",
+   "count": 1
+  }
+ },
+ "items": {},
+ "gates": [
+  [
+   "exploration",
+   "ranked"
+  ]
+ ],
+ "stage_ends": [],
+ "ranking": [
+  1
+ ],
+ "end": {
+  "status": "done",
+  "how": "ende"
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "exploration",
+   "explorer-1",
+   "text"
+  ],
+  [
+   "exploration",
+   "ranker-1",
+   "rating"
+  ],
+  [
+   "ideen",
+   "ideator",
+   "list"
+  ],
+  [
+   "zusammenfassung",
+   "summarizer",
+   "text"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}
