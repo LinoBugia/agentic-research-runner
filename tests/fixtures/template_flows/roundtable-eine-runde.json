@@ -32,21 +32,24 @@
      "kanaele": [
       "runde"
      ],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "diskutant-2": {
      "eingaben": [],
      "kanaele": [
       "runde"
      ],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "summarizer": {
      "eingaben": [],
      "kanaele": [
       "runde"
      ],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ],
@@ -61,7 +64,8 @@
      "kanaele": [
       "runde"
      ],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ]

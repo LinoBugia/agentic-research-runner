@@ -861,8 +861,8 @@ def tree_digest(files: dict[str, bytes]) -> str:
 CURRENT_DIGESTS: dict[str, tuple[str, str]] = {
     ARR_SKILL: ("c82f909", "ef12554041a5820b4665cf46c5b70e9c7d7035175f432bf2276a371c3d2557f7"),
     "exploration": (
-        "93c766f",
-        "c48eda36b4603fce2d9847e4aeeb640e3713952e187850913812ad2e279dcf16",
+        "W4b-06a.3",
+        "b7f69ed596b701188bc34a9c8f2e2148843f03cebf9703a67c161b30c65e4d15",
     ),
     "latex-writeup": (
         "81cb75e",
@@ -870,8 +870,8 @@ CURRENT_DIGESTS: dict[str, tuple[str, str]] = {
     ),
     "proof": ("a3da52c", "64fa3add21db893a9b036f1bd551c4c65c817adc1beabcdf1de2aa5b2439c7af"),
     "proof-review": (
-        "93c766f",
-        "5cf7c9f8ae40581219523f9f29d8dcc36893bdafdca8bca0183f5f697ca42198",
+        "W4b-06a.3",
+        "9bf889c9ed0160186c33f9c708a461da2bbe4aa0cfa60d903e3f980f3dcf31b8",
     ),
     "roundtable": ("a3da52c", "d30453152f47d9dafc6937a9710ddcd7aea61a861cfdbefbff599f303c21cd2f"),
     "sympy-check": (
@@ -1071,12 +1071,13 @@ def _swap(root: int, name: str, new: str) -> str:
     os.rename(name, old, src_dir_fd=root, dst_dir_fd=root)
     try:
         os.rename(new, name, src_dir_fd=root, dst_dir_fd=root)
-    except OSError as exc:
+    except BaseException as exc:  # also Ctrl-C between the two renames (W4b-06a.3, NP4)
         try:
             os.rename(old, name, src_dir_fd=root, dst_dir_fd=root)
         except OSError:
             log.error("Start-Skill %s: alte Fassung liegt unter skills/%s", name, old)
-            raise _OldKept(exc, old) from None
+            if isinstance(exc, OSError):
+                raise _OldKept(exc, old) from None
         raise
     try:
         _remove_tree(root, old)

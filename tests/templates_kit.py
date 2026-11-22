@@ -21,7 +21,7 @@ import os
 import re
 import shutil
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +48,8 @@ WRITE_FLOWS = "ARR_WRITE_TEMPLATE_FLOWS"
 TOOL_SKILLS = ("sympy-check", "latex-writeup")
 PROJECT_PROOF = "beweis.md"
 """A proof in the project `demo` for the parameter `artifact`."""
+PROJECT_PROOF_TEXT = "Beweis aus dem Projekt"
+"""Its heading: the comparison looks for it in the turns (the seed's text, W4b-06a.3)."""
 
 # --------------------------------------------------------------------------------------------
 # Runs
@@ -75,7 +77,7 @@ def _prepare(workfolder: Path) -> None:
     install_start_skills(workfolder, TOOL_SKILLS)
     project = workfolder / "projects" / "demo" / PROJECT_PROOF
     if not project.exists():
-        project.write_text("# Beweis aus dem Projekt\n\nTrivial.\n", encoding="utf-8")
+        project.write_text(f"# {PROJECT_PROOF_TEXT}\n\nTrivial.\n", encoding="utf-8")
 
 
 def _manager(
@@ -304,10 +306,12 @@ def _summary(mgr: RunManager) -> dict[str, Any]:
 
 class _Sight:
     """What an agent sees in a turn: names of its inputs („Eingaben“, mapped per template onto
-    the same words for both sides), the open group channels it is a member of, and whether the
-    submissions of its phase are sealed (M2 of the review)."""
+    the same words for both sides), the open group channels it is a member of, whether the
+    submissions of its phase are sealed (M2 of the review), and which texts of the seeds and
+    the list of ideas appear in its prompt or context package („texte“, W4b-06a.3 NP1)."""
 
-    def __init__(self, mgr: RunManager, log: Any) -> None:
+    def __init__(self, mgr: RunManager, log: Any, words: Sequence[str] = ()) -> None:
+        self.words = list(words)
         resolved = mgr.prepared.resolved if mgr.prepared else None
         chats = list(resolved.groupchats) if resolved else []
         self.members = {c.name: set(c.members) for c in chats}
@@ -337,10 +341,12 @@ class _Sight:
         self.seen[agent] += 1
         view = mine[index] if index < len(mine) else None
         here = self.found.setdefault((phase, visit), {}).setdefault(
-            agent, {"eingaben": set(), "kanaele": set(), "versiegelt": False}
+            agent, {"eingaben": set(), "kanaele": set(), "versiegelt": False, "texte": set()}
         )
         if view is not None:
             here["eingaben"] |= set(tags(view))
+            seen = view.prompt + json.dumps(view.context, ensure_ascii=False, default=str)
+            here["texte"] |= {w for w in self.words if w in seen}
         # a channel counts if the agent shares it with another one (alone it carries nothing)
         here["kanaele"] |= {
             c
@@ -365,6 +371,7 @@ class _Sight:
                             "eingaben": sorted(got[a]["eingaben"]),
                             "kanaele": sorted(got[a]["kanaele"]),
                             "versiegelt": got[a]["versiegelt"],
+                            "texte": sorted(got[a]["texte"]),
                         }
                         for a in agents
                         if a in got
@@ -372,6 +379,27 @@ class _Sight:
                 ]
             )
         return out
+
+
+def _new_words(mgr: RunManager) -> list[str]:
+    """The texts of the seeds a phases run had: the proof from the project, the titles of the
+    list `ideen` (given or from the ideator)."""
+    params = mgr.prepared.resolved.params if mgr.prepared else {}
+    words = [PROJECT_PROOF_TEXT] if params.get("artifact") else []
+    latest = RoomStore(mgr.run_dir).latest_version("ideen")
+    for entry in (latest.fields.get("items") or []) if latest is not None else []:
+        if isinstance(entry, dict) and entry.get("title"):
+            words.append(str(entry["title"]))
+    return words
+
+
+def _old_words(mgr: RunManager, params: Mapping[str, Any]) -> list[str]:
+    """The same texts in a run of an old topology (ideas given or results `idea`)."""
+    words = [PROJECT_PROOF_TEXT] if params.get("artifact") else []
+    given = params.get("ideas") or []
+    words += [str(i.get("title") if isinstance(i, dict) else i) for i in given]
+    words += [r.title for r in RoomStore(mgr.run_dir).results() if r.kind == "idea"]
+    return words
 
 
 def _new_tags(template: str) -> Any:
@@ -389,6 +417,8 @@ def _new_tags(template: str) -> Any:
                 out.add("beweis")
             elif kind == "name" and name == "ideen" or item.get("name") == "ideen":
                 out.add("ideen")  # the list of ideas, from the ideator or given (seed)
+                if item.get("text"):
+                    out.add("ideen-inhalt")  # with its entries (W4b-06a.3 NP1)
             elif kind == "phase" and template == "proof-review":
                 out.add("gutachten")
             elif kind == "phase" and template == "proof":
@@ -436,13 +466,13 @@ def _old_tags(view: Any) -> set[str]:
     if view.stage == "zusammenfassung" and ctx.get("channel"):
         out.add("verlauf")
     if ctx.get("overview"):  # the summary of `exploration`: ranking with the ideas
-        out.add("ideen")
+        out |= {"ideen", "ideen-inhalt"}
     return out
 
 
 def new_flow(mgr: RunManager, status: Any, log: Any = None, template: str = "") -> dict[str, Any]:
     """The flow of a `phases` run."""
-    sight = _Sight(mgr, log)
+    sight = _Sight(mgr, log, _new_words(mgr))
     tags = _new_tags(template)
     seq: list[tuple[str, int, str]] = []
     visits: Counter[str] = Counter()
@@ -572,7 +602,7 @@ def old_flow(mgr: RunManager, status: Any, template: str, log: Any = None) -> di
     resolved = mgr.prepared.resolved if mgr.prepared else None
     params = dict(resolved.params) if resolved else {}
     mapping = OldMap(template, params)
-    sight = _Sight(mgr, log)
+    sight = _Sight(mgr, log, _old_words(mgr, params))
     seq: list[tuple[str, int, str]] = []
     gates: list[list[Any]] = []
     ends: list[list[Any]] = []
@@ -1136,12 +1166,19 @@ def _ask_per_repetition(flow: dict[str, Any], case: Case) -> None:
 def _more_ideas(flow: dict[str, Any], case: Case) -> None:
     phase = OldMap("exploration", case.params).phase("exploration")
     section = _section(flow, phase)
+    seen = _sight_of(flow, phase)
+    titles = _idea_titles(case)
     for number in range(int(case.params["n_ideas"]) + 1, int(case.act["items"]) + 1):
         explorer = f"explorer-{(number - 1) % _explorers(case) + 1}"
         section[explorer] += _per_idea(case)
         _add_submission(flow, f"{phase}/{explorer}", "text", _per_idea(case))
         _add_submission(flow, f"{phase}/ranker-1", "rating", 1)
         flow["ranking"].append(number)
+        title = titles[number - 1]
+        for agent in (explorer, "ranker-1"):
+            seen[agent]["texte"] = sorted({*seen[agent]["texte"], title})
+        summary = _sight_of(flow, "zusammenfassung")["summarizer"]
+        summary["texte"] = sorted({*summary["texte"], title})
 
 
 def _sight_of(flow: dict[str, Any], phase: str, visit: int = 1) -> dict[str, Any]:
@@ -1171,7 +1208,8 @@ def _one_judge_discusses(flow: dict[str, Any], case: Case) -> None:
     for name, visit, agents in flow["sight"]:
         sight.append([name, visit, agents])
         if name == "pruefung":
-            sight.append(["diskussion", visit, {"judge-1": {**seen, "versiegelt": False}}])
+            here = {**seen, "versiegelt": False, "texte": []}
+            sight.append(["diskussion", visit, {"judge-1": here}])
     flow["sight"] = sight
     rounds = sum(1 for t in turns if t[0] == "diskussion")
     _add_submission(flow, "diskussion/judge-1", "review", rounds)
@@ -1201,6 +1239,18 @@ def _explorers_see_the_list(flow: dict[str, Any], case: Case) -> None:
         for agent, seen in agents.items():
             if agent.startswith("explorer"):
                 seen["eingaben"] = sorted({*seen["eingaben"], "ideen"})
+
+
+def _peers_without_titles(flow: dict[str, Any], case: Case) -> None:
+    titles = _idea_titles(case)
+    for name, _visit, agents in flow["sight"]:
+        if name != "exploration-digest":
+            continue
+        for agent, seen in agents.items():
+            if agent.startswith("explorer"):
+                k = int(agent.rsplit("-", 1)[1]) - 1
+                own = titles[k :: _explorers(case)]
+                seen["texte"] = sorted(own)
 
 
 def _same(flow: dict[str, Any], case: Case) -> None:
@@ -1309,6 +1359,16 @@ DEVIATIONS: tuple[Deviation, ...] = (
         _explorers_see_the_list,
     ),
     Deviation(
+        "befund-auszuege-ohne-ideen-titel",
+        "exploration",
+        "Befund (06a.3 sichtbar geworden): Bei `exchange: digest` nannte der Auszug der alten "
+        "Topologie die Idee der anderen Explorer; `peers: summary` nennt nur ihre Kurzfassung "
+        "und die Nummer des Eintrags (gebaut in `runs/phases/runner.py`, außerhalb des "
+        "Bereichs). Übertrag nach Welle 5",
+        lambda c: c.params.get("exchange") == "digest",
+        _peers_without_titles,
+    ),
+    Deviation(
         "abgabe-ueber-submit",
         "*",
         "Abgabe über `submit` mit Format statt `submit_result`/`submit_rating` und Textzeile "
@@ -1370,7 +1430,6 @@ INPUTS_BEYOND_TEST_DATA: dict[tuple[str, str], list[dict[str, Any]]] = {
     ("proof-review", "diskussion"): [{"name": "beweis", "content": "full"}, {"from": "pruefung"}],
     ("proof-review", "revision"): [
         {"name": "beweis", "content": "full"},
-        {"from": "pruefung"},
         {"from": "pruefung-allein"},
         {"from": "diskussion"},
     ],
@@ -1387,22 +1446,92 @@ would not reach the phases the old topologies fed with it. The test data stay as
 (other tests read them)."""
 
 
+def _as_test_data_would_be(name: str, fixture: dict[str, Any]) -> dict[str, Any]:
+    """The test data of W4b-02a with the differences the templates have on purpose."""
+    for phase in fixture.get("phases") or []:  # `inputs` for the seeds (W4b-06a.2)
+        added = INPUTS_BEYOND_TEST_DATA.get((name, phase["name"]))
+        if added is not None:
+            phase["inputs"] = added
+    for (template, key, field), value in GROUP_BEYOND_TEST_DATA.items():
+        if template != name:
+            continue
+        if value is DROPPED:
+            fixture[key].pop(field)
+        else:
+            fixture[key][field] = value
+    return fixture
+
+
+DROPPED = object()
+"""Marks a key the template does not have although the test data do."""
+
+GROUP_BEYOND_TEST_DATA: dict[tuple[str, str, str], Any] = {
+    ("proof-review", "limits", "turns_per_agent"): 12,  # A4: 3 passes × 4 turns
+    ("exploration", "limits", "turns_per_agent"): 16,  # A4: 4 ideas × 2 repeats × 2 turns
+    ("exploration", "params", "n_rankers"): {
+        "default": 1,
+        "min": 1,
+        "max": 3,
+        "doc": "Anzahl der Ranker, mindestens einer",
+    },  # Entscheidung 42
+    ("exploration", "params", "ideator"): DROPPED,  # it does nothing any more (fixed agent)
+    ("exploration", "params", "summarizer"): {
+        "default": "summarizer",
+        "choices": ["summarizer", "none"],
+        "doc": "summarizer: der Agent summarizer fasst am Ende zusammen; none: keine "
+        "Zusammenfassung",
+    },  # a switch (§6.1, N8)
+    ("roundtable", "params", "summarizer"): {
+        "default": "summarizer",
+        "choices": ["summarizer", "none"],
+        "doc": "summarizer: der Agent summarizer fasst am Ende zusammen; none: keine "
+        "Zusammenfassung",
+    },
+}
+"""Keys of a template that differ from the test data of W4b-02a on purpose (§5.1 of the
+report): the limits A4 asks for, `n_rankers` from 1, no `ideator`, `summarizer` as a switch."""
+
+STRUCTURE_KEYS = (
+    "kind",
+    "version",
+    "topology",
+    "description",
+    "params",
+    "rubric",
+    "limits",
+    "defaults",
+    "agents",
+    "channels",
+    "seed",
+    "phases",
+)
+"""Everything of a `group.yaml` the structure check compares with the test data (W4b-06a.3,
+NP2: models, roles, `mix`, members of channels, limits, rubric, seeds as today)."""
+
+TASK_ANCHORS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("exploration", "tasks/ideen.md"): ("{{ params.n_ideas }}",),
+    ("proof-review", "tasks/pruefen.md"): ("unabhängig",),
+}
+"""Words a task file must keep: the number of ideas (§6.1), the independent check."""
+
+
 def structure_issues(name: str, files: Mapping[str, bytes] | None = None) -> list[str]:
-    """What a template does differently from the agreed structure: its phases are those of the
-    test data of W4b-02a (actions, tasks, `inputs`, channels, gates, routes, `turns`), every
-    action and rating action has `turns: 1` (Festlegung des Leads, 22.11.), the checks
-    (`pruefung*`) are isolated, and every task file named is in the skill."""
+    """What a template does differently from the agreed structure: everything of its
+    `group.yaml` equals the test data of W4b-02a up to the named differences
+    (`INPUTS_BEYOND_TEST_DATA`, `GROUP_BEYOND_TEST_DATA`); every action and rating action has
+    `turns: 1` (Festlegung des Leads, 22.11.), the checks (`pruefung*`) are isolated, every
+    task file named is in the skill, and the task files keep their anchors (`TASK_ANCHORS`)."""
     files = files or start_skill_files(name)
     group, _ = parse_yaml_text(files["group.yaml"].decode("utf-8"), "group.yaml")
     fixture_text = (TESTS / "fixtures" / "phases" / f"{FIXTURE_OF[name]}.yaml").read_text("utf-8")
     fixture, _ = parse_yaml_text(fixture_text, "fixture.yaml")
-    for phase in fixture.get("phases") or []:  # what the templates add on purpose
-        added = INPUTS_BEYOND_TEST_DATA.get((name, phase["name"]))
-        if added is not None:
-            phase["inputs"] = added
+    expected = _as_test_data_would_be(name, fixture)
     issues = []
-    if group.get("phases") != fixture.get("phases"):
-        issues.append("phases weichen von den Testdaten ab")
+    for key in STRUCTURE_KEYS:
+        if group.get(key) != expected.get(key):
+            issues.append(f"{key} weichen von den Testdaten ab")
+    for key in sorted(set(group) - set(STRUCTURE_KEYS)):
+        issues.append(f"{key}: nicht in den Testdaten")
     for phase in group.get("phases") or []:
         actions = list((phase.get("actions") or {}).values())
         gate = phase.get("gate") or {}
@@ -1415,4 +1544,9 @@ def structure_issues(name: str, files: Mapping[str, bytes] | None = None) -> lis
                 issues.append(f"{phase['name']}: Auftrag {action.get('task')} fehlt")
         if str(phase["name"]).startswith("pruefung") and phase.get("isolated") is not True:
             issues.append(f"{phase['name']}: nicht isoliert")
+    for (template, task), words in TASK_ANCHORS.items():
+        if template != name:
+            continue
+        text = files.get(task, b"").decode("utf-8", errors="replace")
+        issues += [f"{task}: „{w}“ fehlt" for w in words if w not in text]
     return issues

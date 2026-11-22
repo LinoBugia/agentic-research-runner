@@ -68,21 +68,24 @@
     "strategist": {
      "eingaben": [],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "rater-1": {
      "eingaben": [
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "rater-2": {
      "eingaben": [
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ],
@@ -95,21 +98,24 @@
       "bewertungen"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "rater-1": {
      "eingaben": [
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "rater-2": {
      "eingaben": [
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ],
@@ -122,7 +128,8 @@
       "vorstufen"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "rater-1": {
      "eingaben": [
@@ -130,7 +137,8 @@
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "rater-2": {
      "eingaben": [
@@ -138,7 +146,8 @@
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ],
@@ -152,7 +161,8 @@
       "vorstufen"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "rater-1": {
      "eingaben": [
@@ -160,7 +170,8 @@
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "rater-2": {
      "eingaben": [
@@ -168,7 +179,8 @@
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ],
@@ -181,7 +193,8 @@
       "vorstufen"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "rater-1": {
      "eingaben": [
@@ -189,7 +202,8 @@
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "rater-2": {
      "eingaben": [
@@ -197,7 +211,8 @@
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ],
@@ -211,7 +226,8 @@
       "vorstufen"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "rater-1": {
      "eingaben": [
@@ -219,7 +235,8 @@
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "rater-2": {
      "eingaben": [
@@ -227,7 +244,8 @@
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ]

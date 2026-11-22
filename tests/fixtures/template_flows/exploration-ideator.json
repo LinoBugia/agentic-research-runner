@@ -35,7 +35,8 @@
     "ideator": {
      "eingaben": [],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ],
@@ -48,21 +49,33 @@
       "eintrag"
      ],
      "kanaele": [],
-     "versiegelt": true
+     "versiegelt": true,
+     "texte": [
+      "Idee 1",
+      "Idee 3"
+     ]
     },
     "explorer-2": {
      "eingaben": [
       "eintrag"
      ],
      "kanaele": [],
-     "versiegelt": true
+     "versiegelt": true,
+     "texte": [
+      "Idee 2"
+     ]
     },
     "ranker-1": {
      "eingaben": [
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": [
+      "Idee 1",
+      "Idee 2",
+      "Idee 3"
+     ]
     }
    }
   ],
@@ -73,10 +86,16 @@
     "summarizer": {
      "eingaben": [
       "ideen",
+      "ideen-inhalt",
       "staende"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": [
+      "Idee 1",
+      "Idee 2",
+      "Idee 3"
+     ]
     }
    }
   ]

@@ -42,7 +42,8 @@
     "author": {
      "eingaben": [],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ],
@@ -55,7 +56,8 @@
       "beweis"
      ],
      "kanaele": [],
-     "versiegelt": true
+     "versiegelt": true,
+     "texte": []
     }
    }
   ],
@@ -70,7 +72,8 @@
       "gutachten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ],
@@ -84,7 +87,8 @@
       "einwaende"
      ],
      "kanaele": [],
-     "versiegelt": true
+     "versiegelt": true,
+     "texte": []
     }
    }
   ]

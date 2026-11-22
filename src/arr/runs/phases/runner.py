@@ -470,7 +470,7 @@ class PhaseRunner:
             nxt = await self.enter(target, how, info)
         await self.ctx.checkpoint(phase.name, phase="route", **info)
         if nxt is None or nxt[0] != phase.name:
-            ends = nxt is None and not self._left_by_next(route, info)
+            ends = nxt is None and not self._left_by_next(phase, route, info)
             await self._stage_end(phase, record, ends)
         return nxt
 
@@ -501,16 +501,20 @@ class PhaseRunner:
             data["ranking"] = outcome.ranking
         await self.ctx.checkpoint(phase.name, **data)
 
-    def _left_by_next(self, route: Route | None, info: Mapping[str, Any]) -> bool:
-        """True if the run leaves the phase over `next`, also past the end of the plan (its
-        best attempt counts, as `on_fail: continue` of the old `waterfall`); False if it ends
-        there: route `stop`, `on_exhausted: stop` or the user's „Beenden“ (W4b-06a.1, Entscheidung
-        81)."""
-        if info.get("asked_user"):
-            return info.get("choice") == EscalationOption.CONTINUE.value
+    def _left_by_next(
+        self, phase: ResolvedPhase, route: Route | None, info: Mapping[str, Any]
+    ) -> bool:
+        """True if the run leaves `phase` over `next`, also past the end of the plan (its best
+        attempt counts, as `on_fail: continue` of the old `waterfall`); False if it ends there:
+        route `stop`, its own `on_exhausted: stop` or the user's „Beenden“ about this phase
+        (W4b-06a.1, Entscheidung 81). `on_exhausted` and the user's choice count only when
+        they concern this phase, not a later one the route led into (W4b-06a.3, NP3)."""
         exhausted = info.get("exhausted") or []
-        if exhausted:
-            route = self.run_config.phase(exhausted[-1]).on_exhausted
+        asked = info.get("asked_user")
+        if asked and (asked != "exhausted" or phase.name in exhausted):
+            return info.get("choice") == EscalationOption.CONTINUE.value
+        if phase.name in exhausted:
+            return phase.on_exhausted is RouteKeyword.NEXT
         return route is RouteKeyword.NEXT
 
     async def _stage_end(self, phase: ResolvedPhase, record: PassRecord, ends: bool) -> None:

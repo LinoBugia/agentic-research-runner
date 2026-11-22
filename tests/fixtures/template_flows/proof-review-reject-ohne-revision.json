@@ -37,7 +37,8 @@
     "author": {
      "eingaben": [],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ],
@@ -50,14 +51,16 @@
       "beweis"
      ],
      "kanaele": [],
-     "versiegelt": true
+     "versiegelt": true,
+     "texte": []
     },
     "judge-2": {
      "eingaben": [
       "beweis"
      ],
      "kanaele": [],
-     "versiegelt": true
+     "versiegelt": true,
+     "texte": []
     }
    }
   ],
@@ -74,7 +77,8 @@
      "kanaele": [
       "judges"
      ],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     },
     "judge-2": {
      "eingaben": [
@@ -85,7 +89,8 @@
      "kanaele": [
       "judges"
      ],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ]

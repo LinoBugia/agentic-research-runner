@@ -132,7 +132,6 @@ phases:
     on_exhausted: stop
     inputs:
       - { name: beweis, content: full }
-      - { from: pruefung }
       - { from: pruefung-allein }
       - { from: diskussion }
     actions:

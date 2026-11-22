@@ -35,21 +35,31 @@
       "eintrag"
      ],
      "kanaele": [],
-     "versiegelt": true
+     "versiegelt": true,
+     "texte": [
+      "Modulo 4"
+     ]
     },
     "explorer-2": {
      "eingaben": [
       "eintrag"
      ],
      "kanaele": [],
-     "versiegelt": true
+     "versiegelt": true,
+     "texte": [
+      "Gaußsche Zahlen"
+     ]
     },
     "ranker-1": {
      "eingaben": [
       "zu-bewerten"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": [
+      "Gaußsche Zahlen",
+      "Modulo 4"
+     ]
     }
    }
   ],
@@ -60,10 +70,15 @@
     "summarizer": {
      "eingaben": [
       "ideen",
+      "ideen-inhalt",
       "staende"
      ],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": [
+      "Gaußsche Zahlen",
+      "Modulo 4"
+     ]
     }
    }
   ]

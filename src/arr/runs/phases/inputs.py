@@ -4,13 +4,17 @@
 An input item is a submission as the receiving agent may see it:
 
     {"source", "id", "phase", "attempt", "from", "format", "status", "summary", "path",
-     "name"?, "version"?, "entry"?, "verdict"?, "files"?, "score"?, "text"?, "note"?}
+     "name"?, "version"?, "entry"?, "entry_title"?, "verdict"?, "files"?, "score"?, "text"?,
+     "note"?}
 
 `source` is `phase:<name>` (standard inputs and `from`), `name:<name>` or `channel:<name>`
 (then `messages` instead of a submission). `from` is the author as the receiver sees it
 (`shown`: an agent with an alias is shown to every other agent only under that alias, also
 outside its anonymous channel; `arr` for a seed). `path` is the absolute folder of the
-submission below `output/`. `text` only with `content: full`.
+submission below `output/`. `text` only with `content: full`; for a `list` it holds the
+entries (title and text), cut with a hint to `submission.json` under `path` (W4b-06a.3). A
+submission of an entry of an `over` list (`entry`) names the title of that entry
+(`entry_title`), so a rater knows which entry it rates.
 
 Isolation: a submission another agent handed in that is still sealed is never an input; only
 `peers: summary` shows summaries of the running pass. Everything an agent wrote is cleaned and
@@ -166,10 +170,52 @@ def _file_head(ctx: "RunContext", rel: str, limit: int) -> tuple[str | None, boo
         return None, False
 
 
+def _list_text(s: Submission) -> str:
+    """The entries of a submission in the format `list` as text, one per line (W4b-06a.3)."""
+    items = s.fields.get("items") if s.format == "list" else None
+    if not isinstance(items, list):
+        return ""
+    lines = []
+    for number, entry in enumerate(items, 1):
+        if isinstance(entry, dict):
+            title, text = entry.get("title"), entry.get("text")
+        else:
+            title, text = None, entry
+        lines.append(
+            f"{number}. {line(title or '', MAX_NAME_CHARS)}: {line(text or '', MAX_FULL_CHARS)}"
+        )
+    text = "\n".join(lines)
+    if len(text) > MAX_FULL_CHARS:
+        hint = "\n[Liste gekürzt; alle Einträge stehen in „submission.json“ unter „path“]"
+        text = text[: MAX_FULL_CHARS - len(hint)] + hint
+    return text
+
+
+def _entry_title(ctx: "RunContext", s: Submission, number: int) -> str | None:
+    """The title of entry `number` of the `over` list of the submission's phase (W4b-06a.3);
+    None if there is none."""
+    try:
+        over = ctx.config.phase(str(s.stage)).over
+    except KeyError:
+        return None
+    if over is None:
+        return None
+    latest = ctx.latest_version(over)
+    items = latest.fields.get("items") if latest is not None else None
+    if not isinstance(items, list) or not 1 <= number <= len(items):
+        return None
+    entry = items[number - 1]
+    title = entry.get("title") or entry.get("text") if isinstance(entry, dict) else entry
+    return line(title or "", MAX_NAME_CHARS) or None
+
+
 def _full_text(ctx: "RunContext", s: Submission) -> str:
     parts: list[str] = []
     if s.body:
         parts.append(s.body)
+    listed = _list_text(s)
+    if listed:
+        parts.append(listed)
     for name in s.files:
         title = line(name, MAX_NAME_CHARS)
         if "/" in name or name in ("", ".", ".."):  # never a path of its own (N-G5)
@@ -214,6 +260,9 @@ def item(
     entry = _entry_number(s)
     if entry is not None:
         out["entry"] = entry
+        title = _entry_title(ctx, s, entry)
+        if title is not None:
+            out["entry_title"] = title
     if s.sealed and s.agent == viewer:  # read just now: only an own one can be sealed here
         out["path"] = None
         out["note"] = "Deine Abgabe ist noch versiegelt; sie liegt nach der Phase unter output/."

@@ -21,7 +21,8 @@
     "worker": {
      "eingaben": [],
      "kanaele": [],
-     "versiegelt": false
+     "versiegelt": false,
+     "texte": []
     }
    }
   ]

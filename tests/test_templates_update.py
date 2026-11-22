@@ -469,3 +469,23 @@ def test_n3_only_start_skills_are_read(wf: Path, name: str) -> None:
     with pytest.raises(SkillFileError, match="ist kein Start-Skill"):
         update_start_skills(wf, ["proof", name])
     assert files_of(wf / "skills" / "proof") == files_of(OLD / "proof"), "nothing done first"
+
+
+def test_np4_an_interrupt_between_the_renames_puts_the_old_version_back(
+    wf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """W4b-06a.3 NP4: Ctrl-C while the new version goes into place: the old one comes back,
+    nothing half is left, the interrupt goes on."""
+    before = tree(wf / "skills" / "proof")
+    rename = os.rename
+
+    def interrupted(src: str, dst: str, **kwargs: object) -> None:
+        if str(src).endswith(".tmp"):
+            raise KeyboardInterrupt
+        rename(src, dst, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(skills_module.os, "rename", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        update_start_skills(wf, ["proof"])
+    assert tree(wf / "skills" / "proof") == before
+    assert hidden(wf) == []
