@@ -32,7 +32,7 @@ Welle 4   W4-00 Pflicht-Überträge ─┬─► W4-01 MCP-Bridge + Run-Start-Fr
                                 │
 Welle 4b  W4b-00 Ist-Erhebung ─► W4b-01 Abgaben ─► W4b-02a Schema (Tor) ─┬─► W4b-02b Runner ─┬─► W4b-03 Kanäle ─────┬─► W4b-04 moderated ──┐
                                                                          │                   └─► W4b-09 Entscheider ┤                      │
-                                                                         ├─► W4b-05a Ordner (+W5-00) ───────────────┼─► W4b-06 Vorlagen ───┼─► W4b-08 E2E ─► M2
+                                                                         ├─► W4b-05a Ordner (+W5-00) ───────────────┼─► W4b-06a Vorlagen ──┼─► W4b-06b Rückbau ─► W4b-08 E2E ─► M2
                                                                          └─► W4b-05b Kontext ───────────────────────┴─► W4b-07 Oberfläche ─┘
                                 │
 Welle 5   W5-00 Spike eigener macOS-Benutzer (parallel zu 4b) ─► W5-03 Robustheit + Härtung ─┐
@@ -44,4 +44,4 @@ Welle 4: W4-01 und W4-03 starten, wenn W4-00 und W4-02 gemerged sind; W4-05 brau
 
 Welle 4b (Phasen-Baukasten, eingefügt am 13.11.2026): Eine Research-Group besteht aus Agenten und Phasen; die fünf bisherigen Topologien werden zu Vorlagen. Das Konzept steht in [docs/research-groups.md](../docs/research-groups.md). Der Meilenstein M2 liegt am Ende dieser Welle.
 
-Zuschnitt der Welle 4b vom 17.11.2026: Nach dem Torauftrag W4b-02a (Schema) laufen Runner (W4b-02b), Ordner (W4b-05a) und Kontext (W4b-05b) nebeneinander. W4b-03 und W4b-09 brauchen den Runner, W4b-04 braucht W4b-03. W4b-06 braucht W4b-03, W4b-05a und W4b-05b; W4b-07 braucht W4b-03, W4b-05b und W4b-09. Der Spike W5-00 läuft von Anfang an parallel, sein Ergebnis geht in W4b-05a ein.
+Zuschnitt der Welle 4b vom 17.11.2026: Nach dem Torauftrag W4b-02a (Schema) laufen Runner (W4b-02b), Ordner (W4b-05a) und Kontext (W4b-05b) nebeneinander. W4b-03 und W4b-09 brauchen den Runner, W4b-04 braucht W4b-03. W4b-06 ist seit dem 22.11.2026 geteilt: W4b-06a (Vorlagen) braucht W4b-03, W4b-05a und W4b-05b und läuft neben W4b-04 und W4b-07; W4b-06b (Rückbau der alten Topologien) folgt, wenn die drei gemerged sind; W4b-07 braucht W4b-03, W4b-05b und W4b-09. Der Spike W5-00 läuft von Anfang an parallel, sein Ergebnis geht in W4b-05a ein.
