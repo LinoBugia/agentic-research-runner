@@ -27,6 +27,7 @@ woken (L13); then it closes the item. If the post fails, the item stays open (W3
 
 import logging
 import os
+import re
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -37,8 +38,8 @@ from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
 from arr.errors import ArrError
-from arr.models import Decider, Provider, Starter, TopologyKind
-from arr.permissions.inbox import ApprovalInbox, install_hosts
+from arr.models import Decider, Provider, RouteKeyword, Starter, TopologyKind
+from arr.permissions.inbox import ApprovalInbox, install_hosts, tightened_text
 from arr.permissions.policy import AlwaysRule, is_codex_escalation
 from arr.permissions.types import ApprovalItem as CoreApprovalItem
 from arr.permissions.types import (
@@ -51,10 +52,14 @@ from arr.permissions.types import (
     EscalationOption,
     PermissionRequest,
     RequestCategory,
+    TightenedBy,
+    TightenedSource,
 )
+from arr.plan.read import follow
 from arr.room.store import RoomStore
 from arr.room.types import MessageKind, MessageVia
 from arr.runs.manager import QUESTION_CLOSED
+from arr.runs.orchestrator import WORKED_ON
 from arr.runs.prepare import AgentFile, load_agent_file
 from arr.service.api_models import (
     ApiException,
@@ -74,12 +79,14 @@ from arr.service.api_models import (
     Estimate,
     LastRating,
     LimitsInfo,
+    PhasePlan,
     RiskInfo,
     RiskLevel,
     RunStartAgent,
     RunStartChannel,
 )
 from arr.service.real_api.base import ServiceState, not_allowed, not_found
+from arr.service.real_api.phase_plan import one_line
 from arr.service.real_api.run_starts import RUN_START_KEY, change_infos, is_run_start
 from arr.service.real_api.rundir import (
     RunRecord,
@@ -138,6 +145,12 @@ class GuiDecider:
 # --------------------------------------------------------------------------------------------
 # From approvals.jsonl to items
 # --------------------------------------------------------------------------------------------
+
+
+SUBMITTED_QUESTION = (
+    "Nicht mehr nötig: {agent} hat abgegeben; mit der Abgabe gilt die Frage als erledigt."
+)
+"""A question of a phases run whose agent submitted (Entscheidung 67, W4b-07 §6.7)."""
 
 
 @dataclass
@@ -253,6 +266,43 @@ def _escalated_by(entry: Mapping[str, Any]) -> EscalatedByInfo | None:
     if decider not in (DecidedBy.MANDATE_RULE, DecidedBy.GATEKEEPER):
         return None
     return EscalatedByInfo(decider=decider, note=str(data.get("note") or ""))
+
+
+def _plan_of(raw: Any) -> PhasePlan | None:
+    """The phase plan of an `open` line (W4b-07); an old line or a damaged one: none."""
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return PhasePlan.model_validate(raw)
+    except ValueError:
+        return None
+
+
+_SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+
+
+def tightened_of(entry: Mapping[str, Any]) -> TightenedBy | None:
+    """`tightened_by` of the first line of an item (W4b-09 contract) as the core type; an
+    unknown `source`, a missing or odd `stage`/`attempt` read as `unknown`, never an error;
+    no field: not tightened (W4b-07 §6.9)."""
+    raw = entry.get("tightened_by")
+    if raw is None:
+        return None
+    data = raw if isinstance(raw, Mapping) else {}
+    source = data.get("source")
+    stage, attempt = data.get("stage"), data.get("attempt")
+    if source == TightenedSource.AGENT.value:
+        return TightenedBy(source=TightenedSource.AGENT)
+    if (
+        source == TightenedSource.PHASE.value
+        and isinstance(stage, str)
+        and _SLUG.fullmatch(stage)
+        and isinstance(attempt, int)
+        and not isinstance(attempt, bool)
+        and attempt >= 1
+    ):
+        return TightenedBy(source=TightenedSource.PHASE, stage=stage, attempt=attempt)
+    return TightenedBy(source=TightenedSource.UNKNOWN)
 
 
 def _decision_info(entry: Mapping[str, Any] | None) -> DecisionInfo | None:
@@ -455,6 +505,7 @@ class ApprovalReader:
             why = None  # decided before it reached the user
         rule = self._rule(record.run_id, common["id"])
         label, effects = _rule_text(rule) if rule is not None else (None, [])
+        tightened = tightened_of(lines.opened)
         return ApprovalItem(
             type=ApprovalType.PERMISSION,
             title=item_title(lines.opened),
@@ -469,6 +520,8 @@ class ApprovalReader:
             categories=categories,
             why=why,
             escalated_by=_escalated_by(lines.opened),
+            tightened_by=tightened.model_dump(mode="json") if tightened is not None else None,
+            tightened_text=tightened_text(tightened) if tightened is not None else None,
             consequences=_consequences(request, agent.id),
             content_to=[agent.vendor] if RequestCategory.READ_OUTSIDE in categories else [],
             rule_label=label,
@@ -491,6 +544,14 @@ class ApprovalReader:
         answer = decision.comment if isinstance(decision, DecisionInfo) else None
         if common["status"] is ApprovalStatus.OBSOLETE and lines.closed is None:
             common["status_text"] = f"Nicht mehr nötig: {QUESTION_CLOSED}"
+        elif (
+            common["status"] is ApprovalStatus.OBSOLETE
+            and lines.closed is not None
+            and lines.closed.get("note") == WORKED_ON.format(agent=agent.id)
+            and (peek := record.peek()) is not None
+            and peek.topology is TopologyKind.PHASES
+        ):  # Entscheidung 67: whoever submits is done, the question with it
+            common["status_text"] = SUBMITTED_QUESTION.format(agent=agent.id)
         msg_id = question.get("msg_id")
         return ApprovalItem(
             type=ApprovalType.QUESTION,
@@ -526,6 +587,8 @@ class ApprovalReader:
             capacity=[CapacityInfo.model_validate(c) for c in start.get("capacity") or []],
             deviations=[Deviation.model_validate(d) for d in start.get("deviations") or []],
             standard_notes=[str(n) for n in start.get("standard_notes") or []],
+            phase_plan=_plan_of(start.get("phase_plan")),
+            warnings=[str(w) for w in start.get("warnings") or [] if isinstance(w, str)][:20],
             **common,
         )
 
@@ -549,6 +612,8 @@ class ApprovalReader:
         stage = str(data.get("stage") or "") or None
         keys = [EscalationOption(o) for o in data.get("options") or list(EscalationOption)]
         peek = record.peek()
+        if peek is not None and peek.topology is TopologyKind.PHASES:
+            return self._phase_escalation(record, lines, common, data, stage, keys)
         attempts: list[Attempt] = []
         ratings: list[LastRating] = []
         result_id = None
@@ -579,6 +644,99 @@ class ApprovalReader:
             result_id=result_id,
             **common,
         )
+
+    def _phase_escalation(
+        self,
+        record: RunRecord,
+        lines: _Lines,
+        common: dict[str, Any],
+        data: Mapping[str, Any],
+        stage: str | None,
+        keys: list[EscalationOption],
+    ) -> ApprovalItem:
+        """Gate `user` and escalations of a phases run (W4b-07 §6.8): head „Phase „x“ ·
+        Durchlauf n“ and the reason from the first line of `summary` (`inbox_summary`), the
+        rest of `summary` as plain lines, options that name what happens; no score chips but at
+        a gate `judge` with `mean`. The hint goes to every participant only with „Noch ein
+        Versuch“; `comment_to` stays empty."""
+        summary = data.get("summary")
+        text = summary if isinstance(summary, str) else ""
+        first, *rest = text.split("\n") if text else [""]
+        match = _PHASE_HEAD.match(first)
+        attempt = int(match.group(2)) if match else None
+        reason = one_line(match.group(3), 300) if match else None
+        resolved = record.load_resolved()
+        attempts: list[Attempt] = []
+        if resolved is not None and stage:
+            for info in stage_infos(record, resolved):
+                if info.key == stage:
+                    attempts = [
+                        Attempt(n=p.n, avg_score=p.score, pass_score=p.pass_score, passed=p.passed)
+                        for p in info.passes
+                        if p.score is not None
+                    ]
+        following: str | None = None
+        if resolved is not None and stage:
+            try:
+                following = follow(resolved, stage, RouteKeyword.NEXT)
+            except (KeyError, ValueError):
+                following = None
+        return ApprovalItem(
+            type=ApprovalType.ESCALATION,
+            title=(
+                f"Phase „{stage}“ wartet auf deine Entscheidung"
+                if stage
+                else item_title(lines.opened)
+            ),
+            topology=TopologyKind.PHASES,
+            stage=stage,
+            attempt=attempt,
+            phase_reason=reason,
+            summary_lines=[one_line(unescape_markdown(x), 400) for x in rest if x.strip()][:60],
+            attempts=attempts,
+            options=_phase_option_infos(keys, stage, attempt, following),
+            **common,
+        )
+
+
+_MARKDOWN_ESCAPE = re.compile(r"\\([\\|*_`#\[\]<>])")
+"""A mark `arr.runs.finalize.one_line` escapes for Markdown (`inbox_summary`)."""
+
+
+def unescape_markdown(text: str) -> str:
+    """The summary lines of `inbox_summary` without the Markdown escapes: the card shows them
+    as plain, escaped text, where „\\<img“ would only be noise (W4b-07.1, B5)."""
+    return _MARKDOWN_ESCAPE.sub(r"\1", text)
+
+
+_PHASE_HEAD = re.compile(r"^Phase „([^“]{1,80})“, Durchlauf (\d{1,6})\. (.*)$")
+"""First line of `inbox_summary`: phase, pass and why the user decides."""
+
+
+def _phase_option_infos(
+    keys: Iterable[EscalationOption], stage: str | None, attempt: int | None, following: str | None
+) -> list[EscalationOptionInfo]:
+    """The options of a phase escalation (W4b-07 §6.8, Entscheidungen 22, 31, 48, 51)."""
+    phase = f" „{stage}“" if stage else ""  # B9: no „Die Phase Die Phase“
+    again = f" (Durchlauf {attempt + 1})" if attempt is not None else ""
+    texts = {
+        EscalationOption.RETRY: (
+            "Noch ein Versuch",
+            f"Die Phase{phase} läuft noch einmal{again}, auch über „max_visits“ hinaus. Dein "
+            "Hinweis geht an alle Teilnehmer der Phase.",
+        ),
+        EscalationOption.CONTINUE: (
+            "Weiter",
+            f"Der Run geht mit der Phase „{following}“ weiter."
+            if following
+            else "Es folgt keine Phase mehr: Der Run endet.",
+        ),
+        EscalationOption.END: (
+            "Run beenden",
+            "Keine weitere Phase; arr schließt den Run ab.",
+        ),
+    }
+    return [EscalationOptionInfo(key=k, label=texts[k][0], help=texts[k][1]) for k in keys]
 
 
 def _option_infos(

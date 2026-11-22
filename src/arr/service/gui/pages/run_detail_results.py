@@ -18,7 +18,7 @@ from itertools import groupby
 from typing import TYPE_CHECKING
 
 from arr.room.store import RESULTS_DIR
-from arr.service.api_models import Result, ResultStatus, RunResults
+from arr.service.api_models import Result, ResultStatus, RunResults, SubmissionInfo
 from arr.service.gui import format as fmt
 from arr.service.gui.components.badge import badge_html
 from arr.service.gui.components.banner import empty_state_html
@@ -193,6 +193,98 @@ def result_card_html(result: Result, results: Sequence[Result] = ()) -> str:
     )
 
 
+def submission_dom_id(sub_id: int) -> str:
+    """DOM id of a submission card: an own ID space beside the results (`?abgabe=`, W4b-07)."""
+    return f"a{sub_id:03d}"
+
+
+SUBMISSION_STATUS = {
+    "done": Status("st-ok", "check", "fertig"),
+    "partial": Status("st-neutral", "pending", "teilweise"),
+    "not_solved": Status("st-err", "close", "nicht gelöst"),
+}
+
+
+def _value_html(value: object, depth: int = 0) -> str:
+    """A field of a submission as escaped text; lists become bullet lists (agent text)."""
+    if isinstance(value, dict):
+        return esc(" · ".join(f"{k}: {v}" for k, v in value.items()))
+    if isinstance(value, list) and depth == 0:
+        items = "".join(f"<li>{_value_html(v, 1)}</li>" for v in value)
+        return f'<ul class="plain">{items}</ul>' if items else "–"
+    return esc(value)
+
+
+def submission_title(sub: SubmissionInfo) -> str:
+    """„Abgabe 004 · artifact „beweis“ v2“."""
+    what = sub.format + (f" „{sub.name}“" if sub.name else "")
+    if sub.version is not None:
+        what += f" v{sub.version}"
+    return f"Abgabe {sub.id:03d} · {what}"
+
+
+def submission_card_html(sub: SubmissionInfo) -> str:
+    """One submission: agent (alias and real ID), format, name and version, status, summary,
+    fields, files, path, score and „gilt“; sealed ones say so. Every value is escaped."""
+    who = f'<span class="mono">{esc(sub.agent)}</span>'
+    if sub.alias:
+        who = f'<span class="mono">{esc(sub.alias)}</span> ({who})'
+    meta = [who]
+    if sub.entry is not None:
+        meta.append(f"Eintrag {sub.entry}")
+    meta.append(fmt.clock(sub.ts))
+    status = SUBMISSION_STATUS.get(sub.status, Status("st-neutral", "info", sub.status))
+    badges = badge_html(status)
+    if sub.score is not None:
+        badges += f'<span class="badge st-neutral">Ø {fmt.score(sub.score)}</span>'
+    if sub.accepted:
+        badges += f'<span class="badge st-ok">{icon("check", small=True)}gilt</span>'
+    if sub.sealed:
+        badges += (
+            f'<span class="badge st-wait" data-mark="sealed">{icon("lock", small=True)}'
+            "versiegelt bis zum Ende der Phase</span>"
+        )
+    fields = "".join(
+        f"<dt>{esc(key)}</dt><dd>{_value_html(value)}</dd>" for key, value in sub.fields.items()
+    )
+    files = (
+        '<div class="small">Dateien: '
+        + ", ".join(f'<span class="mono">{esc(f)}</span>' for f in sub.files)
+        + "</div>"
+        if sub.files
+        else ""
+    )
+    body = f'<div class="small excerpt">{esc(sub.body_excerpt)}</div>' if sub.body_excerpt else ""
+    path = f' · <span class="mono">{esc(sub.path)}</span>' if sub.path else ""
+    actions = (
+        f'<div class="btn-row"><button type="button" class="btn btn-sm" '
+        f'data-copy="{esc(sub.path)}" aria-label="Pfad von {esc(submission_title(sub))} '
+        f'kopieren">{icon("content_copy", small=True)}Pfad kopieren</button></div>'
+        if sub.path
+        else ""
+    )
+    dom = submission_dom_id(sub.id)
+    return (
+        f'<article class="card result submission" id="{dom}" aria-labelledby="{dom}-h">'
+        f'<div class="card-head"><h3 id="{dom}-h" tabindex="-1">{esc(submission_title(sub))}'
+        f"</h3>{badges}</div>"
+        f'<div class="small muted">{" · ".join(meta)}{path}</div>'
+        f'<p class="small">{esc(sub.summary)}</p>{body}'
+        + (f'<dl class="fields small">{fields}</dl>' if fields else "")
+        + f"{files}{actions}</article>"
+    )
+
+
+def submissions_html(subs: Sequence[SubmissionInfo]) -> str:
+    """Submissions grouped by phase and pass („Phase beweis · Durchlauf 2“)."""
+    parts = []
+    for (stage, attempt), group in groupby(subs, key=lambda s: (s.stage, s.attempt)):
+        head = f"Phase {stage} · Durchlauf {attempt}" if stage else "Ohne Phase"
+        cards = "".join(submission_card_html(s) for s in group)
+        parts.append(f'<h2 class="stage-h">{esc(head)}</h2>{cards}')
+    return "".join(parts)
+
+
 def handoff_html(handoff: str, run_dir: str) -> str:
     """Block „Übernehmen“: arr never writes results into the project (G8, §10.1 Nr. 2)."""
     return (
@@ -229,6 +321,10 @@ def results_html(results: RunResults, handoff: str, run_dir: str) -> str:
             "</div></section>"
         )
     parts.append(handoff_html(handoff, run_dir))
+    if results.submissions:
+        parts.append(submissions_html(results.submissions))
+    if not results.items and results.submissions:
+        return "".join(parts)
     if not results.items:
         parts.append(
             empty_state_html(
@@ -247,15 +343,24 @@ def results_html(results: RunResults, handoff: str, run_dir: str) -> str:
 class ResultsView:
     """The view „Ergebnisse“; re-rendered when results or ratings arrive."""
 
-    def __init__(self, page: "RunDetailPage", *, result_id: int | None = None) -> None:
+    def __init__(
+        self,
+        page: "RunDetailPage",
+        *,
+        result_id: int | None = None,
+        submission_id: int | None = None,
+    ) -> None:
         self.page = page
         self.result_id = result_id
+        self.submission_id = submission_id
         self.body = None
 
     async def build(self) -> None:
         page = self.page
         results = await page.api.get_results(page.run_id)
         open_at = result_dom_id(self.result_id) if self.result_id else ""
+        if self.submission_id:
+            open_at = submission_dom_id(self.submission_id)
         self.body = raw(
             results_html(results, page.detail.handoff_text, page.detail.run_dir),
             classes="rd-scroll pad results",

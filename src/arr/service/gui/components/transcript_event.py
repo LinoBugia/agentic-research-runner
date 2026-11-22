@@ -125,7 +125,8 @@ def tool_html(ev: TranscriptEvent) -> str:
 def turn_start_html(ev: TranscriptEvent, *, stage_label: str | None = None) -> str:
     """Separator „Turn 6 · 15:10 · Stufe Exploration“ and the collapsed assignment."""
     stage = stage_label or ev.data.get("stage")
-    head = f"Turn {ev.turn} · {fmt.clock(ev.ts)}" + (f" · Stufe {stage}" if stage else "")
+    word = "Notiz-Turn" if ev.data.get("purpose") == "compact" else "Turn"  # W4b-05b, W4b-07
+    head = f"{word} {ev.turn} · {fmt.clock(ev.ts)}" + (f" · Stufe {stage}" if stage else "")
     prompt = str(ev.data.get("prompt") or "")
     return (
         f'<div id="{event_dom_id(ev.seq)}"><div class="turn-sep">{esc(head)}</div>'

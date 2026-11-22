@@ -23,6 +23,7 @@ from arr.service.api_models import (
     ApiException,
     ErrorCode,
     SaveSkillFileRequest,
+    Severity,
     SkillFile,
     SkillInfo,
     SkillIssue,
@@ -285,6 +286,9 @@ class SkillEditor:
         clock = time.strftime("%H:%M", time.localtime(self.api.now()))
         if skill.valid:
             text = f"Gespeichert um {clock}. Prüfung: keine Fehler."
+            if skill.issues:  # hints of `check` (W4b-07): no error, no block
+                hints = len(skill.issues)
+                text = f"Gespeichert um {clock}. Prüfung: keine Fehler, {hints} Hinweise."
             css = "ok-text"
         else:
             n = len(skill.issues)
@@ -302,13 +306,18 @@ class SkillEditor:
     def render_checks(self, skill: SkillInfo) -> None:
         """The check of the skill under the editor; issues of this file jump to their line."""
         self.checks.clear()
-        if skill.valid:
+        if not skill.issues:
             return
+        errors = sum(1 for i in skill.issues if i.severity is not Severity.WARNING)
         with self.checks:
-            raw(f"<h3>Prüfung · {len(skill.issues)} Fehler</h3>")
+            heading = f"{errors} Fehler" if errors else f"{len(skill.issues)} Hinweise"
+            raw(f"<h3>Prüfung · {heading}</h3>")
             for issue in skill.issues:
                 with ui.element("div").classes("check"):
-                    raw('<span class="st bad" aria-hidden="true">✕</span>', tag="span")
+                    if issue.severity is Severity.WARNING:
+                        raw('<span class="st warn" aria-hidden="true">!</span>', tag="span")
+                    else:
+                        raw('<span class="st bad" aria-hidden="true">✕</span>', tag="span")
                     with ui.element("span").classes("txt"):
                         if issue.file == self.path and issue.line:
                             line = issue.line

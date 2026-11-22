@@ -65,6 +65,7 @@ async def test_the_service_offers_all_tools_of_04(wf: Path) -> None:
         "post_to_run",
         "control_run",
         "list_approvals",
+        "group_schema",
     }
 
 

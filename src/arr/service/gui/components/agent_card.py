@@ -144,8 +144,18 @@ def tooltip(agent: AgentState) -> str:
     if agent.assignment_label:
         lines.append(f"Auftrag: {agent.assignment_label}")
     turns = f"Turn {agent.turn}" + (f" von {agent.turns_limit}" if agent.turns_limit else "")
-    lines.append(turns)
+    lines.append(turns + note_turns_text(agent))
+    if agent.context_text:
+        lines.append(agent.context_text)
     return "\n".join(lines)
+
+
+def note_turns_text(agent: AgentState) -> str:
+    """„ (davon 1 Notiz-Turn)“: the note turns of auto-compact count as turns (W4b-07)."""
+    if not agent.note_turns:
+        return ""
+    word = "Notiz-Turn" if agent.note_turns == 1 else "Notiz-Turns"
+    return f" (davon {agent.note_turns} {word})"
 
 
 def card_html(agent: AgentState, now: float | None = None) -> str:
@@ -155,7 +165,11 @@ def card_html(agent: AgentState, now: float | None = None) -> str:
     if agent.questions_to_user:
         n = agent.questions_to_user
         q = f'<span class="q">? {"an dich" if n == 1 else f"{n} an dich"}</span>'
-    meta = [f"Turn {agent.turn}" + (f" von {agent.turns_limit}" if agent.turns_limit else "")]
+    meta = [
+        f"Turn {agent.turn}"
+        + (f" von {agent.turns_limit}" if agent.turns_limit else "")
+        + note_turns_text(agent)
+    ]
     if agent.cost_usd is not None:
         meta.append(fmt.money(agent.cost_usd, agent.cost_kind))
     elif agent.tokens:
@@ -171,6 +185,11 @@ def card_html(agent: AgentState, now: float | None = None) -> str:
         f"{f'<span class=qrow>{q}</span>' if q else ''}"
         f"{f'<span class=warn>⚠ {esc(agent.warning)}</span>' if agent.warning else ''}"
         f'<span class="meta">{esc(" · ".join(meta))}</span>'
+        + (
+            f'<span class="meta ctx" data-mark="context-fill">{esc(agent.context_text)}</span>'
+            if agent.context_text
+            else ""
+        )
     )
 
 

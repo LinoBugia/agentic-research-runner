@@ -435,3 +435,10 @@ section[id] { scroll-margin-top: calc(var(--top-h) + 16px); }
 /* W4-04: the part of the mandate arr checks itself („Vollmacht (von arr geprüft)“) */
 .mandate-checked { border: 1px solid var(--border); border-radius: var(--r2, 6px); padding: var(--s2, 8px) var(--s3, 12px); margin: 0 0 var(--s3, 12px); background: var(--surface-2, transparent); }
 .mandate-checked .kv { margin-top: 6px; grid-template-columns: 120px minmax(0, 1fr); }
+
+/* W4b-07: the phase plan (docs/10 §4.9) scrolls sideways in narrow columns, cells stay readable */
+.tbl-wrap.phase-plan { overflow-x: auto; max-width: 100%; margin: 4px 0 8px; }
+.tbl-wrap.phase-plan table.tbl { min-width: 960px; }
+.tbl-wrap.phase-plan td { vertical-align: top; font-size: 12.5px; }
+.tbl-wrap.phase-plan td:first-child { white-space: nowrap; }
+.agent .meta.ctx { display: block; }

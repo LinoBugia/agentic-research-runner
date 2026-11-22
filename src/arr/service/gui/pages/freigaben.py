@@ -12,6 +12,7 @@ from datetime import datetime
 
 from nicegui import ui
 
+from arr.models import TopologyKind
 from arr.permissions.types import (
     ApprovalStatus,
     ApprovalType,
@@ -323,9 +324,17 @@ class FreigabenPage:
             who = esc(DECIDED_BY[decision.decided_by])
             if decision.rationale:
                 who += f'<span class="note">„{esc(decision.rationale)}“</span>'
+            phase_hint = item.type is ApprovalType.ESCALATION and item.topology is (
+                TopologyKind.PHASES
+            )
             if decision.comment:
                 word = "Antwort" if decision.action is DecisionAction.ANSWER else "Kommentar"
+                word = "Hinweis" if phase_hint else word
                 who += f'<span class="note">{word}: „{esc(decision.comment)}“</span>'
+            elif phase_hint:
+                who += '<span class="note">ohne Hinweis</span>'
+            if item.tightened_text:  # W4b-07 §6.9: why it was yours
+                who += f'<span class="note">Warum bei dir: {esc(item.tightened_text)}</span>'
         status = outcome(item)
         extra = (
             f'<span class="small muted" style="display:block">{esc(item.status_text)}</span>'

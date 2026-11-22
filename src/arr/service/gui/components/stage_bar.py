@@ -11,7 +11,7 @@ says what the discussion waits for: „Runde 2 von 3“, „Ruhe, Ende · noch 0
 import time
 
 from arr.models import TopologyKind
-from arr.service.api_models import Attempt, DiscussionState, StageInfo, StageStatus
+from arr.service.api_models import Attempt, DiscussionState, PassInfo, StageInfo, StageStatus
 from arr.service.gui import format as fmt
 from arr.service.gui.components.agent_card import until_html
 from arr.service.gui.components.base import esc, icon
@@ -23,6 +23,7 @@ _LOOK = {
     StageStatus.WAITING_USER: ("now waitme", "front_hand", "wartet auf dich"),
     StageStatus.FAILED: ("failed", "close", "fehlgeschlagen"),
     StageStatus.TODO: ("todo", "radio_button_unchecked", "offen"),
+    StageStatus.SKIPPED: ("todo skipped", "remove", "nicht betreten"),
 }
 
 
@@ -37,6 +38,25 @@ def attempt_chip(attempt: Attempt, *, running: bool = False) -> str:
         f'<span class="att {cls}" title="Versuch {attempt.n}: {fmt.score(attempt.avg_score)}, '
         f'{word}">V{attempt.n} {fmt.score(attempt.avg_score)}</span>'
     )
+
+
+def pass_chip(info: PassInfo) -> str:
+    """A pass of a phase (W4b-07): „D2 läuft“ blue, „D1 accept“ with the gate's result, „D1 6,0“
+    green/red at a gate `judge` with `mean`; the result is text from the log, escaped."""
+    if info.running and info.value is None and info.score is None:
+        return f'<span class="att live">D{info.n} läuft</span>'
+    if info.score is not None:
+        cls = "pass" if info.passed else "fail"
+        word = "bestanden" if info.passed else "nicht bestanden"
+        limit = f", Grenze {fmt.score(info.pass_score)}" if info.pass_score is not None else ""
+        tip = f"Durchlauf {info.n}: {fmt.score(info.score)}{limit}, {word}"
+        return (
+            f'<span class="att {cls}" title="{esc(tip)}">D{info.n} {fmt.score(info.score)}</span>'
+        )
+    value = info.value or "ohne Ergebnis"
+    cls = "pass" if info.passed else ("fail" if info.passed is False else "live")
+    tip = f"Durchlauf {info.n}: {value}"
+    return f'<span class="att {cls}" title="{esc(tip)}">D{info.n} {esc(value)}</span>'
 
 
 def discussion_html(discussion: DiscussionState, now: float) -> str:
@@ -55,7 +75,10 @@ def _segment(stage: StageInfo, discussion: str = "") -> str:
     name = f"{stage.index} · {stage.label}" if stage.index else stage.label
     if stage.round:
         name += f" R{stage.round}"
-    if stage.attempts:
+    if stage.passes:
+        chips = "".join(pass_chip(p) for p in stage.passes)
+        sub = f'<span class="attempts">{chips}</span>'
+    elif stage.attempts:
         chips = "".join(
             attempt_chip(a, running=now and i == len(stage.attempts) - 1)
             for i, a in enumerate(stage.attempts)
@@ -71,9 +94,16 @@ def _segment(stage: StageInfo, discussion: str = "") -> str:
     )
 
 
+def _scores(stage: StageInfo) -> list[tuple[str, float]]:
+    """Rated attempts („V1“) of the old topologies or rated passes („D1“) of a phase."""
+    if stage.passes:
+        return [(f"D{p.n}", p.score) for p in stage.passes if p.score is not None]
+    return [(f"V{a.n}", a.avg_score) for a in stage.attempts if a.avg_score is not None]
+
+
 def _final_score(stage: StageInfo) -> float | None:
-    rated = [a for a in stage.attempts if a.avg_score is not None]
-    return rated[-1].avg_score if rated else None
+    rated = _scores(stage)
+    return rated[-1][1] if rated else None
 
 
 def _summary(done: list[StageInfo]) -> str:
@@ -81,12 +111,13 @@ def _summary(done: list[StageInfo]) -> str:
         return ""
     first, last = done[0].index, done[-1].index
     span = f"{first}–{last}" if first != last else f"{first}"
+    finished = [s for s in done if s.status is StageStatus.DONE]
+    if len(finished) < len(done):  # never entered phases inside (B8): „6 von 7 erledigt“
+        span = f"{len(finished)} von {len(done)}"
     tips = []
     chips = []
     for stage in done:
-        scores = ", ".join(
-            f"V{a.n} {fmt.score(a.avg_score)}" for a in stage.attempts if a.avg_score is not None
-        )
+        scores = ", ".join(f"{name} {fmt.score(score)}" for name, score in _scores(stage))
         tips.append(f"{stage.index} {stage.label}" + (f" {scores}" if scores else ""))
         final = _final_score(stage)
         if final is not None:
@@ -110,13 +141,20 @@ def stage_bar_html(
     # only a leading run of finished stages can be summed up
     leading = []
     for stage in ordered:
-        if stage.status is not StageStatus.DONE:
+        if stage.status not in (StageStatus.DONE, StageStatus.SKIPPED):
             break
         leading.append(stage)
-    summary = _summary(leading) if len(leading) >= 2 and len(leading) < len(ordered) else ""
+    skipped = any(s.status is StageStatus.SKIPPED for s in leading)
+    fits = len(leading) < len(ordered) or skipped
+    summary = _summary(leading) if len(leading) >= 2 and fits else ""
     segments = "".join(_segment(s, extra) for s in ordered)
     live = (StageStatus.RUNNING, StageStatus.WAITING_USER)
     if extra and not any(s.status in live for s in ordered):
         segments += f'<li class="stage now">{extra}</li>'  # no running stage: show it anyway
-    label = f"Ablauf der Topologie {TOPOLOGY_LABEL[topology]}, {len(ordered)} Stufen"
+    if topology is TopologyKind.PHASES:
+        label = f"Ablauf in Phasen, {len(ordered)} Phasen"
+    else:
+        label = (
+            f"Ablauf der Topologie {TOPOLOGY_LABEL.get(topology, topology)}, {len(ordered)} Stufen"
+        )
     return f'<ol class="stagebar" aria-label="{esc(label)}">{summary}{segments}</ol>'

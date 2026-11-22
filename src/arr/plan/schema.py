@@ -46,6 +46,27 @@ def json_schema(target: Literal["group", "run"] = "group") -> dict[str, Any]:
             "description": "„phases“ schaltet den Phasen-Baukasten ein (docs/10 §4.10).",
         }
         schema["required"] = sorted({*schema.get("required", []), "phases"})
+    else:  # NG6: the short form `topology: phases` as in a group, plus `params` of a run
+        props["topology"] = {
+            "anyOf": [
+                {"const": "phases"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "phases"},
+                        "params": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": False,
+                },
+                {"type": "null"},
+            ],
+            "default": None,
+            "description": (
+                "„phases“ schaltet den Phasen-Baukasten ein (docs/10 §4.10); in der langen Form "
+                "setzt „params“ Parameter des Skills. Ohne „topology“ gilt die des Skills."
+            ),
+        }
     defs = schema["$defs"]
     defs["FieldKind"] = {
         "enum": [kind.value for kind in PUBLIC_KINDS],
@@ -74,7 +95,8 @@ def json_schema(target: Literal["group", "run"] = "group") -> dict[str, Any]:
         "„check“: Namen, die es geben muss (Agenten, Phasen, Kanäle, Abgaben, Parameter), "
         "Routen-Wörter (next, retry, stop, escalate), welche Schlüssel zu welcher Topologie "
         "und welchem Gate passen, Schleifen und Isolation; Platzhalter innerhalb eines "
-        'eigenen Formats; Zahlen als Text ("2") nimmt arr an, das Schema nicht.'
+        'eigenen Formats; Zahlen als Text ("2") und Wahrheitswerte als Text (etwa '
+        '„isolated“: "true") nimmt arr an, das Schema nicht.'
     )
     return schema
 

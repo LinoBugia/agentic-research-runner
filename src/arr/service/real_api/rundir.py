@@ -38,10 +38,10 @@ from arr.models import (
     TopologyKind,
     parse_duration,
 )
-from arr.permissions.policy import is_codex_escalation
+from arr.permissions.policy import RETIRED_DIR, SCRATCH_DIR, is_codex_escalation
 from arr.permissions.types import RequestCategory
 from arr.resolve import parse_yaml_text, validate_model
-from arr.room.store import RoomStore
+from arr.room.store import RoomStore, private_owner
 from arr.room.types import Message as RoomMessage
 from arr.room.types import Result as RoomResult
 from arr.runs.eventlog import RATE_LIMIT_PASSING
@@ -97,6 +97,12 @@ from arr.service.api_models import (
     Vendor,
     WaitReason,
 )
+from arr.service.real_api.phase_run import (
+    agent_logs,
+    context_fill,
+    run_phase_plan,
+    submission_infos,
+)
 from arr.service.real_api.transcript import (
     TOOL_CALL,
     TOOL_RESULT,
@@ -121,7 +127,10 @@ _MODEL_LABELS = {
     "claude-sonnet-5-5": "Claude Sonnet 5.5",
     "claude-haiku-5-5": "Claude Haiku 5.5",
 }
-_SIZE_SKIP = frozenset({"work", "base", "shared", ".venv", "tmp", "blobs"})
+_SIZE_SKIP = frozenset(
+    {"work", "base", "shared", ".venv", "tmp", "blobs", RETIRED_DIR, SCRATCH_DIR}
+)
+"""Not protocols: working copies, snapshot, venv, Run-tmp, filed-away folders and scratch."""
 
 
 # --------------------------------------------------------------------------------------------
@@ -837,6 +846,30 @@ def plan_and_stages(entries: Sequence[Mapping[str, Any]]) -> tuple[list[str], li
     return plan, reached
 
 
+def _start_topology(record: RunRecord) -> TopologyKind | None:
+    """The topology a waiting run start names in its `open` line (no `run.yaml` yet, W4b-07)."""
+    for entry in item_entries(record):
+        start = entry.get("run_start")
+        if entry.get("event") == "open" and isinstance(start, Mapping):
+            try:
+                return TopologyKind(str(start.get("topology")))
+            except ValueError:
+                return None
+    return None
+
+
+def last_entered(entries: Sequence[Mapping[str, Any]]) -> str | None:
+    """The phase of the last `pass_start` of a phases run (W4b-07): after a `goto` back, that
+    is the current phase, not the phase reached last for the first time."""
+    for entry in reversed(entries):
+        if entry.get("kind") != "checkpoint":
+            continue
+        data = _data(entry)
+        if data.get("phase") == "pass_start" and isinstance(data.get("stage"), str):
+            return str(data["stage"])
+    return None
+
+
 def turn_counts(entries: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     """Finished turns per agent (from `turn_end` entries)."""
     counts: dict[str, int] = {}
@@ -1132,13 +1165,15 @@ def run_summary(
     stage = None
     if reached:
         current = reached[-1]
+        if peek is not None and peek.topology is TopologyKind.PHASES:
+            current = last_entered(entries) or current  # loops: the phase entered last
         stage = StageRef(
             index=plan.index(current) + 1 if current in plan else len(reached),
             count=max(len(plan), len(reached)),
             label=current,
         )
     tokens, cost, kind = run_usage(record)
-    topology = peek.topology if peek is not None else TopologyKind.SOLO
+    topology = peek.topology if peek is not None else _start_topology(record) or TopologyKind.SOLO
     skill = meta.skill
     name = meta.name or f"{skill or topology.value} · {meta.project}"
     agent_count = peek.agent_count if peek is not None else len(record.agents)
@@ -1408,6 +1443,20 @@ def stage_infos(record: RunRecord, resolved: ResolvedRun | None) -> list[StageIn
     """Progress bar of a run from the checkpoints (docs/08 §5.0 `StageInfo`)."""
     entries = record.log.entries
     plan, reached = plan_and_stages(entries)
+    if resolved is not None and resolved.topology.kind is TopologyKind.PHASES:
+        from arr.service.real_api.phase_run import phase_stage_infos
+
+        if not plan:
+            plan = [p.name for p in resolved.phases]
+        return phase_stage_infos(
+            entries,
+            resolved,
+            plan,
+            active=record.status.is_active,
+            failed_run=record.status is RunStatus.FAILED,
+            escalation_open=open_escalation_id(record) is not None,
+            final=record.final,
+        )
     if not plan and resolved is not None:
         plan = [s.name for s in resolved.stages]
     ended: dict[str, str] = {}
@@ -1557,6 +1606,7 @@ def run_detail(
         handoff_text=handoff_text(record),
         run_dir=str(record.run_dir),
         task_md=record.task_md,
+        phase_plan=run_phase_plan(record, resolved),
     )
 
 
@@ -1713,6 +1763,9 @@ def agent_states(record: RunRecord, resolved: ResolvedRun | None = None) -> list
                 results_count[result.agent] = results_count.get(result.agent, 0) + 1
             for rating in store.ratings():
                 ratings_count[rating.rater] = ratings_count.get(rating.rater, 0) + 1
+            if resolved.phases:  # `submit` of a phases run counts as a result (W4b-07)
+                for sub in store.submissions():
+                    results_count[sub.agent] = results_count.get(sub.agent, 0) + 1
         except ArrError:
             pass
     questions = room.open_questions() if room.available else []
@@ -1720,6 +1773,7 @@ def agent_states(record: RunRecord, resolved: ResolvedRun | None = None) -> list
     final = record.final
     channels = {c.name: c for c in resolved.groupchats}
     view = flow_view(record.log.entries)
+    logs = agent_logs(record.log.entries)
     waits = {
         str(r["agent"]): dict(r)
         for r in record.room.rows("SELECT * FROM agent_wait WHERE kind='wait_for_messages'")
@@ -1743,6 +1797,7 @@ def agent_states(record: RunRecord, resolved: ResolvedRun | None = None) -> list
             and (index is None or not index.max_turn()),
         )
         usage, _turns = index.usage() if index is not None else (Usage(), 0)
+        fill = context_fill(config.compact, turn_ends, logs.get(config.id))
         cache_ratio = None
         if usage.cache_read and (usage.input or 0) + usage.cache_read > 0:
             cache_ratio = usage.cache_read / ((usage.input or 0) + usage.cache_read)
@@ -1808,6 +1863,12 @@ def agent_states(record: RunRecord, resolved: ResolvedRun | None = None) -> list
                 reachable=not final
                 and state is AgentDisplayState.DONE
                 and view.channel in config.channels,
+                context_text=fill.text if fill is not None else None,
+                context_tokens=fill.tokens if fill is not None else None,
+                context_window=fill.window if fill is not None else None,
+                compact_threshold=fill.threshold if fill is not None else None,
+                compactions=fill.compactions if fill is not None else 0,
+                note_turns=fill.note_turns if fill is not None else 0,
             )
         )
     return out
@@ -1868,6 +1929,7 @@ def channel_infos(record: RunRecord, resolved: ResolvedRun | None = None) -> lis
                 last_message_id=stat.get("last"),
                 open_questions=int(stat.get("open", 0)),
                 pinned=list(stat.get("pinned", [])),
+                private_of=private_owner(info.name),
             )
         )
     return out
@@ -2038,22 +2100,34 @@ def run_results(record: RunRecord, resolved: ResolvedRun | None = None) -> RunRe
                 )
             )
     summary = record.summary_md
+    phases = resolved is not None and resolved.topology.kind is TopologyKind.PHASES
+    submissions = submission_infos(record, store) if phases and store is not None else []
+    if phases:
+        empty = (
+            "Noch keine Abgabe. Agenten geben ihre Arbeit mit submit ab; die Abgaben erscheinen "
+            "hier nach Phase und Durchlauf."
+        )
+    else:
+        empty = (
+            "Noch kein Ergebnis. Agenten geben Ergebnisse über den Gruppenchat ab "
+            "(submit_result); sie erscheinen hier mit ihren Bewertungen."
+        )
     return RunResults(
         items=items,
         summary_md=summary,
         summary_path=SUMMARY_FILE if summary is not None else None,
-        empty_text=None
-        if items
-        else "Noch kein Ergebnis. Agenten geben Ergebnisse über den Gruppenchat ab "
-        "(submit_result); sie erscheinen hier mit ihren Bewertungen.",
+        empty_text=None if items or submissions else empty,
+        submissions=submissions,
     )
 
 
 def log_entries(record: RunRecord) -> list[LogEntry]:
     """`orchestrator.jsonl` as German lines (view „Ablauf“)."""
     out = []
+    peek = record.peek()
+    phases = peek is not None and peek.topology is TopologyKind.PHASES
     for entry in record.log.entries:
-        text = describe_entry(entry, record.run_dir)
+        text = describe_entry(entry, record.run_dir, phases=phases)
         if not text:
             continue
         ts = entry.get("ts")

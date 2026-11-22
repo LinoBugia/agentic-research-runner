@@ -23,6 +23,7 @@ from arr.service.api_models import (
     CreateSkillRequest,
     DuplicateSkillRequest,
     SaveSkillFileRequest,
+    Severity,
     SkillInfo,
     SkillIssue,
     SkillKind,
@@ -31,7 +32,7 @@ from arr.service.gui import format as fmt
 from arr.service.gui.app import get_api
 from arr.service.gui.components.badge import badge_html
 from arr.service.gui.components.banner import empty_state_html
-from arr.service.gui.components.base import button, esc, icon, markdown_html, raw
+from arr.service.gui.components.base import button, esc, icon, markdown_html, query_int, raw
 from arr.service.gui.components.form import Field, radio
 from arr.service.gui.components.form_dialog import FormDialog
 from arr.service.gui.components.page_state import (
@@ -42,6 +43,7 @@ from arr.service.gui.components.page_state import (
     use_screen_assets,
 )
 from arr.service.gui.components.params import CHOICE_LABELS, param_text
+from arr.service.gui.components.phase_table import phase_table_html
 from arr.service.gui.components.skill_editor import SkillEditor, install_editor_js, issue_where
 from arr.service.gui.layout import Frame, tab_title
 from arr.service.gui.texts import TOPOLOGY_LABEL, Status
@@ -132,6 +134,8 @@ def skill_item_html(skill: SkillInfo, selected: bool) -> str:
 
 
 def flow_html(topology: TopologyKind) -> str:
+    if topology not in FLOW:  # `phases`: the overview shows the phase plan instead
+        return '<p class="small muted">Der Ablauf steht im Phasenplan.</p>'
     stages, loop = FLOW[topology]
     first = 0 if topology in (TopologyKind.REVIEW, TopologyKind.EXPLORATION) else 1
     items = "".join(
@@ -223,7 +227,15 @@ def file_href(skill: str, path: str) -> str:
 
 
 def issue_html(skill: str, issue: SkillIssue) -> str:
-    """One problem of the check: where (link to the file's editor) and what to do."""
+    """One problem of the check: where (link to the file's editor) and what to do. A hint
+    (warning) never blocks a start and is marked as „Hinweis“ (W4b-07)."""
+    if issue.severity is Severity.WARNING:
+        return (
+            '<div class="check" data-mark="skill-hint"><span class="st warn" aria-hidden="true">'
+            '!</span><span class="txt"><a class="b" '
+            f'href="{esc(file_href(skill, issue.file))}">Hinweis · {esc(issue_where(issue))}</a>'
+            f"<small>{esc(issue.message)}</small></span></div>"
+        )
     return (
         '<div class="check"><span class="st bad" aria-hidden="true">✕</span><span class="txt">'
         f'<a class="b" href="{esc(file_href(skill, issue.file))}">{esc(issue_where(issue))}</a>'
@@ -235,12 +247,14 @@ class SkillsPage:
     """State of one Skills page (one browser tab)."""
 
     def __init__(
-        self, frame: Frame, api: ApiClient, *, name: str, tab: str, datei: str = ""
+        self, frame: Frame, api: ApiClient, *, name: str, tab: str, datei: str = "", zeile: int = 0
     ) -> None:
         self.frame = frame
         self.api = api
         self.name = name
         self.datei = datei
+        self.zeile = zeile
+        """Line of the opened file to jump to (phase plan → `group.yaml`, W4b-07)."""
         if datei and not tab:
             tab = "dateien"
         self.tab = tab if tab in dict(TABS) else "uebersicht"
@@ -383,11 +397,16 @@ class SkillsPage:
             await self._edit(skill, TAB_FILES[self.tab])
 
     def _render_head(self, skill: SkillInfo) -> None:
-        status = (
-            badge_html(CHECKED)
-            if skill.valid
-            else badge_html(Status("st-warn", "warning", f"{len(skill.issues)} Fehler"))
-        )
+        errors = [i for i in skill.issues if i.severity is not Severity.WARNING]
+        hints = len(skill.issues) - len(errors)
+        if not skill.valid:
+            status = badge_html(Status("st-warn", "warning", f"{len(errors)} Fehler"))
+        elif hints:
+            word = "Hinweis" if hints == 1 else "Hinweise"
+            hint = Status("st-neutral", "info", f"{hints} {word}")
+            status = badge_html(CHECKED) + badge_html(hint)
+        else:
+            status = badge_html(CHECKED)
         self.head.clear()
         with self.head:
             with ui.element("div").classes("page-head").style("margin-bottom:8px"):
@@ -418,9 +437,10 @@ class SkillsPage:
                             )
             raw(f'<p class="muted">{esc(skill.description)}</p>')
             if not skill.valid:
-                first = skill.issues[0] if skill.issues else None
+                errors = [i for i in skill.issues if i.severity is not Severity.WARNING]
+                first = errors[0] if errors else None
                 where = f"{issue_where(first)}: " if first else ""
-                more = f" (und {len(skill.issues) - 1} weitere)" if len(skill.issues) > 1 else ""
+                more = f" (und {len(errors) - 1} weitere)" if len(errors) > 1 else ""
                 raw(
                     '<div class="banner err banner-sm" role="alert" id="skill-blocked" '
                     f'style="margin-bottom:12px">{icon("error")}<div class="txt"><b>{esc(where)}'
@@ -484,9 +504,19 @@ class SkillsPage:
             )
             return
         topology = skill.topology
+        if skill.phase_plan is not None:
+            raw(
+                '<h3>Phasenplan</h3><p class="small muted">Mit den Standardwerten der Parameter. '
+                "Ein Klick auf eine Phase öffnet ihre Zeile in der group.yaml.</p>"
+                + phase_table_html(skill.phase_plan, skill=skill.name)
+            )
+            flow = ""
+        else:
+            label = TOPOLOGY_LABEL.get(topology, str(topology))
+            flow = f"<h3>Ablauf (Topologie {esc(label)})</h3>{flow_html(topology)}"
         raw(
             '<div class="grid-2e"><div>'
-            f"<h3>Ablauf (Topologie {esc(TOPOLOGY_LABEL[topology])})</h3>{flow_html(topology)}"
+            f"{flow}"
             f'<h3 style="margin-top:12px">Parameter</h3>{params_html(skill)}</div>'
             f"<div><h3>Agenten</h3>{agents_html(skill)}"
             f'<h3 style="margin-top:12px">Gruppenchats</h3>{channels_html(skill)}'
@@ -545,6 +575,11 @@ class SkillsPage:
         if await editor.build():
             self.editor = editor
             editor.render_checks(skill)
+            if self.zeile > 0:
+                ui.run_javascript(
+                    f"setTimeout(() => arr.skillEditor.gotoLine({json.dumps(editor.dom_id)}, "
+                    f"{int(self.zeile)}), 50)"
+                )
 
     async def _files(self, skill: SkillInfo) -> None:
         with ui.element("div").classes("sk-files"):
@@ -746,7 +781,7 @@ class SkillsPage:
 def register() -> None:
     """Register `/skills` and `/skills/<name>` (docs/08 §5.7, §4.3)."""
 
-    async def show(name: str, tab: str, zustand: str, datei: str = "") -> None:
+    async def show(name: str, tab: str, zustand: str, datei: str = "", zeile: str = "") -> None:
         api = state_api(get_api(), zustand)
         use_screen_assets()
         install_editor_js()
@@ -758,12 +793,15 @@ def register() -> None:
             focus="#skill-title" if name else None,
         )
         await frame.start()
-        await SkillsPage(frame, api, name=name, tab=tab, datei=datei).build()
+        line = query_int(zeile, 6) or 0
+        await SkillsPage(frame, api, name=name, tab=tab, datei=datei, zeile=line).build()
 
     @ui.page("/skills")
     async def skills(tab: str = "", zustand: str = "") -> None:
         await show("", tab, zustand)
 
     @ui.page("/skills/{name}")
-    async def skill(name: str, tab: str = "", zustand: str = "", datei: str = "") -> None:
-        await show(name, tab, zustand, datei)
+    async def skill(
+        name: str, tab: str = "", zustand: str = "", datei: str = "", zeile: str = ""
+    ) -> None:
+        await show(name, tab, zustand, datei, zeile)
