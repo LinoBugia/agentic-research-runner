@@ -203,6 +203,20 @@ def test_a3_an_agent_without_any_turn_and_one_of_an_old_room(tmp_path: Path) -> 
     refused(store2, "lead")
 
 
+def test_a3_the_lead_only_in_its_action(store: RoomStore) -> None:
+    """The lead itself in a turn of its phase that is not its action (a rating action, a
+    turn without a submission): refused (the role is checked by the expected action as well
+    as by the phase)."""
+    turn(store, "lead", action="gate", fmt="review", number=2)
+    refused(store, "lead")
+    turn(store, "lead", action=None, number=3)
+    refused(store, "lead")
+    turn(store, "lead", action="assign-1", number=4)
+    refused(store, "lead")
+    turn(store, "lead", number=5)
+    store.for_agent("lead").assign("sx", "x", "text")
+
+
 def test_a3_the_lead_after_its_accepted_submission_also_in_an_answer_turn(
     store: RoomStore,
 ) -> None:
@@ -427,6 +441,39 @@ def test_a12_without_open_assignments_at_once(store: RoomStore) -> None:
 
 def test_a12_a_lead_without_any_assignment(store: RoomStore) -> None:
     assert hand_in(store, "lead").action == "work"
+
+
+def test_a12_an_assignment_between_naming_and_filing_is_named_first(
+    store: RoomStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race of §6.6 made certain: #1 is named, then the lead's second `submit` runs, and
+    while its files are staged (after the naming, before the transaction that files it) a
+    new assignment #2 comes in (another connection, as from a second process). The submission
+    is refused and names #2; nothing is cancelled; the next `submit` is accepted."""
+    lead = store.for_agent("lead")
+    lead.assign("sx", "1", "text")
+    with pytest.raises(RoomError, match="#1 an sx"):
+        hand_in(store, "lead")
+    stage = RoomStore._stage_submission
+    once = {"done": False}
+
+    def staged(self: RoomStore, *args: Any, **kwargs: Any) -> Any:
+        if not once["done"]:
+            once["done"] = True
+            RoomStore(self.run_dir).for_agent("lead").assign("sy", "2", "text")
+        return stage(self, *args, **kwargs)
+
+    monkeypatch.setattr(RoomStore, "_stage_submission", staged)
+    with pytest.raises(RoomError) as info:
+        hand_in(store, "lead")
+    assert "#2 an sy" in str(info.value)
+    assert store.submissions(agent="lead") == []
+    assert [(d.status, d.named) for d in store.delegations()] == [
+        (DelegationStatus.QUEUED, True),
+        (DelegationStatus.QUEUED, True),
+    ]
+    hand_in(store, "lead")
+    assert {d.status for d in store.delegations()} == {DelegationStatus.CANCELLED}
 
 
 def test_a12_assign_against_submit_from_two_processes(tmp_path: Path) -> None:

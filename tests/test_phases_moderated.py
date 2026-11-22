@@ -163,6 +163,7 @@ async def test_a1_assign_return_submit_and_the_gate_reads_only_the_lead(workfold
     assert set(subs) == {"work", "assign-1", "assign-2"}
     [gate_] = checkpoints(mgr, "gate")
     assert gate_["agent"] == "a" and gate_["results"] == [subs["work"].id]
+    assert gate_["missing"] == [] and gate_["valid"] == [subs["work"].id]
     assert [d.submission_id for d in rows] == [subs["assign-1"].id, subs["assign-2"].id]
     assert entered(mgr) == ["m"]
     assert "return" in turn_kinds(log, "a")
@@ -197,6 +198,19 @@ async def test_a11_returns_together_in_one_turn_not_counted_at_most_one_each(
     assert numbers == [[1, 2], [3]]
     assert "Aufträge #1, #2 sind zurück." in returns[0].prompt
     assert "Kein weiterer Auftrag läuft oder wartet." in returns[1].prompt
+
+
+async def test_a11_a_return_turn_leaves_the_counted_turns_alone(workfolder: Path) -> None:
+    """`turns: 2`: after the return turn of #1 (no submission) nothing runs: the lead gets its
+    second counted turn and then the follow-up question, the return turn did not use one."""
+
+    def a(view: TurnView) -> list[dict[str, Any]]:
+        return [give("b", "1")] if first(view) else silent(view)
+
+    mgr, log = manager(workfolder, group(phase(turns=2)), {"a": a, "b": answer()})
+    assert await run(mgr) is RunStatus.DONE, errors(mgr)
+    assert turn_kinds(log, "a") == ["first", "return", "continue", "ask"]
+    assert "Turn 2 von 2" in log.of("a")[2].prompt
 
 
 async def test_a11_summary_only_as_data_and_the_path_is_right(workfolder: Path) -> None:
