@@ -57,6 +57,7 @@ TOOLS = {
     "post_to_run",
     "control_run",
     "list_approvals",
+    "group_schema",
 }
 """The tools of the arr MCP server (docs/04 §2, W4-01 `user_api.TOOL_DOCS`)."""
 FIELDS = {
@@ -82,6 +83,7 @@ FIELDS = {
     "n_diskutanten",
     "agent_id",
     "summary_md",
+    "phase_plan",
 }
 """Names in backticks that are fields or parameters, not tools."""
 RUN_FOLDER_SENTENCE = (

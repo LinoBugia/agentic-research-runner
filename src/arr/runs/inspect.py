@@ -9,6 +9,7 @@ the run (`run_lock_held`).
 import contextlib
 import re
 import time
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -398,12 +399,157 @@ def format_runs(
     return "\n".join(lines)
 
 
+_LINE_MAX = 200
+"""At most this many characters of one value from the log in a progress line (W4b-07 §6.16)."""
+_LINE_ALL_MAX = 600
+"""At most this many characters of a whole progress line."""
+_BREAKING = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+"""Unicode categories that never reach a progress line: control and format characters, line
+and paragraph separators (U+2028, U+2029; NEL and the like are `Cc`)."""
+
+_HOW_TEXT = {
+    "normal": "",
+    "retry": " (Wiederholung nach Route „retry“)",
+    "user_retry": " (noch ein Durchlauf, von dir gewählt)",
+}
+"""`how` of a checkpoint `pass_start` of a phases run (W4b-02b §5.2)."""
+_ASKED_TEXT = {
+    "gate_user": "Gate „user“",
+    "escalate": "Route „escalate“",
+    "exhausted": "Durchläufe aufgebraucht",
+    "no_result": "Gate ohne Ergebnis",
+}
+"""`asked_user` of a checkpoint `route`: why the user was asked."""
+_CHOICE_TEXT = {"continue": "weiter", "retry": "noch ein Durchlauf", "end": "Run beenden"}
+"""`choice` of a checkpoint `route` and `option` of `escalation_decided` in a phases run."""
+_PHASE_OUTCOME_TEXT = {
+    "done": "erledigt",
+    "passed": "bestanden",
+    "best_accepted": "beste Abgabe übernommen",
+    "stage_failed": "nicht bestanden",
+}
+"""`outcome` of a checkpoint `stage_end` of a phases run."""
+
+
+def _line_text(value: Any, limit: int = _LINE_MAX) -> str:
+    """A value from the log (agent text, a name, any JSON value) on one line: every control,
+    format and separator character and every run of white space becomes one space; at most
+    `limit` characters, cut with „…“. Escaping for HTML is up to the caller."""
+    text = value if isinstance(value, str) else str(value)
+    cut = len(text) > limit * 8  # bound the work for very long values
+    if cut:
+        text = text[: limit * 8]
+    text = "".join(" " if unicodedata.category(c) in _BREAKING else c for c in text)
+    text = " ".join(text.split())
+    if cut or len(text) > limit:
+        text = text[: limit - 1].rstrip() + "…"
+    return text
+
+
+def _names(value: Any) -> str:
+    """A list of names from the log as `a, b`, shortened; any other value as one text."""
+    if isinstance(value, list | tuple):
+        return _line_text(", ".join(str(v) for v in value))
+    return _line_text(value)
+
+
+def _phase_checkpoint(data: Mapping[str, Any], stage: str) -> str | None:
+    """The checkpoints of a phases run (W4b-02b §5.2), None for any other checkpoint."""
+    kind = data.get("phase")
+    where = f"Phase „{stage}“, Durchlauf {_line_text(data.get('attempt', '–'), 20)}"
+    if kind == "pass_start":
+        how = str(data.get("how"))
+        text = f"Phase „{stage}“: Durchlauf {_line_text(data.get('attempt', '–'), 20)} beginnt"
+        text += _HOW_TEXT.get(how, f" ({_line_text(how, 40)})")
+        return text + (f" mit {_names(data['agents'])}" if data.get("agents") else "")
+    if kind == "gate" and ("gate" in data or "value" in data):
+        gate = f"Gate „{_line_text(data['gate'], 40)}“" if data.get("gate") else "Gate"
+        user = data.get("gate") == "user" and data.get("value") is None
+        if user:  # the user decides: no result of its own
+            text = f"{where}: {gate}, du entscheidest"
+        elif data.get("value") is not None:
+            text = f"{where}: {gate} ergibt „{_line_text(data['value'], 80)}“"
+        else:
+            reason = str(data.get("reason"))
+            text = f"{where}: {gate} ohne Ergebnis"
+            if reason in _REASON_TEXT:
+                text += f" ({_REASON_TEXT[reason]})"
+        if data.get("tie"):
+            text += ", Gleichstand"
+        if "decision" in data and not (user and data["decision"] == "escalated"):
+            decision = str(data["decision"])
+            text += f" – {DECISION_TEXT.get(decision, _line_text(decision, 40))}"
+        if data.get("score") is not None:
+            text += f", Score {_number(data['score'])}"
+        if data.get("missing"):
+            text += f", es fehlt: {_names(data['missing'])}"
+        return text
+    if kind == "route":
+        route = data.get("route")
+        text = f"{where}: Route „{_line_text(route, 80)}“" if route else f"{where}:"
+        if data.get("asked_user"):
+            asked = str(data["asked_user"])
+            choice = str(data.get("choice"))
+            text += "," if route else ""
+            text += f" du entscheidest ({_ASKED_TEXT.get(asked, _line_text(asked, 40))}): "
+            text += _CHOICE_TEXT.get(choice, _line_text(choice, 40))
+            if "hint" in data:
+                text += " mit Hinweis" if data["hint"] else " ohne Hinweis"
+        elif not route:
+            text += " keine Route"
+        if "entered" in data:
+            entered = data["entered"]
+            text += f" → Phase „{_line_text(entered, 80)}“" if entered else " → Ende des Runs"
+        if data.get("exhausted"):
+            text += f" (aufgebraucht: {_names(data['exhausted'])})"
+        return text
+    if kind == "stage_end" and "valid" in data:  # the old topologies write no `valid`
+        outcome = str(data.get("outcome"))
+        text = f"Phase „{stage}“ abgeschlossen nach Durchlauf "
+        text += f"{_line_text(data.get('attempt', '–'), 20)}: "
+        text += _PHASE_OUTCOME_TEXT.get(outcome, _line_text(outcome, 40))
+        if data.get("accepted"):
+            text += f", gilt: Abgabe #{_line_text(data['accepted'], 20)}"
+        if data.get("score") is not None:
+            text += f", Score {_number(data['score'])}"
+        return text
+    if kind == "seed":
+        seeds = data.get("seeds")
+        if isinstance(seeds, Mapping) and seeds:
+            listed = ", ".join(f"{k} #{v}" for k, v in seeds.items())
+            return f"Vorgaben (seed) vor Phase „{stage}“ abgelegt: {_line_text(listed)}"
+        return f"Vorgaben (seed) vor Phase „{stage}“ abgelegt"
+    return None
+
+
 def describe_checkpoint(data: Mapping[str, Any]) -> str:
-    """One German line for a `checkpoint` entry of `orchestrator.jsonl`."""
+    """One German line for a `checkpoint` entry of `orchestrator.jsonl`.
+
+    Always exactly one line: values from the log are shortened (`_line_text`); a checkpoint
+    with unexpected types gets the generic line instead of an error (W4b-07 §6.1, §6.16)."""
+    if not isinstance(data, Mapping):
+        return "Checkpoint" + (f" ({_line_text(data, 300)})" if data else "")
+    try:
+        text = _describe_checkpoint(data)
+    except (TypeError, ValueError, AttributeError, LookupError, ArithmeticError):
+        text = _generic_checkpoint(data)
+    return _line_text(text, _LINE_ALL_MAX)
+
+
+def _generic_checkpoint(data: Mapping[str, Any]) -> str:
+    extra = ", ".join(f"{k}={v}" for k, v in data.items() if k != "stage")
+    stage = _line_text(data.get("stage"), 80)
+    return f"Checkpoint „{stage}“" + (f" ({_line_text(extra, 300)})" if extra else "")
+
+
+def _describe_checkpoint(data: Mapping[str, Any]) -> str:
     stage = data.get("stage")
     if stage == "plan":
         stages = data.get("stages") or []
         return "Plan: " + (" → ".join(str(s) for s in stages) if stages else "keine Stufen")
+    phases = _phase_checkpoint(data, _line_text(stage, 80))
+    if phases is not None:
+        return phases
     if "decision" in data:
         decision = DECISION_TEXT.get(str(data["decision"]), str(data["decision"]))
         if data.get("reason") in _REASON_TEXT:
@@ -420,9 +566,8 @@ def describe_checkpoint(data: Mapping[str, Any]) -> str:
             text += f", akzeptiert #{data['accepted']}"
         return text
     if data.get("phase") == "discussion":
-        return f"Stufe „{stage}“: Diskussion in #{data.get('channel')}"
-    extra = ", ".join(f"{k}={v}" for k, v in data.items() if k != "stage")
-    return f"Checkpoint „{stage}“" + (f" ({extra})" if extra else "")
+        return f"Stufe „{stage}“: Diskussion in #{_line_text(data.get('channel'), 80)}"
+    return _generic_checkpoint(data)
 
 
 def _approval_line(entry: Mapping[str, Any]) -> str:

@@ -54,6 +54,7 @@ from arr.service.api_models import (
     DuplicateSkillRequest,
     ErrorCode,
     ParamInfo,
+    PhasePlan,
     ProfileInfo,
     ProjectCheck,
     ProjectFolder,
@@ -72,6 +73,7 @@ from arr.service.api_models import (
 )
 from arr.service.real_api import skill_files
 from arr.service.real_api.base import ServiceState, not_found
+from arr.service.real_api.phase_plan import phase_plan
 from arr.service.real_api.profiles import load_status, profile_info, unreadable_profiles
 from arr.service.real_api.rundir import open_items
 from arr.skills import (
@@ -316,21 +318,51 @@ def _role_issue(folder: Path, role: str) -> str | None:
     return None
 
 
-def _check_tasks(spec: GroupSpec, folder: Path, out: _Issues) -> None:
+def _with_defaults(
+    resolved: ResolvedRun | None, index: int, key: str | None, task: str
+) -> str | None:
+    """A task path with a placeholder in its text, as the defaults of the parameters make it
+    (W4b-07 §6.3, NG1 of W4b-02a.1): the path of the resolved phase (`key` of an action, None
+    for the gate action). None when the phase is dropped with the defaults."""
+    if resolved is None:
+        return None
+    phase = next((p for p in resolved.phases if p.index == index), None)
+    if phase is None:
+        return None
+    if key is None:
+        return phase.gate.action.task if phase.gate.action is not None else None
+    return next((a.task for a in phase.actions if a.key == key), None)
+
+
+def _check_tasks(
+    spec: GroupSpec, folder: Path, out: _Issues, resolved: ResolvedRun | None = None
+) -> None:
     """Every assignment file (`task` of an action or gate action) of every phase in the
     `group.yaml`, also of phases the standard values drop, is a regular file in the skill, by
-    the rules of the roles (W4b-02a B7, A11; W4b-02a.1 G6). A task given as a placeholder is
-    known only at the start (W4b-02b). Paths and names in messages are cleaned and cut (G8)."""
+    the rules of the roles (W4b-02a B7, A11; W4b-02a.1 G6). A task given as one placeholder is
+    known only at the start (W4b-02b). A task with a placeholder in its text is checked as the
+    defaults make it, and skipped in a phase they drop (W4b-07, NG1). Paths and names in
+    messages are cleaned and cut (G8)."""
     done: set[str] = set()
     for index, phase in enumerate(spec.phases):
-        tasks = [
-            (("phases", index, "actions", key, "task"), action.task)
+        tasks: list[tuple[tuple[str | int, ...], str, str | None]] = [
+            (("phases", index, "actions", key, "task"), action.task, key)
             for key, action in phase.actions.items()
         ]
         if phase.gate is not None and phase.gate.action is not None:
-            tasks.append((("phases", index, "gate", "action", "task"), phase.gate.action.task))
-        for loc, task in tasks:
-            if task in done or is_placeholder(task):
+            tasks.append(
+                (("phases", index, "gate", "action", "task"), phase.gate.action.task, None)
+            )
+        for loc, written, key in tasks:
+            if is_placeholder(written):
+                continue
+            task = written
+            if "{{" in written:
+                found = _with_defaults(resolved, index, key, written)
+                if found is None:
+                    continue
+                task = found
+            if task in done:
                 continue
             done.add(task)
             try:
@@ -381,7 +413,7 @@ def _check_resolved(
         result = check_plan(resolved)
         out.extend(result.errors)
         out.extend(result.warnings, Severity.WARNING)
-        _check_tasks(spec, folder, out)
+        _check_tasks(spec, folder, out, resolved)
         return
     try:
         check_topology(resolved)
@@ -389,6 +421,27 @@ def _check_resolved(
         out.extend(exc.issues)
     except ArrError as exc:
         out.add("topology", exc.message)
+
+
+def blocking(issues: Iterable[SkillIssue]) -> list[SkillIssue]:
+    """The issues that block a start: errors; a hint (`Severity.WARNING`) never does."""
+    return [i for i in issues if i.severity is not Severity.WARNING]
+
+
+def group_plan(folder: Path, spec: GroupSpec, settings: WorkfolderSettings) -> PhasePlan | None:
+    """The phase plan of a group with phases, resolved with the defaults of its parameters
+    (W4b-07 §6.2); rows know their line in the `group.yaml`. None for the old topologies or
+    when the group does not resolve (its check says why)."""
+    if spec.topology is not TopologyKind.PHASES:
+        return None
+    try:
+        _data, lines = parse_yaml_text(read_text_file(folder / GROUP_FILE), GROUP_FILE)
+        run_input = RunInput(project="pruefung", skill=folder.name, task="Prüfung")
+        resolved = resolve_run(run_input, spec, _check_settings(settings))
+        return phase_plan(resolved, names=[p.name for p in spec.phases], lines=lines)
+    except Exception:  # noqa: BLE001 - the check reports why; the page shows no plan then
+        log.info("Phasenplan von %s nicht möglich", folder.name, exc_info=True)
+        return None
 
 
 def check_group(
@@ -647,7 +700,8 @@ class CatalogArea:
     def _skill(
         self, name: str, catalog: SkillCatalog, settings: WorkfolderSettings | None = None
     ) -> SkillInfo:
-        """A skill with the result of its check (W4-02): `valid` only without any issue."""
+        """A skill with the result of its check (W4-02): `valid` only without an error; hints
+        of `arr.plan.check` (warnings) never block a start (Entscheidungen 43, 44; W4b-07)."""
         settings = settings if settings is not None else self._settings()
         folder = catalog.root / name
         info: CoreSkill | None = catalog.skills.get(name)
@@ -686,7 +740,7 @@ class CatalogArea:
             kind=kind,
             audience=info.audience.value if info is not None else None,
             files=self._skill_files(folder),
-            valid=not issues,
+            valid=not blocking(issues),
             issues=issues,
             used_by=self._usage(name),
             topology=spec.topology if spec is not None else None,
@@ -701,6 +755,7 @@ class CatalogArea:
             if spec is not None and spec.rubric
             else None,
             agents_count=_agents_count(spec) if spec is not None else None,
+            phase_plan=group_plan(folder, spec, settings) if spec is not None else None,
         )
 
     def _list(self, kind: SkillKind | None) -> list[SkillInfo]:

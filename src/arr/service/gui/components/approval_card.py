@@ -15,7 +15,7 @@ from typing import Any
 
 from nicegui import ui
 
-from arr.models import ChannelMode, WorkspaceMode
+from arr.models import ChannelMode, TopologyKind, WorkspaceMode
 from arr.permissions.types import (
     ApprovalType,
     DecidedBy,
@@ -24,6 +24,7 @@ from arr.permissions.types import (
     EscalationOption,
     RequestCategory,
 )
+from arr.room.store import private_owner
 from arr.service.api_models import ApprovalItem, DecisionRequest, Deviation
 from arr.service.gui import format as fmt
 from arr.service.gui.components.badge import badge_html
@@ -31,6 +32,7 @@ from arr.service.gui.components.banner import banner_html
 from arr.service.gui.components.base import (
     button,
     esc,
+    icon,
     link_html,
     markdown_html,
     raw,
@@ -39,6 +41,7 @@ from arr.service.gui.components.base import (
 from arr.service.gui.components.copy_field import copy_html
 from arr.service.gui.components.dialog import ConfirmDialog
 from arr.service.gui.components.form import NativeInput, on_value
+from arr.service.gui.components.phase_table import phase_table_html
 from arr.service.gui.texts import (
     APPROVAL_TYPE,
     CATEGORY,
@@ -50,12 +53,17 @@ from arr.service.gui.texts import (
     TOPOLOGY_LABEL,
     VENDOR,
     Status,
+    channel_label,
     scope_label,
 )
 
 DecideHandler = Callable[["ApprovalCard", DecisionRequest], Awaitable[Any]]
 
 _WAIT = Status("st-wait", "front_hand", "")
+PHASE_HINT_LABEL = "Der Hinweis geht nur bei „Noch ein Versuch“ an alle Teilnehmer der Phase."
+"""Visible sentence at the hint field of a gate `user` or an escalation in a phases run
+(W4b-07 §6.8, W4b-07.1 B6): a placeholder was cut off in a narrow field."""
+PHASE_HINT_PLACEHOLDER = "Hinweis (optional)"
 _MODE = {
     ChannelMode.EVENT: "ereignisgesteuert",
     ChannelMode.ROUNDS: "Runden",
@@ -155,6 +163,41 @@ def _origin(item: ApprovalItem, now: float) -> str:
     return at
 
 
+def phase_escalation_html(item: ApprovalItem) -> str:
+    """Phase, pass, why you decide and the summary of the submissions as plain, escaped lines
+    (W4b-07 §6.8): agent text never becomes Markdown here."""
+    head = f"Phase „{item.stage}“" if item.stage else "Phase"
+    if item.attempt:
+        head += f" · Durchlauf {item.attempt}"
+    reason = f'<div class="small">{esc(item.phase_reason)}</div>' if item.phase_reason else ""
+    lines = "".join(f"<li>{esc(line)}</li>" for line in item.summary_lines)
+    summary = (
+        f'<ul class="plain small summary-lines" data-mark="escalation-summary">{lines}</ul>'
+        if lines
+        else ""
+    )
+    return f'<div class="stack"><b>{esc(head)}</b>{reason}{summary}</div>'
+
+
+def run_start_plan_html(item: ApprovalItem) -> str:
+    """The phase plan of a run start with the decider per phase and agent, and the hints of
+    `check` as warnings that do not block (W4b-07 §6.10)."""
+    out = ""
+    if item.warnings:
+        hints = "".join(f"<li>{esc(w)}</li>" for w in item.warnings)
+        out += (
+            '<div class="banner warn banner-sm" data-mark="run-start-hints" '
+            f'style="margin-top:12px">{icon("info")}<div class="txt"><b>Hinweise der Prüfung'
+            f'</b><ul class="plain small">{hints}</ul>Sie sperren den Start nicht.</div></div>'
+        )
+    if item.phase_plan is not None:
+        out += (
+            '<div class="small" style="margin-top:12px"><b>Phasenplan</b> · Entscheider je Phase '
+            f"und Agent</div>{phase_table_html(item.phase_plan, compact=True)}"
+        )
+    return out
+
+
 class ApprovalCard:
     """A full approval card on the Freigaben page; the page decides via `on_decide`."""
 
@@ -240,7 +283,7 @@ class ApprovalCard:
             parts.append(f"<span>· {esc(via) + ' · ' if via else ''}{_origin(item, now)}</span>")
             parts.append(deadline_html(item, now))
         elif item.type is ApprovalType.QUESTION:
-            channel = f" · #{esc(item.channel)}" if item.channel else ""
+            channel = f" · {esc(channel_label(item.channel))}" if item.channel else ""
             parts.append(
                 f"<span>· {run_link}{channel} · {_origin(item, now)} · offen bis zum Ende des "
                 "Runs</span>"
@@ -248,6 +291,9 @@ class ApprovalCard:
         elif item.type is ApprovalType.ESCALATION:
             topology = TOPOLOGY_LABEL[item.topology] if item.topology else "Ablauf"
             stage = f" · Stufe {item.stage}" if item.stage else ""
+            if item.topology is TopologyKind.PHASES:  # W4b-07 §6.8
+                stage = f" · Phase „{item.stage}“" if item.stage else ""
+                stage += f" · Durchlauf {item.attempt}" if item.attempt else ""
             parts.append(f'<span class="tag">{esc(topology + stage)}</span>')
             parts.append(
                 f"<span>· {run_link} · Run pausiert seit {fmt.clock(item.created_at)} · "
@@ -276,6 +322,10 @@ class ApprovalCard:
                 else "Aufsichts-Agent:"
             )
             why = f"<b>{who}</b> {esc(item.escalated_by.note)}"
+        if item.tightened_text:  # W4b-07 §6.9: the setting first, then what was checked before
+            why = f'<span data-mark="tightened">{esc(item.tightened_text)}</span>'
+            if item.escalated_by is not None:
+                why += f"<br><b>Vorher geprüft:</b> {esc(item.escalated_by.note)}"
         rows = [
             (
                 "Wer",
@@ -401,8 +451,12 @@ class ApprovalCard:
 
     # --- escalation -----------------------------------------------------------------------
 
+    def _phase_escalation_head(self) -> None:
+        raw(phase_escalation_html(self.item))
+
     def _escalation_body(self) -> None:
         item = self.item
+        phases = item.topology is TopologyKind.PHASES
         pass_score = item.attempts[0].pass_score if item.attempts else None
         chips = "".join(
             f'<span class="att {"pass" if a.passed else "fail"}">V{a.n} {fmt.score(a.avg_score)}'
@@ -424,14 +478,24 @@ class ApprovalCard:
             for r in item.last_ratings
         )
         limit = f" (bestanden ab {fmt.threshold(pass_score)})" if pass_score is not None else ""
+        if phases:
+            chips = chips.replace(">V", ">D")
+            links = [link_html("Abgaben ansehen", f"/runs/{item.run.id}?ansicht=ergebnisse")]
         with ui.element("div").classes("ab"):
-            raw(
-                '<div class="row" style="gap:24px;align-items:flex-start">'
-                f'<div style="min-width:230px"><div class="small muted">Durchschnitt pro Versuch'
-                f'{limit}</div><div class="attempts" style="margin-top:6px">{chips}</div>'
-                f'<div class="small" style="margin-top:8px">{" · ".join(links)}</div></div>'
-                f'<div style="flex:1;min-width:280px" class="stack small">{comments}</div></div>'
-            )
+            if phases:
+                self._phase_escalation_head()
+            if phases and not item.attempts:
+                raw(f'<div class="small" style="margin-top:8px">{" · ".join(links)}</div>')
+            else:
+                raw(
+                    '<div class="row" style="gap:24px;align-items:flex-start">'
+                    f'<div style="min-width:230px"><div class="small muted">Durchschnitt pro '
+                    f"{'Durchlauf' if phases else 'Versuch'}{limit}</div>"
+                    f'<div class="attempts" style="margin-top:6px">{chips}</div>'
+                    f'<div class="small" style="margin-top:8px">{" · ".join(links)}</div></div>'
+                    '<div style="flex:1;min-width:280px" class="stack small">'
+                    f"{comments}</div></div>"
+                )
             if item.terminal:
                 self._terminal_foot()
                 return
@@ -454,9 +518,19 @@ class ApprovalCard:
                             "</span>",
                             tag="span",
                         )
+        if phases and not item.terminal:
+            raw(
+                f'<span id="{esc(item.id)}-hint">{esc(PHASE_HINT_LABEL)}</span>',
+                classes="small muted hint-note",
+            ).mark("phase-hint")
         with ui.element("div").classes("af"):
             to = self.item.comment_to.id if self.item.comment_to else None
-            self._comment_input(f"Kommentar an {to} (optional)" if to else "Kommentar (optional)")
+            if phases:
+                self._comment_input(PHASE_HINT_PLACEHOLDER, describedby=f"{item.id}-hint")
+            else:
+                self._comment_input(
+                    f"Kommentar an {to} (optional)" if to else "Kommentar (optional)"
+                )
             with ui.element("div").classes("decide"):
                 self.decide_button = button(
                     "Entscheiden",
@@ -487,7 +561,8 @@ class ApprovalCard:
         item = self.item
         agent = item.agent
         assert agent is not None
-        where = f" in #{esc(item.channel)}" if item.channel else ""
+        where = f" in {esc(channel_label(item.channel))}" if item.channel else ""
+        private = private_owner(item.channel or "") is not None
         rows = [
             (
                 "Wer",
@@ -498,9 +573,15 @@ class ApprovalCard:
             ("Frage", f'<div class="quote question-text">{esc(item.question_text or "")}</div>'),
             (
                 "Was passiert",
-                f"Deine Antwort geht als Nachricht an {esc(agent.id)} in den Kanal. Antwortest "
-                "du dort, schließt sich die Frage hier auch. Ohne Antwort schließt sie sich mit "
-                "dem Ende des Runs.",
+                (
+                    f"Deine Antwort geht als Antwort an {esc(agent.id)} in euren privaten Kanal; "
+                    "nur du und der Agent lesen ihn. Antwortest du dort auf die Frage, schließt "
+                    "sie sich hier auch. Gibt der Agent vorher ab, ist sie nicht mehr nötig."
+                )
+                if private
+                else f"Deine Antwort geht als Nachricht an {esc(agent.id)} in den Kanal. "
+                "Antwortest du dort, schließt sich die Frage hier auch. Ohne Antwort schließt sie "
+                "sich mit dem Ende des Runs.",
             ),
         ]
         kv = "".join(f"<dt>{esc(k)}</dt><dd>{v}</dd>" for k, v in rows)
@@ -637,7 +718,8 @@ class ApprovalCard:
                 else ""
             )
             + (f'<div style="margin-top:12px">{capacity}</div>' if capacity else "")
-            + "</div></div>",
+            + "</div></div>"
+            + run_start_plan_html(item),
             classes="ab",
         )
         with ui.element("div").classes("af"):
@@ -692,10 +774,14 @@ class ApprovalCard:
             radio.mark(f"scope-{value}")
             raw(esc(label), tag="span")
 
-    def _comment_input(self, placeholder: str, *, width: str | None = None) -> None:
+    def _comment_input(
+        self, placeholder: str, *, width: str | None = None, describedby: str | None = None
+    ) -> None:
         field = ui.element("input").props(
             f'type="text" placeholder="{esc(placeholder)}" aria-label="{esc(placeholder)}"'
         )
+        if describedby:
+            field.props(f'aria-describedby="{esc(describedby)}"')
         if width:
             field.style(f"width:{width}")
         field.on("input", self._set_comment, js_handler="(e) => emit(e.target.value)")
@@ -783,7 +869,7 @@ def compact_card(
             starter = STARTER.get(item.requested_by, "dir") if item.requested_by else "dir"
             head.append(f"<span>{esc(starter)} · {esc(item.run.project)}</span>")
         elif item.type is ApprovalType.QUESTION:
-            head.append(f"<span>#{esc(item.channel or '')}</span>")
+            head.append(f"<span>{esc(channel_label(item.channel))}</span>")
         else:
             head.append("<span>Run pausiert</span>")
         raw("".join(head), classes="ah")
@@ -793,6 +879,14 @@ def compact_card(
             why = item.why or "Du entscheidest jede Anfrage."
             if item.escalated_by:
                 why = item.escalated_by.note
+            before = ""
+            if item.tightened_text:  # W4b-07 §6.9
+                why = item.tightened_text
+                if item.escalated_by:
+                    before = (
+                        f'<div style="margin-top:4px"><b>Vorher geprüft:</b> '
+                        f"{esc(item.escalated_by.note)}</div>"
+                    )
             what = item.command or item.path or item.url or ""
             risk = (
                 f'<div style="margin-top:6px"><b>Risiko:</b> {risk_line_html(item)}</div>'
@@ -803,7 +897,7 @@ def compact_card(
                 f'<span class="cmd" style="font-size:12px">{esc(what)}</span>{risk}'
                 f'<div class="reason" style="margin-top:6px" title="{esc(item.reason or "")}">'
                 f"<b>Begründung:</b> „{esc(item.reason or '')}“</div>"
-                f'<div style="margin-top:4px"><b>Warum bei dir:</b> {esc(why)}</div>'
+                f'<div style="margin-top:4px"><b>Warum bei dir:</b> {esc(why)}</div>{before}'
                 + (f'<div style="margin-top:4px"><b>{esc(NO_SANDBOX)}</b></div>' * item.no_sandbox),
                 classes="ab small",
             )

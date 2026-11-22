@@ -77,7 +77,8 @@ async def test_dry_run_names_what_goes_and_stays_and_changes_nothing(
     before = sorted(str(p) for p in run_dir.rglob("*"))
     result = await api.run_action(run_dir.name, RunAction.SLIM, dry_run=True)
     assert result.freed_bytes is not None and result.freed_bytes >= 2600
-    assert "Arbeitskopien, Snapshot und Run-venv" in result.message
+    # W4b-07 (A18): the message names a scratch folder too, when the run has one
+    assert "Arbeitskopien, Snapshot, Scratch-Ordner und Run-venv" in result.message
     assert "Transkripte, Roh-Events, Diffs, Gruppenchats, Output und Usage" in result.message
     assert "logische Größe" in result.message and "APFS-Klone" in result.message
     assert sorted(str(p) for p in run_dir.rglob("*")) == before

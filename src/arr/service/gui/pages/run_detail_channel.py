@@ -40,6 +40,7 @@ from arr.service.gui.components.message import (
     message_dom_id,
     message_html,
 )
+from arr.service.gui.texts import channel_label
 
 if TYPE_CHECKING:
     from arr.service.gui.pages.run_detail import RunDetailPage
@@ -159,7 +160,8 @@ class ChannelView:
         joined = len(info.members)
         count = info.message_count
         return (
-            f'<b class="mono" title="{esc(info.purpose or "")}">#{esc(info.name)}</b> · '
+            f'<b class="mono" title="{esc(info.purpose or "")}">{esc(channel_label(info.name))}'
+            "</b> · "
             f'<span title="{esc(members)}">{joined} Mitglied{"" if joined == 1 else "er"}</span>'
             f" · {_MODE[info.mode]}{anon} · "
             f'<span data-count="{esc(info.name)}">{fmt.integer(count)}</span> '
@@ -317,6 +319,8 @@ class ChannelView:
             f'<option value="{esc(m.agent)}">{esc(m.alias or m.agent)}</option>'
             for m in info.members
         ]
+        if info.private_of:  # „An“ is the agent; no `to`: every note wakes it (W4b-03.1 E2)
+            options = [f'<option value="" selected>{esc(info.private_of)}</option>']
         kinds = "".join(
             f'<option value="{k.value}">{KIND[k][0]} {esc(KIND[k][1])}</option>'
             for k in COMPOSE_KINDS
@@ -339,7 +343,7 @@ class ChannelView:
         form = (
             ui.element("form")
             .classes("composer")
-            .props(f'aria-label="Nachricht in #{esc(info.name)} schreiben"')  # no submit: arr.js
+            .props(f'aria-label="Nachricht in {esc(channel_label(info.name))} schreiben"')
         )
         with form:
             raw(
@@ -349,7 +353,7 @@ class ChannelView:
                 f'name="kind">{kinds}</select>'
                 f'<label class="sr-only" for="cmp-body">Nachricht (Markdown und LaTeX)</label>'
                 f'<textarea id="cmp-body" name="body" rows="1" aria-describedby="cmp-hint" '
-                f'placeholder="Nachricht an #{esc(info.name)} …" '
+                f'placeholder="Nachricht an {esc(channel_label(info.name))} …" '
                 'title="Markdown und LaTeX ($…$) möglich. Senden mit ⌘↩">'
                 f"</textarea>{hint}",
                 tag="div",

@@ -68,6 +68,23 @@ MAX_ANSWER = 40_000
 RESULTS_PAGE = 50
 RESULTS_PAGE_MAX = 100
 MAX_RATINGS = 20
+MAX_FIELDS_TEXT = 6_000
+"""Characters of agent text in the fields of one submission (W4b-07 §6.11)."""
+MAX_FIELD_ITEMS = 50
+FIELD_ITEM_COST = 16
+"""What one value of a field costs beside its text (indentation, quotes, commas)."""
+MAX_FILES = 20
+MAX_SEALED_LINES = 20
+FIELDS_CUT = "Felder gekürzt; ganz stehen sie in der Abgabe (path) und in der arr-GUI."
+PRIVATE_KEYS = frozenset({"note_next"})
+"""Never in an answer, also not as a field (private, Entscheidungen 28 und 34)."""
+PRIVATE_POST = "Den privaten Kanal von {agent} beschreibt nur der User in arr."
+SCHEMA_HINT = (
+    "„schema_json“ ist das JSON Schema für „config“ von estimate_run und start_run: eine ganze "
+    "Research-Group mit topology: phases, auch ohne Skill. „project“ setzt arr selbst, die "
+    "Aufgabe kommt als „task“. Prüf jede config zuerst mit estimate_run und nenne dem User den "
+    "Phasenplan (phase_plan) und die Abweichungen (deviations), bevor du start_run aufrufst."
+)
 WAIT_MAX_S = 600
 WAIT_POLL_S = 0.25
 VIA = MessageVia.USER_AGENT
@@ -94,6 +111,140 @@ def agent_text(value: Any, limit: int = MAX_TEXT) -> str:
     if len(text) > limit:
         return f"{text[:limit]} … [gekürzt: {limit} von {len(text)} Zeichen]"
     return text
+
+
+def _line(value: Any, limit: int) -> str:
+    """Agent or YAML text as one line (names, paths, keys): cleaned, bounded, every break and
+    tab a space, so it never starts a line of its own (A20)."""
+    return " ".join(agent_text(value, limit).split())
+
+
+def _plain(value: Any) -> Any:
+    """Every text in plain data (`as_dict` of a phase plan) as one bounded line."""
+    if isinstance(value, str):
+        return _line(value, 400)
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    return value
+
+
+def _plan(data: Any) -> dict[str, Any] | None:
+    """The phase plan (a `PhasePlan` or its JSON data) for Claude Code (W4b-07 §6.2)."""
+    from arr.service.api_models import PhasePlan
+    from arr.service.real_api.phase_plan import as_dict
+
+    if data is None:
+        return None
+    plan = data if isinstance(data, PhasePlan) else PhasePlan.model_validate(data)
+    return _plain(as_dict(plan))
+
+
+def _field_value(value: Any, budget: "Budget", depth: int = 0) -> tuple[bool, Any]:
+    """A value of a submission's field (also a list of objections or ratings) within the
+    budget: numbers as they are, every text and every key through the budget, lists and
+    objects item by item up to depth 3, deeper ones as JSON text. Every value also costs
+    `FIELD_ITEM_COST` for its place in the indented answer. Returns whether the value fit
+    whole and what of it fits (None: nothing)."""
+    if budget.left < FIELD_ITEM_COST:
+        return False, None
+    budget.left -= FIELD_ITEM_COST
+    if value is None or isinstance(value, bool | int | float):
+        return True, value
+    if depth < 3 and isinstance(value, list):
+        items: list[Any] = []
+        for item in value[:MAX_FIELD_ITEMS]:
+            whole, shown = _field_value(item, budget, depth + 1)
+            if shown is not None:
+                items.append(shown)
+            if not whole:
+                return False, items
+        return len(value) <= MAX_FIELD_ITEMS, items
+    if depth < 3 and isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in list(value.items())[:MAX_FIELD_ITEMS]:
+            name = _line(key, 64)
+            if len(name) > budget.left:
+                return False, out
+            budget.left -= len(name)
+            whole, shown = _field_value(item, budget, depth + 1)
+            if shown is not None:
+                out[name] = shown
+            if not whole:
+                return False, out
+        return len(value) <= MAX_FIELD_ITEMS, out
+    raw = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    text = budget.take(raw, 1000)
+    if text is not None:
+        return True, text
+    if budget.left < 100:
+        return False, None
+    text = agent_text(raw, budget.left - 60)
+    budget.left -= len(text)
+    return False, text
+
+
+def _fields(fields: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """The fields of a submission within `MAX_FIELDS_TEXT`, and whether some were cut."""
+    budget = Budget(MAX_FIELDS_TEXT)
+    out: dict[str, Any] = {}
+    names = [k for k in fields if k not in PRIVATE_KEYS]
+    for name in names[:MAX_FIELD_ITEMS]:
+        key = _line(name, 64)
+        budget.left -= len(key)
+        whole, shown = _field_value(fields[name], budget) if budget.left > 0 else (False, None)
+        if shown is not None:
+            out[key] = shown
+        if not whole:
+            return out, True
+    return out, len(names) > MAX_FIELD_ITEMS
+
+
+def _submission(sub: Any) -> dict[str, Any]:
+    """A submission for `read_results`: every text of the agent bounded, without `note_next`
+    (the transcript keeps the full `submit` call, Entscheidung 80)."""
+    fields, cut = _fields(dict(sub.fields))
+    entry: dict[str, Any] = {
+        "submission_id": sub.id,
+        "agent": _line(sub.agent, 100),
+        "alias": _line(sub.alias, 100) if sub.alias else None,
+        "stage": _line(sub.stage, 100) if sub.stage else None,
+        "attempt": sub.attempt,
+        "action": _line(sub.action, 100) if sub.action else None,
+        "format": _line(sub.format, 100),
+        "name": _line(sub.name, 100) if sub.name else None,
+        "version": sub.version,
+        "status": _line(sub.status, 100),
+        "summary": agent_text(sub.summary, 1000),
+        "fields": fields,
+        "files": [_line(f, 300) for f in sub.files[:MAX_FILES]],
+        "agent_text": agent_text(sub.body_excerpt) if sub.body_excerpt else "",
+        "path": _line(sub.path, 300) if sub.path else None,
+        "score": sub.score,
+        "accepted": sub.accepted,
+    }
+    if cut:
+        entry["fields_cut"] = FIELDS_CUT
+    if len(sub.files) > MAX_FILES:
+        entry["files_more"] = len(sub.files) - MAX_FILES
+    return entry
+
+
+def _sealed_lines(subs: list[Any]) -> list[str]:
+    """„n versiegelte Abgaben in Phase x“ per phase (Entscheidung 78): what is sealed stays
+    unread until the phase is released."""
+    counts: dict[str, int] = {}
+    for sub in subs:
+        stage = _line(sub.stage, 100) if sub.stage else "–"
+        counts[stage] = counts.get(stage, 0) + 1
+    lines = [
+        f"{n} versiegelte Abgabe in Phase {stage}"
+        if n == 1
+        else f"{n} versiegelte Abgaben in Phase {stage}"
+        for stage, n in counts.items()
+    ]
+    return lines[:MAX_SEALED_LINES]
 
 
 class Budget:
@@ -189,7 +340,7 @@ class UserApi:
             text = (await self.api.get_skill_file(name, "SKILL.md")).content
         except ApiException as exc:
             raise ToolProblem(exc.error.message) from None
-        return {
+        out = {
             "project": project,
             "name": skill.name,
             "kind": skill.kind.value,
@@ -206,6 +357,9 @@ class UserApi:
                 ],
             },
         }
+        if skill.phase_plan is not None:  # topology: phases (W4b-07 §6.11)
+            out["phase_plan"] = _plan(skill.phase_plan)
+        return out
 
     def _spec(self, project: str, **fields: Any) -> dict[str, Any]:
         out = {"project": project}
@@ -234,7 +388,7 @@ class UserApi:
         except ApiException as exc:
             raise ToolProblem(_problem(exc, params, overrides, config)) from None
         resolved = launch.resolved
-        return {
+        out: dict[str, Any] = {
             "project": project,
             "skill": resolved.skill,
             "topology": resolved.topology.kind.value,
@@ -257,11 +411,21 @@ class UserApi:
             "estimate": card["estimate"],
             "capacity": card["capacity"],
             "deviations": [
-                {"label": d["label"], "value": d["value_text"], "standard": d["default_text"]}
+                {
+                    "path": d["path"],
+                    "label": agent_text(d["label"], 300),
+                    "value": agent_text(d["value_text"], 1000),
+                    "standard": agent_text(d["default_text"], 1000),
+                    "sensitive": d["sensitive"],
+                }
                 for d in card["deviations"]
             ],
             "approval": "Jeder Run von Claude Code braucht die Freigabe des Users in der arr-GUI.",
         }
+        if card.get("phase_plan") is not None:  # topology: phases (W4b-07 §6.10, §6.11)
+            out["phase_plan"] = _plan(card["phase_plan"])
+            out["warnings"] = [_line(w, 400) for w in card.get("warnings") or []]
+        return out
 
     async def list_runs(
         self, project: str, status: str | None = None, limit: int = 20
@@ -418,8 +582,14 @@ class UserApi:
         offset: int = 0,
         limit: int = RESULTS_PAGE,
     ) -> dict[str, Any]:
-        """Results with ratings, page by page: at most `limit` entries and `MAX_ANSWER`
-        characters of agent text per answer, every text of an entry counted (M2, W4-01.1)."""
+        """Results with ratings and the submissions of a phases run (`submit`, W4b-07 §6.11),
+        page by page: at most `limit` entries and `MAX_ANSWER` characters of agent text per
+        answer, every text of an entry counted (M2, W4-01.1). `offset` counts the results first,
+        then the submissions. `stage` and `kind` (the format of a submission) filter both.
+        In this answer a sealed submission stays unread until its phase is released, it is only
+        counted (Entscheidung 78), and `note_next` is never part of it. The transcript of the
+        agent (`read_transcript`) still holds the arguments of its `submit` call in full: it
+        stays the complete record (Entscheidung 80, W4b-07.1)."""
         await self._record(project, run_id)
         results = await self.api.get_results(run_id)
         items = [
@@ -427,49 +597,43 @@ class UserApi:
             for r in results.items
             if (stage is None or r.stage == stage) and (kind is None or r.kind.value == kind)
         ]
+        subs = [
+            s
+            for s in results.submissions
+            if (stage is None or s.stage == stage) and (kind is None or s.format == kind)
+        ]
+        sealed = [s for s in subs if s.sealed]
+        shown = [s for s in subs if not s.sealed]
+        rows: list[tuple[str, Any]] = [("result", r) for r in items]
+        rows += [("submission", s) for s in shown]
         limit = max(1, min(int(limit), RESULTS_PAGE_MAX))
         left = MAX_ANSWER
         out: list[dict[str, Any]] = []
+        out_subs: list[dict[str, Any]] = []
         start = max(0, int(offset))
         next_offset = None
-        for index, result in enumerate(items[start:], start=start):
-            if len(out) >= limit:
+        for index, (what, row) in enumerate(rows[start:], start=start):
+            if len(out) + len(out_subs) >= limit:
                 next_offset = index
                 break
-            ratings = [
-                {
-                    "rater": agent_text(x.rater, 100),
-                    "score": x.score,
-                    "comment": agent_text(x.comment, 1000),
-                }
-                for x in result.ratings[:MAX_RATINGS]
-            ]
-            entry: dict[str, Any] = {
-                "id": result.id,
-                "agent": agent_text(result.agent, 100),
-                "stage": agent_text(result.stage, 100) if result.stage else None,
-                "kind": result.kind.value,
-                "status": result.status.value,
-                "title": agent_text(result.title, 300),
-                "agent_text": agent_text(result.body_excerpt) if result.body_excerpt else "",
-                "avg_score": result.avg_score,
-                "ratings": ratings,
-                "path": agent_text(result.path, 300) if result.path else None,
-            }
-            if len(result.ratings) > MAX_RATINGS:
-                entry["ratings_more"] = len(result.ratings) - MAX_RATINGS
+            entry = self._result(row) if what == "result" else _submission(row)
             cost = len(json.dumps(entry, ensure_ascii=False, indent=2))  # as the answer is sent
-            if cost > left and out:
+            if cost > left and (out or out_subs):
                 next_offset = index
                 break
             left -= cost
-            out.append(entry)
+            (out if what == "result" else out_subs).append(entry)
         answer: dict[str, Any] = {
             "run_id": run_id,
             "notice": NOTICE,
             "total": len(items),
             "results": out,
         }
+        if results.submissions:
+            answer["submissions_total"] = len(shown)
+            answer["submissions"] = out_subs
+            if sealed:
+                answer["sealed"] = _sealed_lines(sealed)
         if next_offset is not None:
             answer["next"] = call_text(
                 "read_results",
@@ -480,6 +644,33 @@ class UserApi:
                 offset=next_offset,
             )
         return answer
+
+    @staticmethod
+    def _result(result: Any) -> dict[str, Any]:
+        """A result of `submit_result` with its ratings for `read_results`."""
+        ratings = [
+            {
+                "rater": agent_text(x.rater, 100),
+                "score": x.score,
+                "comment": agent_text(x.comment, 1000),
+            }
+            for x in result.ratings[:MAX_RATINGS]
+        ]
+        entry: dict[str, Any] = {
+            "id": result.id,
+            "agent": agent_text(result.agent, 100),
+            "stage": agent_text(result.stage, 100) if result.stage else None,
+            "kind": result.kind.value,
+            "status": result.status.value,
+            "title": agent_text(result.title, 300),
+            "agent_text": agent_text(result.body_excerpt) if result.body_excerpt else "",
+            "avg_score": result.avg_score,
+            "ratings": ratings,
+            "path": agent_text(result.path, 300) if result.path else None,
+        }
+        if len(result.ratings) > MAX_RATINGS:
+            entry["ratings_more"] = len(result.ratings) - MAX_RATINGS
+        return entry
 
     async def read_groupchat(
         self, project: str, run_id: str, channel: str, since_id: int = 0, limit: int = 100
@@ -601,6 +792,14 @@ class UserApi:
             "hint": "Entscheiden kann nur der User in der arr-GUI. Erinnere ihn an die Links.",
         }
 
+    async def group_schema(self, project: str) -> dict[str, Any]:
+        """The JSON schema of `config` (`json_schema("run")`), compact, with how to use it
+        (W4b-07 §6.11): read-only, loaded on demand, also for a group without a skill."""
+        from arr.plan.schema import json_schema
+
+        schema = json.dumps(json_schema("run"), ensure_ascii=False, separators=(",", ":"))
+        return {"project": project, "schema_json": schema, "hint": SCHEMA_HINT}
+
     # -- start and intervene ------------------------------------------------------------------
 
     async def start_run(
@@ -653,8 +852,14 @@ class UserApi:
         """A hint of Claude Code into a channel: always `via: user_agent` (Claude Code), whatever
         the arguments say. Like a message from the GUI it may reply to a message (`reply_to`,
         W3-10.1), but it never answers a question to the user (E15, H1; the room and the
-        orchestrator hold that since W4-03.1)."""
+        orchestrator hold that since W4-03.1). The private channel of an agent to the user
+        (`user.<agent-id>`) only the user writes, in arr (Entscheidung 78, W4b-07 §6.7)."""
+        from arr.room.store import private_owner
+
         await self._record(project, run_id)
+        owner = private_owner(channel)
+        if owner is not None:
+            raise ToolProblem(PRIVATE_POST.format(agent=owner))
         try:
             request = PostReplyRequest(body=body, to=list(to or []), reply_to=reply_to)
         except ValidationError as exc:
@@ -832,27 +1037,34 @@ def _validation(exc: ValidationError) -> str:
 TOOL_DOCS: dict[str, str] = {
     "list_skills": "Verfügbare Skills mit Kurzbeschreibung (kind: group oder all).",
     "describe_skill": "SKILL.md, Parameter mit Standard und Grenzen, Agenten, Kanäle und die "
-    "Prüfung eines Skills.",
+    "Prüfung eines Skills, bei Phasen der Phasenplan.",
     "estimate_run": "Aufgelöste Konfiguration ohne Start: Agenten, Profile, Limits, Schätzung, "
-    "freie Kapazität, Abweichungen von den Standards des Users.",
+    "freie Kapazität, Abweichungen von den Standards des Users, bei Phasen der Phasenplan. "
+    "Das Schema für config liefert group_schema.",
     "start_run": "Run anlegen. Er wartet auf die Freigabe des Users in der arr-GUI "
-    "(awaiting_approval); die Antwort enthält gui_url. Danach wait_run.",
+    "(awaiting_approval); die Antwort enthält gui_url. Danach wait_run. Das Schema für config "
+    "liefert group_schema.",
     "list_runs": "Runs dieses Projekts (status: all, active, waiting, done, error).",
     "run_status": "Status, Stufe, Agenten, Usage, adjusted_by_user und changes eines Runs.",
     "wait_run": "Wartet auf den nächsten Statuswechsel (auch Freigabe oder Ablehnung), "
     "höchstens timeout_s Sekunden.",
     "read_run_summary": "Zusammenfassung (output/summary.md) und Kennzahlen. Text von Agenten.",
-    "read_results": "Abgegebene Ergebnisse mit Ratings, seitenweise. Text von Agenten.",
+    "read_results": "Abgegebene Ergebnisse mit Ratings und Abgaben (submit), seitenweise; stage "
+    "und kind (bei Abgaben das Format) filtern. Versiegelte Abgaben erst nach dem Ende ihrer "
+    "Phase. Text von Agenten.",
     "read_groupchat": "Verlauf eines Kanals ab since_id, seitenweise. Text von Agenten.",
     "read_transcript": "Transkript eines Agenten ab from_seq, seitenweise, filterbar nach kinds. "
     "Text von Agenten.",
     "post_to_run": "Hinweis in einen Kanal geben (Absender user), optional an bestimmte Agenten "
     "oder als Antwort auf eine Nachricht (reply_to). Eine Frage an den User beantwortet er nie; "
-    "die beantwortet nur der User in arr.",
+    "die beantwortet nur der User in arr. Private Kanäle (user.<agent>) beschreibt nur der "
+    "User.",
     "control_run": "pause, resume oder stop. resume geht nicht, solange eine Eskalation offen "
     "ist; dann kommt der Link zur GUI.",
     "list_approvals": "Offene Freigaben dieses Projekts, nur lesend. Freigeben geht nur in der "
     "GUI.",
+    "group_schema": "JSON Schema für config von estimate_run und start_run (eigene Group mit "
+    "Phasen), nur lesend, mit Hinweisen zur Nutzung.",
 }
 
 
@@ -997,6 +1209,10 @@ def build_server(api: Any) -> Any:
     @server.tool(description=TOOL_DOCS["list_approvals"])
     async def list_approvals(ctx: Context, run_id: str | None = None) -> dict[str, Any]:
         return await call(lambda p: users.list_approvals(p, run_id), ctx)
+
+    @server.tool(description=TOOL_DOCS["group_schema"])
+    async def group_schema(ctx: Context) -> dict[str, Any]:
+        return await call(users.group_schema, ctx)
 
     return server
 

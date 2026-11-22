@@ -174,6 +174,8 @@ class StageStatus(StrEnum):
     DONE = "done"
     FAILED = "failed"
     WAITING_USER = "waiting_user"
+    SKIPPED = "skipped"
+    """A phase of a finished run that was never entered (W4b-07.1, B8): „nicht betreten“."""
 
 
 class ActivityKind(StrEnum):
@@ -709,6 +711,9 @@ class StageInfo(ApiModel):
     detail: str | None = None
     attempts: list[Attempt] = Field(default_factory=list)
     round: int | None = None
+    passes: list["PassInfo"] = Field(
+        default_factory=list, description="Passes of a phase („D1“, „D2 läuft“, W4b-07)"
+    )
 
 
 class ApprovalTop(ApiModel):
@@ -735,6 +740,7 @@ class RunDetail(ApiModel):
     handoff_text: str = Field(description="„Für Claude Code kopieren“")
     run_dir: str
     task_md: str | None = None
+    phase_plan: "PhasePlan | None" = Field(default=None, description="Runs with phases (W4b-07)")
 
 
 class LogEntry(ApiModel):
@@ -844,6 +850,15 @@ class AgentState(ApiModel):
         description="L13: done while a discussion of its channels runs, a message to it wakes it "
         "(„fertig · ansprechbar“)",
     )
+    context_text: str | None = Field(
+        default=None,
+        description="Fill level of the session (W4b-07, K3): „Kontext 48 % · verdichtet ab 60 %“",
+    )
+    context_tokens: int | None = None
+    context_window: int | None = None
+    compact_threshold: int | None = None
+    compactions: int = Field(default=0, ge=0)
+    note_turns: int = Field(default=0, ge=0, description="Note turns of auto-compact")
 
     @model_validator(mode="after")
     def _blocked_needs_reason(self) -> Self:
@@ -895,6 +910,9 @@ class ChannelInfo(ApiModel):
     pinned: list[int] = Field(default_factory=list, description="IDs of pinned messages")
     summary_next_at: int | None = Field(default=None, description="Message count of next „Stand“")
     votes: list[VoteSummary] = Field(default_factory=list)
+    private_of: str | None = Field(
+        default=None, description="The agent of a private channel to the user (W4b-03, W4b-07)"
+    )
 
 
 class AttachmentInfo(ApiModel):
@@ -1065,6 +1083,7 @@ class RunResults(ApiModel):
     summary_md: str | None = None
     summary_path: str | None = None
     empty_text: str | None = Field(default=None, description="e.g. „Jeder Explorer gibt …“")
+    submissions: list["SubmissionInfo"] = Field(default_factory=list, description="W4b-07")
 
 
 # --------------------------------------------------------------------------------------------
@@ -1295,6 +1314,12 @@ class ApprovalItem(ApiModel):
     )
     transcript_seq: int | None = None
     why: str | None = Field(default=None, description="„Warum bei dir“ without `escalated_by`")
+    tightened_by: dict[str, Any] | None = Field(
+        default=None, description="`tightened_by` of the first line (W4b-09), as written"
+    )
+    tightened_text: str | None = Field(
+        default=None, description="„Warum bei dir“ of a tightened request (`tightened_text`)"
+    )
     no_sandbox: bool = Field(
         default=False, description="Codex escalation: leaves the sandbox, scope only `once`"
     )
@@ -1312,12 +1337,19 @@ class ApprovalItem(ApiModel):
     capacity: list[CapacityInfo] = Field(default_factory=list)
     deviations: list[Deviation] = Field(default_factory=list)
     standard_notes: list[str] = Field(default_factory=list)
+    phase_plan: "PhasePlan | None" = Field(default=None, description="Runs with phases (W4b-07)")
+    warnings: list[str] = Field(default_factory=list, description="Hints of `check` (W4b-07)")
     # escalation
     stage: str | None = None
     attempts: list[Attempt] = Field(default_factory=list)
     last_ratings: list[LastRating] = Field(default_factory=list)
     options: list[EscalationOptionInfo] = Field(default_factory=list)
     result_id: int | None = Field(default=None, description="Latest attempt („Skizze V3 lesen“)")
+    attempt: int | None = Field(default=None, description="Pass of the phase (W4b-07)")
+    phase_reason: str | None = Field(default=None, description="Why the user decides (W4b-07)")
+    summary_lines: list[str] = Field(
+        default_factory=list, description="`summary` of a phase escalation, line by line"
+    )
     comment_to: ApprovalAgentRef | None = Field(
         default=None, description="Agent who gets the user's comment (escalation: the worker)"
     )
@@ -1626,6 +1658,7 @@ class SkillInfo(ApiModel):
     channels_spec: list[dict[str, Any]] = Field(default_factory=list)
     rubric: dict[str, Any] | None = None
     agents_count: int | None = None
+    phase_plan: "PhasePlan | None" = Field(default=None, description="Groups with phases (W4b-07)")
 
 
 class UsageRow(ApiModel):
@@ -2519,3 +2552,108 @@ class StartSkillsResult(ApiModel):
     created: list[str] = Field(default_factory=list)
     existing: list[str] = Field(default_factory=list)
     message: str
+
+
+# --------------------------------------------------------------------------------------------
+# W4b-07: runs and skills of `topology: phases`
+# --------------------------------------------------------------------------------------------
+
+
+class PhaseActionInfo(ApiModel):
+    """An action of a phase in the phase plan: key of the YAML (agent or pattern), the concrete
+    agents, the assignment file and the format of the submission (docs/10 §4.9)."""
+
+    key: str
+    agents: list[str] = Field(default_factory=list)
+    task: str
+    format: str
+    name: str | None = None
+
+
+class PhaseUsage(ApiModel):
+    """Usage of one phase (Entscheidung 14): turns, tokens and cost like `RunSummary`."""
+
+    turns: int = Field(default=0, ge=0)
+    tokens: int | None = None
+    cost_usd: float | None = None
+    cost_kind: CostKind | None = None
+
+
+class PhaseRow(ApiModel):
+    """One row of the phase plan (docs/10 §4.9); the run columns are None outside a run.
+
+    `field` is the path of the phase in the `group.yaml` (`phases[2]`), `line` its line there.
+    `decider_user` is true when the phase or one of its agents tightens the decider to the user.
+    """
+
+    index: int = Field(ge=0)
+    name: str
+    topology: str
+    topology_text: str
+    actions: list[PhaseActionInfo] = Field(default_factory=list)
+    standby: list[str] = Field(default_factory=list)
+    channels: list[str] = Field(default_factory=list)
+    context_text: str = "keep"
+    gate: str = "done"
+    gate_text: str = ""
+    decider_text: str = ""
+    decider_user: bool = False
+    participants: list[str] = Field(default_factory=list)
+    field: str | None = None
+    line: int | None = None
+    visits: int | None = Field(default=None, ge=0)
+    max_visits: int | None = None
+    gate_result: str | None = None
+    usage: PhaseUsage | None = None
+    estimate_text: str | None = None
+
+
+class PhasePlan(ApiModel):
+    """The phase plan of a group or run: one row per phase, the phases `when` drops with the
+    current parameters, notes of the estimate and the decider of the run."""
+
+    rows: list[PhaseRow] = Field(default_factory=list)
+    dropped: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    run_decider: str = ""
+
+
+class PassInfo(ApiModel):
+    """One pass („Durchlauf“) of a phase in the progress bar (K9): result of its gate, with the
+    mean score at a gate `judge` with `mean`."""
+
+    n: int = Field(ge=1)
+    value: str | None = None
+    score: float | None = None
+    pass_score: float | None = None
+    passed: bool | None = None
+    running: bool = False
+
+
+class SubmissionInfo(ApiModel):
+    """A submission (`submit`) in the view „Ergebnisse“ (W4b-07 §6.6). Own ID space beside
+    `Result`; `note_next` is not part of it (this view and `read_results`; the transcript keeps
+    the whole `submit` call, Entscheidung 80). `sealed`: held back until the end of an isolated
+    phase (marked here; `read_results` only counts it). `accepted`: the submission the phase
+    took (`stage_end.accepted`)."""
+
+    id: int = Field(ge=1)
+    ts: float
+    agent: str
+    alias: str | None = None
+    stage: str | None = None
+    attempt: int = Field(default=1, ge=1)
+    action: str | None = None
+    format: str
+    name: str | None = None
+    version: int | None = None
+    status: str
+    summary: str = ""
+    fields: dict[str, Any] = Field(default_factory=dict)
+    files: list[str] = Field(default_factory=list)
+    body_excerpt: str | None = None
+    path: str | None = None
+    score: float | None = None
+    accepted: bool = False
+    sealed: bool = False
+    entry: int | None = None

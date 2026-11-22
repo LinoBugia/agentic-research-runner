@@ -39,6 +39,7 @@ from arr.models import (
     TopologyKind,
     WorkspaceMode,
 )
+from arr.permissions.inbox import tightened_text
 from arr.permissions.types import (
     ApprovalStatus,
     ApprovalType,
@@ -48,6 +49,7 @@ from arr.permissions.types import (
     EscalationOption,
     RequestCategory,
     RiskLevel,
+    TightenedBy,
 )
 from arr.room.types import DeliveryStatus, MessageKind, MessageVia
 from arr.service.api_client import (  # noqa: E402 - re-exported for the GUI and tests
@@ -126,6 +128,11 @@ from arr.service.api_models import (
     MessagesPage,
     NotificationEvent,
     ParamInfo,
+    PassInfo,
+    PhaseActionInfo,
+    PhasePlan,
+    PhaseRow,
+    PhaseUsage,
     PostMessageRequest,
     ProfileActionResult,
     ProfileConcurrency,
@@ -190,6 +197,7 @@ from arr.service.api_models import (
     StorageParts,
     StorageReport,
     StorageSuggestion,
+    SubmissionInfo,
     ToolAccess,
     ToolBundle,
     ToolchainCandidate,
@@ -263,12 +271,14 @@ class Dataset(StrEnum):
     SCENARIO = "szenario"
     LOAD = "last"
     ACCEPTANCE = "abnahme"
+    PHASES = "phasen"  # W4b-07 §6.17: the scenario with a phases run beside the old runs
 
 
 DATASET_LABELS = {
     Dataset.SCENARIO: "Szenario (Wireframes)",
     Dataset.LOAD: "Last-Datensatz",
     Dataset.ACCEPTANCE: "Abnahme (UX-Abnahme 2)",
+    Dataset.PHASES: "Szenario mit Phasen-Run",
 }
 
 
@@ -420,6 +430,8 @@ class _Run:
     running_tools: dict[str, int] = field(default_factory=dict)  # agent → seq (live stream)
     turns_end_at: float | None = None  # paused: running turns end at this time
     paused_workers: list[str] = field(default_factory=list)  # back to work on resume
+    phase_plan: PhasePlan | None = None  # runs with phases (W4b-07)
+    submissions: list[SubmissionInfo] = field(default_factory=list)  # W4b-07 §6.6
 
 
 @dataclass
@@ -1743,6 +1755,7 @@ def _skills() -> list[SkillInfo]:
         )
         for name, spec in _GROUP_SKILLS.items()
     ]
+    skills.append(_phases_skill())
     skills += [
         SkillInfo(
             name="sympy-check",
@@ -1857,6 +1870,15 @@ def _toolchain_candidates() -> list[ToolchainCandidate]:
 
 def _skill_file_text(skill: SkillInfo, path: str) -> str:
     """Sample content of a skill file (read only in v1, docs/08 §5.7)."""
+    if skill.name == PHASES_SKILL and path == "group.yaml":
+        return _PHASES_GROUP_YAML
+    if path.startswith("tasks/"):
+        task = path.removeprefix("tasks/").removesuffix(".md")
+        return (
+            f"# Auftrag: {task}\n\nDu arbeitest in der Phase von {skill.name}, die diesen "
+            "Auftrag nennt. Lies die Eingaben der Phase und gib dein Ergebnis mit submit im "
+            "verlangten Format ab.\n"
+        )
     spec = _GROUP_SKILLS.get(skill.name, {})
     if path == "SKILL.md":
         long = spec.get("long", skill.description)
@@ -2727,7 +2749,7 @@ def _build_generic_detail(run: _Run) -> None:
             ("member-3", "Mitglied"),
         ],
         TopologyKind.SOLO: [("solver", "Löser")],
-    }[run.topology]
+    }.get(run.topology, [("solver", "Löser")])
     final = run.status.is_final
     state = AgentDisplayState.DONE if final else AgentDisplayState.WORKING
     if run.status is RunStatus.FAILED:
@@ -4146,6 +4168,1012 @@ def _fit_storage(runs: dict[str, _Run], total_gb: float, freed_gb: float) -> Non
 
 
 # --------------------------------------------------------------------------------------------
+# Data set: scenario with a phases run (W4b-07 §6.17)
+# --------------------------------------------------------------------------------------------
+# The smallest scope of the Lead: one group skill with `topology: phases` (in every data set)
+# and, in the data set „phasen“ (the scenario plus these runs), a phases run with an open gate
+# `user`, a tightened request, a private channel with a question, submissions and fill levels,
+# and the run start of a second one. The run shows every new display at once; it is a showcase,
+# not one moment a real run reaches.
+
+PHASES_SKILL = "phasen-beweis"
+R_PHASES = "20261024-1340_collatz_phasen-beweis_5c1e"
+R_PHASES_START = "20261024-1518_collatz_phasen-beweis_9b07"
+PHASES_PRIVATE = "user.ideator-1"
+
+_PHASES_GROUP_YAML = """\
+kind: research-group
+version: 1
+topology: phases
+
+params:
+  ideen:
+    default: 3
+    min: 1
+    max: 6
+    doc: |
+      Ideen je Ideengeber
+      Wie viele Ideen jeder Ideengeber in Phase „ideen“ vorschlägt.
+
+rubric:
+  scale: [1, 10]
+  criteria: [korrektheit, vollstaendigkeit, strenge]
+
+agents:
+  - { id: ideator, role: roles/ideator.md, count: 2, compact: { at: 60% },
+      mix: [{ provider: claude }, { provider: codex }] }
+  - { id: scout, role: roles/scout.md, count: 2,
+      mix: [{ provider: claude, model: claude-sonnet-5-5 }, { provider: codex }] }
+  - { id: judge, role: roles/judge.md }
+  - { id: prover, role: roles/prover.md, model: claude-opus-5-5, compact: { at: 60% } }
+  - { id: writer, role: roles/writer.md, model: claude-haiku-5-5 }
+
+channels:
+  - { name: werkstatt, members: [prover, judge] }
+
+phases:
+  - name: ideen
+    topology: parallel
+    isolated: true
+    max_visits: 3
+    actions:
+      ideator-*: { task: tasks/ideen.md, submission: { format: list, name: ideen } }
+    gate: { type: user }               # du siehst die Ideen, bevor die Scouts starten
+
+  - name: exploration
+    topology: parallel
+    isolated: true
+    over: ideen                        # jede Idee wird eine Action, reihum verteilt
+    actions:
+      scout-*: { task: tasks/ausarbeiten.md, submission: { format: text } }
+    gate:
+      type: judge
+      raters: [judge]
+      action: { task: tasks/bewerten.md, submission: { format: rating } }
+      rule: rank
+      routes: { ranked: next }
+
+  - name: beweis
+    topology: solo
+    inputs:
+      - { from: exploration, pick: best }
+    actions:
+      prover: { task: tasks/beweis.md, submission: { format: artifact, name: beweis } }
+    channels: [werkstatt]
+    decider: user                      # hier entscheidest du jede Berechtigungsanfrage selbst
+    gate:
+      type: judge
+      raters: [judge]
+      action: { task: tasks/pruefen.md, submission: { format: review } }
+      rule: majority
+      routes:
+        accept: next
+        minor: next
+        major: { goto: ideen }
+        reject: { goto: ideen }
+
+  - name: zusammenfassung
+    topology: solo
+    actions:
+      writer: { task: tasks/zusammenfassen.md, submission: { format: text } }
+"""
+
+_PHASES_FILES = [
+    "SKILL.md",
+    "group.yaml",
+    *[f"roles/{r}.md" for r in ("ideator", "scout", "judge", "prover", "writer")],
+    *[
+        f"tasks/{t}.md"
+        for t in ("ideen", "ausarbeiten", "bewerten", "beweis", "pruefen", "zusammenfassen")
+    ],
+]
+
+_PHASES_DECIDER = "Aufsichts-Agent, bei Zweifel du"
+
+# (id, role label, model) of the agents in the run
+_PHASES_AGENTS = [
+    ("ideator-1", "Ideengeber", "claude-opus-5-5"),
+    ("ideator-2", "Ideengeber", "gpt-5.5"),
+    ("scout-1", "Scout", "claude-sonnet-5-5"),
+    ("scout-2", "Scout", "gpt-5.5"),
+    ("judge", "Judge", "claude-opus-5-5"),
+    ("prover", "Beweiser", "claude-opus-5-5"),
+    ("writer", "Schreiber", "claude-haiku-5-5"),
+]
+
+
+def _yaml_line(text: str, needle: str) -> int:
+    """Line (1-based) of the first line of `text` that is `needle` after stripping."""
+    return next(i for i, line in enumerate(text.splitlines(), start=1) if line.strip() == needle)
+
+
+def _phase_rows(*, beweis_user: bool = True) -> list[PhaseRow]:
+    """The rows of the phase plan as `real_api.phase_plan.phase_plan` gives them for the
+    `group.yaml` above; `beweis_user=False`: a run start that removes `decider: user`."""
+    open_end = "je Durchlauf, Obergrenze offen"
+
+    def row(index: int, name: str, **kw: Any) -> PhaseRow:
+        line = _yaml_line(_PHASES_GROUP_YAML, f"- name: {name}")
+        return PhaseRow(index=index, name=name, field=f"phases[{index}]", line=line, **kw)
+
+    return [
+        row(
+            0,
+            "ideen",
+            topology="parallel",
+            topology_text="parallel, isoliert, höchstens 3×",
+            actions=[
+                PhaseActionInfo(
+                    key="ideator-*",
+                    agents=["ideator-1", "ideator-2"],
+                    task="tasks/ideen.md",
+                    format="list",
+                    name="ideen",
+                )
+            ],
+            gate="user",
+            gate_text="user: weiter, wiederholen mit Hinweis oder Stopp",
+            decider_text=_PHASES_DECIDER,
+            participants=["ideator-1", "ideator-2"],
+            max_visits=3,
+            estimate_text=f"2–8 {open_end}",
+        ),
+        row(
+            1,
+            "exploration",
+            topology="parallel",
+            topology_text="parallel, isoliert, über „ideen“",
+            actions=[
+                PhaseActionInfo(
+                    key="scout-*",
+                    agents=["scout-1", "scout-2"],
+                    task="tasks/ausarbeiten.md",
+                    format="text",
+                )
+            ],
+            gate="judge",
+            gate_text="judge (judge · rating · Rangliste): ranked → weiter",
+            decider_text=_PHASES_DECIDER,
+            participants=["scout-1", "scout-2", "judge"],
+            estimate_text=f"2–204 {open_end}",
+        ),
+        row(
+            2,
+            "beweis",
+            topology="solo",
+            topology_text="solo",
+            actions=[
+                PhaseActionInfo(
+                    key="prover",
+                    agents=["prover"],
+                    task="tasks/beweis.md",
+                    format="artifact",
+                    name="beweis",
+                )
+            ],
+            channels=["werkstatt"],
+            gate="judge",
+            gate_text="judge (judge · review · Mehrheit): accept, minor → weiter, major, "
+            "reject → ideen",
+            decider_text="du (Phase)" if beweis_user else _PHASES_DECIDER,
+            decider_user=beweis_user,
+            participants=["prover", "judge"],
+            estimate_text=f"2–8 {open_end}",
+        ),
+        row(
+            3,
+            "zusammenfassung",
+            topology="solo",
+            topology_text="solo",
+            actions=[
+                PhaseActionInfo(
+                    key="writer",
+                    agents=["writer"],
+                    task="tasks/zusammenfassen.md",
+                    format="text",
+                )
+            ],
+            gate_text="done → Ende",
+            decider_text=_PHASES_DECIDER,
+            participants=["writer"],
+            estimate_text=f"1–4 {open_end}",
+        ),
+    ]
+
+
+def _phases_plan(*, beweis_user: bool = True) -> PhasePlan:
+    return PhasePlan(
+        rows=_phase_rows(beweis_user=beweis_user),
+        notes=[
+            "Phase „exploration“: Die Zahl der Einträge von „ideen“ steht erst im Lauf fest; "
+            "gerechnet mit höchstens 50.",
+            "Ein Gate „user“ oder „escalate“ lässt dich Phasen auch über „max_visits“ hinaus "
+            "wiederholen; die Obergrenze ist offen.",
+        ],
+        run_decider=_PHASES_DECIDER,
+    )
+
+
+def _phases_skill() -> SkillInfo:
+    """The group skill with phases (W4b-07 §6.17): plan, agents, channel and parameter."""
+    return SkillInfo(
+        name=PHASES_SKILL,
+        description="Von Ideen zum geprüften Beweis, in Phasen",
+        kind=SkillKind.GROUP,
+        audience="Projekt-Agenten und Claude Code",
+        files=list(_PHASES_FILES),
+        used_by=SkillUsage(projects=["collatz"], runs_count=1),
+        topology=TopologyKind.PHASES,
+        agents_count=len(_PHASES_AGENTS),
+        params=[
+            ParamInfo(
+                name="ideen",
+                type="int",
+                default=3,
+                min=1,
+                max=6,
+                doc="Ideen je Ideengeber\nWie viele Ideen jeder Ideengeber in Phase „ideen“ "
+                "vorschlägt.",
+            )
+        ],
+        agents_spec=[
+            {
+                "id": "ideator",
+                "role": "roles/ideator.md",
+                "count": "ideator-1, ideator-2",
+                "model": "Claude Opus 5.5 und gpt-5.5",
+            },
+            {
+                "id": "scout",
+                "role": "roles/scout.md",
+                "count": "scout-1, scout-2",
+                "model": "Claude Sonnet 5.5 und gpt-5.5",
+            },
+            {"id": "judge", "role": "roles/judge.md", "model": "Claude Opus 5.5"},
+            {"id": "prover", "role": "roles/prover.md", "model": "Claude Opus 5.5"},
+            {"id": "writer", "role": "roles/writer.md", "model": "Claude Haiku 5.5"},
+        ],
+        channels_spec=[
+            {"name": "werkstatt", "members": "prover, judge", "mode": "ereignisgesteuert"}
+        ],
+        rubric={
+            "scale": "1–10",
+            "criteria": ["Korrektheit", "Vollständigkeit", "Strenge"],
+        },
+        phase_plan=_phases_plan(),
+    )
+
+
+def _phase_options(stage: str, attempt: int, following: str) -> list[EscalationOptionInfo]:
+    """Options of a gate `user` in the order of the phases runner, worded like
+    `real_api.approvals._phase_option_infos` (the test compares both)."""
+    texts = {
+        EscalationOption.CONTINUE: ("Weiter", f"Der Run geht mit der Phase „{following}“ weiter."),
+        EscalationOption.RETRY: (
+            "Noch ein Versuch",
+            f"Die Phase „{stage}“ läuft noch einmal (Durchlauf {attempt + 1}), auch über "
+            "„max_visits“ hinaus. Dein Hinweis geht an alle Teilnehmer der Phase.",
+        ),
+        EscalationOption.END: ("Run beenden", "Keine weitere Phase; arr schließt den Run ab."),
+    }
+    return [EscalationOptionInfo(key=k, label=v[0], help=v[1]) for k, v in texts.items()]
+
+
+def _phase_agent_ref(agent_id: str) -> ApprovalAgentRef:
+    role, model = next((r, m) for a, r, m in _PHASES_AGENTS if a == agent_id)
+    provider = _provider_for(model)
+    return ApprovalAgentRef(
+        id=agent_id,
+        role_label=role,
+        model=model,
+        model_label=_model_label(model),
+        provider=provider,
+        vendor=_vendor(provider),
+    )
+
+
+def _phases_runs() -> list[_Run]:
+    running = _Run(
+        id=R_PHASES,
+        name="Zyklen mod 2ᵏ – von Ideen zum Beweis",
+        project="collatz",
+        skill=PHASES_SKILL,
+        topology=TopologyKind.PHASES,
+        status=RunStatus.RUNNING,
+        starter=Starter.USER_AGENT,
+        created_at=_at(24, 13, 40),
+        started_at=_at(24, 13, 40),
+        stage=StageRef(index=1, count=4, label="ideen", detail="Durchlauf 2 · wartet auf dich"),
+        wall_time_s=4 * 3600,
+        budget_usd=25.0,
+        spent_usd=9.35,
+        turns_per_agent=40,
+        max_turns_used=12,
+        tokens_total=2_630_000,
+        size=_size(0.9),
+        info="ideen (1 von 4) · Durchlauf 2 · 7 Agenten",
+        task_md="Finde einen Beweis, dass es keine nichttrivialen Zyklen mit höchstens 68 "
+        "ungeraden Schritten gibt.",
+    )
+    start = _Run(
+        id=R_PHASES_START,
+        name="Zyklen mod 3ᵏ – Phasen ohne Verschärfung",
+        project="collatz",
+        skill=PHASES_SKILL,
+        topology=TopologyKind.PHASES,
+        status=RunStatus.AWAITING_APPROVAL,
+        status_since=_at(24, 15, 18),
+        starter=Starter.USER_AGENT,
+        created_at=_at(24, 15, 18),
+        wall_time_s=4 * 3600,
+        budget_usd=25.0,
+        size=SizeInfo(actual_bytes=0, logical_bytes=0),
+        info="von Claude Code · startet nach deiner Freigabe",
+        task_md="Übertrage den Ansatz auf die Abbildung $3n + 1$ modulo $3^k$.",
+    )
+    return [running, start]
+
+
+def _phases_agents(rid: str, waiting: bool) -> dict[str, AgentState]:
+    """The seven agents; `waiting`: the run start, everybody waits for the approval."""
+    if waiting:
+        idle = Activity(kind=ActivityKind.WAIT_STAGE, label="startet nach deiner Freigabe")
+        return {
+            aid: _agent(rid, aid, role, model, AgentDisplayState.IDLE, idle)
+            for aid, role, model in _PHASES_AGENTS
+        }
+    gate = Activity(kind=ActivityKind.WAIT_STAGE, label="wartet auf deine Entscheidung am Gate")
+    later = Activity(kind=ActivityKind.WAIT_STAGE, label="wartet auf die nächste Phase")
+    agents = [
+        _agent(
+            rid,
+            "ideator-1",
+            "Ideengeber",
+            "claude-opus-5-5",
+            AgentDisplayState.IDLE,
+            gate,
+            turn=6,
+            cost=2.10,
+            tokens=520_000,
+            results=2,
+            questions_to_user=1,
+        ).model_copy(
+            update={
+                "context_text": "Kontext 48 % · verdichtet ab 60 %",
+                "context_tokens": 96_000,
+                "context_window": 200_000,
+                "compact_threshold": 120_000,
+            }
+        ),
+        _agent(
+            rid,
+            "ideator-2",
+            "Ideengeber",
+            "gpt-5.5",
+            AgentDisplayState.IDLE,
+            gate,
+            turn=5,
+            tokens=480_000,
+            results=2,
+        ).model_copy(update={"context_text": "Kontext unbekannt"}),
+        _agent(
+            rid,
+            "scout-1",
+            "Scout",
+            "claude-sonnet-5-5",
+            AgentDisplayState.IDLE,
+            later,
+            turn=11,
+            cost=1.60,
+            tokens=610_000,
+            results=1,
+        ),
+        _agent(
+            rid,
+            "scout-2",
+            "Scout",
+            "gpt-5.5",
+            AgentDisplayState.IDLE,
+            later,
+            turn=10,
+            tokens=590_000,
+            results=1,
+        ),
+        _agent(
+            rid,
+            "judge",
+            "Judge",
+            "claude-opus-5-5",
+            AgentDisplayState.IDLE,
+            later,
+            turn=4,
+            cost=1.20,
+            tokens=230_000,
+            ratings=2,
+            channels=["werkstatt"],
+        ),
+        _agent(
+            rid,
+            "prover",
+            "Beweiser",
+            "claude-opus-5-5",
+            AgentDisplayState.WAITING_USER,
+            Activity(kind=ActivityKind.WAIT_APPROVAL, label="wartet auf deine Freigabe"),
+            since=_at(24, 15, 16),
+            blocked_by=BlockedBy(
+                kind=BlockedKind.APPROVAL,
+                approval_id="apr_0051",
+                summary="pip install python-flint",
+                deadline=_at(24, 15, 36),
+            ),
+            turn=12,
+            cost=3.40,
+            tokens=980_000,
+            results=1,
+            channels=["werkstatt"],
+        ).model_copy(
+            update={
+                "context_text": "Kontext 22 % · verdichtet ab 60 % · 1× verdichtet",
+                "context_tokens": 44_000,
+                "context_window": 200_000,
+                "compact_threshold": 120_000,
+                "compactions": 1,
+                "note_turns": 1,
+            }
+        ),
+        _agent(
+            rid,
+            "writer",
+            "Schreiber",
+            "claude-haiku-5-5",
+            AgentDisplayState.IDLE,
+            Activity(kind=ActivityKind.WAIT_STAGE, label="startet in Phase zusammenfassung"),
+        ),
+    ]
+    return {a.id: a for a in agents}
+
+
+def _phases_submissions() -> list[SubmissionInfo]:
+    """Submissions in the order of the room: ideen D1, exploration D1, beweis D1, ideen D2
+    (sealed: the isolated phase has not ended yet)."""
+
+    def sub(
+        n: int, ts: float, agent: str, stage: str, attempt: int, fmt_: str, **kw: Any
+    ) -> SubmissionInfo:
+        return SubmissionInfo(
+            id=n,
+            ts=ts,
+            agent=agent,
+            stage=stage,
+            attempt=attempt,
+            format=fmt_,
+            path=f"output/submissions/{n:03d}",
+            **kw,
+        )
+
+    ideas_1 = [
+        {"title": "Restklassen modulo 2¹⁶", "text": "Zyklen über Paritätsvektoren ausschließen."},
+        {"title": "Baker-Schranke", "text": "Untere Schranke für |2ᵃ − 3ᵇ| nutzen."},
+    ]
+    return [
+        sub(
+            1,
+            _at(24, 13, 49),
+            "ideator-1",
+            "ideen",
+            1,
+            "list",
+            name="ideen",
+            version=1,
+            status="done",
+            summary="Zwei Ideen: Paritätsvektoren und Baker-Schranke.",
+            fields={"items": ideas_1},
+            accepted=True,
+        ),
+        sub(
+            2,
+            _at(24, 13, 51),
+            "ideator-2",
+            "ideen",
+            1,
+            "list",
+            name="ideen",
+            version=1,
+            status="done",
+            summary="Eine Idee: Zyklen als ganzzahlige Punkte einer Kurve.",
+            fields={
+                "items": [
+                    {
+                        "title": "Ganzzahlige Punkte",
+                        "text": "Zyklusgleichung als diophantische Gleichung lesen.",
+                    }
+                ]
+            },
+            accepted=True,
+        ),
+        sub(
+            3,
+            _at(24, 14, 22),
+            "scout-1",
+            "exploration",
+            1,
+            "text",
+            status="done",
+            summary="Paritätsvektoren schließen Zyklen bis Länge 40 aus.",
+            score=7.5,
+            accepted=True,
+            body_excerpt="Für jede Restklasse modulo 2¹⁶ …",
+        ),
+        sub(
+            4,
+            _at(24, 14, 26),
+            "scout-2",
+            "exploration",
+            1,
+            "text",
+            status="partial",
+            summary="Die Baker-Schranke reicht erst ab Länge 120.",
+            score=6.0,
+        ),
+        sub(
+            5,
+            _at(24, 14, 30),
+            "judge",
+            "exploration",
+            1,
+            "rating",
+            status="done",
+            summary="Rangliste: Abgabe 003 vor 004.",
+            fields={
+                "ratings": [
+                    {"ref": 3, "score": 7.5, "comment": "Klar und nachprüfbar."},
+                    {"ref": 4, "score": 6.0, "comment": "Lücke zwischen 40 und 120."},
+                ]
+            },
+        ),
+        sub(
+            6,
+            _at(24, 14, 55),
+            "prover",
+            "beweis",
+            1,
+            "artifact",
+            name="beweis",
+            version=1,
+            status="partial",
+            summary="Beweis bis auf den Fall k = 2.",
+            files=["tex/zyklen.tex"],
+        ),
+        sub(
+            7,
+            _at(24, 15, 1),
+            "judge",
+            "beweis",
+            1,
+            "review",
+            status="done",
+            summary="Urteil major: Der Fall k = 2 fehlt.",
+            fields={
+                "verdict": "major",
+                "objections": [
+                    {"text": "Fall k = 2 wird nur behauptet, nicht bewiesen."},
+                    {"text": "Lemma 2 setzt eine Schranke voraus, die erst danach folgt."},
+                ],
+            },
+        ),
+        sub(
+            8,
+            _at(24, 15, 14),
+            "ideator-1",
+            "ideen",
+            2,
+            "list",
+            name="ideen",
+            version=2,
+            status="done",
+            summary="Drei Ideen, neu: 3-adische Bewertung für k = 2.",
+            fields={"items": [*ideas_1, {"title": "3-adisch", "text": "Fall k = 2 über v₃."}]},
+            sealed=True,
+        ),
+        sub(
+            9,
+            _at(24, 15, 18),
+            "ideator-2",
+            "ideen",
+            2,
+            "list",
+            name="ideen",
+            version=2,
+            status="done",
+            summary="Zwei Ideen, neu: Kettenbruch von log₂ 3.",
+            sealed=True,
+        ),
+    ]
+
+
+def _build_phases_detail(run: _Run) -> None:
+    """The running phases run: ideen D1 → exploration → beweis (major) → ideen D2, whose gate
+    `user` waits for you."""
+    rid = run.id
+    run.agents = _phases_agents(rid, waiting=False)
+    usage = {
+        "ideen": PhaseUsage(
+            turns=11, tokens=1_000_000, cost_usd=2.10, cost_kind=CostKind.ESTIMATED
+        ),
+        "exploration": PhaseUsage(
+            turns=21, tokens=1_200_000, cost_usd=2.40, cost_kind=CostKind.ESTIMATED
+        ),
+        "beweis": PhaseUsage(
+            turns=16, tokens=1_210_000, cost_usd=4.85, cost_kind=CostKind.ESTIMATED
+        ),
+    }
+    progress = {
+        "ideen": (2, "bei dir"),
+        "exploration": (1, "ranked"),
+        "beweis": (1, "major"),
+        "zusammenfassung": (0, None),
+    }
+    plan = _phases_plan()
+    run.phase_plan = plan.model_copy(
+        update={
+            "rows": [
+                row.model_copy(
+                    update={
+                        "visits": progress[row.name][0],
+                        "gate_result": progress[row.name][1],
+                        "usage": usage.get(row.name),
+                    }
+                )
+                for row in plan.rows
+            ]
+        }
+    )
+    run.stages = [
+        StageInfo(
+            key="ideen",
+            index=1,
+            label="ideen",
+            status=StageStatus.WAITING_USER,
+            agents=["ideator-1", "ideator-2"],
+            passes=[PassInfo(n=1, value="weiter"), PassInfo(n=2, running=True)],
+        ),
+        StageInfo(
+            key="exploration",
+            index=2,
+            label="exploration",
+            status=StageStatus.DONE,
+            agents=["scout-1", "scout-2", "judge"],
+            passes=[PassInfo(n=1, value="ranked", passed=True)],
+        ),
+        StageInfo(
+            key="beweis",
+            index=3,
+            label="beweis",
+            status=StageStatus.DONE,
+            agents=["prover", "judge"],
+            passes=[PassInfo(n=1, value="major", passed=False)],
+        ),
+        StageInfo(
+            key="zusammenfassung",
+            index=4,
+            label="zusammenfassung",
+            status=StageStatus.TODO,
+            agents=["writer"],
+        ),
+    ]
+    run.channels = {
+        "werkstatt": _Channel(
+            info=ChannelInfo(
+                name="werkstatt",
+                members=[ChannelMemberInfo(agent=a) for a in ("prover", "judge")],
+                mode=ChannelMode.EVENT,
+            ),
+            fixed={
+                m.id: m
+                for m in [
+                    _msg(
+                        "werkstatt",
+                        1,
+                        _at(24, 14, 40),
+                        "prover",
+                        MessageKind.QUESTION,
+                        "Reicht dir für den Fall $k = 1$ die Rechnung modulo $2^{16}$?",
+                        to=["judge"],
+                    ),
+                    _msg(
+                        "werkstatt",
+                        2,
+                        _at(24, 14, 43),
+                        "judge",
+                        MessageKind.ANSWER,
+                        "Ja, wenn die Tabelle im Anhang steht.",
+                        reply_to=1,
+                    ),
+                ]
+            },
+        ),
+        PHASES_PRIVATE: _Channel(
+            info=ChannelInfo(
+                name=PHASES_PRIVATE,
+                purpose="Privater Kanal zum User",
+                members=[ChannelMemberInfo(agent="ideator-1")],
+                mode=ChannelMode.EVENT,
+                open_questions=1,
+                unread_for_user=1,
+                private_of="ideator-1",
+            ),
+            fixed={
+                m.id: m
+                for m in [
+                    _msg(
+                        PHASES_PRIVATE,
+                        1,
+                        _at(24, 15, 4),
+                        "ideator-1",
+                        MessageKind.NOTE,
+                        "Ich starte Durchlauf 2 mit dem Einwand aus „beweis“: Der Fall "
+                        "$k = 2$ braucht eine eigene Idee.",
+                    ),
+                    _msg(
+                        PHASES_PRIVATE,
+                        2,
+                        _at(24, 15, 12),
+                        "ideator-1",
+                        MessageKind.QUESTION,
+                        _PHASES_QUESTION,
+                        to=["user"],
+                        open=True,
+                    ),
+                ]
+            },
+        ),
+    }
+    run.agents["ideator-1"] = run.agents["ideator-1"].model_copy(
+        update={"channels": [PHASES_PRIVATE]}
+    )
+    start = run.started_at or run.created_at
+    for aid, agent in run.agents.items():
+        if agent.turn:
+            run.transcripts[aid] = _Transcript(
+                total_generated=agent.turn * 8,
+                gen=_generated_transcript_factory(
+                    rid, aid, agent.turn * 8, start, _at(24, 15, 18), agent.turn
+                ),
+            )
+    run.submissions = _phases_submissions()
+    run.results_empty_text = "Die Phasen geben ihre Abgaben mit submit ab."
+    run.log = [
+        LogEntry(
+            ts=_at(24, 13, 40),
+            kind="plan",
+            text="Geplant: ideen, exploration, beweis, zusammenfassung",
+        ),
+        LogEntry(
+            ts=_at(24, 13, 40, 5), kind="checkpoint", text="Phase ideen, Durchlauf 1", stage="ideen"
+        ),
+        LogEntry(
+            ts=_at(24, 13, 52),
+            kind="escalation",
+            text="Gate user: wartet auf deine Entscheidung",
+            stage="ideen",
+        ),
+        LogEntry(
+            ts=_at(24, 13, 55), kind="checkpoint", text="Du hast gewählt: weiter", stage="ideen"
+        ),
+        LogEntry(
+            ts=_at(24, 13, 55, 5),
+            kind="checkpoint",
+            text="Phase exploration, Durchlauf 1",
+            stage="exploration",
+        ),
+        LogEntry(
+            ts=_at(24, 14, 31), kind="checkpoint", text="Gate: ranked → weiter", stage="exploration"
+        ),
+        LogEntry(
+            ts=_at(24, 14, 32), kind="checkpoint", text="Phase beweis, Durchlauf 1", stage="beweis"
+        ),
+        LogEntry(ts=_at(24, 15, 2), kind="checkpoint", text="Gate: major → ideen", stage="beweis"),
+        LogEntry(
+            ts=_at(24, 15, 2, 5), kind="checkpoint", text="Phase ideen, Durchlauf 2", stage="ideen"
+        ),
+        LogEntry(
+            ts=_at(24, 15, 12),
+            kind="user_question",
+            text="ideator-1 fragt dich im privaten Kanal",
+            stage="ideen",
+        ),
+        LogEntry(
+            ts=_at(24, 15, 19),
+            kind="escalation",
+            text="Gate user: wartet auf deine Entscheidung",
+            stage="ideen",
+        ),
+    ]
+
+
+def _build_phases_start_detail(run: _Run) -> None:
+    """The second phases run waits for your approval of its start."""
+    run.agents = _phases_agents(run.id, waiting=True)
+    plan = _phases_plan(beweis_user=False)
+    run.phase_plan = plan.model_copy(
+        update={"rows": [r.model_copy(update={"visits": 0}) for r in plan.rows]}
+    )
+    run.stages = [
+        StageInfo(
+            key=r.name,
+            index=r.index + 1,
+            label=r.name,
+            status=StageStatus.TODO,
+            agents=list(r.participants),
+        )
+        for r in plan.rows
+    ]
+    run.channels = {
+        "werkstatt": _Channel(
+            info=ChannelInfo(
+                name="werkstatt",
+                members=[ChannelMemberInfo(agent=a) for a in ("prover", "judge")],
+                mode=ChannelMode.EVENT,
+            )
+        )
+    }
+    run.results_empty_text = "Die Phasen geben ihre Abgaben mit submit ab."
+
+
+_PHASES_QUESTION = (
+    "Soll ich Zyklen mit mehr als 68 ungeraden Schritten ganz weglassen? Für kurze Zyklen gibt "
+    "es Schranken, für lange müsste ich neu ansetzen."
+)
+
+
+def _phases_approvals(base: str, runs: dict[str, _Run]) -> list[ApprovalItem]:
+    """Gate `user` of ideen D2, the tightened request of beweis D1, the question of ideator-1
+    in its private channel and the start of the second run."""
+
+    def ref(rid: str) -> ApprovalRunRef:
+        run = runs[rid]
+        return ApprovalRunRef(
+            id=rid, name=run.name, project=run.project, gui_url=f"{base}/runs/{rid}"
+        )
+
+    raw = {"source": "phase", "stage": "beweis", "attempt": 1}
+    tightened = TightenedBy.model_validate(raw)
+    start_agents = [
+        _run_start_agent(aid, role, model, web=False) for aid, role, model in _PHASES_AGENTS
+    ]
+    return [
+        ApprovalItem(
+            id="apr_0050",
+            type=ApprovalType.ESCALATION,
+            created_at=_at(24, 15, 19),
+            gui_url=f"{base}/freigaben/apr_0050",
+            title="Phase „ideen“, Durchlauf 2: die Ideen warten auf dich",
+            run=ref(R_PHASES),
+            stage="ideen",
+            attempt=2,
+            phase_reason="Gate „user“: Du entscheidest, ob der Run mit diesen Ideen weitergeht.",
+            summary_lines=[
+                "ideator-1: drei Ideen, neu: 3-adische Bewertung für den Fall k = 2",
+                "ideator-2: zwei Ideen, neu: Kettenbruch von log₂ 3",
+                "Durchlauf 1 von „beweis“ endete mit Urteil major (Fall k = 2 fehlt).",
+            ],
+            options=_phase_options("ideen", 2, "exploration"),
+            topology=TopologyKind.PHASES,
+            # The hint of a phases gate goes to every participant; the contract test of the
+            # data sets wants a recipient on every escalation, the GUI does not show it here.
+            comment_to=_phase_agent_ref("ideator-1"),
+        ),
+        ApprovalItem(
+            id="apr_0051",
+            type=ApprovalType.PERMISSION,
+            created_at=_at(24, 15, 16),
+            gui_url=f"{base}/freigaben/apr_0051",
+            title="prover möchte etwas installieren",
+            run=ref(R_PHASES),
+            deadline=_at(24, 15, 36),
+            agent=_phase_agent_ref("prover"),
+            tool="Bash",
+            command="pip install python-flint",
+            work_dir=f"…/runs/{R_PHASES}/agents/prover/work",
+            reason="Für die Fallunterscheidung modulo 2ᵏ brauche ich schnelle "
+            "Ganzzahl-Arithmetik; python-flint ist ein Mathe-Paket von PyPI.",
+            risk=RiskInfo(level=RiskLevel.LOW, text="Installation in die Run-venv."),
+            categories=[RequestCategory.INSTALL],
+            escalated_by=EscalatedByInfo(
+                decider=DecidedBy.MANDATE_RULE,
+                note="Deine Vollmacht erlaubt bekannte Mathe-Pakete von PyPI.",
+            ),
+            tightened_by=raw,
+            tightened_text=tightened_text(tightened),
+            consequences=Consequences(
+                allow="python-flint wird einmal in die Run-venv installiert.",
+                deny="prover bekommt deinen Kommentar und arbeitet ohne das Paket weiter.",
+                expire="Keine Entscheidung bis 15:36: gilt als abgelehnt.",
+            ),
+            rule_label="pip install python-flint",
+        ),
+        ApprovalItem(
+            id="apr_0052",
+            type=ApprovalType.QUESTION,
+            created_at=_at(24, 15, 12),
+            gui_url=f"{base}/freigaben/apr_0052",
+            title="ideator-1 fragt dich",
+            run=ref(R_PHASES),
+            agent=_phase_agent_ref("ideator-1"),
+            question_text=_PHASES_QUESTION,
+            channel=PHASES_PRIVATE,
+            msg_id=2,
+        ),
+        ApprovalItem(
+            id="apr_0053",
+            type=ApprovalType.RUN_START,
+            created_at=_at(24, 15, 18),
+            gui_url=f"{base}/freigaben/apr_0053",
+            title=f"{PHASES_SKILL}: {runs[R_PHASES_START].name}",
+            run=ref(R_PHASES_START),
+            requested_by=Starter.USER_AGENT,
+            skill=PHASES_SKILL,
+            topology=TopologyKind.PHASES,
+            params={"ideen": 4},
+            task_md=runs[R_PHASES_START].task_md,
+            agents=start_agents,
+            channels=[
+                RunStartChannel(
+                    name="werkstatt", members=["prover", "judge"], mode=ChannelMode.EVENT
+                )
+            ],
+            limits=LimitsInfo(wall_time_s=4 * 3600, turns_per_agent=40, budget_usd=25),
+            decider=Decider.GATEKEEPER_THEN_USER,
+            estimate=Estimate(
+                turns=Range(min=28, max=56),
+                cost_usd=Range(min=6, max=14),
+                cost_kind=CostKind.ESTIMATED,
+                duration_s=Range(min=3600, max=3 * 3600),
+            ),
+            deviations=[
+                Deviation(
+                    path="tightening.removed",
+                    label="Verschärfung aufgehoben (decider: user)",
+                    value_text="für Phase beweis",
+                    default_text="du entscheidest dort jede Anfrage",
+                    default=["beweis"],
+                    value=[],
+                    sensitive=True,
+                )
+            ],
+            standard_notes=[_copy_note("collatz", start_agents), "Budget"],
+            phase_plan=_phases_plan(beweis_user=False),
+            warnings=[
+                "Phase „ideen“: „max_visits: 3“ ohne „on_exhausted“ – nach dem dritten "
+                "Durchlauf entscheidest du."
+            ],
+        ),
+    ]
+
+
+def _add_phases_data(runs: dict[str, _Run], approvals: dict[str, ApprovalItem], base: str) -> None:
+    """The data set „phasen“: the scenario plus the two phases runs and their items. Two old
+    finished runs make room, so the data set keeps the 31 runs of the scenario."""
+    old = sorted(
+        (
+            r
+            for r in runs.values()
+            if r.project == "collatz"
+            and r.status is RunStatus.DONE
+            and not (r.pinned or r.archived or r.slimmed)
+            and r.id not in _DETAIL_BUILDERS
+        ),
+        key=lambda r: r.created_at,
+    )
+    for run in old[:2]:
+        del runs[run.id]
+    for run in _phases_runs():
+        runs[run.id] = run
+    for item in _phases_approvals(base, runs):
+        approvals[item.id] = item
+
+
+# --------------------------------------------------------------------------------------------
 # The mock
 # --------------------------------------------------------------------------------------------
 
@@ -4156,6 +5184,8 @@ _DETAIL_BUILDERS: dict[str, Callable[[_Run], None]] = {
     R_RAMSEY: _build_ramsey_detail,
     R_REVIEW: _build_review_detail,
     R_SATZ2: _build_satz2_detail,
+    R_PHASES: _build_phases_detail,
+    R_PHASES_START: _build_phases_start_detail,
 }
 
 
@@ -4295,11 +5325,13 @@ class MockApi:
 
     def _load(self, dataset: Dataset) -> None:
         self.dataset = dataset
-        if dataset is Dataset.SCENARIO:
+        if dataset in (Dataset.SCENARIO, Dataset.PHASES):
             self.clock = MockClock(SCENARIO_NOW)
             runs = _scenario_runs(SCENARIO_NOW)
-            _fit_storage(runs, total_gb=46.2, freed_gb=14.9)
             approvals = _scenario_approvals(self.base_url)
+            if dataset is Dataset.PHASES:
+                _add_phases_data(runs, approvals, self.base_url)
+            _fit_storage(runs, total_gb=46.2, freed_gb=14.9)
             warnings = _scenario_warnings()
             wf = WorkfolderInfo(
                 name="Mathe privat",
@@ -5213,6 +6245,7 @@ class MockApi:
                 DecisionAction.ADJUST,
             },
             ApprovalType.ESCALATION: {DecisionAction.OPTION},
+            ApprovalType.QUESTION: {DecisionAction.ANSWER},
         }[item.type]
         if request.action not in allowed:
             raise ApiException.of(
@@ -5323,6 +6356,10 @@ class MockApi:
             if action is DecisionAction.ADJUST:
                 return f"Angepasst und freigegeben: {run.name}"
             return f"Run freigegeben: {run.name}"
+        if item.type is ApprovalType.QUESTION:
+            return self._answer_question(item, run, request.comment or "")
+        if run.topology is TopologyKind.PHASES:
+            return self._decide_phase_gate(item, run, request.option_key)
         # escalation
         option = request.option_key
         if option is EscalationOption.END:
@@ -5363,6 +6400,77 @@ class MockApi:
             return f"Noch ein Versuch: {worker} überarbeitet die Stufe „{item.stage}“."
         run.info = "Trotzdem weiter"
         return "Trotzdem weiter: Die nächste Stufe startet."
+
+    def _answer_question(self, item: ApprovalItem, run: _Run, answer: str) -> str:
+        """The answer goes into the channel of the question and closes it (L16)."""
+        detail = self._detail(run.id)
+        channel = detail.channels.get(item.channel or "")
+        who = item.agent.id if item.agent else "Agent"
+        if channel is not None:
+            now = self.now()
+            msg = Message(
+                id=channel.count + 1,
+                ts=now,
+                channel=channel.info.name,
+                sender="user",
+                via=MessageVia.GUI,
+                kind=MessageKind.ANSWER,
+                body=answer,
+                to=[who],
+                reply_to=item.msg_id,
+                delivery=DeliveryInfo(status=DeliveryStatus.NEXT_INBOX, ts=now),
+            )
+            channel.extra.append(msg)
+            asked = channel.fixed.get(item.msg_id or 0)
+            if asked is not None and asked.open:
+                channel.fixed[asked.id] = asked.model_copy(update={"open": False})
+            info = channel.info
+            channel.info = info.model_copy(
+                update={"open_questions": max(0, info.open_questions - 1)}
+            )
+            self._publish(ChannelMessageEvent(seq=0, ts=now, run_id=run.id, message=msg))
+        if who in detail.agents:
+            agent = detail.agents[who]
+            detail.agents[who] = agent.model_copy(
+                update={"questions_to_user": max(0, agent.questions_to_user - 1)}
+            )
+        return f"Antwort an {who} gesendet."
+
+    def _decide_phase_gate(
+        self, item: ApprovalItem, run: _Run, option: EscalationOption | None
+    ) -> str:
+        """Gate `user` of a phases run (W4b-07): another pass, the next phase or the end."""
+        now = self.now()
+        run.status_since = now
+        stage = item.stage or ""
+        if option is EscalationOption.END:
+            run.status = RunStatus.FINALIZING
+            self.state.pending_transitions.append((now + 8, run.id, RunStatus.DONE))
+            return f"Run wird beendet: {run.name}. Die Zusammenfassung wird erstellt."
+        run.status = RunStatus.RUNNING
+        stages = list(self._detail(run.id).stages)
+        for i, s in enumerate(stages):
+            if s.status is not StageStatus.WAITING_USER:
+                continue
+            done = [p.model_copy(update={"running": False}) for p in s.passes]
+            if done:
+                word = "noch ein Versuch" if option is EscalationOption.RETRY else "weiter"
+                done[-1] = done[-1].model_copy(update={"value": word})
+            if option is EscalationOption.RETRY:
+                done.append(PassInfo(n=len(done) + 1, running=True))
+                stages[i] = s.model_copy(update={"status": StageStatus.RUNNING, "passes": done})
+            else:
+                stages[i] = s.model_copy(update={"status": StageStatus.DONE, "passes": done})
+                if i + 1 < len(stages):
+                    nxt = stages[i + 1]
+                    passes = [*nxt.passes, PassInfo(n=len(nxt.passes) + 1, running=True)]
+                    stages[i + 1] = nxt.model_copy(
+                        update={"status": StageStatus.RUNNING, "passes": passes}
+                    )
+        run.stages = stages
+        if option is EscalationOption.RETRY:
+            return f"Noch ein Versuch: Die Phase „{stage}“ läuft noch einmal."
+        return "Weiter: Die nächste Phase startet."
 
     def _apply_changes(self, run: _Run, changes: list[ChangeInfo]) -> None:
         """Your changes from „Anpassen“ go into the run (docs/08 §5.2: same run ID)."""
@@ -5512,6 +6620,7 @@ class MockApi:
             handoff_text=handoff,
             run_dir=f"{self.state.workfolder.path}/runs/{run.id}",
             task_md=run.task_md,
+            phase_plan=run.phase_plan,
         )
 
     async def run_action(
@@ -5740,6 +6849,7 @@ class MockApi:
             summary_md=run.summary_md,
             summary_path="output/summary.md" if run.summary_md else None,
             empty_text=run.results_empty_text,
+            submissions=list(run.submissions),
         )
 
     async def get_log(self, run_id: str) -> list[LogEntry]:

@@ -32,6 +32,7 @@ from arr.service.api_models import (
     TranscriptPage,
     TurnRange,
 )
+from arr.usage import UsageRecord, usage_records
 
 PAGE_LIMIT = 200
 """Largest page of a transcript (docs/08 §6.9)."""
@@ -91,7 +92,9 @@ class TranscriptIndex:
         self._results: dict[str, int] = {}
         self._calls: dict[str, int] = {}
         self._turn_ends: list[int] = []
+        self._turn_starts: list[int] = []
         self._usage_cache: tuple[int, Usage, int] | None = None
+        self._records_cache: tuple[int, list[UsageRecord]] | None = None
 
     # -- building ---------------------------------------------------------------------------
 
@@ -102,7 +105,9 @@ class TranscriptIndex:
         self._results = {}
         self._calls = {}
         self._turn_ends = []
+        self._turn_starts = []
         self._usage_cache = None
+        self._records_cache = None
 
     def refresh(self) -> list[Line]:
         """Read what the file gained since the last call; returns the new complete lines."""
@@ -143,6 +148,8 @@ class TranscriptIndex:
                 self._results.setdefault(line.tool_id, index)
             elif line.kind == "turn_end":
                 self._turn_ends.append(index)
+            elif line.kind == "turn_start":
+                self._turn_starts.append(index)
         return new
 
     @staticmethod
@@ -235,6 +242,21 @@ class TranscriptIndex:
         """The decoded `turn_end` records (one per finished turn)."""
         records = self.read(self._turn_ends)
         return [records[i] for i in self._turn_ends if i in records]
+
+    def usage_records(self, config: Any = None) -> list[UsageRecord]:
+        """One `UsageRecord` per finished turn with its phase (`turn_start.stage`, W4b-07):
+        only the `turn_start` and `turn_end` lines are decoded, cached per file growth."""
+        key = len(self.lines)
+        if self._records_cache is not None and self._records_cache[0] == key:
+            return self._records_cache[1]
+        wanted = sorted([*self._turn_starts, *self._turn_ends])
+        records = self.read(wanted)
+        try:
+            found = usage_records([records[i] for i in wanted if i in records], config)
+        except (TypeError, ValueError, AttributeError):
+            found = []
+        self._records_cache = (key, found)
+        return found
 
     def usage(self) -> tuple[Usage, int]:
         """Summed usage of all finished turns and their number (cached per file growth)."""

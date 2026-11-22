@@ -123,6 +123,7 @@ TOPOLOGY = {
     TopologyKind.EXPLORATION: "exploration",
     TopologyKind.WATERFALL: "waterfall",
     TopologyKind.REVIEW: "review",
+    TopologyKind.PHASES: "phases",
 }
 
 
@@ -132,6 +133,7 @@ TOPOLOGY_LABEL = {
     TopologyKind.EXPLORATION: "Exploration",
     TopologyKind.WATERFALL: "Wasserfall",
     TopologyKind.REVIEW: "Review",
+    TopologyKind.PHASES: "Phasen",
 }
 
 # Dative forms for running text: „abgelehnt von dir“, „erlaubt vom Aufsichts-Agenten“ (§8.1)
@@ -209,3 +211,12 @@ APPROVAL_FILTERS = {
     "eskalationen": ("Eskalationen", ApprovalType.ESCALATION),
     "fragen": ("Fragen", ApprovalType.QUESTION),
 }
+
+
+def channel_label(name: str | None) -> str:
+    """„#main“, or „privat · prover“ for the private channel of an agent to the user (W4b-03,
+    W4b-07): it is never shown as a group chat „#user.prover“."""
+    from arr.room.store import private_owner
+
+    owner = private_owner(name or "")
+    return f"privat · {owner}" if owner else f"#{name or ''}"

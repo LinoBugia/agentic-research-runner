@@ -53,14 +53,17 @@ from arr.models import (
 from arr.permissions.gatekeeper import run_profiles
 from arr.permissions.inbox import ApprovalDecider
 from arr.resolve import load_group_spec, load_run_input, load_yaml_model, resolve_run
+from arr.room.store import private_owner
 from arr.runs.finalize import clean_up_after_scan, finalize_run, last_turn_error
 from arr.runs.inspect import (
+    _CHOICE_TEXT,
     LOCKS_AVAILABLE,
     RUN_LOCK,
     STATUS_TEXT,
     STOP_REQUEST,
     TURN_TEXT,
     RunLock,
+    _line_text,
     describe_checkpoint,
     run_lock_held,
     run_reason,
@@ -870,12 +873,80 @@ def _describe_waiting(data: Mapping[str, Any]) -> str | None:
     return None
 
 
-def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str | None:
-    """One German progress line for an entry of `orchestrator.jsonl`, None to skip it."""
-    kind = str(entry.get("kind"))
+_ENTRY_MAX = 600
+"""At most this many characters of one progress line (W4b-07 §6.16)."""
+_WAKE_MORE_TEXT = {
+    "answer": "deine Antwort",
+    "result_from": "ein Ergebnis, auf das er wartet",
+    "result_missing": "ein Agent ist ohne neues Ergebnis fertig",
+}
+"""Reasons of a `wake` with `reasons` besides `WAKE_TEXT` (W4b-03 §7.1, `arr.runs.pacing`)."""
+_COMPACT_TEXT = {
+    "auto": "Auto-Compact",
+    "phase": "Beginn der Phase mit „context: compact“",
+    "engine": "von der Engine selbst",
+}
+"""`reason` of a `compact` entry (W4b-05b §7.1)."""
+_NOTE_FLAG_TEXT = {"begin": "setzen", "end": "entfernen"}
+"""`action` of a `note_turn_flag` entry."""
+_QUESTION_CLOSED_TEXT = {
+    "result": "der Agent hat ohne deine Antwort abgegeben",
+    "stopped": "der Run wurde gestoppt",
+    "limit": "ein Limit ist erreicht",
+}
+"""`reason` of a `user_question` entry with `state: closed`."""
+
+
+def _tokens(value: Any) -> str:
+    """A token count from the log as `150.000`, „?“ when unknown."""
+    if value is None:
+        return "?"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"{value:,}".replace(",", ".")
+    return _line_text(value, 20)
+
+
+def _channel_words(channel: Any) -> str:
+    """`#name`, or the private channel of an agent to the user in words (W4b-03 §7.1)."""
+    name = _line_text(channel, 80)
+    owner = private_owner(channel) if isinstance(channel, str) else None
+    return f"deinem privaten Kanal mit {owner}" if owner else f"#{name}"
+
+
+def describe_entry(
+    entry: Mapping[str, Any], run_dir: Path | None = None, *, phases: bool = False
+) -> str | None:
+    """One German progress line for an entry of `orchestrator.jsonl`, None to skip it.
+
+    `phases`: the run has `topology: phases`; a turn then names its „Phase“, not its „Stufe“
+    (W4b-07.1, B7). Old runs keep their lines word for word.
+
+    Always exactly one line, at most `_ENTRY_MAX` characters: values from the log are shortened
+    on one line (`_line_text`); an entry with unexpected types gets the generic line `kind:
+    k=v, …` instead of an error (W4b-07 §6.1, §6.16). Escaping for HTML is up to the caller."""
+    if not isinstance(entry, Mapping):
+        return None
+    kind = _line_text(entry.get("kind"), 80)
     data = entry.get("data") or {}
     if not isinstance(data, Mapping):
         data = {}
+    try:
+        line = _describe_entry(kind, data, run_dir, phases)
+    except (TypeError, ValueError, AttributeError, LookupError, ArithmeticError, OSError):
+        line = _generic_entry(kind, data)
+    return None if line is None else _line_text(line, _ENTRY_MAX)
+
+
+def _generic_entry(kind: str, data: Mapping[str, Any]) -> str:
+    extra = ", ".join(f"{k}={v}" for k, v in data.items())
+    return f"{kind}" + (f": {_line_text(extra, 300)}" if extra else "")
+
+
+def _describe_entry(
+    kind: str, data: Mapping[str, Any], run_dir: Path | None, phases: bool = False
+) -> str | None:
+    who = _line_text(data.get("agent"), 80)
+    stage = _line_text(data.get("stage"), 80)
     match kind:
         case "status":
             status = str(data.get("status"))
@@ -888,7 +959,9 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
             return "● " + describe_checkpoint(data)
         case "turn":
             text = f"▶ {data.get('agent')}: Turn {data.get('turn')}"
-            return text + (f" · Stufe „{data['stage']}“" if data.get("stage") else "")
+            where = "Phase" if phases else "Stufe"
+            text += f" · {where} „{data['stage']}“" if data.get("stage") else ""
+            return text + (" (Notiz-Turn)" if data.get("purpose") == "compact" else "")
         case "turn_end":
             status = str(data.get("status"))
             text = f"■ {data.get('agent')}: Turn {data.get('turn')} beendet"
@@ -925,7 +998,20 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
         case "hint":
             return f"📨 Hinweis an {data.get('agent')} mitten im Turn"
         case "wake":
-            return f"⏰ {data.get('agent')} geweckt (#{data.get('channel')})"
+            text = f"⏰ {data.get('agent')} geweckt (#{data.get('channel')})"
+            reasons = data.get("reasons")
+            if not reasons:
+                return text
+            if not isinstance(reasons, list | tuple):
+                reasons = [reasons]
+            texts = {**WAKE_TEXT, **_WAKE_MORE_TEXT}
+            why = ", ".join(texts.get(str(r), _line_text(r, 40)) for r in reasons)
+            return f"{text}: {_line_text(why)}"
+        case "channel_open" if data.get("by") == "private":
+            channel = data.get("channel")
+            owner = private_owner(channel) if isinstance(channel, str) else None
+            text = f"Privater Kanal #{_line_text(channel, 80)} geöffnet"
+            return text + (f": nur {owner} und du" if owner else "")
         case "channel_open":
             return f"Kanal #{data.get('channel')} geöffnet (Stufe „{data.get('stage')}“)"
         case "discussion_start":
@@ -938,7 +1024,18 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
             )
             return text + (f", {data['rounds']} Runden" if data.get("rounds") else "")
         case "escalation":
-            return f"Eskalation in Stufe „{data.get('stage')}“: {data.get('summary')}"
+            lines = str(data.get("summary")).splitlines() or [""]
+            first = _line_text(lines[0], 300)
+            more = " (Details in der Inbox)" if len(lines) > 1 else ""
+            if first.startswith("Phase „"):  # a phases run: phase and pass come first
+                return f"Eskalation: {first}{more}"
+            return f"Eskalation in Stufe „{data.get('stage')}“: {first}{more}"
+        case "escalation_decided" if "hint" in data:  # a phases run (`escalate_with_hint`)
+            option = str(data.get("option"))
+            text = f"Eskalation in Phase „{stage}“ entschieden: "
+            text += _CHOICE_TEXT.get(option, _line_text(option, 40))
+            text += ", mit Hinweis" if data["hint"] else ", ohne Hinweis"
+            return text + ("" if data.get("by_user", True) else " (ohne deine Entscheidung)")
         case "escalation_decided":
             return f"Eskalation entschieden: {data.get('option')}"
         case "error":
@@ -946,6 +1043,10 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
             return f"Fehler{where}: {data.get('message')}"
         case "warning":
             return f"Warnung: {data.get('message')}"
+        case "waiting" if data.get("reason") == "user" and not data.get("agent"):
+            until = f" bis {_clock(data['until'])}" if data.get("until") else ""
+            where = _channel_words(data.get("channel"))
+            return f"⏳ Phase „{stage}“ wartet auf deine Antwort in {where}{until}"
         case "waiting":
             return _describe_waiting(data)
         case "round":
@@ -966,6 +1067,9 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
                 return f"⏹ arr bricht den Turn von {data.get('agent')} hart ab: {why}"
             again = " (zweiter Versuch)" if data.get("attempt") == 2 else ""
             return f"⏹ arr beendet den Turn von {data.get('agent')}{again}: {why}"
+        case "wait_end" if data.get("reason") == "phase_end":
+            phase = f"der Phase „{stage}“" if data.get("stage") else "der Phase"
+            return f"⏹ {who} wartet nicht mehr: die Aufträge {phase} sind erledigt"
         case "wait_end":
             return (
                 f"⏹ {data.get('agent')} wartet nicht mehr: Diskussion in "
@@ -974,10 +1078,71 @@ def describe_entry(entry: Mapping[str, Any], run_dir: Path | None = None) -> str
         case "turn_silent":
             minutes = int(data.get("seconds") or 0) // 60
             return f"⚠ {data.get('agent')}: seit {minutes} min kein Ereignis im Turn"
+        case "phase_enter":
+            agents = data.get("agents")
+            if isinstance(agents, list | tuple):
+                agents = ", ".join(str(a) for a in agents) or "niemand"
+            return (
+                f"Phase „{stage}“, Durchlauf {_line_text(data.get('attempt'), 20)}: "
+                f"Teilnehmer {_line_text(agents)}"
+            )
+        case "compact":
+            reason = str(data.get("reason"))
+            why = _COMPACT_TEXT.get(reason, _line_text(reason, 40))
+            if not data.get("ok", True):
+                failures = data.get("failures")
+                text = f"⚠ Verdichten des Kontexts von {who} fehlgeschlagen ({why}"
+                text += f", {_line_text(failures, 20)}. Fehlschlag)" if failures else ")"
+                return text
+            if reason == "engine":
+                return f"Die Engine hat den Kontext von {who} selbst verdichtet " + (
+                    f"({_tokens(data.get('tokens'))} Token vorher)"
+                    if data.get("tokens") is not None
+                    else "(Füllstand vorher unbekannt)"
+                )
+            text = f"Kontext von {who} verdichtet ({why}"
+            if reason == "auto":
+                text += f": {_tokens(data.get('tokens'))} von {_tokens(data.get('window'))} Token"
+                if data.get("threshold") is not None:
+                    text += f", Schwelle {_tokens(data['threshold'])}"
+            elif data.get("stage"):
+                text += f", Phase „{stage}“"
+            return text + ")"
+        case "compact_no_window":
+            return (
+                f"⚠ Auto-Compact für {who} greift nicht: Schwelle {_line_text(data.get('at'), 20)}"
+                " als Anteil, aber das Fenster des Modells ist unbekannt"
+            )
+        case "compact_no_fill":
+            return (
+                f"⚠ Füllstand des Kontexts von {who} unbekannt (Modell "
+                f"„{_line_text(data.get('model'), 80)}“): Auto-Compact greift für ihn nicht"
+            )
+        case "note_turn_flag":
+            action = str(data.get("action"))
+            verb = _NOTE_FLAG_TEXT.get(action, f"ändern ({_line_text(action, 20)})")
+            text = f"⚠ {who}: die Markierung des Notiz-Turns ließ sich nicht {verb}"
+            return text + (f": {_line_text(data['error'])}" if data.get("error") else "")
+        case "user_question":
+            state = str(data.get("state"))
+            msg = _line_text(data.get("msg"), 20)
+            if state == "open":
+                channel = data.get("channel")
+                own = isinstance(channel, str) and private_owner(channel) == data.get("agent")
+                where = "seinem privaten Kanal" if own else _channel_words(channel)
+                return f"❓ {who} fragt dich in {where} (Nachricht #{msg})"
+            if state == "answered":
+                return f"❓ Frage #{msg} an dich ist beantwortet"
+            if state == "closed":
+                reason = str(data.get("reason"))
+                why = _QUESTION_CLOSED_TEXT.get(reason, "")
+                if not why and data.get("reason"):
+                    why = _line_text(reason, 40)
+                return f"❓ Frage #{msg} an dich ist geschlossen" + (f": {why}" if why else "")
+            return f"❓ Frage #{msg} an dich: {_line_text(state, 40)}"
         case "wake_skipped" | "ping_pong" | "secret_scan":
             return None
-    extra = ", ".join(f"{k}={v}" for k, v in data.items())
-    return f"{kind}" + (f": {extra}" if extra else "")
+    return _generic_entry(kind, data)
 
 
 _DECIDED_BY_WORDS = {

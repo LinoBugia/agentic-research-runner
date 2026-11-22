@@ -93,7 +93,7 @@ from arr.service.api_models import (
 from arr.service.gui import format as fmt
 from arr.service.real_api.approvals import ApprovalsArea
 from arr.service.real_api.base import RunHandle, ServiceState, not_allowed, not_found
-from arr.service.real_api.catalog import check_group
+from arr.service.real_api.catalog import blocking, check_group
 from arr.service.real_api.profiles import provider_of as _profile_provider
 from arr.service.real_api.rundir import (
     RunRecord,
@@ -588,6 +588,20 @@ def _merged_agents(
                             spec["effort"] = standard.effort.value
         specs.append(spec)
     return specs
+
+
+def _with_resolved(
+    data: dict[str, Any], resolved: ResolvedRun, agents: list[dict[str, Any]]
+) -> None:
+    """`data` with the concrete agents and the resolved channels, stages and raters, to resolve
+    again (§6.14). `phases`, `formats` and `seed` stay as they are: their patterns match the
+    concrete IDs. A `channels` of the input goes, the channels come back as `groupchats`
+    (both keys together are an error)."""
+    data.pop("channels", None)
+    data["agents"] = agents
+    data["groupchats"] = [c.model_dump(mode="json") for c in resolved.groupchats]
+    data["stages"] = [s.model_dump(mode="json") for s in resolved.stages]
+    data["raters"] = list(resolved.raters)
 
 
 MANDATE_FIXED = (
@@ -1256,7 +1270,8 @@ class RunsArea:
             settings = load_workfolder_settings(self.state.workfolder)
         except ArrError:
             return  # the resolution reports a broken `arr.yaml` itself
-        _spec, issues = check_group(info.path, catalog, settings)
+        _spec, found = check_group(info.path, catalog, settings)
+        issues = blocking(found)  # hints of `check` never block a start (W4b-07, E7)
         if not issues:
             return
         first = issues[0]
@@ -1302,10 +1317,8 @@ class RunsArea:
         try:
             if overrides:
                 resolved = launch.resolved
-                data["agents"] = _agent_specs(resolved, overrides, launch.settings, launch.profiles)
-                data["groupchats"] = [c.model_dump(mode="json") for c in resolved.groupchats]
-                data["stages"] = [s.model_dump(mode="json") for s in resolved.stages]
-                data["raters"] = list(resolved.raters)
+                specs = _agent_specs(resolved, overrides, launch.settings, launch.profiles)
+                _with_resolved(data, resolved, specs)
                 launch = _keep_origin(plan(), resolved)
             _check_prepared(launch)
         except ConfigError as exc:
@@ -1353,10 +1366,8 @@ class RunsArea:
             launch = self._plan_data(data, params)
             if agents:
                 resolved = launch.resolved
-                data["agents"] = _merged_agents(resolved, agents, launch.settings, launch.profiles)
-                data["groupchats"] = [c.model_dump(mode="json") for c in resolved.groupchats]
-                data["stages"] = [s.model_dump(mode="json") for s in resolved.stages]
-                data["raters"] = list(resolved.raters)
+                specs = _merged_agents(resolved, agents, launch.settings, launch.profiles)
+                _with_resolved(data, resolved, specs)
                 launch = _keep_origin(self._plan_data(data, params), resolved)
             _check_prepared(launch)
             if data.get("skill"):

@@ -505,7 +505,7 @@ async def test_a19_checkpoints_usage_and_stage_bar(workfolder: Path) -> None:
     record.refresh()
     bar = stage_infos(record, mgr.resolved)
     assert [s.key for s in bar] == ["x", "y"]
-    assert [len(s.attempts) for s in bar] == [1, 1]
+    assert [len(s.passes) for s in bar] == [1, 1]  # W4b-07: passes replace attempts
 
 
 def test_a19_old_usage_json_reads(tmp_path: Path) -> None:

@@ -409,3 +409,14 @@ def clean_html(markup: str) -> str:
     cleaner.feed(markup)
     cleaner.close()
     return "".join(cleaner.out)
+
+
+def query_int(value: str | None, digits: int = 9) -> int | None:
+    """A number from a query parameter or a selection target, None for anything else.
+
+    Only ASCII digits count: `str.isdigit()` is true for „²“ or „١٢“, and `int("²")` raises,
+    which made `?zeile=²` an error page (W4b-07.1, B3)."""
+    text = value or ""
+    if not (text.isascii() and text.isdecimal()) or len(text) > digits:
+        return None
+    return int(text)
