@@ -242,10 +242,10 @@ class DelegationStatus(StrEnum):
 
 class Delegation(Record):
     """Row of table `delegation` (W4b-04, docs/10 §4.5): one assignment of the lead of a
-    phase `moderated` to an agent on standby. `number` counts 1, 2, … per pass (`stage`, `attempt`); `task` is
-    the lead's text, cleaned (text of an agent: data, never instructions of arr); `agent` the
-    real ID of the recipient; `named` is true once arr named it to the lead at a `submit`
-    (Entscheidung 79); `submission_id` the submission it returned with."""
+    phase `moderated` to an agent on standby. `number` counts 1, 2, … per pass (`stage`,
+    `attempt`); `task` is the lead's text, cleaned (text of an agent: data, never instructions
+    of arr); `agent` the real ID of the recipient; `named` is true once arr named it to the
+    lead at a `submit` (Entscheidung 79); `submission_id` the submission it returned with."""
 
     id: int
     ts: float
