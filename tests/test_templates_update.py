@@ -31,6 +31,9 @@ from arr.skills import (
 )
 
 OLD = Path(__file__).parent / "fixtures" / "start_skills_old"
+# The lines of `arr skills update` are compared on stdout only: in the full suite a logging
+# handler of an earlier test can write a „--- Logging error ---“ to stderr (full run of 611e104).
+
 GROUP_SKILLS = ("exploration", "proof", "proof-review", "roundtable")
 
 
@@ -334,7 +337,7 @@ def test_a14_the_cli_names_each_start_skill(wf: Path) -> None:
     shutil.rmtree(wf / "skills" / "roundtable")
     result = CliRunner().invoke(app, ["skills", "update", "-w", str(wf)])
     assert result.exit_code == 0, result.output
-    assert result.output.splitlines() == [
+    assert result.stdout.splitlines() == [
         "arr: schon aktuell",
         "exploration: aktualisiert",
         "latex-writeup: schon aktuell",
@@ -344,7 +347,7 @@ def test_a14_the_cli_names_each_start_skill(wf: Path) -> None:
         "sympy-check: schon aktuell",
     ]
     again = CliRunner().invoke(app, ["skills", "update", "-w", str(wf)])
-    assert again.exit_code == 0 and "aktualisiert\n" not in again.output
+    assert again.exit_code == 0 and "aktualisiert\n" not in again.stdout
 
 
 def test_a14_the_cli_fails_with_a_message(tmp_path: Path) -> None:
@@ -358,7 +361,7 @@ def test_a14_the_cli_fails_with_a_message(tmp_path: Path) -> None:
     os.symlink(target, root / "skills")
     result = CliRunner().invoke(app, ["skills", "update", "-w", str(root)])
     assert result.exit_code == 1
-    assert "Link" in result.output
+    assert "Link" in result.stderr
 
 
 def test_a14_update_lines_are_german() -> None:
@@ -398,7 +401,7 @@ def test_m3_a_rest_after_the_swap_is_named(wf: Path, monkeypatch: pytest.MonkeyP
     result = CliRunner().invoke(app, ["skills", "update", "-w", str(wf)])
     assert result.exit_code == 0, result.output
     assert tree(wf / "skills" / "proof") == start_skill_files("proof")
-    [line] = [x for x in result.output.splitlines() if x.startswith("proof:")]
+    [line] = [x for x in result.stdout.splitlines() if x.startswith("proof:")]
     [rest] = [x for x in hidden(wf) if x.startswith(".proof.arr-")]
     assert line == (
         f"proof: aktualisiert; die alte Fassung liegt noch unter skills/{rest}, lösche sie selbst."
@@ -443,11 +446,11 @@ def test_n1_a_failure_at_one_skill_does_not_stop_the_others(
     monkeypatch.setattr(skills_module, "_write_tree", broken_for_proof)
     result = CliRunner().invoke(app, ["skills", "update", "-w", str(wf)])
     assert result.exit_code == 1
-    lines = result.output.splitlines()
+    lines = result.stdout.splitlines()
     assert len(lines) == len(START_SKILLS), "one line per start skill"
     assert "exploration: aktualisiert" in lines
     assert "proof-review: aktualisiert" in lines and "roundtable: aktualisiert" in lines
-    assert "proof: ließ sich nicht aktualisieren (No space left on device)." in result.output
+    assert "proof: ließ sich nicht aktualisieren (No space left on device)." in result.stdout
     assert files_of(wf / "skills" / "proof") == files_of(OLD / "proof")
 
 
