@@ -861,19 +861,19 @@ def tree_digest(files: dict[str, bytes]) -> str:
 CURRENT_DIGESTS: dict[str, tuple[str, str]] = {
     ARR_SKILL: ("c82f909", "ef12554041a5820b4665cf46c5b70e9c7d7035175f432bf2276a371c3d2557f7"),
     "exploration": (
-        "W4b-06a",
+        "a3da52c",
         "feb2423dc651e34ef456a0db20da1add71b78c4803e4c747ed1632effc755ccc",
     ),
     "latex-writeup": (
         "81cb75e",
         "44dcbbcbe1a996f725eb9651dd08fc636317eb1d2db965349471d73f957d1f36",
     ),
-    "proof": ("W4b-06a", "64fa3add21db893a9b036f1bd551c4c65c817adc1beabcdf1de2aa5b2439c7af"),
+    "proof": ("a3da52c", "64fa3add21db893a9b036f1bd551c4c65c817adc1beabcdf1de2aa5b2439c7af"),
     "proof-review": (
-        "W4b-06a",
+        "a3da52c",
         "8ef9e33a89051327957463a765ad32632317f9dd455a880fc17c9294bd4569ef",
     ),
-    "roundtable": ("W4b-06a", "d30453152f47d9dafc6937a9710ddcd7aea61a861cfdbefbff599f303c21cd2f"),
+    "roundtable": ("a3da52c", "d30453152f47d9dafc6937a9710ddcd7aea61a861cfdbefbff599f303c21cd2f"),
     "sympy-check": (
         "1fccb85",
         "324a9f2a829f7c2d99a48935685fcd14fb70d67107713f07a8c2a8d396c1a342",
