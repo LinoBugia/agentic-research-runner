@@ -35,8 +35,8 @@
   (`AgentRoom.submit`) cancels in the room itself.
 - Names: the lead sees every recipient as `inputs.shown` shows it (an alias where there is
   one), in its package, the return turns and every answer of `assign` (W4b-04.1 M1). The
-  packages keep their limit (`fit_package`; the list of the lead and the returned ones are cut
-  with a note, N3).
+  packages keep their limit (the list of the lead first, then `fit_package`; the returned ones
+  are cut with a note, N3, NP-N1).
 
 Log entries (all with `stage` and `attempt`; the text of an assignment is never logged):
 `assign {number, lead, agent, format}` (seen in the table), `assign_start {number, agent}`,
@@ -288,20 +288,20 @@ class _Moderation:
 
     @staticmethod
     def _fit_lead(package: dict[str, Any]) -> dict[str, Any]:
-        """Keep the lead's package within `MAX_PACKAGE_CHARS` (W4b-04.1, N3): first the cuts
-        of `fit_package`, then the summaries of the oldest assignments, then the oldest
-        entries of the list (`assignments_cut`)."""
-        package = fit_package(package)
+        """Keep the lead's package within `MAX_PACKAGE_CHARS` (W4b-04.1 N3, order W4b-04.2
+        NP-N1): first the lead's own list, its summaries (copies of what lies in the result
+        folder, the path stays), then entries from its end, each marked `assignments_cut`;
+        only then the cuts of `fit_package` (inputs, feedback, peers, objections)."""
         items = package["assignments"]
         for entry in items:
             if package_size(package) <= MAX_PACKAGE_CHARS:
-                return package
+                break
             if entry.pop("summary", None) is not None:
                 package["assignments_cut"] = True
         while package_size(package) > MAX_PACKAGE_CHARS and items:
-            items.pop(0)
+            items.pop()
             package["assignments_cut"] = True
-        return package
+        return fit_package(package)
 
     def _returned(self, ids: list[int], rows: list[Delegation]) -> list[dict[str, Any]]:
         by_id = {d.id: d for d in rows}

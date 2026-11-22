@@ -3200,7 +3200,8 @@ class AgentRoom:
         (`_shown_in`, as `inputs.shown`; W4b-04.1 M1): `@` in front allowed; an agent shown by
         an alias is named by it (or its last word, „A“ for „Mitglied A“), never by its ID;
         only an agent on standby of the phase. Errors name the agents on standby as the lead
-        sees them, never an ID behind an alias."""
+        sees them, never an ID behind an alias. A name that several of them carry for the lead
+        is refused (a known limit, W4b-04.2)."""
         standby = [a for a in phase.standby if a not in phase.agents and a != self.agent_id]
         seen = {a: self._shown_in(con, a) for a in standby}
         names = ", ".join(seen.values()) or "niemanden"
@@ -3224,9 +3225,20 @@ class AgentRoom:
             if ok:
                 found.append(agent)
         if len(found) > 1:
+            # a known limit (W4b-04.2, NP-M1): aliases are unique only per channel, so two
+            # agents on standby may look the same to a lead outside their channels; give to
+            # none of them and advise only what the lead can do
+            labels = list(seen.values())
+            unique = [n for n in labels if labels.count(n) == 1]
+            others = (
+                f"Eindeutig benannt sind: {', '.join(unique)}."
+                if unique
+                else "Andere Agenten auf Abruf gibt es für dich in dieser Phase nicht."
+            )
             raise RoomError(
-                f"„{shown}“ ist nicht eindeutig. Nenne den Agenten mit seinem vollen Namen: "
-                f"{names}."
+                f"„{shown}“: So heißen für dich mehrere Agenten auf Abruf dieser Phase; keinem "
+                "von ihnen kannst du in dieser Phase einen Auftrag geben. Gib den Auftrag einem "
+                f"anderen Agenten auf Abruf oder arbeite selbst weiter. {others}"
             )
         if not found:
             raise RoomError(

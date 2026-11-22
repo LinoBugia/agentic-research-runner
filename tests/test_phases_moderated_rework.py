@@ -443,6 +443,101 @@ async def test_n3_the_recipient_package_counts_the_lead_text_within_the_limit(
     assert item["text"] is None and "zu lang" in item["note"]
 
 
+async def test_np_m1_two_recipients_with_the_same_alias_get_no_assignment(
+    workfolder: Path, calls: list[Any]
+) -> None:
+    """W4b-04.2 NP-M1 (a known limit, after `test_r11` of the review): b and c are each the
+    first member of an anonymous channel of their own, both „Mitglied A“ for the lead outside
+    them. `assign` gives to neither of them, and its refusal advises only what the lead can
+    do: no ID, no channel, no „full name“."""
+
+    def a(view: TurnView) -> list[dict[str, Any]]:
+        if first(view):
+            names = view.context["assign_rules"]["standby"]
+            assert names == ["Mitglied A", "Mitglied A"]
+            return [
+                give(names[0], "Teil 1"),
+                give(names[1], "Teil 2"),
+                give("@mitglied a", "Teil 3"),
+                *hand_in(view),
+            ]
+        return hand_in(view)
+
+    channels = [
+        {"name": "anon1", "members": ["b", "x"], "anonymous": True},
+        {"name": "anon2", "members": ["c", "x"], "anonymous": True},
+    ]
+    group = {
+        **AGENTS,
+        "channels": channels,
+        "phases": [
+            solo("vorher", "x", channels=["anon1", "anon2"]),
+            moderated_phase("a", ["b", "c"]),
+        ],
+    }
+    policies = {
+        "a": a,
+        "b": lambda v: hand_in(v),
+        "c": lambda v: hand_in(v),
+        "x": lambda v: hand_in(v),
+    }
+    mgr, log = manager(workfolder, group, policies)
+    assert await run(mgr) is RunStatus.DONE, errors(mgr)
+    assert delegations(mgr) == []  # no assignment to b, none to c
+    assert [v for v in log.of("b") + log.of("c") if is_assignment(v)] == []
+    answers = [r for ag, t, r in calls if ag == "a" and t == "assign"]
+    assert len(answers) == 3 and all(isinstance(r, str) for r in answers)
+    for text in answers:
+        assert "So heißen für dich mehrere Agenten auf Abruf dieser Phase" in text
+        assert "einem anderen Agenten auf Abruf oder arbeite selbst weiter" in text
+        assert "vollen Namen" not in text and "anon" not in text
+        assert not any(f" {i} " in f" {text} ".replace(",", " ").replace(".", " ") for i in "bcx")
+
+
+async def test_np_n1_the_list_is_cut_before_the_inputs(
+    workfolder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """W4b-04.2 NP-N1: a lead's package that is too large only because of its list keeps the
+    full text of its input; the summaries of the list go first (`assignments_cut`)."""
+    hooks = Hooks().install(monkeypatch)
+
+    async def helper(mgr: Any) -> None:
+        await eventually(lambda: len(of_kind(mgr, "assign_end")) == 50, within=100)
+        hooks.open("a")
+
+    def a(view: TurnView) -> list[dict[str, Any]]:
+        if first(view):
+            return [*(give("b" if i % 2 else "c", f"Teil {i}") for i in range(50)), gate()]
+        return hand_in(view)
+
+    def worker(view: TurnView) -> list[dict[str, Any]]:
+        return hand_in(view, summary="Kurzfassung " + "s" * 780)
+
+    def x(view: TurnView) -> list[dict[str, Any]]:
+        return hand_in(view, body="v" * 19_900)
+
+    phase = {
+        **moderated_phase("a", ["b", "c"], jobs=50),
+        "inputs": [{"from": "vorher", "content": "full"}],
+    }
+    group = {**AGENTS, "phases": [solo("vorher", "x"), phase]}
+    mgr, log = manager(
+        workfolder,
+        group,
+        {"a": a, "b": worker, "c": worker, "x": x},
+        task="Zeige es. " + "q" * 62_000,
+    )
+    assert await run_with(mgr, helper, within=120) is RunStatus.DONE, errors(mgr)
+    [ret] = [v for v in log.of("a") if is_return(v)]
+    package = ret.context
+    assert package_size(package) <= MAX_PACKAGE_CHARS
+    assert package.get("assignments_cut") is True
+    [item] = package["inputs"]
+    assert item["text"] == "v" * 19_900 and "inputs_cut" not in package
+    assert len(package["assignments"]) == 50  # only summaries had to go
+    assert any("summary" not in e for e in package["assignments"])
+
+
 # --------------------------------------------------------------------------------------------
 # N5, N6
 # --------------------------------------------------------------------------------------------
