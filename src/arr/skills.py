@@ -861,7 +861,7 @@ def tree_digest(files: dict[str, bytes]) -> str:
 CURRENT_DIGESTS: dict[str, tuple[str, str]] = {
     ARR_SKILL: ("c82f909", "ef12554041a5820b4665cf46c5b70e9c7d7035175f432bf2276a371c3d2557f7"),
     "exploration": (
-        "W4b-06a.2",
+        "93c766f",
         "c48eda36b4603fce2d9847e4aeeb640e3713952e187850913812ad2e279dcf16",
     ),
     "latex-writeup": (
@@ -870,7 +870,7 @@ CURRENT_DIGESTS: dict[str, tuple[str, str]] = {
     ),
     "proof": ("a3da52c", "64fa3add21db893a9b036f1bd551c4c65c817adc1beabcdf1de2aa5b2439c7af"),
     "proof-review": (
-        "W4b-06a.2",
+        "93c766f",
         "5cf7c9f8ae40581219523f9f29d8dcc36893bdafdca8bca0183f5f697ca42198",
     ),
     "roundtable": ("a3da52c", "d30453152f47d9dafc6937a9710ddcd7aea61a861cfdbefbff599f303c21cd2f"),
