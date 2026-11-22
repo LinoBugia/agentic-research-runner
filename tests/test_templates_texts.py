@@ -150,6 +150,8 @@ def test_a9_the_rules_of_phases_runs() -> None:
     assert "nie mit `wait_until`" not in rule4
     assert "(`submit`)" in rule8 and "submit_result" not in rule8 and "`result`" not in rule8
     assert "until_result_from" in rule8
+    # in a phase only a sleeper is woken; a done agent with an action is not (W4b-03 §5.3)
+    assert "weckt dich" not in rule8
 
 
 async def test_a9_a_phases_run_writes_the_phases_rules(workfolder: Path) -> None:
@@ -475,3 +477,66 @@ async def test_a12_a_run_without_role_gets_the_role_of_its_kind(workfolder: Path
     assert await run(mgr) is RunStatus.DONE, errors(mgr)
     role = (mgr.run_dir / "agents" / "a" / "role.md").read_text("utf-8")
     assert role == prepare.DEFAULT_ROLE_PHASES
+
+
+# --------------------------------------------------------------------------------------------
+# A11: the answers of the room server through the real tools (Festlegung des Leads, 22.11.)
+# --------------------------------------------------------------------------------------------
+
+
+def _room(tmp_path: Path, *, phases: bool) -> RoomStore:
+    """A room of two agents `a`, `b` and a channel `main`; with `phases` its `run.yaml` is that
+    of a `phases` run, without it there is none (a run without phases)."""
+    from phases_kit import FAKE_DEFAULTS
+    from run_kit import make_settings
+
+    from arr.models import RunInput
+    from arr.resolve import dump_yaml_model, resolve_run, validate_model
+
+    run_dir = tmp_path / "run"
+    for agent in ("a", "b"):
+        (run_dir / "agents" / agent / "work").mkdir(parents=True)
+    channel = {"name": "main", "members": ["a", "b"]}
+    if phases:
+        data = {
+            "project": "demo",
+            "task": "x",
+            "topology": {"kind": "phases"},
+            "defaults": FAKE_DEFAULTS,
+            "agents": [{"id": "a"}, {"id": "b"}],
+            "channels": [channel],
+            "phases": [solo("p", "a")],
+        }
+        resolved = resolve_run(validate_model(RunInput, data), None, make_settings())
+        (run_dir / "run.yaml").write_text(dump_yaml_model(resolved), encoding="utf-8")
+    store = RoomStore.create(run_dir)
+    store.setup_channels([GroupChatConfig.model_validate(channel)])
+    return store
+
+
+@pytest.mark.parametrize("phases", [False, True], ids=["ohne-phasen", "phasen"])
+async def test_a11_the_wait_tools_answer_per_kind_of_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phases: bool
+) -> None:
+    from mcp.client.client import Client
+
+    from arr.room import waiting
+
+    monkeypatch.setattr(waiting, "STREAK_MAX_S", 0.3)
+    store = _room(tmp_path, phases=phases)
+    a = store.for_agent("a")
+    assert store.uses_phases() is phases
+    a.post_message("main", "@user welches Band?", MessageKind.QUESTION)
+    async with Client(server.build_server(a)) as client:
+        nobody = (await client.call_tool("wait_for_messages", {"seconds": 5})).content[0].text
+        until = (await client.call_tool("wait_until", {"minutes": 2})).content[0].text
+    if phases:
+        assert server.USER_MAY_NOT_ANSWER_PHASES in nobody
+        assert server.USER_MAY_NOT_ANSWER not in nobody
+        assert server.USER_WAITED_LONG_PHASES in until
+        assert server.USER_WAITED_LONG not in until
+    else:  # word for word as on `main`
+        assert MAIN_USER_MAY_NOT_ANSWER in nobody
+        assert server.USER_MAY_NOT_ANSWER_PHASES not in nobody
+        assert MAIN_USER_WAITED_LONG in until
+        assert server.USER_WAITED_LONG_PHASES not in until

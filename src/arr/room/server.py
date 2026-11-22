@@ -456,7 +456,7 @@ def build_server(room: AgentRoom) -> MCPServer:
             log.exception("agent %s: wait_for_messages failed", room.agent_id)
             raise ToolError(await asyncio.to_thread(_with_footer, room, INTERNAL_ERROR)) from None
         asked = outcome.ended_by is WaitEnd.NOBODY and await asyncio.to_thread(room.asked_the_user)
-        text = render_wait(outcome, asked_user=asked)
+        text = render_wait(outcome, asked_user=asked, phases=room.store.uses_phases())
         return await asyncio.to_thread(_with_footer, room, text)
 
     def _wait_until(minutes: float, until_file: str | None, result_from: str | None) -> str:
@@ -464,7 +464,11 @@ def build_server(room: AgentRoom) -> MCPServer:
             state = room.wait_until(minutes, until_file, result_from)
             shown = result_from.strip().removeprefix("@") if state.result_from else None
             return render_wait_until(
-                state.until, state.file, shown, asked_user=room.asked_the_user()
+                state.until,
+                state.file,
+                shown,
+                asked_user=room.asked_the_user(),
+                phases=room.store.uses_phases(),
             )
 
         return _respond(room, "wait_until", call)

@@ -230,8 +230,8 @@ PHASES_CONVERSATION_RULES = (
     "gilt damit als erledigt.",
     *CONVERSATION_RULES[4:7],
     "Wer seinen Teil erledigt hat, gibt ab (`submit`). Fertig heißt: Du wartest nicht mehr, "
-    "bleibst aber ansprechbar; jede Nachricht an dich weckt dich. Wartest du auf die Abgabe "
-    'eines anderen, warte mit `wait_until(minutes, until_result_from="<name>")`.',
+    "bleibst aber ansprechbar. Wartest du auf die Abgabe eines anderen, warte mit "
+    '`wait_until(minutes, until_result_from="<name>")`.',
 )
 """The rules in a run with phases (W4b-06a, Auflage W4b-03): rule 4 after Entscheidungen 67
 and 69 (waiting for the user with `wait_until`, at most five minutes; handing in closes the
