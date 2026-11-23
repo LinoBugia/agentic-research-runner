@@ -1,12 +1,13 @@
-"""RunContext: the API that topologies use to drive agents and group chats.
+"""RunContext: the API the phase runner uses to drive agents and group chats.
 
-A topology is `async def run(ctx: RunContext) -> None` (E8). The orchestrator (W2-03)
-implements `RunContext`; tests can implement it on top of the FakeBackend.
-See docs/01-architektur.md §3, §6 and docs/03-skills-und-research-groups.md §4.
+A topology is `async def run(ctx: RunContext) -> None` (E8); since W4b-06b the only one is the
+phase runner (`arr.runs.phases.runner.run`). The orchestrator (W2-03) implements
+`RunContext`; tests can implement it on top of the FakeBackend.
+See docs/01-architektur.md §3, §6 and docs/10-phasen-baukasten.md §4.
 
 Since W4-03: a phase is a stage (`turn`/`turns`/`discuss` with `stage`); finished (`done`)
-counts per phase (F1). Topologies open and close channels (F3), seal the results of a phase
-until they are released (F4), start fresh sessions (F5) and keep files in `output/`.
+counts per phase (F1). The runner opens and closes channels (F3), seals the submissions of a
+phase until they are released (F4) and starts fresh sessions (F5).
 
 Since W4b-02a the end of `RunContext` holds the signatures the phase runner needs (entering a
 pass of a phase, reading and adding submissions, fresh folders, compacting a session); they
@@ -23,7 +24,7 @@ from typing import Any
 from arr.backends.base import TurnOutcome
 from arr.models import AgentConfig, AgentStatus, ChannelMode, ResolvedRun
 from arr.permissions.types import EscalationOption
-from arr.room.types import Delegation, Message, MessageKind, Rating, Result, Submission
+from arr.room.types import Delegation, Message, MessageKind, Result, Submission
 
 
 @dataclass(slots=True)
@@ -79,8 +80,6 @@ class DiscussionSeats:
       with its format); taken out when that turn starts.
     - `ping_pong`: a `arr.runs.pacing.PingPongTracker` the discussion shares with the waking of
       the phase, so one exchange is counted and flagged once.
-    - `submit`: the texts of the discussion name `submit` (a `phases` run) instead of
-      `submit_result`.
     - `finished`: a member that is not `done` but idle counts as finished when this says so:
       it handed in and asks no other member of the discussion (a question to an agent on
       standby or to one that is not in the phase holds nothing, Entscheidung 64).
@@ -90,7 +89,6 @@ class DiscussionSeats:
     contexts: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     first: dict[str, str] = field(default_factory=dict)
     ping_pong: Any = None
-    submit: bool = True
     finished: Callable[[str], bool] | None = None
 
 
@@ -107,7 +105,7 @@ class DiscussionOutcome:
 
 
 class RunContext(ABC):
-    """Abstract API of a running run for topologies (docs/01-architektur.md §6).
+    """Abstract API of a running run for the phase runner (docs/01-architektur.md §6).
 
     Turn prompts are short and dynamic; the role prompt stays static. Limits (wall time,
     turns per agent, budget, concurrency per auth profile) are enforced by the
@@ -149,7 +147,7 @@ class RunContext(ABC):
         stage: str | None = None,
         context: Mapping[str, Any] | None = None,
     ) -> TurnOutcome:
-        """Give one agent a turn and wait for it, including the results it submitted.
+        """Give one agent a turn and wait for it.
 
         `stage` and `context` are stored as the agent's assignment (`get_assignment()`).
         The inbox (open questions, unread counts) is added to `prompt` by the implementation.
@@ -175,21 +173,6 @@ class RunContext(ABC):
         reply_to: int | None = None,
     ) -> int:
         """Post as `orchestrator` into a channel; return the message ID."""
-
-    @abstractmethod
-    def results(
-        self,
-        *,
-        agent: str | None = None,
-        stage: str | None = None,
-        kind: str | None = None,
-        attempt: int | None = None,
-    ) -> list[Result]:
-        """Submitted results matching all given filters, oldest first."""
-
-    @abstractmethod
-    def ratings(self, result_id: int) -> list[Rating]:
-        """Ratings of one result, oldest first."""
 
     @abstractmethod
     async def checkpoint(self, stage: str, **info: Any) -> None:
@@ -220,23 +203,20 @@ class RunContext(ABC):
     async def discuss(
         self,
         channel: str,
-        prompt: str | None = None,
         *,
         stage: str | None = None,
         rounds: int | None = None,
-        context: Mapping[str, Any] | None = None,
-        kickoff: bool = True,
-        seats: DiscussionSeats | None = None,
+        seats: DiscussionSeats,
     ) -> DiscussionOutcome:
         """Run a discussion phase in `channel` with the channel's pacing and wait for its end.
 
         - With `stage`, the phase starts with `checkpoint(stage, channel=…, phase=
-          "discussion")`, which opens channels with that `open_from`. The channel must be open.
-        - `rounds` mode: per round all members that are not `done` get a turn (parallel or
-          in order), prompt „Runde r von N …“ plus `prompt`. Ends after `rounds` rounds
-          (default 3), when nobody posted anything but `pass` in a round, or on stop.
-        - `event` mode (docs/09 §4): with `kickoff`, all members that are not `done` get
-          `prompt` at once. A message that concerns a member (`to`, `@name`, `reply_to`, a
+          "discussion")`. The channel must be open.
+        - `rounds` mode: per round all members that are not finished get a turn (parallel or
+          in order), prompt „Runde r von N …“. Ends after `rounds` rounds (default 3), when
+          nobody posted anything but `pass` in a round, or on stop.
+        - `event` mode (docs/09 §4): all members that are not finished get the kick-off at
+          once. A message that concerns a member (`to`, `@name`, `reply_to`, a
           question to all) wakes it at once if it is idle or waits with `wait_until`; a
           finished member only for a question to it; `any` after `debounce_s`. At most
           `max_wakeups_per_agent` times per channel; own messages and messages of the
@@ -245,14 +225,14 @@ class RunContext(ABC):
           most `rounds` (default 3). Ends with `all_done`, `rounds` after the last round,
           `quiet` when `quiet_after_s` passed without a message although a round ran, or on
           stop. `DiscussionOutcome.rounds` counts the idle rounds.
-        - Wake-up turns get `stage` and `context` like the kick-off turns. Hints mid-turn and
-          the inbox work in and outside of discussions.
+        - Wake-up turns get `stage` and the context like the kick-off turns. Hints mid-turn
+          and the inbox work in and outside of discussions.
         - `seats` (W4b-03, a phase `chat`): only `seats.members` discuss, each turn of a member
-          carries its own context, the first one starts with `seats.first`; without `seats`
-          all members of the channel discuss with `context`, as before.
+          carries its own context, the first one starts with `seats.first`. Required since
+          W4b-06b (`prompt`, `context` and `kickoff` went with the old topologies).
         """
 
-    # -- W4-03: phases, channels, sealed results, sessions, files ---------------------------
+    # -- W4-03: phases, channels, sealed submissions, sessions ------------------------------
 
     @property
     @abstractmethod
@@ -284,38 +264,13 @@ class RunContext(ABC):
 
     @abstractmethod
     def release_results(self, stage: str) -> list[Result]:
-        """Release the sealed results of `stage` (files to `output/results/`); returns them."""
+        """Release the sealed submissions of `stage` (to `output/`); returns the released
+        results of an old room (none in a run since W4b-06b)."""
 
     @abstractmethod
     def shown_name(self, viewer: str, agent: str) -> str:
         """How `viewer` sees `agent`: its alias when an anonymous channel of `viewer` hides it
         (also a closed one), else its ID. For context packages (F4)."""
-
-    @abstractmethod
-    def result_text(self, result_id: int, max_bytes: int = 64 * 1024) -> str:
-        """Body or start of the file of a result as text (also of a sealed one), for arr's
-        own reading: verdicts, objections, digests. Never follows a link."""
-
-    @abstractmethod
-    def save_output(
-        self,
-        dest: str,
-        *,
-        text: str | None = None,
-        agent: str | None = None,
-        source: str | None = None,
-    ) -> str:
-        """Write `output/<dest>` and return its path relative to the run folder.
-
-        Either `text`, or a copy of `source`: relative to the working folder of `agent`, or,
-        without `agent`, relative to the run folder (e.g. `base/…`, `output/results/…`).
-        Copies follow no link and refuse FIFOs, hardlinks and huge files (`ArrError`).
-        """
-
-    @abstractmethod
-    def read_output(self, rel: str, max_bytes: int) -> str | None:
-        """Text of a file arr wrote below the run folder (e.g. `output/artifacts/…`); None if
-        it is missing, a link, not a regular file, larger than `max_bytes` or not UTF-8."""
 
     # -- W4b-02a: signatures for the phase toolkit (implemented by W4b-02b, 05a, 05b) -------
     #
@@ -380,7 +335,7 @@ class RunContext(ABC):
 
     # -- W4b-02b: what the phase runner needs besides the signatures of W4b-02a ------------
     #
-    # Not abstract: the defaults keep the test contexts of the old topologies working.
+    # Not abstract: the defaults keep the small test contexts working.
 
     def channel_messages(self, channel: str) -> list[Message]:
         """Every message of `channel`, oldest first, as arr reads them (an input
@@ -389,8 +344,8 @@ class RunContext(ABC):
 
     # -- W4b-03: private channels to the user, the participants of a pass ------------------
     #
-    # Not abstract: a context without channels (the test contexts of the old topologies) keeps
-    # the defaults; the `Orchestrator` implements them.
+    # Not abstract: a context without channels (a small test context) keeps the defaults; the
+    # `Orchestrator` implements them.
 
     def open_private_channels(self) -> dict[str, str]:
         """Give every agent its private channel to the user (`user.<agent-id>`, Entscheidung

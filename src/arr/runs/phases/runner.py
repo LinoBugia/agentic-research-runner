@@ -20,8 +20,8 @@ Checkpoints (`orchestrator.jsonl`, the contract for W4b-07; `stage` is the phase
 
 - `{phase: "pass_start", attempt, how, agents}`; `how` is `normal`, `retry` or `user_retry`,
 - `{phase: "gate", attempt, gate, value, tie, decision, reason?, score?, scores?, ranking?,
-  results, agent?, missing, valid}`: `decision` `passed`/`failed`/`escalated` as the old
-  topologies write it (`stage_infos` and `summary.md` read it), `value` the result of the gate,
+  results, agent?, missing, valid}`: `decision` `passed`/`failed`/`escalated` (`stage_infos`
+  and `summary.md` read it, as in the checkpoints of old runs), `value` the result of the gate,
   `results` the newest submission of every action of the pass, `valid` the valid submissions
   of the phase,
 - `{phase: "route", attempt, route, entered, exhausted, asked_user?, choice?, hint?}`,
@@ -109,7 +109,7 @@ MAX_SEED_TITLE = 80
 
 
 def _context_class() -> type:
-    from arr.runs.orchestrator import Orchestrator  # late: the orchestrator imports topologies
+    from arr.runs.orchestrator import Orchestrator  # late: avoids an import cycle
 
     return Orchestrator
 
@@ -507,7 +507,7 @@ class PhaseRunner:
         self, phase: ResolvedPhase, route: Route | None, info: Mapping[str, Any]
     ) -> bool:
         """True if the run leaves `phase` over `next`, also past the end of the plan (its best
-        attempt counts, as `on_fail: continue` of the old `waterfall`); False if it ends there:
+        attempt counts); False if it ends there:
         route `stop`, its own `on_exhausted: stop` or the user's „Beenden“ about this phase
         (W4b-06a.1, Entscheidung 81). `on_exhausted` and the user's choice count only when
         they concern this phase, not a later one the route led into (W4b-06a.3, NP3)."""
@@ -522,7 +522,7 @@ class PhaseRunner:
     async def _stage_end(self, phase: ResolvedPhase, record: PassRecord, ends: bool) -> None:
         """Checkpoint `stage_end` when a phase is left. With a threshold gate the outcome is
         `passed`, `best_accepted` (left over `next`) or `stage_failed` (`ends`: the run ends here
-        because the phase did not pass; then nothing is accepted, as in the old `waterfall`)."""
+        because the phase did not pass; then nothing is accepted)."""
         valid = self.state.valid.get(phase.name, [])
         outcome = "done"
         if phase.gate.type is GateType.JUDGE and phase.gate.rule is GateRule.MEAN:

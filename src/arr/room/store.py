@@ -46,7 +46,6 @@ from arr.models import (
     ResolvedPhase,
     ResolvedRun,
     Rubric,
-    TopologyKind,
 )
 from arr.resolve import load_yaml_model
 from arr.room.address import USER_ADDRESS, address, is_user_question, mentions
@@ -223,50 +222,37 @@ CONVERSATION_RULES = (
     "Behauptungen mit Begründung oder Beleg: Datei, Rechnung, Anhang.",
     "Beantworte Fragen an dich zuerst.",
     "Wer jemanden fragt, schreibt `@name` (oder `to`); `@alle` fragt alle, `@user` den User "
-    "(nur er antwortet darauf). Auf eine Antwort wartest du mit `wait_for_messages`, auf den "
-    "User nie mit `wait_until`: Antwortet er nicht, arbeite mit einer begründeten Annahme weiter "
-    "und nenne sie in deinem Ergebnis.",
+    "(nur er antwortet darauf). Auf einen Agenten wartest du mit `wait_for_messages`. Brauchst "
+    "du die Antwort des Users, warte mit `wait_until` bis zu fünf Minuten; seine Antwort und "
+    "jede Nachricht des Users in deinem privaten Kanal beenden das Warten. Antwortet er nicht, "
+    "arbeite mit einer begründeten Annahme weiter und nenne sie in deiner Abgabe. Wer abgibt, "
+    "ist fertig; seine offene Frage gilt damit als erledigt.",
     "Widerspruch als `objection` mit `reply_to`, sachlich und konkret.",
     "Nicht wiederholen. Zustimmung nur, wenn sie etwas hinzufügt.",
     "Lange Inhalte (Beweise, Code, Tabellen) als Anhang, im Text nur die Kernaussage.",
-    "Wer seinen Teil erledigt hat, gibt sein Ergebnis ab (`submit_result` oder Nachricht "
-    "`result`) oder meldet `done`. Fertig heißt: Du wartest nicht mehr, bleibst aber "
-    "ansprechbar; jede Nachricht an dich weckt dich. Wartest du auf das Ergebnis eines anderen, "
-    'warte mit `wait_until(minutes, until_result_from="<name>")`.',
-)
-"""Conversation rules of docs/06-gruppenchats.md §6 and docs/09 §4.7, in every channel brief of
-a run without phases (unchanged since W4b-03; W4b-06b drops them with the old topologies)."""
-
-PHASES_CONVERSATION_RULES = (
-    *CONVERSATION_RULES[:3],
-    "Wer jemanden fragt, schreibt `@name` (oder `to`); `@alle` fragt alle, `@user` den User "
-    "(nur er antwortet darauf). Auf einen Agenten wartest du mit `wait_for_messages`. Brauchst "
-    "du die Antwort des Users, warte mit `wait_until` bis zu fünf Minuten; eine Antwort des "
-    "Users (in deinem privaten Kanal auch eine Notiz) beendet das Warten. Antwortet er nicht, "
-    "arbeite mit einer begründeten Annahme weiter und nenne sie in deiner Abgabe. Wer abgibt, "
-    "ist fertig; seine offene Frage gilt damit als erledigt.",
-    *CONVERSATION_RULES[4:7],
     "Wer seinen Teil erledigt hat, gibt ab (`submit`). Fertig heißt: Du wartest nicht mehr, "
     "bleibst aber ansprechbar. Wartest du auf die Abgabe eines anderen, warte mit "
     '`wait_until(minutes, until_result_from="<name>")`.',
 )
-"""The rules in a run with phases (W4b-06a, Auflage W4b-03): rule 4 after Entscheidungen 67
-and 69 (waiting for the user with `wait_until`, at most five minutes; handing in closes the
-question), rule 8 names `submit` (G8: the room of a `phases` run offers no `submit_result`)."""
+"""Conversation rules of docs/06-gruppenchats.md §6 and docs/09 §4.7 in every channel brief:
+since W4b-06b one version, the one of the runs with phases (W4b-06a, Auflage W4b-03): rule 4
+after Entscheidungen 67 and 69 (waiting for the user with `wait_until`, at most five minutes;
+handing in closes the question; every message of the user in the private channel ends the wait,
+W4b-04 NR2), rule 8 names `submit`."""
 
 _MODE_TEXT = {
     ChannelMode.ROUNDS: "Runden: Alle Mitglieder kommen pro Runde dran, sonst `pass`.",
     ChannelMode.EVENT: "ereignisgesteuert: Wer mit `@name` angesprochen, gefragt oder mit "
     "`reply_to` beantwortet wird, wird sofort geweckt. Runden gibt es nur, wenn niemand mehr "
     "schreibt.",
-    ChannelMode.MODERATED: "moderiert: Der Moderator erteilt das Wort und beendet die Diskussion.",
 }
+"""The pacing of a channel in its brief. A channel `moderated` exists in no run since W4b-06b
+(`arr.plan.check` refuses it with `topology: phases`)."""
 _END_TEXT = {
     ChannelMode.ROUNDS: "nach der letzten Runde oder wenn alle `pass`/`done` melden.",
     ChannelMode.EVENT: "wenn alle fertig sind (Ergebnis abgegeben oder `done`) und keine "
     "Nachricht an einen von ihnen ungelesen ist, nach den Leerlauf-Runden oder wenn es lange "
     "ruhig ist.",
-    ChannelMode.MODERATED: "wenn der Moderator die Diskussion mit einer Entscheidung beendet.",
 }
 
 
@@ -357,14 +343,15 @@ PRIVATE_BRIEF = (
     "Steckbrief #{name}\n"
     "Dein privater Kanal zum User: Hier fragst du ihn mit einer `question` an `@user`, in jeder "
     "Phase, auch in einer isolierten. Nur der User liest diesen Kanal; kein anderer Agent sieht "
-    "ihn. Brauchst du die Antwort, warte mit `wait_until` bis zu fünf Minuten; eine Antwort oder "
-    "Notiz des Users beendet das Warten. Gibst du ab, gilt deine Frage als erledigt. Die "
-    "Annahme, mit der du ohne Antwort weiterarbeitest, nennst du in deiner Abgabe."
+    "ihn. Brauchst du die Antwort, warte mit `wait_until` bis zu fünf Minuten; eine Nachricht "
+    "des Users in deinem privaten Kanal beendet das Warten. Gibst du ab, gilt deine Frage als "
+    "erledigt. Die Annahme, mit der du ohne Antwort weiterarbeitest, nennst du in deiner Abgabe."
 )
 """The pinned brief of a private channel: what it is for, who reads it, how to wait for the
-answer (W4b-06a, Entscheidung 69: `wait_until`, at most five minutes; an answer or a note of the
-user ends it) and that handing in closes an open question (Entscheidung 67). Not: „end the turn
-without handing in, the phase waits“ (W4b-03.1 NR1: the next turn starts at once)."""
+answer (W4b-06a, Entscheidung 69: `wait_until`, at most five minutes; every message of the user
+in it ends the wait, W4b-04 NR2, checked in W4b-06b) and that handing in closes an open
+question (Entscheidung 67). Not: „end the turn without handing in, the phase waits“ (W4b-03.1
+NR1: the next turn starts at once)."""
 
 
 def private_channel(agent_id: str) -> str:
@@ -832,9 +819,8 @@ class RoomStore:
         aliases: Mapping[str, str | None],
         roles: Mapping[str, str],
     ) -> str:
-        """The generated brief; its rules follow the kind of run (`run.yaml`, written by
-        `prepare_run` before `setup_channels`): without `run.yaml` or phases the old ones."""
-        rules = PHASES_CONVERSATION_RULES if self.uses_phases() else CONVERSATION_RULES
+        """The generated brief with the conversation rules (one version since W4b-06b)."""
+        rules = CONVERSATION_RULES
         lines = [f"Steckbrief #{config.name}"]
         if config.purpose:
             lines.append(f"Zweck: {config.purpose}")
@@ -977,12 +963,6 @@ class RoomStore:
             run_yaml = self.run_dir / "run.yaml"
             self._run = load_yaml_model(run_yaml, ResolvedRun) if run_yaml.is_file() else None
         return self._run
-
-    def uses_phases(self) -> bool:
-        """True if `run.yaml` names the topology `phases` (W4b-01): its agents get `submit`
-        instead of `submit_result` and `submit_rating`."""
-        run = self._resolved()
-        return run is not None and run.topology.kind is TopologyKind.PHASES
 
     def rubric(self) -> Rubric:
         """Rubric of the run from `run.yaml` (docs/03 §3); the default scale without one."""
@@ -2148,7 +2128,7 @@ class RoomStore:
     ) -> "AgentRoom":
         """View of one research agent; `work_dir` defaults to the folder from `agent.json`.
 
-        `rubric` defaults to the rubric of `run.yaml` (checked by `submit_rating`).
+        `rubric` defaults to the rubric of `run.yaml` (the scale of a `rating` with `submit`).
         """
         return AgentRoom(
             self,

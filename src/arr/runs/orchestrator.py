@@ -12,12 +12,13 @@ hands it to the topology (`async def run(ctx: RunContext) -> None`, E8). The orc
 - watches the room: hints mid-turn, `blocked` while an approval waits, delivery state of
   `user` messages, waits of the agents, turns without events, and the discussion phases of
   `arr.runs.pacing` (`discuss`);
-- sets the status after a turn (docs/09 §4.2): `done` when the agent reported it, submitted a
-  result without an open question of its own, or was `done` before and was woken by a message
-  to it (L13); `waiting` after `wait_until`; `idle` otherwise. `done` counts per phase (W4-03
-  F1): a turn or a discussion of another stage makes a finished agent `idle` again;
-- opens and closes channels for the topology (F3), seals and releases the results of a phase
-  (F4), starts fresh sessions (F5) and keeps files in `output/` (`save_output`, `read_output`);
+- sets the status after a turn (docs/09 §4.2): `done` when the agent reported it, handed in
+  (`submit` or a message `result`) without an open question of its own, or was `done` before
+  and was woken by a message to it (L13); `waiting` after `wait_until`; `idle` otherwise.
+  `done` counts per phase (W4-03 F1): a turn or a discussion of another stage makes a finished
+  agent `idle` again;
+- opens and closes channels for the phase runner (F3), seals and releases the submissions of a
+  phase (F4) and starts fresh sessions (F5);
 - turns a question of an agent to the user (`@user`, L16) into an open item „Frage“ of the
   approval inbox and closes it when the user answers in the channel or in the inbox, or when
   the run ends;
@@ -31,16 +32,13 @@ import contextlib
 import functools
 import json
 import logging
-import os
-import stat
 import sys
 import threading
 import time
-import uuid
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Protocol
 
 from arr.backends.base import (
@@ -73,7 +71,6 @@ from arr.room.types import (
     Message,
     MessageKind,
     MessageVia,
-    Rating,
     Result,
     RoomError,
     Submission,
@@ -241,10 +238,13 @@ class OrchestratorLog:
         return entry
 
     def entries(self) -> list[dict[str, Any]]:
-        """All entries (empty if the file does not exist)."""
+        """All entries (empty if the file does not exist). Split only at `"\n"`, the end of an
+        entry: `write` keeps U+2028, U+2029 and U+0085 inside a value (`ensure_ascii=False`),
+        and `splitlines()` would cut the entry there (W4b-06b, as `ApprovalLog.entries()` since
+        Entscheidung 68)."""
         if not self.path.exists():
             return []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
+        lines = self.path.read_text(encoding="utf-8").split("\n")
         return [json.loads(line) for line in lines if line.strip()]
 
 
@@ -435,8 +435,8 @@ class _TurnRecord:
 class Orchestrator(RunContext):
     """`RunContext` of one running run (W2-03); built and driven by the RunManager.
 
-    Besides the `RunContext` API, topologies can use `discuss` for a discussion phase in a
-    channel (docs/06 §5). The RunManager uses `watch`, `halt`, `pause`/`resume` and
+    The phase runner uses the `RunContext` API, `discuss` for the discussion of a phase `chat`
+    in a channel (docs/06 §5). The RunManager uses `watch`, `halt`, `pause`/`resume` and
     `halted`. All public methods run on the event loop of the run.
     """
 
@@ -484,9 +484,12 @@ class Orchestrator(RunContext):
             agent_id: room.for_agent(agent_id, agent.work_dir, rubric=rubric)
             for agent_id, agent in prepared.agents.items()
         }
-        self._waiting = {c.name for c in prepared.resolved.groupchats if c.open_from}
+        self._waiting: set[str] = set()
+        """Channels that are closed for their members (`close_channel`, F3) until
+        `open_channel`. No stage opens one any more (`open_from` went with the old
+        topologies, W4b-06b)."""
         self._held: set[str] = set()
-        """Channels the topology closed (F3): no stage opens them, only `open_channel`."""
+        """Channels the phase runner closed (F3): only `open_channel` opens them."""
         self._phase: dict[str, str] = {}
         """The stage of each agent's latest turn or discussion: `done` counts per phase (F1)."""
         self._active: dict[str, _ActiveTurn] = {}
@@ -593,17 +596,17 @@ class Orchestrator(RunContext):
           paused and a slot of the agent's auth profile is free (`concurrency`, rate limits).
         - The prompt gets the agent's inbox in front (`pacing.render_turn_prompt`); `prompt`,
           `stage` and `context` are stored as the assignment (`get_assignment()`).
-          `context["attempt"]` becomes the `attempt` of results submitted in this turn.
-        - A `stage` opens channels whose `open_from` is reached (like `checkpoint`).
-        - The outcome holds status, last text, usage, the results submitted in the turn and
-          the session. Status `limit`: a run limit stopped or prevented the turn;
+          `context["attempt"]` becomes the `attempt` of submissions handed in this turn.
+        - The outcome holds status, last text, usage and the session (`results` stays empty
+          since W4b-06b: no run has `submit_result` any more). Status `limit`: a run limit
+          stopped or prevented the turn;
           `interrupted`: the user stopped the run. In both cases `stop_requested` is true and
           further turns return at once without running. Errors of the backend come back as
           status `error`, they are not raised.
         """
         handle = self._handle(agent_id)
         if stage is not None:
-            self._reach_stage(stage)
+            self.stage = stage
         async with self._locks[agent_id]:
             await self._runnable.wait()
             if (refused := self._refuse(handle)) is not None:
@@ -704,7 +707,6 @@ class Orchestrator(RunContext):
         rebuild = self._take_rebuild(agent_id, prompt, stage, context)
         full_prompt = rebuild + self._prompt_with_inbox(agent_id, prompt)
         self.room.add_assignment(agent_id, number, prompt, stage=stage, context=context)
-        before = max((r.id for r in self.room.results(agent=agent_id)), default=0)
         if stage is not None:
             self._enter_phase(handle, stage)
         was_done = handle.status is AgentStatus.DONE
@@ -732,8 +734,7 @@ class Orchestrator(RunContext):
                 active.delivery.cancel()  # the backend has already let the hint go
             self.room.clear_wait(agent_id, WaitKind.MESSAGES)
             self._waits.pop(agent_id, None)
-            submitted = any(r.id > before for r in self.room.results(agent=agent_id))
-            self._finish_status(handle, since=since, mark=mark, was_done=was_done, result=submitted)
+            self._finish_status(handle, since=since, mark=mark, was_done=was_done)
             self._write_session(agent_id, backend)
             self._follow_session(agent_id, backend, measured=True)
             self._context_of(agent_id).sending = None  # not started: the package stays (G4)
@@ -747,14 +748,13 @@ class Orchestrator(RunContext):
         status = record.status or TurnStatus.ERROR
         if status is TurnStatus.INTERRUPTED and self._limit is not None:
             status = TurnStatus.LIMIT
-        results = [r for r in self.room.results(agent=agent_id) if r.id > before]
         self.log.write(
             "turn_end",
             agent=agent_id,
             turn=number,
             status=status.value,
             cost_usd=record.usage.cost_usd,
-            results=[r.id for r in results],
+            results=[],  # the key stays (readers of old runs); no run writes results any more
         )
         return TurnOutcome(
             agent_id=agent_id,
@@ -762,7 +762,6 @@ class Orchestrator(RunContext):
             status=status,
             text=record.text,
             usage=record.usage,
-            results=results,
             session=record.session,
             num_turns=record.num_turns,
             duration_s=loop.time() - started,
@@ -880,15 +879,15 @@ class Orchestrator(RunContext):
         self.room.set_agent_status(handle.id, status, note)
 
     def _finish_status(
-        self, handle: AgentHandle, *, since: float, mark: int, was_done: bool, result: bool
+        self, handle: AgentHandle, *, since: float, mark: int, was_done: bool
     ) -> None:
         """After a turn: `done`, `waiting` or `idle` (docs/09 §4.2, §4.3, §4.5).
 
         In this order: the turn quota is used up → `done` (`limit`, the run goes on: it stops
         only when an exhausted agent would get another turn, `_refuse`); the agent reported
         `working` in this turn → `waiting` after `wait_until`, else `idle`; it reported `done`
-        → `done`; it called `wait_until` → `waiting`; it submitted a result (`submit_result`
-        or a message `result`) and has no open question to another agent → `done`; it was
+        → `done`; it called `wait_until` → `waiting`; it handed in (`submit` or a message
+        `result`) and has no open question to another agent → `done`; it was
         `done` before the turn (woken by a message to it, L13) → `done` again; else `idle`.
         The status the agent reported comes from `agent_report`, so an approval in the same
         turn, which sets `blocked` and `working` in `agent_state`, cannot lose a `done` (Ist §1).
@@ -913,7 +912,7 @@ class Orchestrator(RunContext):
             status, reason = AgentStatus.DONE, "reported"
         elif long_wait is not None:
             status = AgentStatus.WAITING
-        elif (result or self._posted_result(agent_id, mark)) and not [
+        elif self._posted_result(agent_id, mark) and not [
             q for q in self.room.open_questions_by(agent_id) if not is_user_question(q)
         ]:
             status, reason = AgentStatus.DONE, "result"
@@ -1014,14 +1013,11 @@ class Orchestrator(RunContext):
 
     def new_result(
         self, agent_id: str, since: float, after: int = 0
-    ) -> Result | Message | Submission | None:
-        """The first result `agent_id` submitted after `since` (Unix time): `submit_result` or
-        a message `result` with an ID above `after`, in any channel (L14), or (W4b-03 §6.8) a
-        submission of `submit` that is not sealed; None if there is none yet. What of it the
-        waiting agent may see decides `arr.runs.pacing`."""
-        for result in self.room.results(agent=agent_id):
-            if result.ts > since:
-                return result
+    ) -> Message | Submission | None:
+        """The first result of `agent_id` after `since` (Unix time): a message `result` with an
+        ID above `after`, in any channel (L14), or (W4b-03 §6.8) a submission of `submit` that
+        is not sealed; None if there is none yet. What of it the waiting agent may see decides
+        `arr.runs.pacing`."""
         for msg in self.room.messages_after(after):
             if msg.sender == agent_id and msg.kind is MessageKind.RESULT and msg.ts > since:
                 return msg
@@ -1100,31 +1096,12 @@ class Orchestrator(RunContext):
         """
         return self.room.post(channel, body, kind=kind, to=list(to), reply_to=reply_to).id
 
-    def results(
-        self,
-        *,
-        agent: str | None = None,
-        stage: str | None = None,
-        kind: str | None = None,
-        attempt: int | None = None,
-    ) -> list[Result]:
-        """Submitted results matching all given filters, oldest first."""
-        return [
-            r
-            for r in self.room.results(stage=stage, agent=agent)
-            if (kind is None or r.kind == kind) and (attempt is None or r.attempt == attempt)
-        ]
-
-    def ratings(self, result_id: int) -> list[Rating]:
-        """Ratings of one result, oldest first."""
-        return self.room.ratings(result_id=result_id)
-
     async def checkpoint(self, stage: str, **info: Any) -> None:
         """Record a stage in `orchestrator.jsonl` (`{"kind": "checkpoint", "data": {stage, …}}`).
 
         `plan` with `stages=[…]` replaces the planned stages (the RunManager writes it at
-        start). Any other stage becomes the current stage and opens every channel whose
-        `open_from` is this stage or, in plan order, an earlier one. `info` must be JSON data.
+        start). Any other stage becomes the current stage. `info` must be JSON data. Since
+        W4b-06b no stage opens a channel (`open_from` went with the old topologies).
         """
         self.log.write("checkpoint", stage=stage, **info)
         if stage == PLAN_STAGE:
@@ -1132,20 +1109,7 @@ class Orchestrator(RunContext):
             if isinstance(stages, list | tuple):
                 self.plan = [str(s) for s in stages]
             return
-        self._reach_stage(stage)
-
-    def _reach_stage(self, stage: str) -> None:
         self.stage = stage
-        for name in sorted(self._waiting - self._held):
-            open_from = self.config.channel(name).open_from
-            if open_from == stage or (
-                open_from in self.plan
-                and stage in self.plan
-                and self.plan.index(stage) >= self.plan.index(open_from)
-            ):
-                self.room.open_channel(name)
-                self._waiting.discard(name)
-                self.log.write("channel_open", channel=name, stage=stage)
 
     async def escalate(
         self,
@@ -1200,42 +1164,27 @@ class Orchestrator(RunContext):
     async def discuss(
         self,
         channel: str,
-        prompt: str | None = None,
         *,
         stage: str | None = None,
         rounds: int | None = None,
-        context: Mapping[str, Any] | None = None,
-        kickoff: bool = True,
-        seats: DiscussionSeats | None = None,
+        seats: DiscussionSeats,
     ) -> DiscussionOutcome:
         """Discussion phase as specified in `RunContext.discuss`; logs its start and end.
-        With `seats` (a phase `chat`, W4b-03) only `seats.members` discuss."""
+        Only `seats.members` discuss (a phase `chat`, W4b-03)."""
         try:
             config = self.config.channel(channel)
         except KeyError:
             raise ArrError(f"Den Kanal „{channel}“ gibt es in diesem Run nicht.") from None
-        members = list(seats.members) if seats is not None else list(config.members)
+        members = list(seats.members)
         if stage is not None:
             await self.checkpoint(stage, channel=channel, phase="discussion")
             for member in members:  # F1: a new phase, `done` from before ends
                 if member in self._handles and not self.is_busy(member):
                     self._enter_phase(self._handles[member], stage)
         if channel in self._waiting:
-            raise ArrError(
-                f"Der Kanal #{channel} ist noch geschlossen. Er öffnet ab Stufe "
-                f"„{config.open_from}“."
-            )
+            raise ArrError(f"Der Kanal #{channel} ist geschlossen.")
         self.log.write("discussion_start", channel=channel, mode=config.mode.value, stage=stage)
-        outcome = await run_discussion(
-            self,
-            channel,
-            prompt,
-            stage=stage,
-            rounds=rounds,
-            context=context,
-            kickoff=kickoff,
-            seats=seats,
-        )
+        outcome = await run_discussion(self, channel, stage=stage, rounds=rounds, seats=seats)
         self.log.write(
             "discussion_end",
             channel=channel,
@@ -1348,71 +1297,6 @@ class Orchestrator(RunContext):
         """How `viewer` sees `agent` (alias in an anonymous channel of `viewer`, F4)."""
         return self._views[viewer].shown_name(agent)
 
-    def result_text(self, result_id: int, max_bytes: int = 64 * 1024) -> str:
-        """Body or start of the file of a result, also of a sealed one (arr's own reading)."""
-        return self.room.result_text(result_id, max_bytes)
-
-    def _run_path(self, rel: str, *, under: str = "") -> Path:
-        path = PurePosixPath(rel)
-        if path.is_absolute() or not path.parts or ".." in path.parts or "\0" in rel:
-            raise ArrError(f"„{rel}“ ist kein Pfad innerhalb des Runs.")
-        return self.prepared.run_dir / under / path
-
-    def save_output(
-        self,
-        dest: str,
-        *,
-        text: str | None = None,
-        agent: str | None = None,
-        source: str | None = None,
-    ) -> str:
-        """Write `output/<dest>` from `text` or a safe copy of `source` (see `RunContext`)."""
-        if (text is None) == (source is None):
-            raise ValueError("save_output needs either text or source")
-        target = self._run_path(dest, under="output")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}")
-        try:
-            if text is not None:
-                temp.write_text(text, encoding="utf-8")
-            else:
-                assert source is not None
-                if agent is not None:
-                    view = self._views[agent]
-                else:  # a file of the run folder (`base/…`, `output/…`), no agent's view
-                    view = AgentRoom(self.room, next(iter(self._handles)), self.prepared.run_dir)
-                try:
-                    view.copy_file(source, temp)
-                except RoomError as exc:
-                    raise ArrError(str(exc)) from None
-            os.replace(temp, target)
-        finally:
-            temp.unlink(missing_ok=True)
-        return target.relative_to(self.prepared.run_dir).as_posix()
-
-    def read_output(self, rel: str, max_bytes: int) -> str | None:
-        """Text of a file below the run folder that arr wrote, or None (see `RunContext`)."""
-        try:
-            path = self._run_path(rel)
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        except (ArrError, OSError):
-            return None
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
-                return None
-            data = os.read(fd, max_bytes + 1)
-        except OSError:
-            return None
-        finally:
-            os.close(fd)
-        if len(data) > max_bytes:
-            return None
-        try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-
     # -- W4b-02b: phases (`enter_phase`), submissions, the user's hint --------------------------
 
     @property
@@ -1505,8 +1389,8 @@ class Orchestrator(RunContext):
 
     _participants: frozenset[str] | None = None
     """While a pass of a phase runs: its participants (with an action, on standby, raters);
-    only they hear of messages (`_recipients`, Entscheidung 64). None: everybody (the old
-    topologies)."""
+    only they hear of messages (`_recipients`, Entscheidung 64). None: everybody (between
+    passes)."""
 
     @property
     def _private(self) -> dict[str, str]:

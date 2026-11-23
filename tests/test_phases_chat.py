@@ -467,5 +467,5 @@ async def test_a16_the_texts_of_a_phase_chat_name_submit(workfolder: Path) -> No
     for key, text in pacing._SUBMIT_TEXTS.items():
         assert "`submit`" in text, key
         assert "submit_result" not in text and "Ergebnis ab" not in text, key
-    for old in (pacing._ROUND_PROMPT, pacing._KICKOFF_PROMPT, pacing._WAKE_PROMPT):
-        assert "`submit`" not in old, "the old topologies keep their texts"
+    for old in ("_ROUND_PROMPT", "_KICKOFF_PROMPT", "_WAKE_PROMPT", "_ANSWER_PROMPT"):
+        assert not hasattr(pacing, old), "one version since W4b-06b"

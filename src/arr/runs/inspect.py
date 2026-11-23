@@ -516,15 +516,17 @@ def _phase_checkpoint(data: Mapping[str, Any], stage: str) -> str | None:
     return None
 
 
-def describe_checkpoint(data: Mapping[str, Any]) -> str:
+def describe_checkpoint(data: Mapping[str, Any], *, phases: bool = False) -> str:
     """One German line for a `checkpoint` entry of `orchestrator.jsonl`.
 
     Always exactly one line: values from the log are shortened (`_line_text`); a checkpoint
-    with unexpected types gets the generic line instead of an error (W4b-07 §6.1, §6.16)."""
+    with unexpected types gets the generic line instead of an error (W4b-07 §6.1, §6.16).
+    `phases`: the run has `topology: phases`; the discussion of a phase `chat` then names its
+    „Phase“, not its „Stufe“ (W4b-06b). Old runs keep their lines word for word."""
     if not isinstance(data, Mapping):
         return "Checkpoint" + (f" ({_line_text(data, 300)})" if data else "")
     try:
-        text = _describe_checkpoint(data)
+        text = _describe_checkpoint(data, phases_run=phases)
     except (TypeError, ValueError, AttributeError, LookupError, ArithmeticError):
         text = _generic_checkpoint(data)
     return _line_text(text, _LINE_ALL_MAX)
@@ -536,7 +538,7 @@ def _generic_checkpoint(data: Mapping[str, Any]) -> str:
     return f"Checkpoint „{stage}“" + (f" ({_line_text(extra, 300)})" if extra else "")
 
 
-def _describe_checkpoint(data: Mapping[str, Any]) -> str:
+def _describe_checkpoint(data: Mapping[str, Any], *, phases_run: bool = False) -> str:
     stage = data.get("stage")
     if stage == "plan":
         stages = data.get("stages") or []
@@ -560,7 +562,8 @@ def _describe_checkpoint(data: Mapping[str, Any]) -> str:
             text += f", akzeptiert #{data['accepted']}"
         return text
     if data.get("phase") == "discussion":
-        return f"Stufe „{stage}“: Diskussion in #{_line_text(data.get('channel'), 80)}"
+        word = "Phase" if phases_run else "Stufe"
+        return f"{word} „{stage}“: Diskussion in #{_line_text(data.get('channel'), 80)}"
     return _generic_checkpoint(data)
 
 

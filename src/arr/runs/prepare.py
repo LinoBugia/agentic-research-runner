@@ -42,7 +42,6 @@ from arr.models import (
     RunStatus,
     RunVenvMode,
     Starter,
-    TopologyKind,
     WorkfolderSettings,
     WorkspaceMode,
 )
@@ -94,19 +93,10 @@ logger = logging.getLogger(__name__)
 RUN_SOURCE = "run.yaml"
 DEFAULT_ROLE = (
     "Du bist ein Research-Agent in diesem Run. Für dich ist keine Rolle festgelegt: "
-    "Bearbeite die Aufgabe selbstständig und gib deine Ergebnisse mit `submit_result` ab.\n"
-)
-"""The role of an agent without one, in a run without phases."""
-DEFAULT_ROLE_PHASES = (
-    "Du bist ein Research-Agent in diesem Run. Für dich ist keine Rolle festgelegt: "
     "Bearbeite deinen Auftrag selbstständig und gib mit `submit` ab.\n"
 )
-"""The role of an agent without one in a run with phases (W4b-06a): its room offers `submit`."""
-
-
-def default_role(resolved: ResolvedRun) -> str:
-    """The role text of an agent without a role, for the kind of run."""
-    return DEFAULT_ROLE_PHASES if resolved.topology.kind is TopologyKind.PHASES else DEFAULT_ROLE
+"""The role of an agent without one (W4b-06a; the only text since W4b-06b): its room offers
+`submit`."""
 
 
 ALWAYS_EXCLUDED = (".claude/skills", ".agents/skills", "/.mcp.json", "/AGENTS.override.md")
@@ -506,19 +496,13 @@ def _role_label(agent: AgentConfig) -> str:
 
 
 def _parts(resolved: ResolvedRun, agent_id: str) -> list[str]:
-    """What an agent's part of the run is, from `run.yaml` (docs/09 §4.7): its stages, rating,
-    moderating, summarizing."""
-    parts = []
-    for stage in resolved.stages:
-        if stage.agent == agent_id:
-            produces = f", liefert `{stage.produces}`" if stage.produces else ""
-            parts.append(f"Stufe „{stage.name}“{produces}")
-    if agent_id in resolved.raters:
-        parts.append("bewertet Ergebnisse")
-    parts += [f"moderiert #{c.name}" for c in resolved.groupchats if c.moderator == agent_id]
+    """What an agent's part of the run is, from `run.yaml` (docs/09 §4.7): summarizing, when
+    the parameter `summarizer` names the agent (the start skills `roundtable` and
+    `exploration`: `summarizer: summarizer`). The parts of the old topologies (stages, rating,
+    moderating a channel) went with them in W4b-06b; a phases run has none of them."""
     if resolved.params.get("summarizer") == agent_id:
-        parts.append("fasst die Diskussion zusammen")
-    return parts
+        return ["fasst die Diskussion zusammen"]
+    return []
 
 
 def _team_items(resolved: ResolvedRun, agent: AgentConfig) -> list[str]:
@@ -597,9 +581,8 @@ def _research_block(
                 items.append(f"  - `{name}`" + (f": {purpose}" if purpose else ""))
         else:
             items.append("- Du bist in keinem Gruppenchat.")
-    tool = "submit" if resolved.topology.kind is TopologyKind.PHASES else "submit_result"
     items.append(
-        f"- Ergebnisse gibst du mit `{tool}` ab. Dateien in diesem Ordner sind "
+        "- Ergebnisse gibst du mit `submit` ab. Dateien in diesem Ordner sind "
         "Arbeitsmaterial; erst was du abgibst, zählt als Ergebnis."
     )
     template = Template(read_template("run", "research-agent-block.md"))
@@ -1326,7 +1309,7 @@ def _build_run(
         if role_source is not None:
             shutil.copyfile(role_source, agent_dir / "role.md")
         else:
-            (agent_dir / "role.md").write_text(default_role(resolved), encoding="utf-8")
+            (agent_dir / "role.md").write_text(DEFAULT_ROLE, encoding="utf-8")
 
         mode = agent.workspace.mode
         generated: list[str] = []
