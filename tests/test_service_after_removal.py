@@ -29,7 +29,6 @@ from arr.service.api_models import ApprovalItem
 from arr.service.real_api import RealApi
 from arr.skills import (
     START_SKILLS,
-    SkillUpdate,
     updatable_start_skills,
     update_lines,
     update_start_skills,
@@ -96,9 +95,7 @@ async def test_the_api_updates_like_arr_skills_update(wf: Path, tmp_path: Path) 
     result = await api.update_start_skills()
     assert result.lines == update_lines(update_start_skills(twin)), "the lines of the CLI"
     assert result.updated == ["exploration", "proof-review", "roundtable"]
-    assert "proof: geändert, bleibt" in "\n".join(result.lines) or any(
-        line.startswith("proof:") for line in result.lines
-    )
+    assert "proof: von dir geändert, bleibt unverändert" in result.lines
     assert (wf / "skills" / "proof" / "SKILL.md").read_text() == "geändert\n"
     assert (await api.update_start_skills(dry_run=True)).updatable == []
     skills = {s.name: s for s in await api.list_skills()}
@@ -113,7 +110,7 @@ async def test_the_lines_name_a_changed_start_skill(wf: Path) -> None:
     (wf / "skills" / "proof" / "SKILL.md").write_text("geändert\n", "utf-8")
     result = await RealApi(wf, base_url=BASE).update_start_skills()
     [proof] = [line for line in result.lines if line.startswith("proof:")]
-    assert SkillUpdate.CHANGED.value in proof or "geändert" in proof
+    assert proof == "proof: von dir geändert, bleibt unverändert"
 
 
 async def test_the_mock_has_the_method_and_nothing_to_update() -> None:
@@ -378,3 +375,53 @@ def test_run_results_and_run_summary_without_the_old_topologies(wf: Path) -> Non
     assert "submit_result" not in empty and "mit submit ab" in empty
     summary = run_summary(record, base_url=BASE, now=2.0)
     assert summary.topology is TopologyKind.PHASES, "the fallback is `phases`, not `solo`"
+
+
+@pytest.mark.parametrize(
+    ("old", "line"),
+    [
+        (False, "Zuletzt:   Phase „beweis“: Diskussion in #main"),
+        (True, "Zuletzt:   Stufe „beweis“: Diskussion in #main"),  # as on `main` (9a7fccc)
+    ],
+)
+def test_runs_status_says_phase_in_a_phases_run(tmp_path: Path, old: bool, line: str) -> None:
+    """W4b-06b.1 (N3): `arr runs status` names the „Phase“ of a discussion in a phases run;
+    an old run keeps „Stufe“, word for word as on `main`."""
+    from old_runs_kit import restore
+    from service_kit import make_run_folder
+
+    from arr.runs.inspect import format_status, run_status
+    from arr.runs.orchestrator import OrchestratorLog
+
+    workfolder = make_workfolder(tmp_path)
+    if old:
+        (workfolder / "runs").mkdir(exist_ok=True)
+        folder = restore(workfolder, "20261003-1000_demo_waterfall_a003")
+    else:
+        folder = make_run_folder(workfolder, status=RunStatus.DONE)
+    OrchestratorLog(folder).write("checkpoint", stage="beweis", channel="main", phase="discussion")
+    text = format_status(run_status(folder), now=0.0)
+    assert [x for x in text.splitlines() if x.startswith("Zuletzt:")] == [line]
+
+
+@pytest.mark.parametrize(
+    ("name", "line"),
+    [
+        ("20261002-1000_demo_waterfall_a002", "Stufe „skizze“ abgeschlossen: nicht bestanden"),
+        (
+            "20261003-1000_demo_waterfall_a003",
+            "Stufe „beweis“ abgeschlossen: bestanden, akzeptiert #3",
+        ),
+        ("20261004-1000_demo_solo_a004", "Stufe „arbeit“, Versuch – (solver): bestanden"),
+    ],
+)  # fmt: skip
+def test_runs_status_of_an_old_run_is_as_on_main(tmp_path: Path, name: str, line: str) -> None:
+    """The line „Zuletzt“ of the old runs of the test data, as `main` (9a7fccc) gives it."""
+    from old_runs_kit import restore
+
+    from arr.runs.inspect import format_status, run_status
+
+    workfolder = make_workfolder(tmp_path)
+    (workfolder / "runs").mkdir(exist_ok=True)
+    text = format_status(run_status(restore(workfolder, name)), now=0.0)
+    assert [x for x in text.splitlines() if x.startswith("Zuletzt:")] == [f"Zuletzt:   {line}"]

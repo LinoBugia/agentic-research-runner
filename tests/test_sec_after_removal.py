@@ -5,6 +5,8 @@ instead of an old topology, `submit` instead of `submit_result`.
 - S4 (error): a turn of an isolated phase fails after another agent handed in; the run fails,
   and still nothing stays sealed: the submissions are released to `output/` (was
   `test_review_exploration_w403_1.py::test_m31_an_error_in_the_review_still_releases_…`).
+  W4b-06b.1 (M1): the test also shows that the phase *was* sealed: the submission of `a` is
+  sealed when the error comes, and the log has `results_sealed` and `results_released`.
 
 FakeBackend agents with the real RunManager, Orchestrator and room; no model.
 """
@@ -19,7 +21,7 @@ from run_kit import eventually, make_workfolder
 from arr.models import RunStatus
 from arr.room import store as room_store
 from arr.room.store import RoomStore
-from arr.runs.orchestrator import Orchestrator
+from arr.runs.orchestrator import Orchestrator, OrchestratorLog
 
 AGENTS = {"agents": [{"id": a} for a in ("a", "b")]}
 
@@ -35,10 +37,12 @@ async def test_s4_an_error_in_an_isolated_phase_still_releases_the_sealed_submis
     """Entscheidung 57: a stop ends the turns regularly; the release matters as well when the
     phase fails: here a turn of `b` raises after `a` handed in."""
     real = Orchestrator.turn
+    before: list[bool] = []
 
     async def failing(self: Orchestrator, agent_id: str, prompt: str, **kwargs: Any) -> Any:
         if agent_id == "b" and kwargs.get("stage") == "x":
             await eventually(lambda: bool(self.room.submissions(agent="a")), within=10)
+            before.extend(s.sealed for s in self.room.submissions(agent="a"))
             raise RuntimeError("Backend weg")
         return await real(self, agent_id, prompt, **kwargs)
 
@@ -47,10 +51,15 @@ async def test_s4_an_error_in_an_isolated_phase_still_releases_the_sealed_submis
     mgr, _log = manager(workfolder, group, {"a": answer(), "b": answer()})
     assert await run(mgr) is RunStatus.FAILED
     assert any("Backend weg" in e for e in errors(mgr)), errors(mgr)
+    assert before == [True], "the phase was sealed when the error came"
+    log = OrchestratorLog(mgr.run_dir).entries()
+    sealed = [e["data"] for e in log if e["kind"] == "results_sealed"]
+    released = [e["data"] for e in log if e["kind"] == "results_released"]
+    assert [d["stage"] for d in sealed] == ["x"] and [d["stage"] for d in released] == ["x"]
     store = RoomStore(mgr.run_dir)
     assert store.sealed_stages() == {}, "nothing stays sealed after the error"
     [sub] = store.submissions()
     assert sub.agent == "a" and not sub.sealed
     assert sub.path.startswith("output/") and (mgr.run_dir / sub.path).is_dir()
-    sealed = mgr.run_dir / room_store.SEALED_DIR
-    assert not sealed.exists() or list(sealed.iterdir()) == []
+    folder = mgr.run_dir / room_store.SEALED_DIR
+    assert not folder.exists() or list(folder.iterdir()) == []

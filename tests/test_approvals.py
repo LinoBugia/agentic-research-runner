@@ -89,17 +89,22 @@ def asking(*asks: dict[str, Any], steps: list[dict[str, Any]] | None = None) -> 
     return {**turns(steps or [say("weiter"), done()]), "asks": list(asks)}
 
 
-@pytest.fixture
-def wf(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    arr_home.mkdir(parents=True, exist_ok=True)
-    write_profiles(arr_home, {"fake-auth": "claude_oauth", "fake-codex": "codex_chatgpt"})
-    monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
-    workfolder = make_workfolder(tmp_path)
+def write_tasks(workfolder: Path) -> Path:
+    """The assignments of the phases runs of this file (`run_input`, the escalation of a
+    phase) in the project `demo` (W4b-06b); every fixture that uses them calls this."""
     tasks = workfolder / "projects" / "demo" / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
     for name in ("runde", "arbeit", "skizze", "bewerten"):
         (tasks / f"{name}.md").write_text(f"Auftrag {name}.\n", "utf-8")
     return workfolder
+
+
+@pytest.fixture
+def wf(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    arr_home.mkdir(parents=True, exist_ok=True)
+    write_profiles(arr_home, {"fake-auth": "claude_oauth", "fake-codex": "codex_chatgpt"})
+    monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
+    return write_tasks(make_workfolder(tmp_path))
 
 
 class Service:

@@ -680,13 +680,12 @@ KILL_AFTER = textwrap.dedent(
     from pathlib import Path
     from arr.room import store as m
     run, marker, call, agent = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
-    name = "replace" if call == "release-results" else "rename"
-    real = getattr(os, name)
+    real = os.rename
     def once(src, dst):
         real(src, dst)
         marker.write_text("x")
         time.sleep(120)
-    setattr(m.os, name, once)
+    m.os.rename = once
     store = m.RoomStore(run)
     if call.startswith("release"):
         store.release("pruefung")

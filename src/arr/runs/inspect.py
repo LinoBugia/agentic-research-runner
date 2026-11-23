@@ -574,6 +574,19 @@ def _approval_line(entry: Mapping[str, Any]) -> str:
     return text + (f" · {what}" if what else "")
 
 
+def _is_phases_run(run_dir: Path) -> bool:
+    """Whether the run folder's `run.yaml` names `topology: phases`; without a readable one the
+    old wording stays (old runs, half-prepared folders)."""
+    from arr.models import ResolvedRun, TopologyKind
+    from arr.resolve import load_yaml_model
+
+    try:
+        resolved = load_yaml_model(run_dir / "run.yaml", ResolvedRun)
+    except (ArrError, OSError, ValueError):
+        return False
+    return resolved.topology.kind is TopologyKind.PHASES
+
+
 def format_status(view: RunStatusView, *, now: float | None = None) -> str:
     """Text of `arr runs status` (German)."""
     meta = view.meta
@@ -586,7 +599,8 @@ def format_status(view: RunStatusView, *, now: float | None = None) -> str:
         f"Beginn:    {_clock(meta.started)} · Dauer: {_run_duration(meta, now)}",
     ]
     if view.checkpoint is not None:
-        lines.append(f"Zuletzt:   {describe_checkpoint(view.checkpoint)}")
+        phases = _is_phases_run(view.run_dir)  # W4b-06b.1 (N3): „Phase“ in a phases run
+        lines.append(f"Zuletzt:   {describe_checkpoint(view.checkpoint, phases=phases)}")
     if view.turns:
         lines.append("Turns je Agent:")
         for agent, count in view.turns.items():

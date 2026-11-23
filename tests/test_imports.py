@@ -1,4 +1,5 @@
 import importlib
+import importlib.util
 import inspect
 import pkgutil
 
@@ -41,8 +42,10 @@ def test_the_old_topologies_are_gone() -> None:
     """W4b-06b: `arr.runs.topologies` is removed; its helpers live in `arr.runs.topology` and
     `arr.runs.phases.start`."""
     assert not [m for m in MODULES if m.startswith("arr.runs.topologies")]
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("arr.runs.topologies")
+    # W4b-06b.1 (N1): a leftover `__pycache__/` would make it a namespace package; what counts
+    # is that there is no source and no regular package (no `__init__.py`)
+    spec = importlib.util.find_spec("arr.runs.topologies")
+    assert spec is None or spec.origin is None, spec
     from arr.runs.phases.start import SOURCE, require_task
     from arr.runs.topology import check_topology, topology_for
 

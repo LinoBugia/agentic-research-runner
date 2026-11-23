@@ -17,6 +17,7 @@ from nicegui import ElementFilter
 from nicegui.testing import User
 from run_kit import FAST, fake_builders, say, solo_phases, turns, wait, write_profiles
 from service_kit import append, hold_lock, make_run_folder, make_workfolder
+from test_approvals import write_tasks
 from test_gui import gui_user
 from test_gui_real import page_html, see
 
@@ -40,12 +41,7 @@ def wf(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     arr_home.mkdir(parents=True, exist_ok=True)
     write_profiles(arr_home, {"fake-auth": "claude_oauth", "fake-codex": "codex_chatgpt"})
     monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
-    workfolder = make_workfolder(tmp_path)
-    tasks = workfolder / "projects" / "demo" / "tasks"  # for the escalation of a phase
-    tasks.mkdir(parents=True, exist_ok=True)
-    for name in ("skizze", "bewerten"):
-        (tasks / f"{name}.md").write_text(f"Auftrag {name}.\n", "utf-8")
-    return workfolder
+    return write_tasks(make_workfolder(tmp_path))  # for the escalation of a phase
 
 
 def run_input(agent: dict[str, Any]) -> dict[str, Any]:

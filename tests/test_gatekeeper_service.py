@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from run_kit import FAST, fake_builders, write_profiles
 from service_kit import make_workfolder
-from test_approvals import BASE, OPEN, asking, run_input, until
+from test_approvals import BASE, OPEN, asking, run_input, until, write_tasks
 from test_gatekeeper import ALLOW_JSON, ASK_JSON, FakeModel
 
 from arr.models import Decider, RunStatus
@@ -49,10 +49,7 @@ def wf(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     folder = make_workfolder(tmp_path)
     (folder / "mandates").mkdir()
     (folder / "mandates" / "standard.md").write_text(standard_text(), "utf-8")
-    tasks = folder / "projects" / "demo" / "tasks"  # the phase `chat` of `run_input`
-    tasks.mkdir(parents=True, exist_ok=True)
-    (tasks / "runde.md").write_text("Auftrag runde.\n", "utf-8")
-    return folder
+    return write_tasks(folder)
 
 
 class Service:
