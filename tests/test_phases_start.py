@@ -158,21 +158,23 @@ async def test_a1_solo_and_parallel_run_to_the_end(workfolder: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------------
-# A2: refused before the start until the order that builds it is merged (W4b-03: `chat` and
-# `standby` run now, only `moderated` waits for W4b-04)
+# A2: refused before the start (W4b-03: `chat` and `standby` run; W4b-04: `moderated` runs, and
+# only a context class without the methods of the assignments refuses it)
 # --------------------------------------------------------------------------------------------
+
+MODERATED = {
+    "phases": [{**solo("m", "a"), "topology": "moderated", "max_assignments": 2, "standby": ["b"]}]
+}
 
 NOT_YET = {
     "moderated": (
-        {
-            "phases": [
-                {**solo("m", "a"), "topology": "moderated", "max_assignments": 2, "standby": ["b"]}
-            ]
-        },
+        MODERATED,
         "phases[0].topology",
-        "Die Topologie „moderated“ (Phase „m“) ist in dieser Version noch nicht verfügbar.",
+        "Die Topologie „moderated“ (Phase „m“) braucht Aufträge des Leads, und dieser Ablauf "
+        "kann sie nicht vergeben.",
     ),
 }
+"""W4b-04: what a context class without `start.DELEGATION_METHODS` refuses."""
 
 READY_SINCE_W4B03 = {
     "chat": {
@@ -180,30 +182,47 @@ READY_SINCE_W4B03 = {
         "channels": [{"name": "k", "members": ["a", "b"]}],
     },
     "standby": {"phases": [{**solo("s", "a"), "standby": ["b"]}]},
+    "moderated": MODERATED,  # W4b-04
 }
 
 
 @pytest.mark.parametrize("case", list(READY_SINCE_W4B03))
 def test_w4b03_chat_and_standby_pass_the_start_check(case: str) -> None:
-    """W4b-03 A1: `chat` and `standby` are no longer refused; `moderated` still is."""
+    """W4b-03 A1: `chat` and `standby` are no longer refused; since W4b-04 neither is
+    `moderated` (W4b-04 A1)."""
     group = READY_SINCE_W4B03[case]
     if case == "chat":
         group = {**group, "phases": [{**group["phases"][0], "channels": ["k"]}]}
     resolved = resolved_of({**TWO, **group})
     check_topology(resolved)
     assert start.start_issues(resolved, Orchestrator) == []
-    assert start.READY == "solo, parallel, chat" and start.STANDBY_READY
+    assert start.READY == "solo, parallel, chat, moderated" and start.STANDBY_READY
+    assert start.NOT_YET == {}
 
 
 @pytest.mark.parametrize("case", list(NOT_YET))
 def test_a2_refused_with_path_and_sentence(case: str) -> None:
+    """W4b-04 A1: a context class without the methods of the assignments refuses
+    `moderated` with path and sentence; the `Orchestrator` does not."""
+
+    class Bare(RunContext):  # type: ignore[misc]
+        pass
+
     group, path, text = NOT_YET[case]
     resolved = resolved_of({**TWO, **group})
-    with pytest.raises(ConfigError) as info:
-        check_topology(resolved)
-    found = [i for i in info.value.issues if i.path == path]
-    assert found and found[0].message.startswith(text), info.value
-    assert "W4b" not in str(info.value)
+    found = [i for i in start.start_issues(resolved, Bare) if i.path == path]
+    assert found and found[0].message.startswith(text), found
+    assert "W4b" not in found[0].message
+    check_topology(resolved)  # with the `Orchestrator`
+    for method in start.DELEGATION_METHODS:  # each one alone is needed
+
+        class Partial(RunContext):  # type: ignore[misc]
+            pass
+
+        for other in start.DELEGATION_METHODS:
+            if other != method:
+                setattr(Partial, other, getattr(Orchestrator, other))
+        assert [i.path for i in start.start_issues(resolved, Partial)] == [path], method
 
 
 def test_a2_reset_with_folder_keep_runs_today() -> None:
@@ -249,11 +268,12 @@ def test_a2_plan_launch_creates_nothing_for_a_refused_run(
     workfolder: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_file = launch_setup(workfolder, arr_home, monkeypatch)
-    moderated = "topology: moderated\n    max_assignments: 2\n    standby: [b]\n"
+    # W4b-04: `moderated` runs; refused is one without `max_assignments` (an error of `check`)
+    moderated = "topology: moderated\n    standby: [b]\n"
     run_file.write_text(RUN_FILE.replace("topology: solo\n", moderated), "utf-8")
-    with pytest.raises(ConfigError, match="noch nicht verfügbar") as info:
+    with pytest.raises(ConfigError, match="braucht „max_assignments“") as info:
         plan_launch(run_file, cwd=workfolder)
-    assert [i.path for i in info.value.issues] == ["phases[0].topology"]
+    assert [i.path for i in info.value.issues] == ["phases[0].max_assignments"]
     assert list((workfolder / "runs").iterdir()) == []
 
 
@@ -276,11 +296,11 @@ def test_w4b03_plan_launch_accepts_chat_and_standby(
 
 async def test_a2_the_runner_checks_again_at_its_start(workfolder: Path) -> None:
     """`check_topology` skipped: the runner refuses at its start, before any turn."""
-    phase = {**solo("m", "a"), "topology": "moderated", "max_assignments": 2, "standby": ["b"]}
+    phase = {**solo("m", "a"), "topology": "moderated", "standby": ["b"]}  # no max_assignments
     group = {**TWO, "phases": [phase]}
     mgr, log = manager(workfolder, group, {"a": answer()})
     assert await run(mgr) is RunStatus.FAILED
-    assert "noch nicht verfügbar" in errors(mgr)[0] and log.turns == []
+    assert "braucht „max_assignments“" in errors(mgr)[0] and log.turns == []
 
 
 async def test_a2_a_run_without_task_is_refused_before_a_turn(workfolder: Path) -> None:

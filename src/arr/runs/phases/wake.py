@@ -28,8 +28,16 @@ channel, until the user answers or `pacing.user_question_hold_s()` after the que
 An answer gives the asker exactly one turn with the context of its action (a wake-up of the
 channel; none above its limit). A stop or limit ends the wait at once.
 
+W4b-04: a sleeper with an assignment of the lead (`moderated`) leaves the sleepers for its
+duration (`take_out`: a running wake-up turn ends first, a due one lapses with the reason
+`assignment`) and is woken like an agent with an action; `put_back` returns it after the turns
+of its assignments, and a direct message it did not see in its last turn wakes it then, once.
+`hold` takes an optional `abort` (a cancelled assignment ends the holding at once). In its
+private channel a question of the user without `@name` is a question to its owner (NR2).
+
 Log entries: `wake_scheduled`, `wake`, `wake_skipped` (reasons `max_wakeups_per_agent`,
-`ping_pong`, `phase_end`, `turns_per_agent`), `ping_pong`, `wait_end` (reason `phase_end`) and
+`ping_pong`, `phase_end`, `turns_per_agent`, `assignment`), `ping_pong`, `wait_end` (reason
+`phase_end`) and
 `waiting` (`channel`, `reason: user`, `until`, `stage`; `reason: none` at the end); every entry
 of the waker has `stage` (the phase) and `attempt`.
 """
@@ -38,7 +46,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -132,6 +140,11 @@ class Waker:
         discussion channel of a `chat` in `rounds`, which has no guard of its own (W4b-03.1,
         E4)."""
         self.waking = True
+        self.assigned: set[str] = set()
+        """Sleepers taken out for an assignment of the lead (W4b-04, `take_out`)."""
+        self.held: dict[str, list[Message]] = {}
+        """Direct messages to an agent while it works on assignments: what it did not see in
+        its last turn wakes it when it is put back (`put_back`)."""
         self.due: dict[str, _Due] = {}
         self.woken: set[tuple[str, int]] = set()
         self.turns: dict[str, asyncio.Task[Any]] = {}
@@ -232,8 +245,13 @@ class Waker:
         if msg.sender in (member, ORCHESTRATOR):
             return None
         how = address(msg, member, self.orch.sender_of)
-        if how is None and msg.sender == USER and private_owner(msg.channel) == member:
-            how = Address.MENTION  # E2: in its private channel every message of the user is direct
+        if msg.sender == USER and private_owner(msg.channel) == member:
+            # E2: in its private channel every message of the user is direct; a question
+            # without `@name` is a question to its owner (W4b-04, NR2)
+            if how is None:
+                how = Address.MENTION
+            elif how is Address.QUESTION_ALL:
+                how = Address.QUESTION
         return _wakes(how, config.wake_on)
 
     def _take(self, agent: str, msg: Message, reason: str) -> None:
@@ -241,6 +259,8 @@ class Waker:
             self._schedule(agent, msg, reason)
         else:
             self.messages.setdefault(agent, []).append(msg)
+            if agent in self.assigned:  # kept apart: `clear` of a wait does not drop them
+                self.held.setdefault(agent, []).append(msg)
 
     def _schedule(self, agent: str, msg: Message, reason: str) -> None:
         if (agent, msg.id) in self.woken or self.orch.exhausted(agent):
@@ -289,6 +309,51 @@ class Waker:
     def clear(self, agent: str) -> None:
         """Forget the direct messages kept for `agent` (its wait ended or never began)."""
         self.messages.pop(agent, None)
+
+    # -- W4b-04: a sleeper with an assignment of the lead -------------------------------------
+
+    async def take_out(self, agent: str) -> None:
+        """`agent` (on standby) begins an assignment of the lead (W4b-04 §6.4): it leaves
+        `sleepers` for its duration, so it is woken like an agent with an action (a direct
+        message ends its `wait_until`, no wake-up turn). A due wake-up lapses (`wake_skipped`,
+        reason `assignment`; its messages are in the inbox of the first turn of the
+        assignment); a running wake-up turn ends first: the assignment, its `transition` too,
+        begins after it."""
+        if agent in self.sleepers:
+            self.sleepers.remove(agent)
+            self.assigned.add(agent)
+        due = self.due.pop(agent, None)
+        if due is not None:
+            self._log(
+                "wake_skipped",
+                channel=due.channels[0],
+                agent=agent,
+                reason="assignment",
+                messages=due.messages,
+            )
+        running = self.turns.get(agent)
+        if running is not None:
+            await asyncio.gather(running, return_exceptions=True)
+
+    def put_back(self, agent: str) -> None:
+        """The turns of the assignments of `agent` are over: it is on standby again. A direct
+        message it did not see in its last turn wakes it now, once per message (after the end
+        of the actions it lapses, `phase_end`)."""
+        if agent not in self.assigned:
+            return
+        self.assigned.discard(agent)
+        if agent not in self.sleepers:
+            self.sleepers.append(agent)
+        seen = self.orch.turn_mark(agent)
+        self.messages.pop(agent, None)
+        for msg in self.held.pop(agent, []):
+            entry = self.channels.get(msg.channel)
+            if entry is None or msg.id <= seen:
+                continue
+            reason = self._reason(msg, agent, entry[0])
+            if reason is not None:
+                self._schedule(agent, msg, reason)
+        self.changed.set()
 
     # -- wake-up turns -----------------------------------------------------------------------
 
@@ -361,13 +426,20 @@ class Waker:
         self.orch.log.write(kind, stage=self.phase.name, attempt=self.pass_.attempt, **data)
 
 
-async def hold(runner: "PhaseRunner", phase: ResolvedPhase, pass_: Pass, slots: list[Slot]) -> None:
+async def hold(
+    runner: "PhaseRunner",
+    phase: ResolvedPhase,
+    pass_: Pass,
+    slots: list[Slot],
+    abort: Callable[[], bool] | None = None,
+) -> None:
     """B3 in every topology (§6.6): while a question to the user is open that an agent of
     `slots` asked in this pass, in an open channel of the phase or its private channel, wait
     until the user answers or `user_question_hold_s()` after the question passed. Each answer
     gives its asker one turn with the context of its action (a wake-up of the channel, none
-    above its limit); a new submission in it counts. A stop or limit ends the wait at once.
-    A context without the orchestrator's questions holds nothing."""
+    above its limit); a new submission in it counts. A stop or limit ends the wait at once,
+    and so does `abort` when it turns true (W4b-04: a cancelled assignment), before an answer
+    turn as well. A context without the orchestrator's questions holds nothing."""
     orch: Orchestrator = runner.ctx  # type: ignore[assignment]
     if not callable(getattr(orch, "open_user_questions", None)):
         return
@@ -383,8 +455,9 @@ async def hold(runner: "PhaseRunner", phase: ResolvedPhase, pass_: Pass, slots: 
     handled: set[int] = set()
     watched: dict[int, tuple[Any, str]] = {}
     reported: set[str] = set()
+    stopped = abort if abort is not None else (lambda: False)
     try:
-        while not orch.stop_requested:
+        while not orch.stop_requested and not stopped():
             try:
                 orch.poll()  # an answer just given closes its question first
             except Exception:  # the watcher keeps polling; a read error ends nothing
@@ -402,7 +475,7 @@ async def hold(runner: "PhaseRunner", phase: ResolvedPhase, pass_: Pass, slots: 
                 handled.add(msg_id)
                 if orch.user_question_answered(question.item_id):
                     answered.setdefault(question.agent, []).append((question, channel))
-            if answered:
+            if answered and not stopped():
                 await asyncio.gather(
                     *(
                         _answer_turn(runner, phase, pass_, askers[agent], items)

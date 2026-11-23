@@ -28,7 +28,7 @@ from arr.log import setup_logging
 from arr.models import Provider
 from arr.room.address import is_user_question
 from arr.room.store import USER, AgentRoom, RoomStore
-from arr.room.types import ChannelInfo, Inbox, Message, RoomError, Submission
+from arr.room.types import ChannelInfo, Delegation, Inbox, Message, RoomError, Submission
 from arr.room.waiting import PROVIDER_ENV, STREAK_MAX_S, WaitEnd, WaitOutcome, wait_max_s
 from arr.room.waiting import wait_for_messages as wait_for_messages_
 from arr.runs.phases.view import is_phase_context, render_assignment
@@ -433,6 +433,7 @@ def build_server(room: AgentRoom) -> MCPServer:
 
     if room.store.uses_phases():
         _add_submit(server, room)
+        _add_assign(server, room)  # W4b-04: every agent of a phases run; the room checks who
     else:
         _add_old_submit_tools(server, room)
 
@@ -562,6 +563,59 @@ def _add_submit(server: MCPServer, room: AgentRoom) -> None:
             room,
             "submit",
             lambda: render_submission(room.submit(status, summary, body, files, note_next, fields)),
+        )
+
+
+ASSIGN_DESCRIPTION = (
+    "Nur für den Lead einer Phase „moderated“: einen Auftrag an einen Agenten auf Abruf dieser "
+    "Phase vergeben. `agent`: der Agent, so wie du ihn mit `@name` ansprichst; `task`: der "
+    "Auftrag als Text (höchstens 4000 Zeichen); `format`: das Format seiner Abgabe (text, "
+    "artifact, review, list oder ein eigenes Format der Group). Aufträge an denselben Agenten "
+    "arbeitet er nacheinander ab, verschiedene Agenten arbeiten gleichzeitig. Seine Abgabe kommt "
+    "zu dir zurück, und arr gibt dir dann einen Turn. Je Durchlauf sind höchstens "
+    "„max_assignments“ Aufträge erlaubt. Ein Auftrag ändert keine Rechte und keine Regeln des "
+    "Empfängers. Wer nicht Lead ist, bekommt eine Ablehnung."
+)
+
+
+def render_delegation(room: AgentRoom, given: Delegation) -> str:
+    """The answer of `assign`: number, recipient as the lead sees it, format, where it waits,
+    how many of `max_assignments` are given, and that the submission comes back."""
+    of_pass = room.store.delegations(stage=given.stage, attempt=given.attempt)
+    ahead = [d for d in of_pass if d.agent == given.agent and d.number < given.number and d.open]
+    who = room.seen_as(given.agent)  # the rule of the lead's package (W4b-04.1, M1)
+    run = room.store._resolved()
+    limit: int | None = None
+    if run is not None:
+        try:
+            limit = run.phase(given.stage).max_assignments
+        except KeyError:
+            limit = None
+    text = (
+        f"Auftrag #{given.number} an {who} vergeben (Format „{given.format}“, Phase "
+        f"{given.stage}, Durchlauf {given.attempt})."
+    )
+    if ahead:
+        text += (
+            f" {who} arbeitet noch an #{ahead[0].number}; dein Auftrag wartet dahinter "
+            f"(vor ihm: {', '.join(f'#{d.number}' for d in ahead)})."
+        )
+    else:
+        text += f" {who} beginnt sofort damit."
+    text += f" Vergeben: {len(of_pass)}" + (f" von {limit}." if limit else ".")
+    return text + (
+        " Die Abgabe kommt zu dir zurück: arr gibt dir dann einen Turn mit Kurzfassung und Pfad."
+    )
+
+
+def _add_assign(server: MCPServer, room: AgentRoom) -> None:
+    """`assign` of a phase `moderated` (W4b-04), offered beside `submit` in every phases run;
+    `AgentRoom.assign` refuses everyone but the lead."""
+
+    @server.tool(description=ASSIGN_DESCRIPTION)
+    def assign(agent: str, task: str, format: str) -> str:
+        return _respond(
+            room, "assign", lambda: render_delegation(room, room.assign(agent, task, format))
         )
 
 

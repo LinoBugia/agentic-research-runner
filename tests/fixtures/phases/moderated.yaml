@@ -1,0 +1,29 @@
+# A phase `moderated` (W4b-04, docs/10 §4.5): a coordinator gives assignments to two agents on
+# standby and hands in; a writer sums up. Test data for W4b-04 (A24) and later orders (W4b-06a,
+# W4b-08).
+kind: research-group
+version: 1
+topology: phases
+
+agents:
+  - { id: coordinator, role: roles/coordinator.md }
+  - { id: helper,      role: roles/helper.md, count: 2 }
+  - { id: writer,      role: roles/writer.md }
+
+channels:
+  - { name: team, members: [coordinator, helper-*] }
+
+phases:
+  - name: zerlegung
+    topology: moderated
+    max_assignments: 4
+    actions:
+      coordinator: { task: tasks/zerlegen.md, submission: { format: text } }
+    standby: [helper-*]                # Agenten auf Abruf: sie bekommen Aufträge des Leads
+    channels: [team]
+    gate: { type: done }
+
+  - name: zusammenfassung
+    topology: solo
+    actions:
+      writer: { task: tasks/zusammenfassen.md, submission: { format: text } }

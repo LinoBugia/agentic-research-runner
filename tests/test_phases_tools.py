@@ -21,6 +21,7 @@ PHASES_TOOLS = {
     "get_attachment",
     "set_status",
     "submit",
+    "assign",  # W4b-04
     "get_assignment",
     "wait_for_messages",
     "wait_until",

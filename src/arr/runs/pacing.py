@@ -35,6 +35,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -1089,8 +1090,39 @@ class _EventDiscussion:
         return self.outcome
 
 
-_QUOTES = str.maketrans({"„": "'", "“": "'", "”": "'", '"': "'"})
-"""Quotation marks in a summary become `'`: only arr's „…“ delimit it."""
+_QUOTE_LOOKALIKES = (
+    '„‚"＂″‶〝〞〟ˮ「」『』'
+    "\u275b\u275c\u275d\u275e\U0001f676\U0001f677\U0001f678\u2e42\uff62\uff63"
+    "\ufe41\ufe42\ufe43\ufe44\u05f4\u02ba\u3003"
+)
+"""Quotation marks the rule below may miss: low-9 marks, the ASCII and full-width double
+quote, primes, the look-alikes of “, the corner brackets, ornaments, Hebrew gershayim, the
+modifier double prime and the ditto mark (W4b-04 NR3, W4b-04.1 N2)."""
+_QUOTE_NAMES = ("QUOTATION MARK", "CORNER BRACKET")
+_QUOTE_RANGES = (range(0x10000), range(0x1F000, 0x1FC00))
+"""The Basic Multilingual Plane and the symbols and ornaments (U+1F000–U+1FBFF): every
+quotation mark of Unicode lies there."""
+
+
+def _is_quote(char: str) -> bool:
+    if unicodedata.category(char) in ("Pi", "Pf"):
+        return True
+    name = unicodedata.name(char, "")
+    return any(part in name for part in _QUOTE_NAMES)
+
+
+_QUOTES = str.maketrans(
+    {
+        char: "'"
+        for char in {
+            *(chr(c) for r in _QUOTE_RANGES for c in r if _is_quote(chr(c))),
+            *_QUOTE_LOOKALIKES,
+        }
+    }
+)
+"""Quotation marks in a summary become `'`: every character of the Unicode categories `Pi`
+and `Pf` (« » ‘ ’ “ ” ‹ › …), every one whose name contains „QUOTATION MARK“ or „CORNER
+BRACKET“ and the look-alikes above, so only arr's „…“ delimit it."""
 
 SUBMISSION_SUMMARY_CHARS = MAX_SUMMARY_CHARS
 """How much of the summary of a submission the wake-up of `until_result_from` shows (W4b-03)."""
