@@ -79,7 +79,12 @@ from arr.runs.secret_scan import (
     record_scan,
     scan_run_dir,
 )
-from arr.runs.topologies import check_topology, topology_for
+from arr.runs.topology import (
+    GROUP_SOURCE,
+    check_topology,
+    refuse_old_topology,
+    topology_for,
+)
 from arr.settings import app_dir
 from arr.skills import discover_skills
 from arr.workfolder import (
@@ -340,12 +345,18 @@ def plan_run_input(
 ) -> Launch:
     """Check a run given as data (the service's `start_run`, W3-01) like `plan_launch`.
 
-    `arr.yaml` → group skill → project → resolve with `params` → `check_topology` →
-    `profiles.yaml`; nothing is created. `source` names the origin in error messages.
+    `arr.yaml` → group skill → an old topology of `run.yaml` or the group is refused with
+    its message, before the resolution can hide it (W4b-06b §6.1) → project → resolve with
+    `params` → `check_topology` → `profiles.yaml`; nothing is created. `source` names the
+    origin in error messages.
     """
     root = Path(workfolder).expanduser().absolute()
     settings = load_workfolder_settings(root)
+    if run_input.topology is not None:
+        refuse_old_topology(run_input.topology.kind, source=source)
     group_spec = _group_spec(root, run_input, source)
+    if group_spec is not None:
+        refuse_old_topology(group_spec.topology, path="topology", source=GROUP_SOURCE)
     project = project_dir(root, run_input.project)
     resolved = resolve_run(
         run_input,

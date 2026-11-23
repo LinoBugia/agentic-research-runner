@@ -1,9 +1,9 @@
 """W4b-03 §6.5: the topology `chat` with FakeBackend agents and the real RunManager,
 Orchestrator and room (A12 the discussion as `discuss` today, A13 submissions, A16 texts).
 
-The comparison runs the same script once through the old topology `roundtable` (`discuss` with
-`set_status done`) and once through a phase `chat` (`submit`): the turns of the discussion
-begin in the same order and it ends for the same reason."""
+A12 ran the same script through the old topology `roundtable` (`discuss` with `set_status
+done`) and through a phase `chat` (`submit`) until W4b-06b; since then the phase `chat` is held
+to the order of turns and the reason of the end both gave then."""
 
 from collections.abc import Callable
 from pathlib import Path
@@ -25,11 +25,10 @@ from phases_kit import (
 from run_kit import channel, eventually, make_manager, make_workfolder, room, turns
 
 from arr.models import RunStatus
-from arr.runs.topologies import roundtable
 
 D = ["d1", "d2", "d3"]
 DONE = {"do": "DONE"}
-"""Marker in a script: `set_status done` in the old run, `submit` in the phase `chat`."""
+"""Marker in a script: `submit` in the phase `chat` (`set_status done` in the old run)."""
 
 
 @pytest.fixture
@@ -59,10 +58,6 @@ def discussion(mgr: Any) -> tuple[list[str], dict[str, Any]]:
     raise AssertionError("no discussion_end")
 
 
-def old_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [room("set_status", status="done") if s is DONE else s for s in steps]
-
-
 def scripted(script: list[list[dict[str, Any]]]) -> Callable[[TurnView], list[dict[str, Any]]]:
     """A policy that plays `script` turn by turn (DONE → `submit`); afterwards it hands in."""
     left = list(script)
@@ -87,22 +82,12 @@ async def compare(
     rounds: int,
     helper: Any = None,
     **channel_extra: Any,
-) -> tuple[tuple[list[str], dict[str, Any]], tuple[list[str], dict[str, Any]], Any]:
-    """Run `scripts` through `roundtable` and through a phase `chat`; returns both
-    discussions and the phases manager."""
+) -> tuple[tuple[list[str], dict[str, Any]], Any]:
+    """Run `scripts` through a phase `chat`; returns its discussion and the manager. Until
+    W4b-06b the same scripts ran through the old `roundtable` as well, and both discussions
+    were compared; the values asserted below are those both gave (`discuss` of `main`)."""
     members = list(scripts)
     chat = channel("runde", members, mode=mode, **channel_extra)
-
-    old = make_manager(
-        make_workfolder(tmp / "alt"),
-        roundtable.run,
-        {a: turns(*[old_steps(t) for t in s]) for a, s in scripts.items()},
-        groupchats=[chat],
-        run_extra={"topology": {"kind": "roundtable", "params": {"rounds": rounds}}},
-    )
-    status = await run_with(old, helper) if helper else await run(old)
-    assert status is RunStatus.DONE, errors(old)
-
     phase = {**parallel("diskussion", members), "topology": "chat", "channels": ["runde"]}
     phase["rounds"] = rounds
     new, _log = manager(
@@ -112,7 +97,7 @@ async def compare(
     )
     status = await run_with(new, helper) if helper else await run(new)
     assert status is RunStatus.DONE, errors(new)
-    return discussion(old), discussion(new), new
+    return discussion(new), new
 
 
 # --------------------------------------------------------------------------------------------
@@ -127,13 +112,13 @@ async def test_a12_rounds_end_after_the_last_round_like_discuss(tmp_path: Path, 
         "d2": [[say("runde", "Einwand 2.", kind="objection")], [say("runde", "Weiter 2.")]],
         "d3": [[say("runde", "Idee 3.", kind="idea")], [say("runde", "Weiter 3.")]],
     }
-    old, new, mgr = await compare(tmp_path, scripts, mode="rounds", rounds=2, order=order)
+    new, mgr = await compare(tmp_path, scripts, mode="rounds", rounds=2, order=order)
     if order == "sequential":
-        assert old[0] == new[0] == D + D
+        assert new[0] == D + D
     else:
-        assert sorted(old[0][:3]) == sorted(new[0][:3]) == D and len(new[0]) == 6
-    assert old[1]["ended_by"] == new[1]["ended_by"] == "rounds"
-    assert old[1]["rounds"] == new[1]["rounds"] == 2
+        assert sorted(new[0][:3]) == D and len(new[0]) == 6
+    assert new[1]["ended_by"] == "rounds"
+    assert new[1]["rounds"] == 2
     asked = [v for v in of_kind(mgr, "turn") if v["stage"] == "diskussion"]
     assert len(asked) == 9, "after the discussion each of the three gets its one follow-up"
 
@@ -149,14 +134,14 @@ async def test_a12_all_passed_and_all_done_in_rounds_like_discuss(tmp_path: Path
             [room("post_message", channel="runde", body="", kind="pass")],
         ],
     }
-    old, new, _ = await compare(tmp_path / "a", passed, mode="rounds", rounds=3, order="sequential")
-    assert old[0] == new[0] == ["d1", "d2", "d1", "d2"]
-    assert old[1]["ended_by"] == new[1]["ended_by"] == "all_passed"
+    new, _ = await compare(tmp_path / "a", passed, mode="rounds", rounds=3, order="sequential")
+    assert new[0] == ["d1", "d2", "d1", "d2"]
+    assert new[1]["ended_by"] == "all_passed"
 
     done = {"d1": [[say("runde", "Fertig."), DONE]], "d2": [[DONE]]}
-    old, new, mgr = await compare(tmp_path / "b", done, mode="rounds", rounds=3, order="sequential")
-    assert old[0] == new[0] == ["d1", "d2"]
-    assert old[1]["ended_by"] == new[1]["ended_by"] == "all_done"
+    new, mgr = await compare(tmp_path / "b", done, mode="rounds", rounds=3, order="sequential")
+    assert new[0] == ["d1", "d2"]
+    assert new[1]["ended_by"] == "all_done"
     assert [s.agent for s in mgr.room.submissions()] == ["d1", "d2"]
 
 
@@ -186,12 +171,12 @@ async def test_a12_event_kick_off_wake_ups_and_l15_like_discuss(tmp_path: Path) 
         )
         release(mgr, "d1", "frage")
 
-    old, new, mgr = await compare(
+    new, mgr = await compare(
         tmp_path, scripts, mode="event", rounds=2, helper=helper, idle_after_s=30
     )
-    assert old[0] == new[0] == ["d1", "d2", "d3", "d2", "d1"]
-    assert old[1]["ended_by"] == new[1]["ended_by"] == "all_done"
-    assert old[1]["wakeups"] == new[1]["wakeups"] == {"d2": 1, "d1": 1}
+    assert new[0] == ["d1", "d2", "d3", "d2", "d1"]
+    assert new[1]["ended_by"] == "all_done"
+    assert new[1]["wakeups"] == {"d2": 1, "d1": 1}
     wakes = [(d["agent"], d["reasons"]) for d in of_kind(mgr, "wake")]
     assert wakes == [("d2", ["question"]), ("d1", ["reply"])]
 
@@ -200,10 +185,10 @@ async def test_a12_event_ends_quiet_and_after_its_idle_rounds(tmp_path: Path) ->
     """Nobody writes and nobody finishes: idle rounds, then `quiet` or `rounds` – whichever
     the old `discuss` reaches, the phase `chat` reaches as well (no durations compared)."""
     silent = {a: [[{"do": "text", "text": "…"}]] * 4 for a in ("d1", "d2")}
-    old, new, mgr = await compare(
+    new, mgr = await compare(
         tmp_path, silent, mode="event", rounds=1, idle_after_s=0.05, quiet_after_s=0.05
     )
-    assert old[1]["ended_by"] in ("quiet", "rounds") and new[1]["ended_by"] in ("quiet", "rounds")
+    assert new[1]["ended_by"] in ("quiet", "rounds")
     assert [d["number"] for d in of_kind(mgr, "round")] == [1]
     [gate] = of_kind(mgr, "checkpoint", phase="gate")
     assert gate["missing"] == [], "both handed in when asked once after the discussion"

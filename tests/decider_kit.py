@@ -285,7 +285,8 @@ def asking_run(
     timeout: str = "20m",
 ) -> AskingRun:
     """A RunManager whose agents ask `want` at every turn. `policies` (phase runs) or `scripts`
-    (old topologies) write the turns; `decider` is the run's `approvals.decider`."""
+    (a topology function of the test) write the turns; `decider` is the run's
+    `approvals.decider`."""
     model = model or FakeModel()
     user = user or User()
     user.model = model
@@ -351,7 +352,7 @@ MAIN_LINES = Path(__file__).parent / "fixtures" / "decider" / "main_lines.json"
 """Normalized lines of `comparison_run` as `main` at 5333531 (before W4b-09) wrote them."""
 
 DECIDERS = ("user", "gatekeeper", "gatekeeper_then_user")
-KINDS = ("phases", "solo")
+KINDS = ("phases",)
 
 
 def outside(agent: str) -> PermissionRequest:
@@ -388,57 +389,43 @@ def normalized(run_dir: Path) -> dict[str, list[Any]]:
 
 async def comparison_run(workfolder: Path, arr_home: Path, decider: str, kind: str) -> Any:
     """A run without `decider` at agents and phases whose agent asks in every turn: inside the
-    mandate in the first phase (and in `solo`), outside in the second. Returns its lines."""
+    mandate in the first phase, outside in the second. Returns its lines. Only `phases` since
+    W4b-06b (the old topology `solo` is gone)."""
     from phases_kit import hand_in, solo
 
     from arr.runs.phases import runner as phase_runner
-    from arr.runs.topologies import solo as solo_topology
 
+    assert kind == "phases", kind
     prepare_workfolder(workfolder, arr_home)
-    if kind == "phases":
-        data: dict[str, Any] = {
-            "agents": [{"id": "p"}, {"id": "r1"}],
-            "topology": {"kind": "phases"},
-            "phases": [
-                {
-                    **solo("erkunden", "p"),
-                    "gate": {
-                        "type": "judge",
-                        "raters": ["r1"],
-                        "action": {
-                            "task": "tasks/bewerten.md",
-                            "submission": {"format": "rating"},
-                            "turns": 1,
-                        },
-                        "rule": "rank",
-                        "routes": {"ranked": "next"},
+    data: dict[str, Any] = {
+        "agents": [{"id": "p"}, {"id": "r1"}],
+        "topology": {"kind": "phases"},
+        "phases": [
+            {
+                **solo("erkunden", "p"),
+                "gate": {
+                    "type": "judge",
+                    "raters": ["r1"],
+                    "action": {
+                        "task": "tasks/bewerten.md",
+                        "submission": {"format": "rating"},
+                        "turns": 1,
                     },
+                    "rule": "rank",
+                    "routes": {"ranked": "next"},
                 },
-                solo("beweisen", "p"),
-            ],
-        }
-        policies = {"p": hand_in, "r1": hand_in}
-        run = asking_run(
-            workfolder,
-            data,
-            want=lambda a, s: inside(a) if s == "erkunden" else outside(a),
-            decider=decider,
-            topology=phase_runner.run,
-            policies=policies,
-        )
-    else:
-        data = {
-            "agents": [{"id": "p"}],
-            "topology": {"kind": "solo", "params": {"require_result": False, "max_turns": 2}},
-        }
-        script = {"turns": [{"steps": [{"do": "text", "text": "ok"}]}], "repeat_last": True}
-        run = asking_run(
-            workfolder,
-            data,
-            want=lambda a, _s: inside(a),
-            decider=decider,
-            topology=solo_topology.run,
-            scripts={"p": script},
-        )
+            },
+            solo("beweisen", "p"),
+        ],
+    }
+    policies = {"p": hand_in, "r1": hand_in}
+    run = asking_run(
+        workfolder,
+        data,
+        want=lambda a, s: inside(a) if s == "erkunden" else outside(a),
+        decider=decider,
+        topology=phase_runner.run,
+        policies=policies,
+    )
     status = await asyncio.wait_for(run.mgr.run(), 60)
     return status, normalized(run.mgr.run_dir), run

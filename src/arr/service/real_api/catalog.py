@@ -9,7 +9,8 @@ the `.mcp.json` check looks at the file only.
 
 Every skill is checked when it is listed (`check_skill`): SKILL.md, `group.yaml` (YAML,
 parameters, placeholders, patterns, resolution with the parameters' defaults), role files in
-the skill, skills of the agents and `check_topology`. Every problem names file, line where
+the skill, skills of the agents and the phase plan (`arr.plan.check`). A group of an old
+topology gets one message, `old_topology_message` (W4b-06b). Every problem names file, line where
 known, and what to do; a skill with problems cannot be started. Writing goes through
 `skill_files` (no links, atomic, conflicts), and the skill is checked again right after.
 """
@@ -46,7 +47,7 @@ from arr.resolve import (
     resolve_run,
     validate_model,
 )
-from arr.runs.topologies import check_topology
+from arr.runs.topology import refuse_old_topology
 from arr.service.api_models import (
     Action,
     ApiException,
@@ -380,11 +381,9 @@ def _check_tasks(
 def _check_resolved(
     spec: GroupSpec, resolved: ResolvedRun, folder: Path, catalog: SkillCatalog, out: _Issues
 ) -> None:
-    """Roles in the skill, skills of the agents and the topology, for the resolved defaults.
-
-    A group with `topology: phases` gets the messages of `arr.plan.check.check` (hints as
-    warnings) and the check of its assignment files instead of `check_topology` (W4b-02a).
-    """
+    """Roles in the skill, skills of the agents and the phases, for the resolved defaults:
+    the messages of `arr.plan.check.check` (hints as warnings) and the check of the assignment
+    files (W4b-02a). An old topology never gets here (`_check_group`, W4b-06b)."""
     roles_done: set[str] = set()
     skills_done: set[str] = set()
     for agent in resolved.agents:
@@ -409,18 +408,10 @@ def _check_resolved(
         base = f"agents[{index}].skills" if own.skills is not None else "defaults.skills"
         _found, issues = check_research_skills(catalog, agent.skills, base)
         out.extend(issues)
-    if resolved.topology.kind is TopologyKind.PHASES:
-        result = check_plan(resolved)
-        out.extend(result.errors)
-        out.extend(result.warnings, Severity.WARNING)
-        _check_tasks(spec, folder, out, resolved)
-        return
-    try:
-        check_topology(resolved)
-    except ConfigError as exc:
-        out.extend(exc.issues)
-    except ArrError as exc:
-        out.add("topology", exc.message)
+    result = check_plan(resolved)
+    out.extend(result.errors)
+    out.extend(result.warnings, Severity.WARNING)
+    _check_tasks(spec, folder, out, resolved)
 
 
 def blocking(issues: Iterable[SkillIssue]) -> list[SkillIssue]:
@@ -466,10 +457,10 @@ def _check_group(
 ) -> tuple[GroupSpec | None, list[SkillIssue]]:
     """Check the `group.yaml` of a skill folder; the spec (if it loads) and its issues.
 
-    Order: read (regular file, at most 256 KB, UTF-8) → YAML → fields → placeholders and
-    `when` → resolution with the parameters' defaults (patterns, IDs, stages, raters) → roles,
-    skills of the agents, topology. Stops at the first stage that fails, because later stages
-    need its result.
+    Order: read (regular file, at most 256 KB, UTF-8) → YAML → fields → an old topology gets
+    its message and nothing more (W4b-06b) → placeholders and `when` → resolution with the
+    parameters' defaults → roles, skills of the agents, phases. Stops at the first stage that
+    fails, because later stages need its result.
     """
     file = folder / GROUP_FILE
     try:
@@ -487,6 +478,15 @@ def _check_group(
     out = _Issues(GROUP_FILE, lines)
     try:
         spec = validate_model(GroupSpec, data, source=GROUP_FILE, lines=lines)
+    except ConfigError as exc:
+        out.extend(exc.issues)
+        return None, out.items
+    try:
+        refuse_old_topology(spec.topology, path="topology", source=GROUP_FILE)
+    except ConfigError as exc:  # one message, no further checks of an old group (W4b-06b)
+        out.extend(exc.issues)
+        return spec, out.items
+    try:
         check_group_spec(spec, source=GROUP_FILE)
     except ConfigError as exc:
         out.extend(exc.issues)

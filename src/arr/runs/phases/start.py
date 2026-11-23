@@ -17,13 +17,13 @@ version of the runner cannot run yet, each with its path and a German sentence:
 
 `check_topology` calls it with the `Orchestrator` before anything is created; the runner calls
 it again at its start with the class of its context (`ensure_valid`), in case the check was
-skipped.
+skipped. `SOURCE` and `require_task` came here from `arr.runs.topologies` (W4b-06b).
 """
 
 import re
 from collections.abc import Sequence
 
-from arr.errors import ConfigIssue
+from arr.errors import ArrError, ConfigIssue
 from arr.models import ContextMode, FolderMode, PhaseTopology, ResolvedRun
 from arr.plan.check import check
 from arr.runs.context import RunContext
@@ -32,11 +32,16 @@ __all__ = [
     "DELEGATION_METHODS",
     "NOT_YET",
     "READY",
+    "SOURCE",
     "STANDBY_READY",
     "implements",
     "merge_issues",
+    "require_task",
     "start_issues",
 ]
+
+SOURCE = "run.yaml"
+"""The source named in the `ConfigError` of the start checks."""
 
 NOT_YET: dict[PhaseTopology, str] = {}
 """Topologies of a phase this version refuses at the start (empty since W4b-04)."""
@@ -62,6 +67,17 @@ def implements(context_type: type, method: str) -> bool:
     """True if `context_type` has its own `method`, not the default of `RunContext` that
     raises `NotImplementedError`."""
     return getattr(context_type, method, None) is not getattr(RunContext, method)
+
+
+def require_task(ctx: RunContext) -> str:
+    """The task text of the run; `ArrError` if it is empty, before the first turn starts."""
+    task = (ctx.config.task or "").strip()
+    if not task:
+        raise ArrError(
+            "Der Run hat keinen Auftrag: task.md ist leer. Gib die Aufgabe mit „task:“ oder "
+            "„task_file:“ in der run.yaml an."
+        )
+    return task
 
 
 _QUOTED = re.compile(r"„([^“]*)“")

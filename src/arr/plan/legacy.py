@@ -47,7 +47,9 @@ def old_topology_message(kind: TopologyKind | str) -> str | None:
     if skill:
         where = (
             f" Vorlage ist der Start-Skill „{skill}“ ({phases}): Lege ihn unter „Skills“ neu "
-            "an oder übernimm dessen group.yaml und trage deine Parameter ein."
+            "an oder übernimm dessen group.yaml und trage deine Parameter ein. Hast du den "
+            "Start-Skill nie geändert, bringt „Start-Skills aktualisieren“ auf der Skills-Seite "
+            "(oder „arr skills update“) ihn auf die neue Fassung."
         )
     else:
         where = (

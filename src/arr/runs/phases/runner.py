@@ -67,7 +67,7 @@ from arr.runs.phases.inputs import (
     item,
     shown,
 )
-from arr.runs.phases.start import start_issues
+from arr.runs.phases.start import SOURCE, require_task, start_issues
 from arr.runs.phases.state import (
     HOW_NORMAL,
     HOW_RETRY,
@@ -81,7 +81,6 @@ from arr.runs.phases.tasks import KIND_GATE, KIND_WORK, Tasks, load_tasks
 from arr.runs.phases.text import MAX_SUMMARY_CHARS, MAX_TITLE_CHARS, fit_package, line
 from arr.runs.phases.view import ask_again_prompt, continue_prompt, render_assignment
 from arr.runs.phases.wake import Waker, hold
-from arr.runs.topologies import SOURCE, require_task
 
 __all__ = ["OPTIONS", "PASSES", "WAIT_POLL_S", "PhaseRunner", "check", "run"]
 

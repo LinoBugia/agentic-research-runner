@@ -125,19 +125,10 @@ async def _runs(workfolder: Path) -> list[str]:
     )
     await run(mgr)
     out.append(mgr.run_dir.name)
-    # an old run (topology `solo`) to compare with
-    from run_kit import make_manager, room, turns
+    # an old run (topology `solo`, written by `main` before W4b-06b) to compare with
+    from old_runs_kit import SOLO, restore
 
-    from arr.runs.topologies import solo as old_solo
-
-    mgr = make_manager(
-        workfolder,
-        old_solo.run,
-        {"a": turns([room("submit_result", kind="proof", title="Beweis", body="Fertig.")])},
-        run_extra={"topology": {"kind": "solo"}},
-    )
-    await mgr.run()
-    out.append(mgr.run_dir.name)
+    out.append(restore(workfolder, SOLO).name)
     return out
 
 

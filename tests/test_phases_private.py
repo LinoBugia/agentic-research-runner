@@ -24,7 +24,7 @@ from phases_kit import (
     say,
     solo,
 )
-from run_kit import eventually, make_manager, make_workfolder, room, turns, write_profiles
+from run_kit import eventually, make_workfolder, write_profiles
 
 from arr.backends.codex_config import filesystem_entries
 from arr.errors import ArrError
@@ -89,20 +89,6 @@ async def test_a2_every_agent_gets_its_private_channel_before_the_first_turn(
     opened = [i for i, (k, d) in enumerate(entries(mgr)) if d.get("by") == "private"]
     assert len(opened) == 3 and max(opened) < first_turn
     assert "user.a" not in (mgr.run_dir / "run.yaml").read_text("utf-8")
-
-
-async def test_a2_the_old_topologies_get_no_private_channel(workfolder: Path) -> None:
-    from arr.runs.topologies import solo as old_solo
-
-    mgr = make_manager(
-        workfolder,
-        old_solo.run,
-        {"a": turns([room("submit_result", kind="proof", title="T", body="B")])},
-        run_extra={"topology": {"kind": "solo"}},
-    )
-    assert await mgr.run() is RunStatus.DONE, errors(mgr)
-    assert mgr.room.channels() == []
-    assert not [d for _, d in entries(mgr, "channel_open") if d.get("by") == "private"]
 
 
 async def test_a2_the_name_is_a_safe_folder_and_file_name(workfolder: Path) -> None:

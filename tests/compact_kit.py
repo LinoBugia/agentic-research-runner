@@ -128,7 +128,7 @@ def layered_manager(
         group_defaults = {**defaults, **({"compact": compact} if layer == "group defaults" else {})}
         group = validate_model(
             GroupSpec,
-            {"topology": "solo", "defaults": group_defaults, "agents": [agent]},
+            {"topology": "phases", "defaults": group_defaults, "agents": [agent]},
             source="group.yaml",
         )
         run_input = make_run_input([], defaults=defaults)

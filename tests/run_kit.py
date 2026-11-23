@@ -67,7 +67,7 @@ def make_run_input(
     data: dict[str, Any] = {
         "project": "demo",
         "task": "Teste arr.",
-        "topology": {"kind": "solo"},
+        "topology": {"kind": "phases"},
         "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
         "agents": agents,
         "groupchats": groupchats or [],

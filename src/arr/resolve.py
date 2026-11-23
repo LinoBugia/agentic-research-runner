@@ -1700,8 +1700,8 @@ def resolve_run(
     if kind is None:
         raise ConfigError.single(
             "topology",
-            "Es fehlt „topology“. Gib z. B. „topology: {kind: solo}“ an oder starte den Run "
-            "aus einem Group-Skill.",
+            "Es fehlt „topology“. Gib z. B. „topology: {kind: phases}“ mit einer Liste "
+            "„phases“ an oder starte den Run aus einem Group-Skill.",
             source=RUN_SOURCE,
         )
 
