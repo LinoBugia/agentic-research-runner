@@ -52,7 +52,7 @@ async def test_inputs_of_a_finished_run(wf: Path) -> None:
     finally:
         await api.close()
     assert inputs.available and inputs.name == "Erster Versuch"
-    assert (inputs.project, inputs.skill, inputs.topology.value) == ("demo", "runde", "roundtable")
+    assert (inputs.project, inputs.skill, inputs.topology.value) == ("demo", "runde", "phases")
     assert inputs.task_md == "# Aufgabe\n\nZwei Ideen prüfen."
     rounds = next(p for p in inputs.params if p.name == "rounds")
     assert (rounds.value, rounds.default, rounds.doc, rounds.changed) == (1, 2, "Runden", True)

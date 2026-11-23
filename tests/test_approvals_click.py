@@ -54,7 +54,11 @@ def wf(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     arr_home.mkdir(parents=True, exist_ok=True)
     write_profiles(arr_home, {"fake-auth": "claude_oauth", "fake-codex": "codex_chatgpt"})
     monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
-    return make_workfolder(tmp_path)
+    workfolder = make_workfolder(tmp_path)
+    tasks = workfolder / "projects" / "demo" / "tasks"  # the phase `chat` of `run_input`
+    tasks.mkdir(parents=True, exist_ok=True)
+    (tasks / "runde.md").write_text("Auftrag runde.\n", "utf-8")
+    return workfolder
 
 
 def bash(run_id: str, command: str, agent: str = "a", reason: str | None = None) -> Any:
@@ -622,6 +626,8 @@ async def test_the_inbox_stays_the_source_after_a_workfolder_switch(
     monkeypatch.setattr(Client, "instances", {})  # pages left by GUI tests hang on closed loops
     (tmp_path / "zweiter").mkdir()
     other = make_workfolder(tmp_path / "zweiter")
+    (other / "projects" / "demo" / "tasks").mkdir()
+    (other / "projects" / "demo" / "tasks" / "runde.md").write_text("Auftrag runde.\n", "utf-8")
     async with Service(wf, {"a": asking(HOST)}) as svc:
         await svc.api.select_workfolder(WorkfolderRequest(path=str(other)))
         assert svc.api.state.workfolder == other
