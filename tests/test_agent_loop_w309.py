@@ -22,8 +22,10 @@ from run_kit import (
     log_entries,
     make_workfolder,
     post,
+    result_message,
     room,
     say,
+    seats_of,
     turns,
     wait,
 )
@@ -408,7 +410,7 @@ async def test_a1_l15_an_unread_direct_message_wakes_once_before_all_done(
 
 
 async def test_a2_until_result_from_wakes_at_the_result(workfolder: Path) -> None:
-    submit = room("submit_result", kind="lemma", title="Lemma B", body="Beweis durch Induktion.")
+    submit = result_message("main", "Lemma B", "Beweis durch Induktion.")
     scripts = {
         D1: turns([room("wait_until", minutes=0.5, until_result_from=D2)], [done()]),
         D2: turns([wait(0.6), submit]),
@@ -547,7 +549,7 @@ async def discuss_two_channels(
     results: list[Any] = []
 
     async def topology(ctx: Any) -> None:
-        results.append(await ctx.discuss("main", "Löst die Aufgabe."))
+        results.append(await ctx.discuss("main", seats=seats_of(ctx, "main")))
 
     manager = make_manager(
         workfolder,
@@ -595,7 +597,8 @@ async def test_w3_09_1_b2_wake_prompt_in_an_anonymous_channel_keeps_the_alias(
     workfolder: Path, monkeypatch: pytest.MonkeyPatch, naive: bool
 ) -> None:
     """S5b: D1 waits for „Mitglied B“; the wake-up prompt names „Mitglied B“, never the real
-    ID, also not in the path of the result file. Counter-check: with real IDs it leaks."""
+    ID (W4b-06b: the result is a message `result`, no file of the old `submit_result`).
+    Counter-check: with real IDs it leaks."""
     from arr.room.store import AgentRoom
 
     if naive:
@@ -603,15 +606,16 @@ async def test_w3_09_1_b2_wake_prompt_in_an_anonymous_channel_keeps_the_alias(
     (workfolder / "projects" / "demo" / "lemma.md").write_text("Beweis.\n", "utf-8")
     scripts = {
         D1: turns([room("wait_until", minutes=0.5, until_result_from="Mitglied B")], [done()]),
-        D2: turns([wait(0.5), room("submit_result", kind="lemma", title="Lemma",
-                                   path="lemma.md")]),
+        D2: turns([wait(0.5), result_message("main", "Lemma", "Beweis.")]),
     }  # fmt: skip
     manager, outcome, _ = await discuss(workfolder, scripts, {**IDLE, "anonymous": True})
     assert outcome.ended_by is DiscussionEnd.ALL_DONE
     woken = prompts_of(manager, D1)[1]
     assert (D2 in woken) is naive, "real_id_in_prompt"
     if not naive:
-        assert "Mitglied B hat ein Ergebnis abgegeben" in woken and "(als Datei)" in woken
+        assert (
+            "Mitglied B hat ein Ergebnis abgegeben" in woken and "Ergebnis von Mitglied B" in woken
+        )
 
 
 def test_w3_09_1_b2_m20_b5_the_real_id_of_a_hidden_member_is_refused(tmp_path: Path) -> None:
@@ -845,8 +849,8 @@ async def test_w3_09_1_b11_m47_an_older_result_does_not_wake(workfolder: Path) -
         D1: turns([say("bereit")],
                   [room("wait_until", minutes=0.5, until_result_from=D2)], [done()]),
         D2: turns([post("main", f"@{D3} stimmt das?", kind="question"),
-                   room("submit_result", kind="x", title="Alt", body="alt")],
-                  [wait(0.8), room("submit_result", kind="x", title="Neu", body="neu"), done()],
+                   result_message("main", "Alt", "alt")],
+                  [wait(0.8), result_message("main", "Neu", "neu"), done()],
                   repeat_last=True),
         D3: turns([wait(1.0), post("main", f"@{D1} {D2} rechnet noch."), wait(1.0),
                    post("main", "Ja.", kind="answer", reply_to=2), done()]),
@@ -884,7 +888,7 @@ async def test_w3_09_1_m06_a_result_resets_the_count_of_deadlines(workfolder: Pa
     scripts = {
         D1: turns([waits], [waits],
                   [room("wait_until", minutes=0.5, until_result_from=D2)], [done()]),
-        D2: turns([wait(1.5), room("submit_result", kind="x", title="T", body="B")]),
+        D2: turns([wait(1.5), result_message("main", "T", "B")]),
     }  # fmt: skip
     manager, outcome, _ = await discuss(workfolder, scripts, IDLE)
     reasons = [r for agent, rs in wakes(manager) if agent == D1 for r in rs]
@@ -927,7 +931,7 @@ async def test_w3_09_1_m29_stop_with_an_open_question(workfolder: Path) -> None:
 
     async def topology(ctx: Any) -> None:
         helper = asyncio.create_task(stop(ctx))
-        results.append(await ctx.discuss("main", "Los."))
+        results.append(await ctx.discuss("main", seats=seats_of(ctx, "main")))
         await helper
 
     from run_kit import channel, make_manager
@@ -993,7 +997,7 @@ async def test_w4_00_b14_a_result_in_the_waiting_turn_counts(
         monkeypatch.setattr(Orchestrator, "_result_since", lambda self, agent, wait: wait.since)
     scripts = {
         D1: turns([wait(0.8), room("wait_until", minutes=0.5, until_result_from=D2)], [done()]),
-        D2: turns([wait(0.3), room("submit_result", kind="x", title="Früh", body="früh"),
+        D2: turns([wait(0.3), result_message("main", "Früh", "früh"),
                    wait(1.5), done()]),
     }  # fmt: skip
     manager, outcome, took = await discuss(workfolder, scripts, IDLE)

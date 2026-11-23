@@ -49,8 +49,6 @@ def store(tmp_path: Path) -> RoomStore:
             GroupChatConfig(
                 name="seminar",
                 members=["critic", "explorer-1"],
-                mode="moderated",
-                moderator="critic",
             ),
             GroupChatConfig(name="private", members=["judge-1"]),
         ]
@@ -90,8 +88,8 @@ async def tool_names(store: RoomStore, agent: str) -> set[str]:
 
 
 async def test_tool_list_has_no_vote_and_no_moderator_tools(store: RoomStore) -> None:
-    """W4b-03 A15: the moderator of a channel gets the same tools as everybody; without
-    `run.yaml` every agent gets `submit` and `assign` (W4b-06b)."""
+    """W4b-03 A15: every agent gets the same tools (no moderator tools); without `run.yaml`
+    every agent gets `submit` and `assign` (W4b-06b)."""
     assert await tool_names(store, "explorer-1") == AGENT_TOOLS
     assert await tool_names(store, "critic") == AGENT_TOOLS
     assert not (await tool_names(store, "critic")) & REMOVED_TOOLS
@@ -112,7 +110,6 @@ async def test_all_agent_tools_over_mcp_with_footer(store: RoomStore) -> None:
 
         channels = await e1.ok("list_channels")
         assert "#main – event, offen, 1 Nachricht, 1 ungelesen" in channels
-        assert "Moderator: critic" in channels
 
         assert "[#1 orchestrator · note · #main] (angeheftet)" in await e1.ok("read_messages")
         assert e1.footers[-1] == "ungelesen: nichts"

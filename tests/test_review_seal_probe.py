@@ -1,12 +1,15 @@
 """Lock probe of W4-03 F4: no judge reads another judge's sealed review (A3).
 
-A review submitted in the sealed phase `pruefung` lies in `groupchats/sealed/` until arr
-releases it. The probe runs in the lab of the login guard (`login_guard_kit.py`): arr's real
+A review handed in with `submit` (format `review`, the file in `files`) in the sealed
+(isolated) phase `pruefung` lies in `groupchats/sealed/` until arr releases it (since W4b-06b
+with `submit`; until then the old `submit_result`). The probe runs in the lab of the login
+guard (`login_guard_kit.py`): arr's real
 profiles, the real Claude CLI against a fake model, `codex sandbox` with the agent's real
 permission map, a test `HOME`. It tries every way an agent has: the shell of both backends and
 Claude's Read tool, the latter even with an approval. Counter-checks show that each way works
 and that the probe sees the review as soon as the protection is gone: after the release
-(the file in `output/results/`, as without sealing) and with the policy rule switched off.
+(the file below `output/submissions/`, as without sealing) and with the policy rule switched
+off.
 """
 
 import asyncio
@@ -49,18 +52,27 @@ def seal_a_review(lab: Any) -> tuple[RoomStore, Path, str]:
     transcript = {"kind": "tool_call", "data": {"input": {"body": f"Urteil: major {bait}"}}}
     (work.parent / "transcript.jsonl").write_text(json.dumps(transcript) + "\n")
     store = RoomStore(run_dir)
-    store.seal("pruefung", None)
-    store.add_assignment(OTHER, 1, "Prüfe.", stage="pruefung")
-    result = store.for_agent(OTHER, work).submit_result("review", "Gutachten", path="review.md")
-    assert result.path and result.path.startswith("groupchats/sealed/")
-    assert not list((run_dir / "output" / "results").iterdir())
-    return store, run_dir / result.path, bait
+    store.seal("pruefung")
+    expect = {"submission": {"format": "review"}}
+    store.add_assignment(OTHER, 1, "Prüfe.", stage="pruefung", context=expect)
+    sub = store.for_agent(OTHER, work).submit(
+        "done",
+        "Gutachten",
+        files=["review.md"],
+        fields={"verdict": "major", "objections": []},
+    )
+    assert sub.sealed and sub.path.startswith("groupchats/sealed/")
+    assert not (run_dir / "output" / "submissions").exists() or not list(
+        (run_dir / "output" / "submissions").iterdir()
+    )
+    return store, run_dir / sub.path / "files" / "review.md", bait
 
 
 def released_path(store: RoomStore) -> Path:
-    [result] = store.release("pruefung")
-    assert result.path and result.path.startswith("output/results/")
-    return store.run_dir / result.path
+    store.release("pruefung")
+    [sub] = store.submissions()
+    assert not sub.sealed and sub.path.startswith("output/submissions/")
+    return store.run_dir / sub.path / "files" / "review.md"
 
 
 PROBE = (
@@ -169,7 +181,7 @@ def foreign_targets(lab: Any) -> dict[str, Path]:
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
 def test_h1_the_shell_reads_no_folder_of_another_agent(provider: str) -> None:
-    """The draft lies in the other judge's working copy before `submit_result`, the text of
+    """The draft lies in the other judge's working copy before `submit`, the text of
     the review in its transcript. Counter-check: the same way reads a file of the agent's own
     working folder."""
     import login_guard_kit as kit

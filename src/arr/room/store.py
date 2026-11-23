@@ -819,7 +819,14 @@ class RoomStore:
         aliases: Mapping[str, str | None],
         roles: Mapping[str, str],
     ) -> str:
-        """The generated brief with the conversation rules (one version since W4b-06b)."""
+        """The generated brief with the conversation rules (one version since W4b-06b). A
+        channel `moderated` is refused: it exists in no run since W4b-06b (`arr.plan.check`
+        refuses it with phases; a phase `moderated` replaces it)."""
+        if config.mode not in _MODE_TEXT:
+            raise ArrError(
+                f"Einen Kanal mit „mode: {config.mode.value}“ gibt es nicht (Kanal "
+                f"„{config.name}“). Nimm eine Phase mit „topology: moderated“."
+            )
         rules = CONVERSATION_RULES
         lines = [f"Steckbrief #{config.name}"]
         if config.purpose:

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from mcp_kit import Service, make_api, prepare_workfolder, result_data
+from old_runs_kit import add_result
 from run_kit import write_profiles
 from service_kit import make_run_folder, make_workfolder
 
@@ -60,11 +61,11 @@ async def test_read_results_names_the_copy_of_a_review_after_the_run(
 ) -> None:
     folder = make_run_folder(wf, agents=["judge-1", "author"], status=RunStatus.DONE)
     store = RoomStore.create(folder)
-    judge = store.for_agent("judge-1")
     long_review = "Urteil: major\n\n## Einwände\n\n- " + "Lücke bei n ≡ 2 (mod 5). " * 60
-    judge.submit_result(kind="review", title="Gutachten Runde 1", body=long_review)
-    judge.submit_result(kind="review", title="Gutachten Runde 2", body="Urteil: minor")
-    judge.submit_result(kind="review", title="Gutachten Runde 3", body="Urteil: accept")
+    # an old run (W4b-06b): the rows as the old `submit_result` wrote them
+    add_result(store, "judge-1", "review", "Gutachten Runde 1", long_review)
+    add_result(store, "judge-1", "review", "Gutachten Runde 2", "Urteil: minor")
+    add_result(store, "judge-1", "review", "Gutachten Runde 3", "Urteil: accept")
     results = folder / "output" / "results"
     results.mkdir(parents=True, exist_ok=True)
     (results / "001-judge-1-review.md").write_text(long_review, "utf-8")  # as finalize does

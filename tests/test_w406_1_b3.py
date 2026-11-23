@@ -23,6 +23,7 @@ from run_kit import (
     make_manager,
     make_workfolder,
     post,
+    seats_of,
     turns,
     wait,
 )
@@ -67,7 +68,7 @@ async def judges(
     async def topology(ctx: RunContext) -> None:
         assert isinstance(ctx, Orchestrator)
         helper = asyncio.create_task(during(ctx)) if during is not None else None
-        results.append(await ctx.discuss("judges", "Besprecht die Gutachten.", rounds=1))
+        results.append(await ctx.discuss("judges", rounds=1, seats=seats_of(ctx, "judges")))
         if helper is not None:
             await helper
 
@@ -220,7 +221,7 @@ async def test_a_question_in_another_channel_does_not_hold(
     results: list[DiscussionOutcome] = []
 
     async def topology(ctx: RunContext) -> None:
-        results.append(await ctx.discuss("judges", "Besprecht.", rounds=1))
+        results.append(await ctx.discuss("judges", rounds=1, seats=seats_of(ctx, "judges")))
 
     manager = make_manager(
         workfolder,
@@ -259,7 +260,7 @@ async def test_a_stop_while_the_phase_waits_ends_at_once(
     async def topology(ctx: RunContext) -> None:
         assert isinstance(ctx, Orchestrator)
         helper = asyncio.create_task(stopper(ctx))
-        results.append(await ctx.discuss("judges", "Besprecht.", rounds=1))
+        results.append(await ctx.discuss("judges", rounds=1, seats=seats_of(ctx, "judges")))
         await helper
 
     manager = make_manager(

@@ -260,11 +260,14 @@ async def test_a10_gate_user_from_the_card_to_the_next_pass(
 
 
 def test_a10_old_escalations_keep_their_texts() -> None:
-    from arr.service.real_api.approvals import _option_infos
+    """A decided escalation of an old run reads as on `main` (W4b-06b: its agent was named only
+    while it was open, which no old run is now; the snapshot of `old_runs_kit` holds the
+    whole item)."""
+    from arr.service.real_api.approvals import _old_option_infos
 
-    options = _option_infos(list(EscalationOption), "prover", "skizze")
+    options = _old_option_infos(list(EscalationOption), "skizze")
     assert [(o.label, o.help) for o in options] == [
-        ("Noch ein Versuch", "Die Nacharbeit wird um 1 erhöht. prover überarbeitet die Stufe."),
+        ("Noch ein Versuch", "Die Nacharbeit wird um 1 erhöht. Der Agent überarbeitet die Stufe."),
         ("Trotzdem weiter", "Der Run geht mit dem besten Versuch von „skizze“ weiter."),
         ("Run beenden", "Die Zusammenfassung wird erstellt, das Protokoll bleibt vollständig."),
     ]
@@ -488,19 +491,14 @@ def test_a9_labels_never_show_a_group_chat_for_a_private_channel() -> None:
 
 
 async def test_a9_old_runs_have_no_private_channels(workfolder: Path, api: Any) -> None:
-    from run_kit import make_manager, room, turns
+    """An old run (topology `solo`, written by `main` before W4b-06b) lists no channel and
+    has no phase plan (`tests/fixtures/old_runs/`)."""
+    from old_runs_kit import SOLO, restore
 
-    from arr.runs.topologies import solo as old_solo
-
-    mgr = make_manager(
-        workfolder,
-        old_solo.run,
-        {"a": turns([room("submit_result", kind="proof", title="T", body="B")])},
-        run_extra={"topology": {"kind": "solo"}},
-    )
-    assert await mgr.run() is RunStatus.DONE, errors(mgr)
-    assert await api.list_channels(mgr.run_dir.name) == []
-    detail = await api.get_run(mgr.run_dir.name)
+    run_id = restore(workfolder, SOLO).name
+    channels = await api.list_channels(run_id)
+    assert [c.name for c in channels] == ["main"] and not [c for c in channels if c.private_of]
+    detail = await api.get_run(run_id)
     assert detail.phase_plan is None and all(not s.passes for s in detail.stages)
 
 

@@ -1,23 +1,22 @@
-"""Helpers for W4b-06a: the start skills as phases against the old topologies (P6).
+"""Helpers for W4b-06a: the start skills as phases against the target flows of the old
+topologies (P6).
 
-Both sides run with FakeBackend agents whose turns a Python policy writes (`phases_kit`):
+The new side runs the real start skill from the package (`start_skill_files`), `solo` as
+`tests/fixtures/phases/solo.yaml`, with FakeBackend agents whose turns a Python policy writes
+(`phases_kit`); the policies hand in with `submit`. `new_flow` turns a finished run into the
+shape of the target flow („Soll-Ablauf“), already on the names of the phases: turns per
+section, submissions per phase and agent, named items and their versions, gate results and
+routes, the end, what the user has. `compare` checks it against
+`tests/fixtures/template_flows/<template>-<case>.json`, except the deviations it names
+(`Deviation`).
 
-- the **old side** runs the old `group.yaml` of a start skill from
-  `tests/fixtures/start_skills_old/<name>/` (the trees of `81523c5`) with its old topology,
-  `solo` as run data; its policies hand in with `submit_result`/`submit_rating`,
-- the **new side** runs the real start skill from the package (`start_skill_files`), `solo` as
-  `tests/fixtures/phases/solo.yaml`; its policies hand in with `submit`.
-
-`old_flow` and `new_flow` turn a finished run into the same shape, already on the names of the
-phases (the target flow, „Soll-Ablauf“): turns per section, submissions per phase and agent,
-named items and their versions, gate results and routes, the end, what the user has. The old
-side writes or checks it as `tests/fixtures/template_flows/<template>-<case>.json`
-(`ARR_WRITE_TEMPLATE_FLOWS=1` writes; a normal run only checks); the new side compares with it
-(`compare`), except the deviations it names (`Deviation`).
+Until W4b-06b an old side ran the old `group.yaml` of `tests/fixtures/start_skills_old/` with
+its old topology and wrote these files; it went with the old topologies (contract of W4b-06a
+§7.2). The files stay as the proof for P6. `OldMap` stays: some deviations name the phase an
+old stage maps to.
 """
 
 import json
-import os
 import re
 import shutil
 from collections import Counter
@@ -40,11 +39,8 @@ from arr.runs.phases import runner as phase_runner
 from arr.skills import install_start_skills, start_skill_files
 
 TESTS = Path(__file__).parent
-OLD_SKILLS = TESTS / "fixtures" / "start_skills_old"
 FLOWS = TESTS / "fixtures" / "template_flows"
 SOLO = TESTS / "fixtures" / "phases" / "solo.yaml"
-WRITE_FLOWS = "ARR_WRITE_TEMPLATE_FLOWS"
-"""Set to 1 to (re)write the target flows from the old topologies; never happens otherwise."""
 TOOL_SKILLS = ("sympy-check", "latex-writeup")
 PROJECT_PROOF = "beweis.md"
 """A proof in the project `demo` for the parameter `artifact`."""
@@ -63,14 +59,6 @@ def _write_tree(target: Path, files: Mapping[str, bytes]) -> None:
         path = target / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
-
-
-def _tree(folder: Path) -> dict[str, bytes]:
-    return {
-        p.relative_to(folder).as_posix(): p.read_bytes()
-        for p in sorted(folder.rglob("*"))
-        if p.is_file()
-    }
 
 
 def _prepare(workfolder: Path) -> None:
@@ -108,31 +96,6 @@ def _manager(
     return mgr, log
 
 
-def old_manager(
-    workfolder: Path,
-    name: str,
-    policies: Mapping[str, Policy],
-    *,
-    params: Mapping[str, Any] | None = None,
-    decider: Any = None,
-    log: Log | None = None,
-) -> tuple[RunManager, Log]:
-    """The old start skill `name` (tree of `81523c5`) with its old topology."""
-    from arr.runs.topologies import topology_for  # the old side only (W4b-06b removes it)
-
-    _prepare(workfolder)
-    _write_tree(workfolder / "skills" / name, _tree(OLD_SKILLS / name))
-    return _manager(
-        workfolder,
-        name,
-        policies,
-        params,
-        decider,
-        log,
-        lambda resolved: topology_for(resolved.topology.kind),
-    )
-
-
 def new_manager(
     workfolder: Path,
     name: str,
@@ -153,35 +116,6 @@ def new_manager(
         return phase_runner.run
 
     return _manager(workfolder, name, policies, params, decider, log, topology)
-
-
-def old_solo_manager(
-    workfolder: Path, policies: Mapping[str, Policy], *, max_turns: int = 3
-) -> tuple[RunManager, Log]:
-    """The old topology `solo` as run data: one agent `worker`, `max_turns`."""
-    from arr.runs.topologies import topology_for
-
-    log = Log()
-    data = {
-        "project": "demo",
-        "task": TASK,
-        "topology": {"kind": "solo", "params": {"max_turns": max_turns}},
-        "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
-        "agents": [{"id": "worker"}],
-    }
-    run_input = validate_model(RunInput, data)
-    resolved = resolve_run(run_input, None, make_settings())
-    mgr = RunManager(
-        workfolder,
-        run_input,
-        resolved,
-        topology=topology_for("solo"),
-        backend_factory=policy_factory(policies, log),
-        settings=make_settings(),
-        pacing=FAST,
-        finalizer=finalize_run,
-    )
-    return mgr, log
 
 
 def new_solo_manager(
@@ -219,33 +153,12 @@ def new_solo_manager(
 
 
 # --------------------------------------------------------------------------------------------
-# Policies of the old side (`submit_result`, `submit_rating`)
+# Small helpers of the policies
 # --------------------------------------------------------------------------------------------
-
-
-def old_result(kind: str, title: str = "Ergebnis", body: str | None = None, path: str = "") -> Any:
-    args: dict[str, Any] = {"kind": kind, "title": title}
-    if body is not None:
-        args["body"] = body
-    if path:
-        args["path"] = path
-    return room("submit_result", **args)
-
-
-def old_review(verdict: str, objections: list[str] | None = None, known: str = "") -> str:
-    lines = [f"Urteil: {verdict}", "", "## Einwände", ""]
-    lines += [f"- {o}" for o in objections or []]
-    if known:
-        lines.append(known)
-    return "\n".join(lines) + "\n"
 
 
 def write_file(view: Any, name: str, text: str) -> None:
     (view.work_dir / name).write_text(text, encoding="utf-8")
-
-
-def old_rate(score: float, ref: str) -> dict[str, Any]:
-    return room("submit_rating", result_id=ref, score=score, comment="begründet")
 
 
 def nothing(view: Any) -> list[dict[str, Any]]:
@@ -256,16 +169,6 @@ def nothing(view: Any) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------------------------
 # The flow of a run on the names of the phases
 # --------------------------------------------------------------------------------------------
-
-OLD_KIND_FORMAT = {
-    "artifact": "artifact",
-    "review": "review",
-    "note": "artifact",
-    "idea": "list",
-    "exploration": "text",
-    "summary": "text",
-}
-"""Kind of an old result → format of the submission that replaces it."""
 
 
 def _entries(mgr: RunManager) -> list[dict[str, Any]]:
@@ -393,15 +296,6 @@ def _new_words(mgr: RunManager) -> list[str]:
     return words
 
 
-def _old_words(mgr: RunManager, params: Mapping[str, Any]) -> list[str]:
-    """The same texts in a run of an old topology (ideas given or results `idea`)."""
-    words = [PROJECT_PROOF_TEXT] if params.get("artifact") else []
-    given = params.get("ideas") or []
-    words += [str(i.get("title") if isinstance(i, dict) else i) for i in given]
-    words += [r.title for r in RoomStore(mgr.run_dir).results() if r.kind == "idea"]
-    return words
-
-
 def _new_tags(template: str) -> Any:
     def tags(view: Any) -> set[str]:
         ctx = view.context
@@ -440,34 +334,6 @@ def _new_tags(template: str) -> Any:
         return out
 
     return tags
-
-
-def _old_tags(view: Any) -> set[str]:
-    ctx = view.context
-    out: set[str] = set()
-    if "artifact" in ctx:
-        out.add("beweis")
-    if ctx.get("reviews"):
-        out.add("gutachten")
-    if ctx.get("objections"):
-        out.add("einwaende")
-    if ctx.get("idea"):
-        out.add("eintrag")
-    if ctx.get("digest"):
-        out.add("auszuege")
-    if ctx.get("result_id") or ctx.get("result_ids"):
-        out.add("zu-bewerten")
-    elif ctx.get("results"):
-        out.add("staende")
-    if ctx.get("accepted"):
-        out.add("vorstufen")
-    if ctx.get("rework"):
-        out.add("bewertungen")
-    if view.stage == "zusammenfassung" and ctx.get("channel"):
-        out.add("verlauf")
-    if ctx.get("overview"):  # the summary of `exploration`: ranking with the ideas
-        out |= {"ideen", "ideen-inhalt"}
-    return out
 
 
 def new_flow(mgr: RunManager, status: Any, log: Any = None, template: str = "") -> dict[str, Any]:
@@ -597,114 +463,6 @@ class OldMap:
         return str(stage)
 
 
-def old_flow(mgr: RunManager, status: Any, template: str, log: Any = None) -> dict[str, Any]:
-    """The flow of a run of an old topology, on the names of the phases."""
-    resolved = mgr.prepared.resolved if mgr.prepared else None
-    params = dict(resolved.params) if resolved else {}
-    mapping = OldMap(template, params)
-    sight = _Sight(mgr, log, _old_words(mgr, params))
-    seq: list[tuple[str, int, str]] = []
-    gates: list[list[Any]] = []
-    ends: list[list[Any]] = []
-    ranking: list[int] = []
-    round_ = 1
-    attempts: Counter[str] = Counter()
-    how = "ende"
-    for entry in _entries(mgr):
-        data = entry["data"]
-        if entry["kind"] == "checkpoint":
-            stage = data.get("stage")
-            kind = data.get("phase")
-            if template == "proof-review":
-                if stage == "pruefung" and kind is None:
-                    round_ = int(data["round"])
-                elif stage == "urteil":
-                    where = "diskussion" if _discussed(params, mgr) else mapping.phase("pruefung")
-                    gates.append([where, data["verdict"]])
-                elif stage == "zusammenfassung":
-                    how = "stopp"  # accepted, revisions used up: the run stops after a round
-            elif template == "proof":
-                if kind == "stage_end":
-                    ends.append([stage, data["outcome"], data.get("accepted")])
-                elif "decision" in data and "attempt" in data:
-                    attempts[stage] = int(data["attempt"])
-                    gates.append([stage, "pass" if data["decision"] == "passed" else "fail"])
-            elif (
-                template == "exploration"
-                and stage == "zusammenfassung"
-                and data.get("ranking") is not None
-            ):
-                scored = [r for r in data["ranking"] if r.get("score") is not None]
-                ranking = [int(str(r["idea"]).removeprefix("I")) for r in scored]
-                if data["ranking"]:
-                    gates.append([mapping.phase("bewertung"), "ranked"])
-        elif entry["kind"] == "turn" and data.get("purpose"):
-            sight.skip(data["agent"])
-        elif entry["kind"] == "turn":
-            stage = data.get("stage")
-            phase = mapping.phase(stage)
-            if template == "proof-review" and phase != "fassung":
-                visit = round_
-            elif template == "proof":
-                visit = attempts[stage] + 1
-            else:
-                visit = 1
-            seq.append((phase, visit, data["agent"]))
-            sight.turn(data["agent"], phase, visit, _old_tags)
-        else:
-            sight.event(entry["kind"], data, mapping.phase)
-    store = RoomStore(mgr.run_dir)
-    results = store.results()
-    by_id = {r.id: r for r in results}
-    counted: dict[str, dict[str, Any]] = {}
-    files: set[tuple[str, str, str]] = set()
-    for result in results:
-        fmt = OLD_KIND_FORMAT.get(result.kind, "text")
-        key = f"{mapping.phase(result.stage)}/{result.agent}"
-        item = counted.setdefault(key, {"format": fmt, "count": 0})
-        item["count"] += 1
-        files.add((mapping.phase(result.stage), result.agent, fmt))
-    for rating in store.ratings():
-        rated = by_id.get(rating.result_id)
-        key = f"{mapping.phase(rated.stage if rated else None)}/{rating.rater}"
-        item = counted.setdefault(key, {"format": "rating", "count": 0})
-        item["count"] += 1
-        files.add((mapping.phase(rated.stage if rated else None), rating.rater, "rating"))
-    items: dict[str, dict[str, Any]] = {}
-    if template == "proof-review":
-        versions = sorted((mgr.run_dir / "output" / "artifacts").glob("v*"))
-        if versions:
-            by = "projekt" if params.get("artifact") else "author"
-            if len(versions) > 1 or not params.get("artifact"):
-                by = "author"
-            items["beweis"] = {"versions": len(versions), "last_by": by}
-    elif template == "proof":
-        for stage in ("strategie", "skizze", "beweis"):
-            mine = [r for r in results if r.stage == stage]
-            if mine:
-                items[stage] = {"versions": len(mine), "last_by": mine[-1].agent}
-    accepted = [
-        [stage, outcome, by_id[acc].attempt if acc in by_id else None]
-        for stage, outcome, acc in ends
-    ]
-    if template == "proof" and ends and ends[-1][1] == "stage_failed":
-        how = "stopp"
-    turns = _sections(seq)
-    return {
-        "turns": turns,
-        "sight": sight.sections(turns),
-        "submissions": dict(sorted(counted.items())),
-        "items": dict(sorted(items.items())),
-        "gates": gates,
-        "stage_ends": accepted,
-        "ranking": ranking,
-        "end": {"status": str(getattr(status, "value", status)), "how": how, **_summary(mgr)},
-        **_sessions(mgr),
-        "files": sorted([list(f) for f in files])
-        + ([["summary.md"]] if _summary_file(mgr) else []),
-    }
-
-
 def _sessions(mgr: RunManager) -> dict[str, dict[str, int]]:
     """New sessions (`session_reset`) and fresh working folders (`folder_fresh`) per agent."""
     resets: Counter[str] = Counter()
@@ -729,22 +487,6 @@ def _discussed(params: Mapping[str, Any], mgr: RunManager) -> bool:
 
 def flow_file(template: str, case: str) -> Path:
     return FLOWS / f"{template}-{case}.json"
-
-
-def write_or_check(template: str, case: str, flow: Mapping[str, Any], params: Any) -> None:
-    """Write the target flow (with `ARR_WRITE_TEMPLATE_FLOWS=1`) or check that the old
-    topology still produces exactly it."""
-    data = {"template": template, "case": case, "params": dict(params), **flow}
-    path = flow_file(template, case)
-    if os.environ.get(WRITE_FLOWS) == "1":
-        FLOWS.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
-        return
-    assert path.is_file(), f"{path.name} fehlt; schreiben mit {WRITE_FLOWS}=1"
-    stored = json.loads(path.read_text(encoding="utf-8"))
-    assert stored == json.loads(json.dumps(data)), (
-        f"{path.name} beschreibt die alte Topologie nicht"
-    )
 
 
 def load_flow(template: str, case: str) -> dict[str, Any]:
@@ -938,85 +680,6 @@ def talk(channel: str, view: Any) -> dict[str, Any]:
     return room("post_message", channel=channel, body=f"Beitrag von {view.agent}.")
 
 
-def old_policies(case: Case) -> dict[str, Policy]:
-    """Policies of the old side for `case` (`submit_result`, `submit_rating`)."""
-    t = case.template
-    if t == "solo":
-        hand = case.act.get("hand_in", True)
-        return {
-            "worker": (lambda v: [old_result("result", "Ergebnis", "Inhalt")]) if hand else nothing
-        }
-    if t == "proof-review":
-        verdicts = case.act["verdicts"]
-
-        def author(view: Any) -> list[dict[str, Any]]:
-            path = str(case.params.get("artifact") or "beweis.md")
-            write_file(view, path, f"Beweis, {view.stage}\n")
-            return [old_result("artifact", "Beweis", path=path)]
-
-        def judge(view: Any) -> list[dict[str, Any]]:
-            if view.stage == "diskussion" and not last_round(view):
-                return [talk("judges", view)]
-            mine = verdicts[view.agent]
-            verdict = mine[min(int(view.context.get("round", 1)), len(mine)) - 1]
-            objections = [] if verdict == "accept" else [f"{view.agent}: Lücke"]
-            return [old_result("review", "Gutachten", old_review(verdict, objections))]
-
-        return {"author": author, **{j: judge for j in verdicts}}
-    if t == "proof":
-
-        def worker(view: Any) -> list[dict[str, Any]]:
-            write_file(view, f"{view.stage}.md", f"{view.stage}, Versuch {view.attempt}\n")
-            return [old_result("note", view.stage, path=f"{view.stage}.md")]
-
-        def rater(view: Any) -> list[dict[str, Any]]:
-            ctx = view.context
-            score = _score(case, ctx.get("stage"), int(ctx.get("attempt", 1)))
-            return [old_rate(score, str(ctx["result_id"]))]
-
-        raters = {f"rater-{i}": rater for i in range(1, 5)}
-        return {"strategist": worker, "prover": worker, **raters}
-    if t == "exploration":
-        titles = _idea_titles(case)
-        silent_ones = set(case.act.get("silent", []))
-
-        def ideator(view: Any) -> list[dict[str, Any]]:
-            return [old_result("idea", title, f"Ansatz {title}") for title in titles]
-
-        def explorer(view: Any) -> list[dict[str, Any]]:
-            if view.agent in silent_ones:
-                return nothing(view)
-            return [old_result("exploration", "Stand", f"## Stand\nText von {view.agent}")]
-
-        def ranker(view: Any) -> list[dict[str, Any]]:
-            steps = []
-            for entry in view.context.get("results", []):
-                number = next(
-                    (i for i, title in enumerate(titles, 1) if str(entry["idea"]) == title), 9
-                )
-                steps.append(old_rate(_entry_score(number), str(entry["result_id"])))
-            return steps
-
-        def summarizer(view: Any) -> list[dict[str, Any]]:
-            return [old_result("summary", "Zusammenfassung", "## Gesichert\nwenig")]
-
-        explorers = {f"explorer-{i}": explorer for i in range(1, 7)}
-        rankers = {f"ranker-{i}": ranker for i in range(1, 4)}
-        return {"ideator": ideator, **explorers, **rankers, "summarizer": summarizer}
-    if t == "roundtable":
-
-        def diskutant(view: Any) -> list[dict[str, Any]]:
-            return [talk("runde", view)]
-
-        def summarizer(view: Any) -> list[dict[str, Any]]:
-            if view.stage == "diskussion":
-                return [room("set_status", status="done", note="fertig")]
-            return [old_result("summary", "Zusammenfassung", "## Gesichert\nwenig")]
-
-        return {**{f"diskutant-{i}": diskutant for i in range(1, 6)}, "summarizer": summarizer}
-    raise KeyError(t)
-
-
 def new_policies(case: Case) -> dict[str, Policy]:
     """Policies of the new side for `case` (`submit`), acting as `old_policies` does."""
     from phases_kit import answer, hand_in
@@ -1076,25 +739,6 @@ def decider_for(case: Case) -> Any:
     if case.decider is None:
         return None
     return Choose(EscalationOption(case.decider))
-
-
-async def run_old(workfolder: Path, case: Case) -> tuple[RunManager, dict[str, Any]]:
-    from phases_kit import run
-
-    if case.template == "solo":
-        mgr, log = old_solo_manager(
-            workfolder, old_policies(case), max_turns=int(case.params["max_turns"])
-        )
-    else:
-        mgr, log = old_manager(
-            workfolder,
-            case.template,
-            old_policies(case),
-            params=case.params,
-            decider=decider_for(case),
-        )
-    status = await run(mgr)
-    return mgr, old_flow(mgr, status, case.template, log)
 
 
 async def run_new(

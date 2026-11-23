@@ -22,6 +22,7 @@ from mcp_kit import (
     spec,
     until,
 )
+from old_runs_kit import add_rating, add_result
 from run_kit import done, post, room, turns, write_profiles
 from service_kit import make_run_folder, make_workfolder, transcript_line
 
@@ -275,11 +276,10 @@ def test_deviation_decider_against_arr_yaml(wf: Path) -> None:
 async def test_read_results_is_bounded_and_paged(wf: Path) -> None:
     folder = make_run_folder(wf, agents=["a", "b"], status=RunStatus.DONE)
     store = RoomStore.create(folder)
-    a, b = store.for_agent("a"), store.for_agent("b")
-    for index in range(1500):
-        a.submit_result(kind="sketch", title=f"{index} " + "T" * 400, body="x")
+    for index in range(1500):  # an old run (W4b-06b: rows as `submit_result` wrote them)
+        add_result(store, "a", "sketch", f"{index} " + "T" * 400, "x")
     for result_id in range(1, 6):
-        b.submit_rating(result_id, 5, "K" * 3000)
+        add_rating(store, "b", result_id, 5, "K" * 3000)
     async with Service(make_api(wf)) as service:
         seen: list[int] = []
         offset = 0
@@ -708,9 +708,9 @@ def _next_args(text: str) -> dict[str, Any]:
 
 async def test_n2_next_keeps_the_filters_of_read_results(wf: Path) -> None:
     folder = make_run_folder(wf, agents=["a"], status=RunStatus.DONE)
-    agent = RoomStore.create(folder).for_agent("a")
+    store = RoomStore.create(folder)
     for index in range(60):
-        agent.submit_result(kind="proof" if index % 2 else "sketch", title=f"{index}", body="x")
+        add_result(store, "a", "proof" if index % 2 else "sketch", f"{index}", "x")
     wanted = [r for r in range(1, 61) if r % 2 == 0]
     async with Service(make_api(wf)) as service:
         args: dict[str, Any] = {"run_id": folder.name, "kind": "proof", "limit": 7}
@@ -836,9 +836,9 @@ async def test_n5_more_than_twenty_ratings(wf: Path) -> None:
     channel = {"name": "main", "members": ["a", *raters]}
     folder = make_run_folder(wf, agents=["a", *raters], status=RunStatus.DONE, channels=[channel])
     store = RoomStore.create(folder)
-    store.for_agent("a").submit_result(kind="sketch", title="Skizze", body="x")
+    add_result(store, "a", "sketch", "Skizze", "x")
     for rater in raters:
-        store.for_agent(rater).submit_rating(1, 5, f"Kommentar von {rater}")
+        add_rating(store, rater, 1, 5, f"Kommentar von {rater}")
     async with Service(make_api(wf)) as service:
         page = await call(service, "read_results", run_id=folder.name)
     [entry] = page["results"]

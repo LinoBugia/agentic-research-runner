@@ -56,16 +56,31 @@ DENY = DecisionRequest(action=DecisionAction.DENY, comment="Nimm die lokale Kopi
 OPEN = [ApprovalStatus.OPEN]
 
 
+CHAT_TASK = "tasks/runde.md"
+
+
 def run_input(*agents: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    """A phases run (W4b-06b; until then `roundtable`): one phase `chat` in `#main`, one round;
+    the agents ask in their turns."""
     ids = [a["id"] for a in agents]
+    action = {"task": CHAT_TASK, "submission": {"format": "text"}}
     return {
         "project": "demo",
         "name": "Testlauf",
         "task": "Teste arr.",
-        "topology": {"kind": "roundtable", "params": {"rounds": 1, "channel": "main"}},
+        "topology": {"kind": "phases"},
         "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
         "agents": list(agents),
         "groupchats": [channel("main", ids, mode="rounds")],
+        "phases": [
+            {
+                "name": "runde",
+                "topology": "chat",
+                "channels": ["main"],
+                "rounds": 1,
+                "actions": {a: action for a in ids},
+            }
+        ],
         **extra,
     }
 
@@ -79,7 +94,12 @@ def wf(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     arr_home.mkdir(parents=True, exist_ok=True)
     write_profiles(arr_home, {"fake-auth": "claude_oauth", "fake-codex": "codex_chatgpt"})
     monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
-    return make_workfolder(tmp_path)
+    workfolder = make_workfolder(tmp_path)
+    tasks = workfolder / "projects" / "demo" / "tasks"
+    tasks.mkdir(parents=True, exist_ok=True)
+    for name in ("runde", "arbeit", "skizze", "bewerten"):
+        (tasks / f"{name}.md").write_text(f"Auftrag {name}.\n", "utf-8")
+    return workfolder
 
 
 class Service:
@@ -404,9 +424,11 @@ async def test_a5_run_of_a_second_process_is_read_only_and_fixed_allows_do_not_s
     tmp_path: Path, wf: Path, arr_home: Path
 ) -> None:
     (wf / "solo.yaml").write_text(
-        "version: 1\nproject: demo\ntask: Los.\ntopology: {kind: solo}\n"
+        "version: 1\nproject: demo\ntask: Los.\ntopology: {kind: phases}\n"
         "defaults: {provider: claude, model: fake-model, auth: fake-auth}\n"
-        "agents: [{id: a}]\n",
+        "agents: [{id: a}]\n"
+        "phases: [{name: arbeit, topology: solo, "
+        "actions: {a: {task: tasks/arbeit.md, submission: {format: text}}}}]\n",
         encoding="utf-8",
     )
     asks = [{"tool": "Bash", "command": "python3 check.py"}, HOST]
@@ -436,33 +458,44 @@ async def test_a5_run_of_a_second_process_is_read_only_and_fixed_allows_do_not_s
     assert "decided" not in events_of(wf, item.run.id)
 
 
-# --- A6: escalations of a topology ------------------------------------------------------------
+# --- A6: escalations (of a phase since W4b-06b; until then of `waterfall`) ---------------------
 
 
 async def _escalation_item(wf: Path, extra: dict[str, Any]) -> tuple[Service, Any, Any]:
-    submit = room("submit_result", kind="sketch", title="Skizze", body="Erster Versuch.")
-    worker = {"turns": [], "by_stage": {"skizze": {"turns": [{"steps": [submit, done()]}]}}}
-    worker["by_stage"]["skizze"]["repeat_last"] = True
+    """A phase `skizze` whose gate `judge` fails (one pass) and asks the user
+    (`on_exhausted: escalate`)."""
+    submit = room("submit", status="done", summary="Skizze", body="Erster Versuch.")
+    worker = {"turns": [{"steps": [submit, done()]}], "repeat_last": True}
     job = room("get_assignment", save_as="job")
-    rating = room(
-        "submit_rating", result_id="${job.context.result_id}", score=2, comment="Zu dünn."
-    )
-    rater = {"turns": [], "by_stage": {"skizze": {"turns": [{"steps": [job, rating, done()]}]}}}
-    rater["by_stage"]["skizze"]["repeat_last"] = True
+    ratings = [{"ref": "${job.context.submission.rate.0}", "score": 2, "comment": "Zu dünn."}]
+    rating = room("submit", status="done", summary="Zu dünn.", fields={"ratings": ratings})
+    rater = {"turns": [{"steps": [job, rating, done()]}], "repeat_last": True}
     svc = Service(wf, {"w": worker, "r": rater})
     await svc.__aenter__()
     data = {
         "project": "demo",
-        "name": "Wasserfall",
+        "name": "Eskalation",
         "task": "Teste arr.",
-        "topology": {
-            "kind": "waterfall",
-            "params": {"on_fail": "escalate", "max_rework": 0, "pass_score": 6},
-        },
+        "topology": {"kind": "phases"},
         "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
         "agents": [{"id": "w"}, {"id": "r"}],
-        "stages": [{"name": "skizze", "agent": "w"}],
-        "raters": ["r"],
+        "phases": [
+            {
+                "name": "skizze",
+                "topology": "solo",
+                "max_visits": 1,
+                "on_exhausted": "escalate",
+                "actions": {"w": {"task": "tasks/skizze.md", "submission": {"format": "text"}}},
+                "gate": {
+                    "type": "judge",
+                    "raters": ["r"],
+                    "action": {"task": "tasks/bewerten.md", "submission": {"format": "rating"}},
+                    "rule": "mean",
+                    "pass_score": 6,
+                    "routes": {"pass": "next", "fail": "retry"},
+                },
+            }
+        ],
         **extra,
     }
     started = await svc.api.start_run(data)
@@ -473,12 +506,13 @@ async def test_a6_escalation_shows_options_pauses_and_the_choice_goes_on(wf: Pat
     svc, started, item = await _escalation_item(wf, {})
     try:
         assert item.type is ApprovalType.ESCALATION and item.stage == "skizze"
-        assert [o.key for o in item.options] == list(EscalationOption)
-        assert [o.label for o in item.options][0] == "Noch ein Versuch"
-        assert item.topology.value == "waterfall" and item.deadline is None
-        assert "skizze" in item.title and "nicht bestanden" in item.title
+        labels = {o.key: o.label for o in item.options}
+        assert set(labels) == set(EscalationOption)
+        assert labels[EscalationOption.RETRY] == "Noch ein Versuch"
+        assert item.topology.value == "phases" and item.deadline is None
+        assert item.title == "Phase „skizze“ wartet auf deine Entscheidung"
         assert item.attempts and item.attempts[0].avg_score == 2
-        assert item.last_ratings[0].comment == "Zu dünn."
+        assert item.attempt == 1 and item.phase_reason
         assert "Eskalation" in await _sent(svc)
         await until_status(svc.api, started.run_id, RunStatus.PAUSED)
         run = (await svc.api.get_run(started.run_id)).run

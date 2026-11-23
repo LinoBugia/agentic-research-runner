@@ -100,26 +100,42 @@ async def test_every_tool_tried_leaves_the_item_open(wf: Path) -> None:
 
 
 async def test_resume_with_an_open_escalation_is_refused_with_the_link(wf: Path) -> None:
+    """S9 on a phases run (W4b-06b; until then a `waterfall` escalation): the gate `judge` of
+    `skizze` fails and asks the user; Claude Code cannot resume past it."""
     job = room("get_assignment", save_as="job")
-    rating = room("submit_rating", result_id="${job.context.result_id}", score=2, comment="Nein.")
+    ratings = [{"ref": "${job.context.submission.rate.0}", "score": 2, "comment": "Nein."}]
+    rating = room("submit", status="done", summary="Nein.", fields={"ratings": ratings})
     rate = {"turns": [{"steps": [job, rating, done()]}], "repeat_last": True}
-    submit = room("submit_result", kind="sketch", title="Skizze", body="Text.")
+    submit = room("submit", status="done", summary="Skizze", body="Text.")
     work = {"turns": [{"steps": [submit, done()]}], "repeat_last": True}
-    scripts = {
-        "w": {"turns": [], "by_stage": {"skizze": work}},
-        "r": {"turns": [], "by_stage": {"skizze": rate}},
-    }
+    scripts = {"w": work, "r": rate}
+    tasks = wf / "projects" / "demo" / "tasks"
+    tasks.mkdir(parents=True, exist_ok=True)
+    for name in ("skizze", "bewerten"):
+        (tasks / f"{name}.md").write_text(f"Auftrag {name}.\n", "utf-8")
     api = make_api(wf, scripts)
     run_input = {
         "project": "demo",
         "task": "Teste arr.",
-        "topology": {
-            "kind": "waterfall",
-            "params": {"on_fail": "escalate", "max_rework": 0, "pass_score": 6},
-        },
+        "topology": {"kind": "phases"},
         "agents": [{"id": "w"}, {"id": "r"}],
-        "stages": [{"name": "skizze", "agent": "w"}],
-        "raters": ["r"],
+        "phases": [
+            {
+                "name": "skizze",
+                "topology": "solo",
+                "max_visits": 1,
+                "on_exhausted": "escalate",
+                "actions": {"w": {"task": "tasks/skizze.md", "submission": {"format": "text"}}},
+                "gate": {
+                    "type": "judge",
+                    "raters": ["r"],
+                    "action": {"task": "tasks/bewerten.md", "submission": {"format": "rating"}},
+                    "rule": "mean",
+                    "pass_score": 6,
+                    "routes": {"pass": "next", "fail": "retry"},
+                },
+            }
+        ],
     }
     async with Service(api) as service:
         run_id = (await api.start_run(run_input)).run_id

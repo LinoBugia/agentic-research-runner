@@ -27,8 +27,10 @@ from run_kit import (
     make_settings,
     make_workfolder,
     post,
+    result_message,
     room,
     say,
+    seats_of,
     turns,
     wait,
 )
@@ -447,7 +449,7 @@ async def discuss(
     async def topology(ctx: RunContext) -> None:
         assert isinstance(ctx, Orchestrator)
         helper = asyncio.create_task(during(ctx)) if during is not None else None
-        results.append(await ctx.discuss("main", "Löst die Aufgabe.", rounds=rounds))
+        results.append(await ctx.discuss("main", rounds=rounds, seats=seats_of(ctx, "main")))
         if helper is not None:
             await helper
 
@@ -579,7 +581,7 @@ async def test_a3_run_c_result_without_done_ends_with_all_done_at_once(workfolde
 async def test_submit_result_finishes_but_an_open_own_question_keeps_working(
     workfolder: Path,
 ) -> None:
-    submit = room("submit_result", kind="idea", title="Ansatz", body="Induktion")
+    submit = result_message("main", "Ansatz", "Induktion")
     scripts = {
         D1: turns([submit]),
         D2: turns([submit, post("main", "@diskutant-1 passt das?", kind="question")],
@@ -793,7 +795,7 @@ async def test_a6_a9_open_approval_waits_with_deadline_and_keeps_done(workfolder
     results: list[DiscussionOutcome] = []
 
     async def topology(ctx: RunContext) -> None:
-        results.append(await ctx.discuss("main", "Los."))
+        results.append(await ctx.discuss("main", seats=seats_of(ctx, "main")))
 
     manager = make_manager(
         workfolder,
@@ -1014,7 +1016,7 @@ async def test_hint_that_never_arrives_wakes_after_the_turn(workfolder: Path) ->
     results: list[DiscussionOutcome] = []
 
     async def topology(ctx: RunContext) -> None:
-        results.append(await ctx.discuss("main", "Los."))
+        results.append(await ctx.discuss("main", seats=seats_of(ctx, "main")))
 
     scripts = {
         D1: turns([wait(0.2), post("main", "@diskutant-2 schau mal"), done()]),

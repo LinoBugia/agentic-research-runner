@@ -44,6 +44,7 @@ from run_kit import (
     post,
     room,
     say,
+    seats_of,
     turns,
     wait,
 )
@@ -97,7 +98,7 @@ async def run_case(
     async def topology(ctx: RunContext) -> None:
         assert isinstance(ctx, Orchestrator)
         helper = asyncio.create_task(during(holder["m"])) if during is not None else None
-        results.append(await ctx.discuss("main", "Löst die Aufgabe."))
+        results.append(await ctx.discuss("main", seats=seats_of(ctx, "main")))
         if helper is not None:
             helper.cancel()
 
@@ -402,7 +403,7 @@ async def test_h9_approval_open_until_timeout_other_waits(workfolder: Path) -> N
     results: list[DiscussionOutcome] = []
 
     async def topology(ctx: RunContext) -> None:
-        results.append(await ctx.discuss("main", "Los."))
+        results.append(await ctx.discuss("main", seats=seats_of(ctx, "main")))
 
     manager = make_manager(workfolder, topology, scripts,
                            groupchats=[channel("main", [D1, D2], mode="event", **IDLE)],
@@ -614,7 +615,7 @@ async def test_nb2_a_turn_that_ignores_the_interrupt_ends_hard(
     results: list[DiscussionOutcome] = []
 
     async def topology(ctx: RunContext) -> None:
-        results.append(await ctx.discuss("main", "Los."))
+        results.append(await ctx.discuss("main", seats=seats_of(ctx, "main")))
 
     manager = make_manager(
         workfolder, topology, scripts,
