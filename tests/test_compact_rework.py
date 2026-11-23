@@ -200,8 +200,6 @@ async def test_p2_unknown_fill_level_is_logged_once(workfolder: Path) -> None:
 
 REFUSED_TOOLS = [
     room("submit", status="done", summary="im Notiz-Turn", body="b"),
-    room("submit_result", kind="idea", title="im Notiz-Turn", body="b"),
-    room("submit_rating", result_id=1, score=5, comment="c"),
     post("main", "im Notiz-Turn"),
     post("main", "Frage im Notiz-Turn?", kind="question", to=["user"]),
     room("set_status", status="done", note="fertig"),

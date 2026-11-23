@@ -18,6 +18,7 @@ from run_kit import (
     post,
     room,
     say,
+    seats_of,
     turns,
     wait,
 )
@@ -168,45 +169,6 @@ async def test_turn_prompt_has_the_inbox_and_user_messages_stand_out(workfolder:
     assert prompts(manager.run_dir, "c") == ["Ohne Kanal."]
 
 
-async def test_channels_open_from_their_stage(workfolder: Path) -> None:
-    async def topology(ctx: RunContext) -> None:
-        await ctx.turn("a", "vorher", stage="review")
-        await ctx.checkpoint("diskussion")
-        await ctx.turn("a", "nachher", stage="diskussion")
-
-    scripts = {
-        "a": turns(
-            [post("jury", "zu früh")],
-            [post("jury", "jetzt"), post("spaet", "auch")],
-        ),
-        "b": turns(),
-    }
-    groupchats = [
-        channel("main", ["a", "b"]),
-        channel("jury", ["a", "b"], open_from="diskussion"),
-        channel("spaet", ["a", "b"], open_from="review2"),
-    ]
-    manager = make_manager(
-        workfolder,
-        topology,
-        scripts,
-        groupchats=groupchats,
-        stages=["review", "review2", "diskussion"],
-    )
-    assert await manager.run() is RunStatus.DONE
-    first, second = prompts(manager.run_dir, "a")
-    assert "#jury" not in first and "#spaet" not in first
-    assert "#jury 1" in second and "#spaet 1" in second  # the brief
-    results = [e["data"] for e in events(manager.run_dir, "a") if e["kind"] == "tool_result"]
-    assert results[0]["is_error"] and "öffnet ab Phase „diskussion“" in results[0]["content"]
-    assert not results[1]["is_error"] and not results[2]["is_error"]
-    opened = [
-        (e["data"]["channel"], e["data"]["stage"])
-        for e in log_entries(manager.run_dir, "channel_open")
-    ]
-    assert opened == [("jury", "diskussion"), ("spaet", "diskussion")]
-
-
 # --------------------------------------------------------------------------------------------
 # A5 rounds
 # --------------------------------------------------------------------------------------------
@@ -223,7 +185,10 @@ async def run_discussion(
     results: list[DiscussionOutcome] = []
 
     async def topology(ctx: RunContext) -> None:
-        results.append(await ctx.discuss("main", **discuss))
+        discuss.pop("prompt", None)  # W4b-06b: the discussion's own texts, no prompt
+        discuss.pop("context", None)
+        discuss.pop("kickoff", None)
+        results.append(await ctx.discuss("main", seats=seats_of(ctx, "main"), **discuss))
 
     members = list(scripts)
     manager = make_manager(
@@ -293,7 +258,9 @@ async def test_w2_03_1_topology_discusses_through_the_run_context_contract(
     found: list[DiscussionOutcome] = []
 
     async def topology(ctx: RunContext) -> None:  # uses the contract only, no isinstance
-        found.append(await ctx.discuss("main", "Tauscht euch aus.", stage="austausch", rounds=2))
+        found.append(
+            await ctx.discuss("main", stage="austausch", rounds=2, seats=seats_of(ctx, "main"))
+        )
 
     scripts = {
         "a": turns([post("main", "a1")], [post("main", "a2")]),
@@ -342,7 +309,7 @@ async def test_event_wakes_at_once_for_a_question_without_debounce(workfolder: P
     [wake] = log_entries(manager.run_dir, "wake")
     assert wake["data"]["agent"] == "b" and wake["data"]["reasons"][0] == "question"
     kickoff, woken = prompts(manager.run_dir, "b")
-    assert kickoff.endswith("## Auftrag\n\nPrüft Lemma A.")
+    assert "## Auftrag\n\nDiskussion in #main:" in kickoff  # W4b-06b: the discussion text
     assert "Du wurdest in #main geweckt: eine Frage an dich" in woken
     assert "Gilt Lemma A für n = 9?" in woken, "the open question is in the inbox"
     first_post = min(m.ts for m in manager.room.messages("main") if m.sender == "a")
@@ -422,7 +389,7 @@ async def test_event_discussion_ends_on_stop(workfolder: Path) -> None:
     results: list[DiscussionOutcome] = []
 
     async def topology(ctx: RunContext) -> None:
-        results.append(await ctx.discuss("main", "Los."))
+        results.append(await ctx.discuss("main", seats=seats_of(ctx, "main")))
 
     scripts = {"a": turns([wait(30)]), "b": turns([wait(30)])}
     manager = make_manager(
@@ -617,7 +584,7 @@ async def test_user_messages_wake_or_hint_and_record_the_delivery(workfolder: Pa
     results: list[DiscussionOutcome] = []
 
     async def topology(ctx: RunContext) -> None:
-        results.append(await ctx.discuss("main", "Los.", kickoff=True))
+        results.append(await ctx.discuss("main", seats=seats_of(ctx, "main")))
 
     scripts = {"a": turns([wait(0.5)], [done()]), "b": turns([done()])}
     manager = make_manager(
@@ -690,7 +657,7 @@ async def test_delivery_state_comes_from_the_addressee(workfolder: Path, to: lis
     """Review W3-02 M1: `a` is woken, the hint to `b` arrives after that and changes nothing."""
 
     async def topology(ctx: RunContext) -> None:
-        await ctx.discuss("main", "Los.", kickoff=True)
+        await ctx.discuss("main", seats=seats_of(ctx, "main"))
 
     scripts = {"a": turns([say("bereit")], [done()]), "b": turns([wait(1.0), done()])}
     manager = make_manager(

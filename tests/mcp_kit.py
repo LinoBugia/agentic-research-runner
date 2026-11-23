@@ -16,7 +16,7 @@ DEFAULTS = {"provider": "claude", "model": "fake-model", "auth": "fake-auth"}
 SKILL_MD = "---\nname: {name}\ndescription: Eine Runde zum Testen.\n---\n# Runde\n"
 GROUP_YAML = """kind: research-group
 version: 1
-topology: roundtable
+topology: phases
 params:
   rounds: { default: 1, min: 1, max: 4, doc: "Runden" }
 limits:
@@ -29,11 +29,20 @@ agents:
     role: roles/m.md
   - id: critic
     role: roles/critic.md
-groupchats:
+channels:
   - name: main
     members: [m-*, critic]
     mode: rounds
+phases:
+  - name: runde
+    topology: chat
+    channels: [main]
+    rounds: "{{ params.rounds }}"
+    actions:
+      m-*: { task: tasks/runde.md, submission: { format: text } }
+      critic: { task: tasks/runde.md, submission: { format: text } }
 """
+TASK_MD = "# Runde\n\nDiskutiere die Aufgabe in #main und gib deinen Beitrag mit `submit` ab.\n"
 ARR_YAML = """version: 1
 toolchain: {run_venv: off}
 defaults:
@@ -52,6 +61,8 @@ def group_skill(wf: Path, name: str = "runde", group_yaml: str = GROUP_YAML) -> 
     (folder / "roles" / "m.md").write_text("# Rolle m\n", "utf-8")
     (folder / "roles" / "critic.md").write_text("# Rolle critic\n", "utf-8")
     (folder / "group.yaml").write_text(group_yaml, "utf-8")
+    (folder / "tasks").mkdir(exist_ok=True)
+    (folder / "tasks" / "runde.md").write_text(TASK_MD, "utf-8")
     return folder
 
 

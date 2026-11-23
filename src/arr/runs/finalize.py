@@ -16,9 +16,9 @@ does not stop the others):
    the copy; it is left out with a hint in `summary.md`. Each filed-away working folder
    `retired/<id>/<folder>/` (W4b-05a) gets its diff `agents/<id>/retired-<folder>.diff` by the
    same rules.
-4. `output/results/NNN-<agent>-<kind>.md` per result (unless the submitted file has that
-   name), `output/results.json`, `output/ratings.json`; for submissions of `submit` (W4b-01)
-   `output/submissions.json`, only when there are any or the topology is `phases`.
+4. `output/submissions.json`: every submission of `submit` (W4b-01). Since W4b-06b no run
+   writes `output/results.json` and `output/ratings.json` any more (the old topologies did;
+   their `output/results/NNN-<agent>-<kind>.md` stay readable, `result_file`).
 5. `usage.json`, and an empty `approvals.jsonl` if there were no requests.
 6. Cleaning up (W4b-05a, `arr.runs.folders.park_end_of_run`): `scratch/`, the rests of
    submissions in `groupchats/staging/` and folders in `output/submissions/` without a database
@@ -27,10 +27,8 @@ does not stop the others):
    `arr run` still sees them; `clean_up_after_scan` deletes them after it (Entscheidung 54),
    otherwise slimming does.
 7. `output/summary.md` (German): status and reason, duration, agents, stages with attempts and
-   scores, the overview a topology built itself (`review`: verdict and rounds, `exploration`:
-   ranking; the latest checkpoint with `overview`, W4-03 F8/F9), results with links, the
-   submissions with their summaries (W4b-01, docs/10 §4.8, without a model), a summarizer's
-   summary, usage sums, hints.
+   scores, the submissions with their summaries (W4b-01, docs/10 §4.8, without a model), usage
+   sums, hints. Since W4b-06b without „## Ergebnisse“ and the overview of the old topologies.
 
 Running it again overwrites every file with the same content (idempotent).
 See docs/02-workfolder-und-runs.md §4, §7.
@@ -43,17 +41,16 @@ import logging
 import os
 import stat
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from statistics import fmean
 from typing import Any
 
 from arr.backends.base import EventKind, TurnStatus
-from arr.models import RunStatus, TopologyKind, WorkspaceMode
+from arr.models import RunStatus, WorkspaceMode
 from arr.room.store import RESULTS_DIR, ROOM_DIR, RoomStore
-from arr.room.types import Rating, Result, Submission
+from arr.room.types import Result, Submission
 from arr.runs.eventlog import TRANSCRIPT_FILE, read_events, write_transcript_md
 from arr.runs.folders import park_end_of_run, purge_trash, retired_diff_name, retired_folders
 from arr.runs.orchestrator import ORCHESTRATOR_LOG, OrchestratorLog, stopped_text
@@ -74,10 +71,7 @@ logger = logging.getLogger(__name__)
 DIFF_FILE = "changes.diff"
 APPROVALS_FILE = "approvals.jsonl"
 SUMMARY_FILE = "output/summary.md"
-RESULTS_JSON = "output/results.json"
-RATINGS_JSON = "output/ratings.json"
 SUBMISSIONS_JSON = "output/submissions.json"
-SUMMARY_KIND = "summary"
 MAX_DIFF_BYTES = 256 * 1024
 """Files larger than this are listed as changed without a line diff (difflib is slow)."""
 MAX_DIFF_LINES = 10_000
@@ -97,7 +91,6 @@ _LIMIT_TEXT = {
 }
 _DECISION_TEXT = {
     "passed": "bestanden",
-    "rework": "Nacharbeit",
     "failed": "nicht bestanden",
     "escalated": "eskaliert",
 }
@@ -146,12 +139,13 @@ def _write_json(path: Path, data: Any) -> None:
 
 
 def _read_log(run_dir: Path) -> list[dict[str, Any]]:
-    """Entries of `orchestrator.jsonl`; damaged lines are skipped."""
+    """Entries of `orchestrator.jsonl`; damaged lines are skipped. Split only at `"\n"`, as
+    `OrchestratorLog.entries()` (W4b-06b): U+2028, U+2029, U+0085 stay inside a value."""
     path = run_dir / ORCHESTRATOR_LOG
     if not path.is_file():
         return []
     entries = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").split("\n"):
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -189,7 +183,7 @@ def _duration(seconds: float) -> str:
 
 
 def _safe_kind(kind: str) -> str:
-    """Same file-name rule as `AgentRoom.submit_result`."""
+    """The file-name rule of the old `AgentRoom.submit_result` (`result_file` reads old runs)."""
     return "".join(c if c.isalnum() or c in "-_" else "-" for c in kind)
 
 
@@ -205,7 +199,8 @@ def one_line(text: str, limit: int = 200) -> str:
 
 
 def result_file(result: Result) -> str:
-    """`output/results/NNN-<agent>-<kind>.md`, relative to the run folder."""
+    """`output/results/NNN-<agent>-<kind>.md`, relative to the run folder: the copy an old run
+    (before W4b-06b) wrote for a result; `read_results` names it."""
     return f"{RESULTS_DIR}/{result.id:03d}-{result.agent}-{_safe_kind(result.kind)}.md"
 
 
@@ -405,8 +400,6 @@ class _Finalizer:
         self.failures: list[str] = []
         self.hints: list[str] = []
         self.room: RoomStore | None = None
-        self.results: list[Result] = []
-        self.ratings: list[Rating] = []
         self.submissions: list[Submission] = []
         self.usage: RunUsage | None = None
 
@@ -416,7 +409,6 @@ class _Finalizer:
             ("Kanal-Exporte", self._exports),
             ("Transkripte", self._transcripts),
             ("changes.diff", self._diffs),
-            ("Ergebnisse und Ratings", self._results),
             ("Abgaben", self._submissions),
             ("usage.json", self._usage),
             ("approvals.jsonl", self._approvals),
@@ -457,12 +449,10 @@ class _Finalizer:
             if self.prepared.resolved.groupchats:
                 self.hints.append(
                     "Die Gruppenchat-Datenbank fehlt (der Run wurde nicht fertig vorbereitet). "
-                    "Es gibt keine Kanal-Exporte, Ergebnisse und Ratings."
+                    "Es gibt keine Kanal-Exporte und keine Abgaben."
                 )
             return
         self.room = RoomStore(self.run_dir)
-        self.results = self.room.results()
-        self.ratings = self.room.ratings()
         self.submissions = self.room.submissions()
 
     def _exports(self) -> None:
@@ -514,43 +504,9 @@ class _Finalizer:
                 where="finalizer",
             )
 
-    def _results(self) -> None:
-        by_result: dict[int, list[Rating]] = {}
-        for rating in self.ratings:
-            by_result.setdefault(rating.result_id, []).append(rating)
-        entries = []
-        for result in self.results:
-            ratings = by_result.get(result.id, [])
-            target = result_file(result)
-            if result.path != target:
-                _write_text(self.run_dir / target, _result_markdown(result, ratings))
-            entries.append(
-                {
-                    **result.model_dump(mode="json"),
-                    "file": target,
-                    "score": fmean(r.score for r in ratings) if ratings else None,
-                    "ratings": [r.id for r in ratings],
-                }
-            )
-        _write_json(
-            self.run_dir / RESULTS_JSON, {"version": 1, "run": self.run_id, "results": entries}
-        )
-        _write_json(
-            self.run_dir / RATINGS_JSON,
-            {
-                "version": 1,
-                "run": self.run_id,
-                "ratings": [r.model_dump(mode="json") for r in self.ratings],
-            },
-        )
-
     def _submissions(self) -> None:
-        """`output/submissions.json`: every submission with head, fields and folder (W4b-01).
-
-        Written only when there are submissions or the run uses `phases`, so the output of
-        the five old topologies stays as it was."""
-        if not self.submissions and self.prepared.resolved.topology.kind is not TopologyKind.PHASES:
-            return
+        """`output/submissions.json`: every submission with head, fields and folder (W4b-01),
+        in every run (since W4b-06b every run is a phases run)."""
         entries = []
         for sub in self.submissions:
             entry = sub.model_dump(mode="json", exclude={"body"})
@@ -592,10 +548,7 @@ class _Finalizer:
             role = f", Rolle {Path(agent.role).stem}" if agent.role else ""
             lines.append(f"- `{agent.id}`: {agent.provider.value}, {agent.model}{role}")
         lines += self._stages(entries)
-        lines += self._overview(entries)
-        lines += self._results_section(entries)
         lines += self._submissions_section()
-        lines += self._summarizer()
         lines += self._usage_section()
         lines += self._hints(entries)
         return "\n".join(lines).rstrip("\n") + "\n"
@@ -665,46 +618,6 @@ class _Finalizer:
             lines += ["", *ends] if rows else ends
         return lines
 
-    @staticmethod
-    def _overview(entries: Sequence[Mapping[str, Any]]) -> list[str]:
-        """The overview of the latest checkpoint that has one (review, exploration)."""
-        found = [
-            e["data"]["overview"]
-            for e in entries
-            if e["kind"] == "checkpoint" and isinstance(e["data"].get("overview"), str)
-        ]
-        return ["", "## Übersicht", "", found[-1]] if found else []
-
-    def _results_section(self, entries: Sequence[Mapping[str, Any]]) -> list[str]:
-        lines = ["", "## Ergebnisse", ""]
-        if not self.results:
-            return [*lines, "Keine Ergebnisse abgegeben."]
-        accepted = {
-            e["data"].get("accepted")
-            for e in entries
-            if e["kind"] == "checkpoint" and e["data"].get("phase") == "stage_end"
-        }
-        scores: dict[int, list[float]] = {}
-        for rating in self.ratings:
-            scores.setdefault(rating.result_id, []).append(rating.score)
-        for result in self.results:
-            link = Path(result_file(result)).relative_to("output").as_posix()
-            title = one_line(result.title)
-            text = f"- [#{result.id} {title}]({link}) · `{result.agent}` · {one_line(result.kind)}"
-            if result.stage:
-                text += f" · Stufe {result.stage}, Versuch {result.attempt}"
-            if result.id in scores:
-                values = scores[result.id]
-                text += (
-                    f" · Ø {_number(fmean(values))} ({_count(len(values), 'Rating', 'Ratings')})"
-                )
-            if result.id in accepted:
-                text += " · ✓ akzeptiert"
-            if result.path and result.path != result_file(result):
-                text += f" · Datei: [{Path(result.path).name}](../{result.path})"
-            lines.append(text)
-        return lines
-
     def _submissions_section(self) -> list[str]:
         """The overview of all submissions from their summaries, without a model (docs/10
         §4.8); nothing for a run without submissions."""
@@ -729,21 +642,6 @@ class _Finalizer:
                 text += f" · [Ordner]({Path(sub.path).relative_to('output').as_posix()}/)"
             lines += [text, f"  {one_line(sub.summary, 800)}"]
         return lines
-
-    def _summarizer(self) -> list[str]:
-        summaries = [r for r in self.results if r.kind == SUMMARY_KIND]
-        if not summaries:
-            return []
-        last = summaries[-1]
-        body = last.body or f"Siehe [{Path(str(last.path)).name}](../{last.path})."
-        return [
-            "",
-            f"## Zusammenfassung von {last.agent}",
-            "",
-            f"**{one_line(last.title)}**",
-            "",
-            body,
-        ]
 
     def _usage_section(self) -> list[str]:
         if self.usage is None:
@@ -809,33 +707,6 @@ def _usage_line(label: str, total: UsageTotal) -> str:
     if total.cost_unknown_turns:
         parts.append(_count(total.cost_unknown_turns, "Turn", "Turns") + " ohne Kosten")
     return f"- {label}: " + ", ".join(parts)
-
-
-def _result_markdown(result: Result, ratings: Iterable[Rating]) -> str:
-    lines = [f"# {one_line(result.title)}", ""]
-    meta = [f"Ergebnis #{result.id}", f"`{result.agent}`", result.kind]
-    if result.stage:
-        meta.append(f"Stufe {result.stage}, Versuch {result.attempt}")
-    meta.append(_clock(result.ts))
-    lines += [" · ".join(meta), ""]
-    if result.path:
-        name = Path(result.path).name
-        lines += [f"Datei: [{name}]({name})", ""]
-    if result.body:
-        lines += [result.body, ""]
-    ratings = list(ratings)
-    if ratings:
-        lines += ["## Ratings", ""]
-        for rating in ratings:
-            text = f"- `{rating.rater}`: {_number(rating.score)}"
-            if rating.criteria:
-                text += (
-                    " (" + ", ".join(f"{k} {_number(v)}" for k, v in rating.criteria.items()) + ")"
-                )
-            if rating.comment:
-                text += f" – {rating.comment}"
-            lines.append(text)
-    return "\n".join(lines).rstrip("\n") + "\n"
 
 
 def failed_stage_text(entries: Sequence[Mapping[str, Any]]) -> str | None:

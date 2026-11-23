@@ -154,10 +154,24 @@ def test_a7_live_three_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
             "project": "collatz-mini",
             "name": "W4-04 A7 Aufsichts-Agent live",
             "task": "Live-Test des Aufsichts-Agenten (W4-04 A7).",
-            "topology": {"kind": "roundtable", "params": {"rounds": 1, "channel": "main"}},
+            "topology": {"kind": "phases"},
             "defaults": {"provider": "claude", "model": "claude-haiku-5-5", "auth": "max"},
             "agents": [{"id": "explorer-1"}],
             "groupchats": [channel("main", ["explorer-1"], mode="rounds")],
+            "phases": [  # W4b-06b: one round in #main as a phase `chat` (was `roundtable`)
+                {
+                    "name": "runde",
+                    "topology": "chat",
+                    "channels": ["main"],
+                    "rounds": 1,
+                    "actions": {
+                        "explorer-1": {
+                            "task": "tasks/ohne-skill.md",
+                            "submission": {"format": "text"},
+                        }
+                    },
+                }
+            ],
             "approvals": {
                 "decider": "gatekeeper_then_user",
                 "timeout": "5m",

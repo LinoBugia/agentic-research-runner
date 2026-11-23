@@ -1,13 +1,14 @@
-"""W4b-06a A8-A12: briefs, rules, prompts and texts for both kinds of run, and the own alias.
+"""W4b-06a A8-A12: briefs, rules, prompts and texts, and the own alias. Since W4b-06b every
+text has one version, the one of the runs with phases (the old topologies are gone), with the
+wording of NR2: every message of the user in the private channel ends the wait.
 
 - A8: the brief of the private channel after Entscheidung 69, word for word and in behavior
   (probe `np_n2_and_brief.py`, parts 1 and 2, of the Nachprüfung W4b-03.1).
-- A9: the brief of a group channel: in a `phases` run rule 4 after Entscheidung 69 and rule 8
-  with `submit` (G8); in a run without phases character for character as on `main`; without
-  `run.yaml` the old one.
+- A9: the brief of a group channel: rule 4 after Entscheidung 69 and rule 8 with `submit` (G8),
+  also without `run.yaml`.
 - A10 (B2): the project context names the own alias per anonymous channel, as the room has it.
-- A11: the prompts and the answers of the room server are right for both kinds of run.
-- A12: `prepare.py` names `submit` in `phases` runs, `submit_result` in the others.
+- A11: the prompts and the answers of the room server.
+- A12: `prepare.py` names `submit`.
 """
 
 import re
@@ -39,7 +40,6 @@ from arr.models import ChannelMode, GroupChatConfig, RunStatus, WorkspaceMode
 from arr.room import server
 from arr.room.store import (
     CONVERSATION_RULES,
-    PHASES_CONVERSATION_RULES,
     PRIVATE_BRIEF,
     USER,
     RoomStore,
@@ -53,45 +53,6 @@ from arr.runs.phases import wake
 ASK = "@user Darf ich annehmen, dass n prim ist?"
 AGENTS = {"agents": [{"id": "a"}]}
 
-MAIN_JUDGES_BRIEF = """Steckbrief #judges
-Zweck: Diskussion der Judges
-Mitglieder:
-- Mitglied A (judge)
-- Mitglied B
-Der Kanal ist anonym: Mitglieder erscheinen nur als „Mitglied A/B/…“.
-Taktung: Runden: Alle Mitglieder kommen pro Runde dran, sonst `pass`.
-Länge einer Nachricht: höchstens 3000 Zeichen.
-Gesprächsregeln:
-1. Eine Nachricht, ein Gedanke. Setze `kind` korrekt.
-2. Behauptungen mit Begründung oder Beleg: Datei, Rechnung, Anhang.
-3. Beantworte Fragen an dich zuerst.
-4. Wer jemanden fragt, schreibt `@name` (oder `to`); `@alle` fragt alle, `@user` den User \
-(nur er antwortet darauf). Auf eine Antwort wartest du mit `wait_for_messages`, auf den User \
-nie mit `wait_until`: Antwortet er nicht, arbeite mit einer begründeten Annahme weiter und \
-nenne sie in deinem Ergebnis.
-5. Widerspruch als `objection` mit `reply_to`, sachlich und konkret.
-6. Nicht wiederholen. Zustimmung nur, wenn sie etwas hinzufügt.
-7. Lange Inhalte (Beweise, Code, Tabellen) als Anhang, im Text nur die Kernaussage.
-8. Wer seinen Teil erledigt hat, gibt sein Ergebnis ab (`submit_result` oder Nachricht \
-`result`) oder meldet `done`. Fertig heißt: Du wartest nicht mehr, bleibst aber ansprechbar; \
-jede Nachricht an dich weckt dich. Wartest du auf das Ergebnis eines anderen, warte mit \
-`wait_until(minutes, until_result_from="<name>")`.
-Ende: nach der letzten Runde oder wenn alle `pass`/`done` melden."""
-"""The brief of a run without phases as `main` (`cf8dd55`) writes it, character for character
-(generated there with the same channel)."""
-
-MAIN_USER_MAY_NOT_ANSWER = (
-    "Deine Frage an den User ist noch offen, und er antwortet vielleicht lange nicht. Warte "
-    "nicht länger auf ihn, auch nicht mit `wait_until`: Arbeite mit einer begründeten Annahme "
-    "weiter und nenne sie in deinem Ergebnis. Antwortet er später, weckt dich das; prüfe dann "
-    "deine Annahme."
-)
-MAIN_USER_WAITED_LONG = (
-    "Beachte: Deine Frage an den User ist noch offen, und er antwortet vielleicht lange nicht. "
-    "Warte danach nicht noch einmal auf ihn: Arbeite besser mit einer begründeten Annahme weiter "
-    "und nenne sie in deinem Ergebnis. Eine späte Antwort weckt dich auch dann; prüfe dann deine "
-    "Annahme."
-)
 JUDGES = GroupChatConfig(
     name="judges",
     purpose="Diskussion der Judges",
@@ -127,27 +88,23 @@ def rules_of(brief: str) -> list[str]:
 # --------------------------------------------------------------------------------------------
 
 
-def test_a9_without_run_yaml_the_brief_is_that_of_main(tmp_path: Path) -> None:
+def test_a9_without_run_yaml_the_brief_has_the_one_set_of_rules(tmp_path: Path) -> None:
     store = RoomStore.create(tmp_path / "run")
     brief = store.create_channel(JUDGES, roles={"judge-1": "judge"}).body
-    assert brief == MAIN_JUDGES_BRIEF
+    assert rules_of(brief) == list(CONVERSATION_RULES)
+    assert "submit_result" not in brief
 
 
-def test_a9_the_rules_of_runs_without_phases_are_unchanged() -> None:
-    assert rules_of(MAIN_JUDGES_BRIEF) == list(CONVERSATION_RULES)
-
-
-def test_a9_the_rules_of_phases_runs() -> None:
-    old, new = CONVERSATION_RULES, PHASES_CONVERSATION_RULES
-    assert len(new) == len(old) == 8
-    assert [i for i in range(8) if old[i] != new[i]] == [3, 7], "only rules 4 and 8 differ"
-    rule4, rule8 = new[3], new[7]
+def test_a9_the_rules() -> None:
+    rules = CONVERSATION_RULES
+    assert len(rules) == 8
+    rule4, rule8 = rules[3], rules[7]
     assert "Auf einen Agenten wartest du mit `wait_for_messages`." in rule4
     assert "Brauchst du die Antwort des Users, warte mit `wait_until` bis zu fünf Minuten" in rule4
-    # N5 (W4b-06a.1): in a group channel only an answer ends the wait, in the private channel
-    # also a note (`room/address.py`, `runs/phases/wake.py`)
+    # N5 (W4b-06a.1), NR2 (W4b-06b): in a group channel the answer ends the wait, in the
+    # private channel every message of the user (`room/address.py`, `runs/phases/wake.py`)
     assert (
-        "eine Antwort des Users (in deinem privaten Kanal auch eine Notiz) beendet das Warten."
+        "seine Antwort und jede Nachricht des Users in deinem privaten Kanal beenden das Warten."
         in rule4
     )
     assert "begründeten Annahme" in rule4 and "in deiner Abgabe" in rule4
@@ -165,7 +122,7 @@ async def test_a9_a_phases_run_writes_the_phases_rules(workfolder: Path) -> None
     )
     assert await run(mgr) is RunStatus.DONE, errors(mgr)
     brief = mgr.room.messages("judges")[0].body
-    assert rules_of(brief) == list(PHASES_CONVERSATION_RULES)
+    assert rules_of(brief) == list(CONVERSATION_RULES)
     assert "submit_result" not in brief
 
 
@@ -183,7 +140,7 @@ async def test_a9_run_yaml_is_read_when_the_channel_is_made(
     store = RoomStore.create(target)
     shutil.copyfile(mgr.run_dir / "run.yaml", target / "run.yaml")
     brief = store.create_channel(JUDGES).body
-    assert rules_of(brief) == list(PHASES_CONVERSATION_RULES)
+    assert rules_of(brief) == list(CONVERSATION_RULES)
 
 
 # --------------------------------------------------------------------------------------------
@@ -197,7 +154,7 @@ def test_a8_the_private_brief_after_decision_69() -> None:
     assert "Hier fragst du ihn mit einer `question` an `@user`, in jeder Phase" in text
     assert "Nur der User liest diesen Kanal" in text
     assert "Brauchst du die Antwort, warte mit `wait_until` bis zu fünf Minuten" in text
-    assert "eine Antwort oder Notiz des Users beendet das Warten" in text
+    assert "eine Nachricht des Users in deinem privaten Kanal beendet das Warten" in text
     assert "Gibst du ab, gilt deine Frage als erledigt." in text
     assert "beende den Turn ohne Abgabe" not in text and "Die Phase wartet" not in text
 
@@ -358,11 +315,11 @@ def bullet(text: str, title: str) -> str:
     return line
 
 
-@pytest.mark.parametrize("title", ["Runs mit Phasen", "Dein Kanal zum User"])
+@pytest.mark.parametrize("title", ["Phasen", "Dein Kanal zum User"])
 def test_a11_the_phases_bullets_are_the_same_in_both_backends(title: str) -> None:
     claude, codex = (bullet(prompt_text(n), title) for n in BACKENDS)
     assert claude == codex
-    assert "In einem Run mit Phasen" in claude
+    assert "In einem Run mit Phasen" not in claude, "one version since W4b-06b"
 
 
 def test_a11_the_private_channel_after_decisions_67_and_69() -> None:
@@ -372,7 +329,7 @@ def test_a11_the_private_channel_after_decisions_67_and_69() -> None:
         "Nur der User liest ihn.",
         "mit einer `question` an `@user`, in jeder Phase",
         "Brauchst du die Antwort, warte mit `wait_until` bis zu fünf Minuten",
-        "eine Antwort oder Notiz des Users beendet das Warten",
+        "eine Nachricht des Users in deinem privaten Kanal beendet das Warten",
         "Gibst du ab, ist deine Frage erledigt",
         "nenne die Annahme, mit der du gearbeitet hast, in der Abgabe",
     ):
@@ -381,80 +338,57 @@ def test_a11_the_private_channel_after_decisions_67_and_69() -> None:
 
 
 def test_a11_on_call_and_what_counts() -> None:
-    text = bullet(prompt_text("claude.md"), "Runs mit Phasen")
+    text = bullet(prompt_text("claude.md"), "Phasen")
     assert "Abstimmungen und Moderator-Werkzeuge gibt es nicht" in text
     assert "was zählt, steht in den Abgaben" in text
     # Punkt 8, Satz 2: woken by a message to it and by the user in its private channel; NR2
-    # is open, so the text says „Notiz“, not „jede Nachricht“
+    # (checked in W4b-06b): every message of the user there, not only a note
     assert "(`@name`, eine Frage an dich, eine Antwort auf deine Nachricht)" in text
-    assert "oder eine Notiz des Users in deinem privaten Kanal" in text
-    assert "jede Nachricht des Users" not in text
+    assert "oder eine Nachricht des Users in deinem privaten Kanal" in text
+    assert "Notiz des Users" not in text
 
 
 @pytest.mark.parametrize("name", BACKENDS)
-def test_a11_done_for_both_kinds_of_run(name: str) -> None:
+def test_a11_done(name: str) -> None:
     text = bullet(prompt_text(name), "Ergebnisse und fertig")
-    assert "`submit_result` in einem Run ohne Phasen, `submit` in einem Run mit Phasen" in text
-    assert "In einem Run ohne Phasen gilt:" in text
-    assert "In einem Run mit Phasen bist du mit deinem Teil fertig, sobald du abgegeben hast" in (
-        text
-    )
+    assert text.startswith("- **Ergebnisse und fertig:** Dein Ergebnis gibst du mit `submit` ab.")
+    assert "Mit deinem Teil bist du fertig, sobald du abgegeben hast" in text
     assert "eine offene Frage an den User gilt mit der Abgabe als erledigt" in text
     assert (
         "In einer Diskussion `chat` bist du fertig, sobald du abgegeben hast und keinen anderen "
         "Diskutanten mehr fragst." in text
     )
-    # every mention of an old way to be done is bound to runs without phases
-    tail = text.split("In einem Run mit Phasen bist du")[1]
-    assert "submit_result" not in tail and "set_status" not in tail
+    assert "ohne Phasen" not in text and "set_status" not in text
 
 
 @pytest.mark.parametrize("name", BACKENDS)
-def test_a11_v10_holds_in_runs_without_phases(name: str) -> None:
+def test_a11_v10_one_version(name: str) -> None:
+    """V10 since W4b-06b: the user is waited for as in „Dein Kanal zum User“ (once, at most
+    five minutes); the sentence of the runs without phases („nie mit `wait_until`“) is gone."""
     text = bullet(prompt_text(name), "Ansprechen und warten")
-    assert (
-        "In einem Run ohne Phasen wartest du auf den User nur mit `wait_for_messages`, nie mit "
-        "`wait_until`: Antwortet er nicht, arbeite mit einer begründeten Annahme weiter und "
-        "nenne sie in deinem Ergebnis." in text
-    )
-    assert "In einem Run mit Phasen wartest du auf ihn wie unter „Dein Kanal zum User“." in text
-    assert "Auf den User wartest du nur" not in text, "no sentence for every kind of run"
+    assert text.endswith("Auf den User wartest du wie unter „Dein Kanal zum User“.")
+    assert "nie mit `wait_until`" not in text and "ohne Phasen" not in text
 
 
 @pytest.mark.parametrize("name", BACKENDS)
-def test_a11_no_sentence_names_submit_result_alone(name: str) -> None:
-    """`submit_result` and `set_status` appear only where a run without phases is named."""
-    for line in prompt_text(name).splitlines():
-        for sentence in re.split(r"(?<=[.:])\s+(?=[A-ZÄÖÜ„])", line):
-            if "submit_result" in sentence or "set_status" in sentence:
-                context = line[: line.index(sentence) + len(sentence)]
-                assert "ohne Phasen" in context, sentence
+def test_a11_no_sentence_names_submit_result_or_set_status(name: str) -> None:
+    text = prompt_text(name)
+    assert "submit_result" not in text and "set_status" not in text
+    assert "ohne Phasen" not in text and "mit Phasen" not in text
 
 
 def _outcome() -> WaitOutcome:
     return WaitOutcome(ended_by=WaitEnd.NOBODY, waited_s=300, remaining_s=0, limit_s=45, asked_s=45)
 
 
-def test_a11_the_room_answers_of_runs_without_phases_are_those_of_main() -> None:
-    assert server.USER_MAY_NOT_ANSWER == MAIN_USER_MAY_NOT_ANSWER
-    assert server.USER_WAITED_LONG == MAIN_USER_WAITED_LONG
-    old = server.render_wait(_outcome(), asked_user=True)
-    assert MAIN_USER_MAY_NOT_ANSWER in old
-    assert old == server.render_wait(_outcome(), asked_user=True, phases=False)
-    until = server.render_wait_until(4e9, None, asked_user=True)
-    assert until.endswith(f" {MAIN_USER_WAITED_LONG}")
-
-
-def test_a11_the_room_answers_of_phases_runs_allow_one_wait() -> None:
-    text = server.render_wait(_outcome(), asked_user=True, phases=True)
-    assert server.USER_MAY_NOT_ANSWER_PHASES in text
+def test_a11_the_room_answers_allow_one_wait() -> None:
+    text = server.render_wait(_outcome(), asked_user=True)
+    assert server.USER_MAY_NOT_ANSWER in text
     assert "warte einmal mit `wait_until` bis zu fünf Minuten" in text
     assert "auch nicht mit `wait_until`" not in text
-    until = server.render_wait_until(4e9, None, asked_user=True, phases=True)
-    assert until.endswith(f" {server.USER_WAITED_LONG_PHASES}")
+    until = server.render_wait_until(4e9, None, asked_user=True)
+    assert until.endswith(f" {server.USER_WAITED_LONG}")
     assert "höchstens fünf Minuten" in until and "Gibst du ab, gilt deine Frage" in until
-    # without an open question both kinds say the same
-    assert server.render_wait(_outcome(), phases=True) == server.render_wait(_outcome())
 
 
 # --------------------------------------------------------------------------------------------
@@ -472,16 +406,15 @@ async def test_a12_a_phases_run_names_submit(workfolder: Path) -> None:
         context = (mgr.run_dir / "agents" / agent.id / "context.md").read_text("utf-8")
         assert "- Ergebnisse gibst du mit `submit` ab." in context
         assert "submit_result" not in context
-    assert prepare.default_role(resolved) == prepare.DEFAULT_ROLE_PHASES
-    assert "`submit`" in prepare.DEFAULT_ROLE_PHASES
-    assert "submit_result" not in prepare.DEFAULT_ROLE_PHASES
+    assert "`submit`" in prepare.DEFAULT_ROLE
+    assert "submit_result" not in prepare.DEFAULT_ROLE
 
 
-async def test_a12_a_run_without_role_gets_the_role_of_its_kind(workfolder: Path) -> None:
+async def test_a12_a_run_without_role_gets_the_default_role(workfolder: Path) -> None:
     mgr, _log = manager(workfolder, {**AGENTS, "phases": [solo("p", "a")]}, {"a": answer()})
     assert await run(mgr) is RunStatus.DONE, errors(mgr)
     role = (mgr.run_dir / "agents" / "a" / "role.md").read_text("utf-8")
-    assert role == prepare.DEFAULT_ROLE_PHASES
+    assert role == prepare.DEFAULT_ROLE
 
 
 # --------------------------------------------------------------------------------------------
@@ -491,7 +424,7 @@ async def test_a12_a_run_without_role_gets_the_role_of_its_kind(workfolder: Path
 
 def _room(tmp_path: Path, *, phases: bool) -> RoomStore:
     """A room of two agents `a`, `b` and a channel `main`; with `phases` its `run.yaml` is that
-    of a `phases` run, without it there is none (a run without phases)."""
+    of a `phases` run, without it there is none."""
     from phases_kit import FAKE_DEFAULTS
     from run_kit import make_settings
 
@@ -519,8 +452,8 @@ def _room(tmp_path: Path, *, phases: bool) -> RoomStore:
     return store
 
 
-@pytest.mark.parametrize("phases", [False, True], ids=["ohne-phasen", "phasen"])
-async def test_a11_the_wait_tools_answer_per_kind_of_run(
+@pytest.mark.parametrize("phases", [False, True], ids=["ohne-run-yaml", "phasen"])
+async def test_a11_the_wait_tools_answer_the_same_in_every_room(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phases: bool
 ) -> None:
     from mcp.client.client import Client
@@ -530,18 +463,9 @@ async def test_a11_the_wait_tools_answer_per_kind_of_run(
     monkeypatch.setattr(waiting, "STREAK_MAX_S", 0.3)
     store = _room(tmp_path, phases=phases)
     a = store.for_agent("a")
-    assert store.uses_phases() is phases
     a.post_message("main", "@user welches Band?", MessageKind.QUESTION)
     async with Client(server.build_server(a)) as client:
         nobody = (await client.call_tool("wait_for_messages", {"seconds": 5})).content[0].text
         until = (await client.call_tool("wait_until", {"minutes": 2})).content[0].text
-    if phases:
-        assert server.USER_MAY_NOT_ANSWER_PHASES in nobody
-        assert server.USER_MAY_NOT_ANSWER not in nobody
-        assert server.USER_WAITED_LONG_PHASES in until
-        assert server.USER_WAITED_LONG not in until
-    else:  # word for word as on `main`
-        assert MAIN_USER_MAY_NOT_ANSWER in nobody
-        assert server.USER_MAY_NOT_ANSWER_PHASES not in nobody
-        assert MAIN_USER_WAITED_LONG in until
-        assert server.USER_WAITED_LONG_PHASES not in until
+    assert server.USER_MAY_NOT_ANSWER in nobody  # one version since W4b-06b
+    assert server.USER_WAITED_LONG in until

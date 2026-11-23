@@ -31,12 +31,13 @@ from arr.runs.orchestrator import WORKED_ON
 D1, D2 = "diskutant-1", "diskutant-2"
 BACKENDS = ["claude.md", "codex.md"]
 USER_WAIT = (
-    "In einem Run ohne Phasen wartest du auf den User nur mit `wait_for_messages`, nie mit "
-    "`wait_until`: Antwortet er nicht, arbeite mit einer begründeten Annahme weiter und nenne sie "
-    "in deinem Ergebnis. Eine späte Antwort weckt dich; prüfe dann deine Annahme."
+    "Brauchst du die Antwort, warte mit `wait_until` bis zu fünf Minuten; eine Nachricht des "
+    "Users in deinem privaten Kanal beendet das Warten. Gibst du ab, ist deine Frage erledigt; "
+    "nenne die Annahme, mit der du gearbeitet hast, in der Abgabe."
 )
-"""V10 in the prompts: since W4b-06a for runs without phases (there the agent may wait for
-the user once with `wait_until`, at most five minutes, Entscheidung 69)."""
+"""V10 in the prompts, since W4b-06b only the version of phases runs: the agent may wait for
+the user once with `wait_until`, at most five minutes (Entscheidung 69); the version of runs
+without phases („nur mit `wait_for_messages`“) is gone."""
 
 
 def prompt_text(name: str) -> str:
@@ -54,19 +55,21 @@ def bullet(text: str, title: str) -> str:
 
 
 @pytest.mark.parametrize("name", BACKENDS)
-def test_v10_the_prompt_waits_for_the_user_only_with_wait_for_messages(name: str) -> None:
+def test_v10_the_prompt_waits_for_the_user_once_with_wait_until(name: str) -> None:
     text = prompt_text(name)
-    assert USER_WAIT in text
+    assert USER_WAIT in bullet(text, "Dein Kanal zum User")
     assert "beim User mit einer begründeten Annahme" not in text, "the old, weaker advice"
+    assert "In einem Run ohne Phasen" not in text and "nie mit `wait_until`" not in text
     waiting_part = bullet(text, "Ansprechen und warten")
     assert "5 min" in waiting_part and "`@user`" in waiting_part
+    assert "Auf den User wartest du wie unter „Dein Kanal zum User“." in waiting_part
 
 
 def test_v10_conversation_rule_4_says_the_same() -> None:
     rule = CONVERSATION_RULES[3]
     assert rule.startswith("Wer jemanden fragt")
-    assert "auf den User nie mit `wait_until`" in rule
-    assert "begründeten Annahme" in rule and "in deinem Ergebnis" in rule
+    assert "Brauchst du die Antwort des Users, warte mit `wait_until` bis zu fünf Minuten" in rule
+    assert "begründeten Annahme" in rule and "in deiner Abgabe" in rule
 
 
 def test_the_honest_way_out_is_the_same_in_both_backends() -> None:
@@ -132,7 +135,7 @@ async def test_v10_nobody_answers_advises_an_assumption_while_the_user_is_asked(
     store.for_agent("a").post_message("main", "@user welches Band?", MessageKind.QUESTION)
     text = await _nobody(store)
     assert "Niemand antwortet" in text and USER_MAY_NOT_ANSWER in text
-    assert "auch nicht mit `wait_until`" in text
+    assert "warte einmal mit `wait_until` bis zu fünf Minuten" in text
     assert "oder warte mit `wait_until`" not in text, "no advice to wait long"
 
 
@@ -164,7 +167,7 @@ async def test_v10_wait_until_is_accepted_but_advised_against(
     assert not asked.is_error, "accepted: no hard limit (V10 option a is not decided)"
     text = _text(asked)
     assert text.startswith("Gut. Beende jetzt deinen Turn") and USER_WAITED_LONG in text
-    assert "antwortet vielleicht lange nicht" in text and "begründeten Annahme" in text
+    assert "höchstens fünf Minuten und nur einmal" in text and "begründeten Annahme" in text
     assert store.waits(waiting.WaitKind.UNTIL)["a"].until > 0, "the wait stands"
 
 

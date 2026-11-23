@@ -14,6 +14,11 @@ The texts are filed in the run folder (`tasks/`), one Markdown file per assignme
 `tasks/index.json` listing them (phase, kind, key, agents, the path in the YAML, where the
 file was found, the filed copy). Agents get the text in the prompt and through
 `get_assignment`, never as a file.
+
+A run without a skill (W4b-06b, F1: the agent `solver` with one phase `arbeit`) has no skill
+and usually no assignment in its project: its one assignment `NO_SKILL_TASK` comes from arr's
+package (`templates/run/ohne-skill.md`). Only a run without a skill reads it, and only under
+this one name; a run with a skill never does.
 """
 
 import json
@@ -30,12 +35,16 @@ from arr.resolve import _substitute, format_loc
 from arr.runs.phases.text import MAX_TASK_BYTES, line
 from arr.submissions.text import clean_text
 
-__all__ = ["TASKS_DIR", "TASKS_INDEX", "TaskText", "Tasks", "load_tasks"]
+__all__ = ["NO_SKILL_TASK", "TASKS_DIR", "TASKS_INDEX", "TaskText", "Tasks", "load_tasks"]
 
 TASKS_DIR = "tasks"
 TASKS_INDEX = "index.json"
 KIND_WORK = "work"
 KIND_GATE = "gate"
+NO_SKILL_TASK = "tasks/ohne-skill.md"
+"""The assignment of a run without a skill; its text comes from the package (F1)."""
+NO_SKILL_LABEL = "arr"
+"""Where the assignment of a run without a skill was found (`tasks/index.json`)."""
 
 _GUARD = "\x00"
 """Put in front of a text so that a file that is exactly one placeholder is still „longer
@@ -129,6 +138,13 @@ def _entries(run: ResolvedRun) -> list[tuple[Any, str, str, list[str], ResolvedT
     return out
 
 
+def _no_skill_text() -> str:
+    """The assignment of a run without a skill, from the package (F1)."""
+    from arr.workfolder import read_template  # late: keeps this module light
+
+    return read_template("run", "ohne-skill.md")
+
+
 def load_tasks(run_folder: Path, run: ResolvedRun, params: Mapping[str, Any]) -> Tasks:
     """Read, check and insert every assignment of every phase; file them under `tasks/`.
 
@@ -146,6 +162,8 @@ def load_tasks(run_folder: Path, run: ResolvedRun, params: Mapping[str, Any]) ->
         path_text = format_loc(loc)
         shown = line(task.task, 120)
         where = f"Phase „{phase.name}“: Der Auftrag „{shown}“"
+        if task.task not in cache and not run.skill and task.task == NO_SKILL_TASK:
+            cache[task.task] = (_no_skill_text(), NO_SKILL_LABEL, None)
         if task.task not in cache:
             path, label, problem = _problem(task.task, folders)
             text = None

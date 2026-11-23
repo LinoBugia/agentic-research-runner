@@ -36,7 +36,7 @@ from arr.runs.phases import start
 from arr.runs.phases.runner import seed_items
 from arr.runs.phases.tasks import TASKS_DIR, TASKS_INDEX
 from arr.runs.phases.text import MAX_TASK_BYTES
-from arr.runs.topologies import AVAILABLE, check_topology, planned_stages
+from arr.runs.topology import check_topology, topology_for
 from arr.service.real_api.rundir import RunRecord, stage_infos
 from arr.usage import RunUsage, compute_run_usage, write_usage_json
 
@@ -95,9 +95,11 @@ def launch_setup(workfolder: Path, arr_home: Path, monkeypatch: pytest.MonkeyPat
 
 
 def test_a1_phases_is_available_and_plans_its_phases() -> None:
-    assert TopologyKind.PHASES in AVAILABLE
+    from arr.runs.phases import runner
+
+    assert topology_for(TopologyKind.PHASES) is runner.run
     resolved = resolved_of({**TWO, "phases": [solo("x", "a"), parallel("y", ["a", "b"])]})
-    assert planned_stages(resolved) == ["x", "y"]
+    assert [p.name for p in resolved.phases] == ["x", "y"]  # the plan of the RunManager
     check_topology(resolved)  # no error
 
 

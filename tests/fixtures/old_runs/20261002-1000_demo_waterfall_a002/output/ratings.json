@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "run": "20261002-1000_demo_waterfall_a002",
+  "ratings": [
+    {
+      "id": 1,
+      "ts": 1795441628.806388,
+      "rater": "q",
+      "result_id": 1,
+      "score": 3.0,
+      "criteria": {},
+      "comment": "passt"
+    }
+  ]
+}

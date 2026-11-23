@@ -25,6 +25,7 @@ from test_approvals import (
     log_of,
     run_input,
     until,
+    write_tasks,
 )
 
 from arr.models import RunStatus
@@ -54,7 +55,7 @@ def wf(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     arr_home.mkdir(parents=True, exist_ok=True)
     write_profiles(arr_home, {"fake-auth": "claude_oauth", "fake-codex": "codex_chatgpt"})
     monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
-    return make_workfolder(tmp_path)
+    return write_tasks(make_workfolder(tmp_path))
 
 
 def bash(run_id: str, command: str, agent: str = "a", reason: str | None = None) -> Any:
@@ -621,7 +622,7 @@ async def test_the_inbox_stays_the_source_after_a_workfolder_switch(
 
     monkeypatch.setattr(Client, "instances", {})  # pages left by GUI tests hang on closed loops
     (tmp_path / "zweiter").mkdir()
-    other = make_workfolder(tmp_path / "zweiter")
+    other = write_tasks(make_workfolder(tmp_path / "zweiter"))
     async with Service(wf, {"a": asking(HOST)}) as svc:
         await svc.api.select_workfolder(WorkfolderRequest(path=str(other)))
         assert svc.api.state.workfolder == other

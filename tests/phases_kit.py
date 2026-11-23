@@ -133,6 +133,34 @@ def policy_factory(policies: Mapping[str, Policy], log: Log) -> Callable[[Prepar
     return factory
 
 
+def policy_builders(policies: dict[str, Any], log: Log) -> dict[Any, Any]:
+    """Replacement for `arr.runs.launch.BACKEND_BUILDERS`: a `PolicyBackend` per agent (W4b-06a
+    A7; since W4b-06b here, for every run through the launcher); every call is recorded under
+    `"calls"` as `(provider, agent_id)`. An agent without a policy is `silent`."""
+    from arr.models import Provider
+
+    calls: list[tuple[str, str]] = []
+
+    def builder_for(provider: Provider) -> Any:
+        def build(prepared: Any, **kwargs: Any) -> PolicyBackend:
+            calls.append((provider.value, prepared.id))
+            view = RoomStore(prepared.run_dir).for_agent(prepared.id, prepared.work_dir)
+            return PolicyBackend(
+                prepared.file.config,
+                {"turns": []},
+                run_id=kwargs.get("run_id", prepared.run_dir.name),
+                room=view,
+                policy=policies.get(prepared.id, silent),
+                log=log,
+            )
+
+        return build
+
+    builders: dict[Any, Any] = {p: builder_for(p) for p in Provider}
+    builders["calls"] = calls
+    return builders
+
+
 # --------------------------------------------------------------------------------------------
 # Policies
 # --------------------------------------------------------------------------------------------

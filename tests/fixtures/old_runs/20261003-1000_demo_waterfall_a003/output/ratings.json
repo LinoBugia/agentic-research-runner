@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "run": "20261003-1000_demo_waterfall_a003",
+  "ratings": [
+    {
+      "id": 1,
+      "ts": 1795441628.863056,
+      "rater": "q",
+      "result_id": 1,
+      "score": 3.0,
+      "criteria": {},
+      "comment": "passt"
+    },
+    {
+      "id": 2,
+      "ts": 1795441628.879631,
+      "rater": "q",
+      "result_id": 2,
+      "score": 7.0,
+      "criteria": {},
+      "comment": "passt"
+    },
+    {
+      "id": 3,
+      "ts": 1795441628.8973582,
+      "rater": "q",
+      "result_id": 3,
+      "score": 8.0,
+      "criteria": {
+        "korrektheit": 8.0,
+        "klarheit": 7.0
+      },
+      "comment": "gut"
+    }
+  ]
+}

@@ -62,17 +62,30 @@ def wf(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     group.mkdir(parents=True)
     (group / "SKILL.md").write_text("---\nname: runde\ndescription: Eine Runde.\n---\n# Runde\n")
     (group / "group.yaml").write_text(
-        "kind: research-group\nversion: 1\ntopology: roundtable\n"
+        "kind: research-group\nversion: 1\ntopology: phases\n"
         "params:\n  rounds: {default: 2, min: 1, max: 5, doc: Runden}\n"
         "agents:\n  - {id: m-1}\n  - {id: m-2}\n"
         "groupchats:\n  - {name: main, members: [m-1, m-2]}\n"
+        "phases:\n  - name: diskussion\n    topology: chat\n    channels: [main]\n"
+        "    rounds: '{{ params.rounds }}'\n"
+        "    actions: {m-*: {task: tasks/runde.md, submission: {format: text}}}\n"
     )
+    (group / "tasks").mkdir()
+    (group / "tasks" / "runde.md").write_text("Diskutiere die Aufgabe.\n", "utf-8")
+    tasks = workfolder / "projects" / "demo" / "tasks"  # the run of `finished`
+    tasks.mkdir(parents=True, exist_ok=True)
+    (tasks / "idee.md").write_text("Finde eine Idee.\n", "utf-8")
+    (tasks / "bewerten.md").write_text("Bewerte die Idee.\n", "utf-8")
     return workfolder
+
+
+RATING = [{"ref": "${job.context.submission.rate.0}", "score": 7, "comment": "ok"}]
 
 
 @pytest.fixture
 def finished(wf: Path) -> str:
-    """A finished FakeBackend run with a message, a result and a rating."""
+    """A finished FakeBackend run with a message, a result and a rating (since W4b-06b a phases
+    run: `a` hands in, `b` rates at the gate `judge`)."""
     from arr.models import RunInput
     from arr.resolve import validate_model
 
@@ -81,11 +94,17 @@ def finished(wf: Path) -> str:
             [
                 say("Hallo"),
                 post("main", "Idee 1", kind="idea"),
-                room("submit_result", kind="idea", title="Idee 1", body="n zerlegen"),
+                room("submit", status="done", summary="Idee 1", body="n zerlegen"),
                 done(),
             ]
         ),
-        "b": turns([room("submit_rating", result_id=1, score=7, comment="ok"), done()]),
+        "b": turns(
+            [
+                room("get_assignment", save_as="job"),
+                room("submit", status="done", summary="ok", fields={"ratings": RATING}),
+                done(),
+            ]
+        ),
     }
     run_input = validate_model(
         RunInput,
@@ -93,10 +112,29 @@ def finished(wf: Path) -> str:
             "project": "demo",
             "name": "Fertiger Lauf",
             "task": "Teste arr.",
-            "topology": {"kind": "roundtable", "params": {"rounds": 1, "channel": "main"}},
+            "topology": {"kind": "phases"},
             "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
             "agents": [{"id": "a"}, {"id": "b"}],
             "groupchats": [{"name": "main", "members": ["a", "b"], "mode": "rounds"}],
+            "phases": [
+                {
+                    "name": "diskussion",
+                    "topology": "solo",
+                    "channels": ["main"],
+                    "actions": {"a": {"task": "tasks/idee.md", "submission": {"format": "text"}}},
+                    "gate": {
+                        "type": "judge",
+                        "raters": ["b"],
+                        "action": {
+                            "task": "tasks/bewerten.md",
+                            "submission": {"format": "rating"},
+                        },
+                        "rule": "mean",
+                        "pass_score": 6,
+                        "routes": {"pass": "next", "fail": "stop"},
+                    },
+                }
+            ],
         },
     )
     launch = plan_run_input(run_input, workfolder=wf)

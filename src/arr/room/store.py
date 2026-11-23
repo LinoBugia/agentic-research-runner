@@ -46,7 +46,6 @@ from arr.models import (
     ResolvedPhase,
     ResolvedRun,
     Rubric,
-    TopologyKind,
 )
 from arr.resolve import load_yaml_model
 from arr.room.address import USER_ADDRESS, address, is_user_question, mentions
@@ -89,8 +88,8 @@ SEALED_DIR = f"{ROOM_DIR}/sealed"
 """Result files of a sealed stage (W4-03 F4): beside `room.sqlite`, readable for no agent (the
 read profile denies the run folder, the policy names it a hard block) until `release`."""
 STAGING_DIR = f"{ROOM_DIR}/staging"
-"""Where `submit_result` copies a file first; readable for no agent, so a sealed result never
-passes through `output/` (W4-03 F4)."""
+"""Where `submit` prepares a submission first; readable for no agent, so a sealed submission
+never passes through `output/` (W4-03 F4)."""
 SUBMISSIONS_DIR = "output/submissions"
 """Unnamed submissions: `<nr>-<phase>-<agent or alias>/` (docs/10 §4.12, W4b-01)."""
 OUTPUT_DIR = "output"
@@ -223,50 +222,37 @@ CONVERSATION_RULES = (
     "Behauptungen mit Begründung oder Beleg: Datei, Rechnung, Anhang.",
     "Beantworte Fragen an dich zuerst.",
     "Wer jemanden fragt, schreibt `@name` (oder `to`); `@alle` fragt alle, `@user` den User "
-    "(nur er antwortet darauf). Auf eine Antwort wartest du mit `wait_for_messages`, auf den "
-    "User nie mit `wait_until`: Antwortet er nicht, arbeite mit einer begründeten Annahme weiter "
-    "und nenne sie in deinem Ergebnis.",
+    "(nur er antwortet darauf). Auf einen Agenten wartest du mit `wait_for_messages`. Brauchst "
+    "du die Antwort des Users, warte mit `wait_until` bis zu fünf Minuten; seine Antwort und "
+    "jede Nachricht des Users in deinem privaten Kanal beenden das Warten. Antwortet er nicht, "
+    "arbeite mit einer begründeten Annahme weiter und nenne sie in deiner Abgabe. Wer abgibt, "
+    "ist fertig; seine offene Frage gilt damit als erledigt.",
     "Widerspruch als `objection` mit `reply_to`, sachlich und konkret.",
     "Nicht wiederholen. Zustimmung nur, wenn sie etwas hinzufügt.",
     "Lange Inhalte (Beweise, Code, Tabellen) als Anhang, im Text nur die Kernaussage.",
-    "Wer seinen Teil erledigt hat, gibt sein Ergebnis ab (`submit_result` oder Nachricht "
-    "`result`) oder meldet `done`. Fertig heißt: Du wartest nicht mehr, bleibst aber "
-    "ansprechbar; jede Nachricht an dich weckt dich. Wartest du auf das Ergebnis eines anderen, "
-    'warte mit `wait_until(minutes, until_result_from="<name>")`.',
-)
-"""Conversation rules of docs/06-gruppenchats.md §6 and docs/09 §4.7, in every channel brief of
-a run without phases (unchanged since W4b-03; W4b-06b drops them with the old topologies)."""
-
-PHASES_CONVERSATION_RULES = (
-    *CONVERSATION_RULES[:3],
-    "Wer jemanden fragt, schreibt `@name` (oder `to`); `@alle` fragt alle, `@user` den User "
-    "(nur er antwortet darauf). Auf einen Agenten wartest du mit `wait_for_messages`. Brauchst "
-    "du die Antwort des Users, warte mit `wait_until` bis zu fünf Minuten; eine Antwort des "
-    "Users (in deinem privaten Kanal auch eine Notiz) beendet das Warten. Antwortet er nicht, "
-    "arbeite mit einer begründeten Annahme weiter und nenne sie in deiner Abgabe. Wer abgibt, "
-    "ist fertig; seine offene Frage gilt damit als erledigt.",
-    *CONVERSATION_RULES[4:7],
     "Wer seinen Teil erledigt hat, gibt ab (`submit`). Fertig heißt: Du wartest nicht mehr, "
     "bleibst aber ansprechbar. Wartest du auf die Abgabe eines anderen, warte mit "
     '`wait_until(minutes, until_result_from="<name>")`.',
 )
-"""The rules in a run with phases (W4b-06a, Auflage W4b-03): rule 4 after Entscheidungen 67
-and 69 (waiting for the user with `wait_until`, at most five minutes; handing in closes the
-question), rule 8 names `submit` (G8: the room of a `phases` run offers no `submit_result`)."""
+"""Conversation rules of docs/06-gruppenchats.md §6 and docs/09 §4.7 in every channel brief:
+since W4b-06b one version, the one of the runs with phases (W4b-06a, Auflage W4b-03): rule 4
+after Entscheidungen 67 and 69 (waiting for the user with `wait_until`, at most five minutes;
+handing in closes the question; every message of the user in the private channel ends the wait,
+W4b-04 NR2), rule 8 names `submit`."""
 
 _MODE_TEXT = {
     ChannelMode.ROUNDS: "Runden: Alle Mitglieder kommen pro Runde dran, sonst `pass`.",
     ChannelMode.EVENT: "ereignisgesteuert: Wer mit `@name` angesprochen, gefragt oder mit "
     "`reply_to` beantwortet wird, wird sofort geweckt. Runden gibt es nur, wenn niemand mehr "
     "schreibt.",
-    ChannelMode.MODERATED: "moderiert: Der Moderator erteilt das Wort und beendet die Diskussion.",
 }
+"""The pacing of a channel in its brief. A channel `moderated` exists in no run since W4b-06b
+(`arr.plan.check` refuses it with `topology: phases`)."""
 _END_TEXT = {
     ChannelMode.ROUNDS: "nach der letzten Runde oder wenn alle `pass`/`done` melden.",
     ChannelMode.EVENT: "wenn alle fertig sind (Ergebnis abgegeben oder `done`) und keine "
     "Nachricht an einen von ihnen ungelesen ist, nach den Leerlauf-Runden oder wenn es lange "
     "ruhig ist.",
-    ChannelMode.MODERATED: "wenn der Moderator die Diskussion mit einer Entscheidung beendet.",
 }
 
 
@@ -357,14 +343,15 @@ PRIVATE_BRIEF = (
     "Steckbrief #{name}\n"
     "Dein privater Kanal zum User: Hier fragst du ihn mit einer `question` an `@user`, in jeder "
     "Phase, auch in einer isolierten. Nur der User liest diesen Kanal; kein anderer Agent sieht "
-    "ihn. Brauchst du die Antwort, warte mit `wait_until` bis zu fünf Minuten; eine Antwort oder "
-    "Notiz des Users beendet das Warten. Gibst du ab, gilt deine Frage als erledigt. Die "
-    "Annahme, mit der du ohne Antwort weiterarbeitest, nennst du in deiner Abgabe."
+    "ihn. Brauchst du die Antwort, warte mit `wait_until` bis zu fünf Minuten; eine Nachricht "
+    "des Users in deinem privaten Kanal beendet das Warten. Gibst du ab, gilt deine Frage als "
+    "erledigt. Die Annahme, mit der du ohne Antwort weiterarbeitest, nennst du in deiner Abgabe."
 )
 """The pinned brief of a private channel: what it is for, who reads it, how to wait for the
-answer (W4b-06a, Entscheidung 69: `wait_until`, at most five minutes; an answer or a note of the
-user ends it) and that handing in closes an open question (Entscheidung 67). Not: „end the turn
-without handing in, the phase waits“ (W4b-03.1 NR1: the next turn starts at once)."""
+answer (W4b-06a, Entscheidung 69: `wait_until`, at most five minutes; every message of the user
+in it ends the wait, W4b-04 NR2, checked in W4b-06b) and that handing in closes an open
+question (Entscheidung 67). Not: „end the turn without handing in, the phase waits“ (W4b-03.1
+NR1: the next turn starts at once)."""
 
 
 def private_channel(agent_id: str) -> str:
@@ -832,9 +819,15 @@ class RoomStore:
         aliases: Mapping[str, str | None],
         roles: Mapping[str, str],
     ) -> str:
-        """The generated brief; its rules follow the kind of run (`run.yaml`, written by
-        `prepare_run` before `setup_channels`): without `run.yaml` or phases the old ones."""
-        rules = PHASES_CONVERSATION_RULES if self.uses_phases() else CONVERSATION_RULES
+        """The generated brief with the conversation rules (one version since W4b-06b). A
+        channel `moderated` is refused: it exists in no run since W4b-06b (`arr.plan.check`
+        refuses it with phases; a phase `moderated` replaces it)."""
+        if config.mode not in _MODE_TEXT:
+            raise ArrError(
+                f"Einen Kanal mit „mode: {config.mode.value}“ gibt es nicht (Kanal "
+                f"„{config.name}“). Nimm eine Phase mit „topology: moderated“."
+            )
+        rules = CONVERSATION_RULES
         lines = [f"Steckbrief #{config.name}"]
         if config.purpose:
             lines.append(f"Zweck: {config.purpose}")
@@ -872,16 +865,15 @@ class RoomStore:
     # Sealed stages (W4-03 F4: independent reviews)
     # ----------------------------------------------------------------------------------------
 
-    def seal(self, stage: str, channel: str | None = None) -> None:
-        """Results submitted in `stage` from now on stay hidden: their files go to
-        `SEALED_DIR`, readable for no agent, until `release(stage)`. `channel` names the
-        anonymous channel whose aliases the file names use (else the first anonymous channel
-        of the agent, else its ID)."""
+    def seal(self, stage: str) -> None:
+        """Submissions of `stage` from now on stay hidden: their files go to `SEALED_DIR`,
+        readable for no agent, until `release(stage)`. The column `channel` of `sealed_stage`
+        stays empty (the old topologies named the alias channel of their result files there)."""
         with self._write() as con:
             con.execute(
                 "INSERT INTO sealed_stage(stage, channel, ts) VALUES(?,?,?) "
                 "ON CONFLICT(stage) DO UPDATE SET channel=excluded.channel, ts=excluded.ts",
-                (stage, channel, _now()),
+                (stage, None, _now()),
             )
 
     def sealed_stages(self) -> dict[str, str | None]:
@@ -973,39 +965,11 @@ class RoomStore:
             con.execute("UPDATE submission SET path=final_path WHERE id=?", (row["id"],))
             con.execute("DELETE FROM sealed_submission WHERE submission_id=?", (row["id"],))
 
-    def result_text(self, result_id: int, max_bytes: int) -> str:
-        """Body of a result and the start of its file (also a sealed one) as text, for arr's
-        own reading (verdicts, digests): together at most `max_bytes` characters (W4-03.1 H2:
-        `body` is as long as the agent wants), never through a link."""
-        result = self.result(result_id)
-        body = (result.body or "")[:max_bytes]
-        if not result.path or len(body) >= max_bytes:
-            return body
-        try:
-            fd = os.open(self.run_dir / result.path, _FILE_FLAGS)
-        except OSError:
-            return body
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                return body
-            data = os.read(fd, max_bytes)
-        finally:
-            os.close(fd)
-        text = data.decode("utf-8", errors="replace")
-        return (f"{body}\n\n{text}" if body else text)[:max_bytes]
-
     def _resolved(self) -> ResolvedRun | None:
         if not hasattr(self, "_run"):
             run_yaml = self.run_dir / "run.yaml"
             self._run = load_yaml_model(run_yaml, ResolvedRun) if run_yaml.is_file() else None
         return self._run
-
-    def uses_phases(self) -> bool:
-        """True if `run.yaml` names the topology `phases` (W4b-01): its agents get `submit`
-        instead of `submit_result` and `submit_rating`."""
-        run = self._resolved()
-        return run is not None and run.topology.kind is TopologyKind.PHASES
 
     def rubric(self) -> Rubric:
         """Rubric of the run from `run.yaml` (docs/03 §3); the default scale without one."""
@@ -2171,7 +2135,7 @@ class RoomStore:
     ) -> "AgentRoom":
         """View of one research agent; `work_dir` defaults to the folder from `agent.json`.
 
-        `rubric` defaults to the rubric of `run.yaml` (checked by `submit_rating`).
+        `rubric` defaults to the rubric of `run.yaml` (the scale of a `rating` with `submit`).
         """
         return AgentRoom(
             self,
@@ -2986,18 +2950,6 @@ class AgentRoom:
                 if address(m, self.agent_id, sender_of) is not None
             ]
 
-    def _file_label(self, con: sqlite3.Connection, channel: str | None) -> str:
-        """How my result files are named: by my alias in `channel` or, without it, in my
-        first anonymous channel (also a closed one), else by my ID (W4-03 F4)."""
-        channels = self._my_channels(con)
-        if channel is not None:
-            channels = [ch for ch in channels if ch.name == channel] + channels
-        for ch in channels:
-            if ch.anonymous and ch.members.get(self.agent_id):
-                alias = str(ch.members[self.agent_id])
-                return "".join(c if c.isalnum() else "-" for c in alias.casefold())
-        return self.agent_id
-
     @staticmethod
     def _sealed(con: sqlite3.Connection, stage: str | None) -> tuple[bool, str | None]:
         if stage is None:
@@ -3009,129 +2961,11 @@ class AgentRoom:
             return False, None
         return (True, found["channel"]) if found is not None else (False, None)
 
-    def submit_result(
-        self,
-        kind: str,
-        title: str,
-        body: str | None = None,
-        path: str | None = None,
-    ) -> Result:
-        """Submit a result; a file in `path` is copied to `output/results/NNN-<name>-<kind>`.
-
-        `<name>` is my alias if I am in an anonymous channel, else my ID (W4-03 F4). The copy
-        is made in `STAGING_DIR` first; in a sealed stage (`RoomStore.seal`) the file stays in
-        `SEALED_DIR` until the stage is released, so no other agent can read it before.
-        """
-        self.not_in_note_turn()
-        if not kind.strip() or not title.strip():
-            raise RoomError("„kind“ und „title“ dürfen nicht leer sein.")
-        if not (body and body.strip()) and not path:
-            raise RoomError("Gib den Inhalt in „body“ an oder eine Datei in „path“.")
-        run_dir = self.store.run_dir
-        staged: Path | None = None
-        final: Path | None = None
-        suffix = ""
-        if path:
-            staging = run_dir / STAGING_DIR
-            staging.mkdir(parents=True, exist_ok=True)
-            staged = staging / f".staging-{uuid.uuid4().hex}"
-            suffix = Path(self._copy_source(path, staged)).suffix
-        try:
-            with self.store._write() as con:
-                assignment = self.store._latest_assignment(con, self.agent_id)
-                stage = assignment.stage if assignment else None
-                attempt = 1
-                if assignment and isinstance(assignment.context.get("attempt"), int):
-                    attempt = max(1, assignment.context["attempt"])
-                sealed, channel = self._sealed(con, stage)
-                cur = con.execute(
-                    "INSERT INTO result(ts, agent, stage, kind, title, body, path, attempt) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
-                    (_now(), self.agent_id, stage, kind, title, body, None, attempt),
-                )
-                result_id = cur.lastrowid
-                assert result_id is not None
-                if sealed:
-                    con.execute(
-                        "INSERT INTO sealed_result(result_id, stage) VALUES(?,?)",
-                        (result_id, stage),
-                    )
-                if staged is not None:
-                    folder = run_dir / (SEALED_DIR if sealed else RESULTS_DIR)
-                    folder.mkdir(parents=True, exist_ok=True)
-                    safe_kind = "".join(c if c.isalnum() or c in "-_" else "-" for c in kind)
-                    label = self._file_label(con, channel)
-                    final = folder / f"{result_id:03d}-{label}-{safe_kind}{suffix}"
-                    staged.rename(final)
-                    staged = None
-                    rel = final.relative_to(run_dir).as_posix()
-                    con.execute("UPDATE result SET path=? WHERE id=?", (rel, result_id))
-                row = con.execute("SELECT * FROM result WHERE id=?", (result_id,)).fetchone()
-                result = _row_to_result(row)
-            final = None  # committed
-            return result
-        finally:
-            for leftover in (staged, final):
-                if leftover is not None:
-                    leftover.unlink(missing_ok=True)
-
     def copy_file(self, rel: str, target: Path) -> str:
         """Copy a regular file of my working folder to `target` (no link followed, no FIFO,
         no hardlink, at most `MAX_ATTACHMENT_BYTES`); returns its name. `RoomError` with a
         German reason otherwise. For arr's own copies, e.g. versions of an artifact (W4-03)."""
         return self._copy_source(rel, target)
-
-    def submit_rating(
-        self,
-        result_id: int,
-        score: float,
-        comment: str,
-        criteria: dict[str, float] | None = None,
-    ) -> Rating:
-        """Rate a result of another agent; a second rating of the same result replaces the first.
-
-        `score` and the values in `criteria` must lie on the scale of the rubric; with
-        criteria in the rubric only those names are allowed.
-        """
-        self.not_in_note_turn()
-        criteria = dict(criteria or {})
-        self._check_score("score", score)
-        known = self.rubric.criteria
-        unknown = sorted(set(criteria) - set(known)) if known else []
-        if unknown:
-            raise RoomError(
-                f"Unbekannte Kriterien: {', '.join(unknown)}. Die Rubrik kennt: {', '.join(known)}."
-            )
-        for name, value in criteria.items():
-            self._check_score(f"criteria[„{name}“]", value)
-        with self.store._write() as con:
-            row = con.execute("SELECT agent FROM result WHERE id=?", (result_id,)).fetchone()
-            if row is None:
-                raise RoomError(f"Das Ergebnis #{result_id} gibt es nicht.")
-            if row["agent"] == self.agent_id:
-                raise RoomError("Eigene Ergebnisse kannst du nicht bewerten.")
-            con.execute(
-                "INSERT INTO rating(ts, rater, result_id, score, criteria, comment) "
-                "VALUES(?,?,?,?,?,?) ON CONFLICT(rater, result_id) DO UPDATE SET "
-                "ts=excluded.ts, score=excluded.score, criteria=excluded.criteria, "
-                "comment=excluded.comment",
-                (_now(), self.agent_id, result_id, score, json.dumps(criteria), comment),
-            )
-            new = con.execute(
-                "SELECT * FROM rating WHERE rater=? AND result_id=?", (self.agent_id, result_id)
-            ).fetchone()
-            return _row_to_rating(new)
-
-    def _check_score(self, what: str, value: float) -> None:
-        low, high = self.rubric.scale
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, int | float)
-            or not math.isfinite(value)
-        ):
-            raise RoomError(f"„{what}“ muss eine Zahl sein (Skala {low:g} bis {high:g}).")
-        if not low <= value <= high:
-            raise RoomError(f"„{what}“ = {value:g} liegt außerhalb der Skala {low:g} bis {high:g}.")
 
     def get_assignment(self) -> Assignment | None:
         """Current assignment with stage and context package."""
@@ -3143,7 +2977,7 @@ class AgentRoom:
 
     def _shown_label(self, con: sqlite3.Connection, channel: str | None) -> str:
         """How my submissions show me: my alias in `channel` or, without it, in my first
-        anonymous channel (also a closed one), else my ID (the rule of `_file_label`)."""
+        anonymous channel (also a closed one), else my ID (W4-03 F4)."""
         channels = self._my_channels(con)
         if channel is not None:
             channels = [ch for ch in channels if ch.name == channel] + channels
@@ -3472,7 +3306,7 @@ class AgentRoom:
         Head and `fields` are checked at once against the expected format (`check_submission`);
         `RoomError` names every problem in German, and the agent can try again in the same
         turn. Files are copied from my working folder by the rules of attachments
-        (`_copy_source`). Stage and attempt come from the assignment, as for `submit_result`.
+        (`_copy_source`). Stage and attempt come from the assignment.
         Every accepted submission is filed once (`RoomStore._publish`); in a sealed stage it
         stays in `SEALED_DIR` until `release`.
         """

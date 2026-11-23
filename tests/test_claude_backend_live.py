@@ -76,7 +76,7 @@ def make_run(root: Path) -> PreparedRun:
         {
             "project": "smoke",
             "task": "Smoke",
-            "topology": {"kind": "solo"},
+            "topology": {"kind": "phases"},
             "defaults": {"provider": "claude", "model": MODEL, "auth": "max", "effort": "low"},
             "agents": [{"id": "e1"}, {"id": "critic"}],
             "groupchats": [{"name": "main", "members": ["e1", "critic"]}],

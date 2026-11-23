@@ -1,7 +1,7 @@
 kind: research-group
 version: 1
 description: Breite Ideensuche mit mehreren Explorern und einem Ranker
-topology: exploration
+topology: phases
 
 params:
   explorers: { default: 2, min: 1, max: 6, doc: "Anzahl der Explorer" }
@@ -29,3 +29,15 @@ groupchats:
     members: [explorer-*]
   - name: ranking
     members: [ranker]
+
+phases:
+  - name: suche
+    topology: parallel
+    channels: [main]
+    actions:
+      explorer-*: { task: tasks/suchen.md, submission: { format: text } }
+  - name: rangfolge
+    topology: solo
+    channels: [ranking]
+    actions:
+      ranker: { task: tasks/ordnen.md, submission: { format: text } }

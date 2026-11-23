@@ -1,0 +1,4 @@
+{"seq": 2, "ts": 1795441628.805331, "raw": {"fake_step": {"do": "room", "action": "get_assignment", "args": {}, "save_as": "job"}}}
+{"seq": 3, "ts": 1795441628.80573, "raw": {"fake_step": {"do": "room", "action": "get_assignment", "args": {}, "save_as": "job"}}}
+{"seq": 4, "ts": 1795441628.8057642, "raw": {"fake_step": {"do": "room", "action": "submit_rating", "args": {"result_id": "${job.context.result_id}", "score": 3, "comment": "passt", "criteria": {}}, "save_as": null}}}
+{"seq": 5, "ts": 1795441628.8068411, "raw": {"fake_step": {"do": "room", "action": "submit_rating", "args": {"result_id": "${job.context.result_id}", "score": 3, "comment": "passt", "criteria": {}}, "save_as": null}}}

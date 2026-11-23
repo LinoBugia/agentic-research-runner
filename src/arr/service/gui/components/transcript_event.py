@@ -122,11 +122,15 @@ def tool_html(ev: TranscriptEvent) -> str:
     )
 
 
-def turn_start_html(ev: TranscriptEvent, *, stage_label: str | None = None) -> str:
-    """Separator „Turn 6 · 15:10 · Stufe Exploration“ and the collapsed assignment."""
+def turn_start_html(
+    ev: TranscriptEvent, *, stage_label: str | None = None, phases: bool = False
+) -> str:
+    """Separator „Turn 6 · 15:10 · Stufe Exploration“ and the collapsed assignment; in a
+    phases run „Phase“ (W4b-06b), an old run keeps „Stufe“."""
     stage = stage_label or ev.data.get("stage")
     word = "Notiz-Turn" if ev.data.get("purpose") == "compact" else "Turn"  # W4b-05b, W4b-07
-    head = f"{word} {ev.turn} · {fmt.clock(ev.ts)}" + (f" · Stufe {stage}" if stage else "")
+    part = "Phase" if phases else "Stufe"
+    head = f"{word} {ev.turn} · {fmt.clock(ev.ts)}" + (f" · {part} {stage}" if stage else "")
     prompt = str(ev.data.get("prompt") or "")
     return (
         f'<div id="{event_dom_id(ev.seq)}"><div class="turn-sep">{esc(head)}</div>'
@@ -158,14 +162,17 @@ def rate_limit_text(data: dict[str, Any]) -> str:
     return f"Meldung zum Nutzungslimit („{status}“)" + (f": {window}" if window else "")
 
 
-def event_html(ev: TranscriptEvent, *, agent_id: str, stage_label: str | None = None) -> str:
-    """Any transcript entry except a waiting tool call (that one carries a K5 card)."""
+def event_html(
+    ev: TranscriptEvent, *, agent_id: str, stage_label: str | None = None, phases: bool = False
+) -> str:
+    """Any transcript entry except a waiting tool call (that one carries a K5 card); `phases`:
+    the run has `topology: phases` (the turn separator says „Phase“)."""
     kind = ev.kind
     dom = event_dom_id(ev.seq)
     if kind is TranscriptKind.TOOL:
         return tool_html(ev)
     if kind is TranscriptKind.TURN_START:
-        return turn_start_html(ev, stage_label=stage_label)
+        return turn_start_html(ev, stage_label=stage_label, phases=phases)
     text = str(ev.data.get("text") or "")
     if kind is TranscriptKind.TEXT:
         return (

@@ -9,7 +9,8 @@ the `.mcp.json` check looks at the file only.
 
 Every skill is checked when it is listed (`check_skill`): SKILL.md, `group.yaml` (YAML,
 parameters, placeholders, patterns, resolution with the parameters' defaults), role files in
-the skill, skills of the agents and `check_topology`. Every problem names file, line where
+the skill, skills of the agents and the phase plan (`arr.plan.check`). A group of an old
+topology gets one message, `old_topology_message` (W4b-06b). Every problem names file, line where
 known, and what to do; a skill with problems cannot be started. Writing goes through
 `skill_files` (no links, atomic, conflicts), and the skill is checked again right after.
 """
@@ -46,7 +47,7 @@ from arr.resolve import (
     resolve_run,
     validate_model,
 )
-from arr.runs.topologies import check_topology
+from arr.runs.topology import refuse_old_topology
 from arr.service.api_models import (
     Action,
     ApiException,
@@ -70,6 +71,7 @@ from arr.service.api_models import (
     SkillKind,
     SkillUsage,
     StartSkillsResult,
+    StartSkillsUpdateResult,
 )
 from arr.service.real_api import skill_files
 from arr.service.real_api.base import ServiceState, not_found
@@ -83,12 +85,16 @@ from arr.skills import (
     SkillAudience,
     SkillCatalog,
     SkillFileError,
+    SkillUpdate,
     check_research_skills,
     discover_skills,
     install_start_skills,
     read_text_file,
     skills_for_user_agent,
     start_skills_message,
+    updatable_start_skills,
+    update_lines,
+    update_start_skills,
 )
 from arr.skills import SkillInfo as CoreSkill
 from arr.workfolder import (
@@ -380,11 +386,9 @@ def _check_tasks(
 def _check_resolved(
     spec: GroupSpec, resolved: ResolvedRun, folder: Path, catalog: SkillCatalog, out: _Issues
 ) -> None:
-    """Roles in the skill, skills of the agents and the topology, for the resolved defaults.
-
-    A group with `topology: phases` gets the messages of `arr.plan.check.check` (hints as
-    warnings) and the check of its assignment files instead of `check_topology` (W4b-02a).
-    """
+    """Roles in the skill, skills of the agents and the phases, for the resolved defaults:
+    the messages of `arr.plan.check.check` (hints as warnings) and the check of the assignment
+    files (W4b-02a). An old topology never gets here (`_check_group`, W4b-06b)."""
     roles_done: set[str] = set()
     skills_done: set[str] = set()
     for agent in resolved.agents:
@@ -409,18 +413,10 @@ def _check_resolved(
         base = f"agents[{index}].skills" if own.skills is not None else "defaults.skills"
         _found, issues = check_research_skills(catalog, agent.skills, base)
         out.extend(issues)
-    if resolved.topology.kind is TopologyKind.PHASES:
-        result = check_plan(resolved)
-        out.extend(result.errors)
-        out.extend(result.warnings, Severity.WARNING)
-        _check_tasks(spec, folder, out, resolved)
-        return
-    try:
-        check_topology(resolved)
-    except ConfigError as exc:
-        out.extend(exc.issues)
-    except ArrError as exc:
-        out.add("topology", exc.message)
+    result = check_plan(resolved)
+    out.extend(result.errors)
+    out.extend(result.warnings, Severity.WARNING)
+    _check_tasks(spec, folder, out, resolved)
 
 
 def blocking(issues: Iterable[SkillIssue]) -> list[SkillIssue]:
@@ -466,10 +462,10 @@ def _check_group(
 ) -> tuple[GroupSpec | None, list[SkillIssue]]:
     """Check the `group.yaml` of a skill folder; the spec (if it loads) and its issues.
 
-    Order: read (regular file, at most 256 KB, UTF-8) → YAML → fields → placeholders and
-    `when` → resolution with the parameters' defaults (patterns, IDs, stages, raters) → roles,
-    skills of the agents, topology. Stops at the first stage that fails, because later stages
-    need its result.
+    Order: read (regular file, at most 256 KB, UTF-8) → YAML → fields → an old topology gets
+    its message and nothing more (W4b-06b) → placeholders and `when` → resolution with the
+    parameters' defaults → roles, skills of the agents, phases. Stops at the first stage that
+    fails, because later stages need its result.
     """
     file = folder / GROUP_FILE
     try:
@@ -487,6 +483,15 @@ def _check_group(
     out = _Issues(GROUP_FILE, lines)
     try:
         spec = validate_model(GroupSpec, data, source=GROUP_FILE, lines=lines)
+    except ConfigError as exc:
+        out.extend(exc.issues)
+        return None, out.items
+    try:
+        refuse_old_topology(spec.topology, path="topology", source=GROUP_FILE)
+    except ConfigError as exc:  # one message, no further checks of an old group (W4b-06b)
+        out.extend(exc.issues)
+        return spec, out.items
+    try:
         check_group_spec(spec, source=GROUP_FILE)
     except ConfigError as exc:
         out.extend(exc.issues)
@@ -864,7 +869,8 @@ class CatalogArea:
         return self._created(request.name, f"{what} „{request.name}“ angelegt.", [])
 
     async def create_skill(self, request: CreateSkillRequest) -> SkillChangeResult:
-        """A new skill from the built-in template (tool: SKILL.md; group: roundtable)."""
+        """A new skill from the built-in template (tool: SKILL.md; group: the smallest phases
+        group with one phase `diskussion`, W4b-06b)."""
         return await asyncio.to_thread(self._create, request)
 
     def _duplicate(self, name: str, request: DuplicateSkillRequest) -> SkillChangeResult:
@@ -910,3 +916,30 @@ class CatalogArea:
         """Create the missing start skills (W4-05); a skill with the same name is never
         overwritten, also when it is broken (`arr.skills.install_start_skills`)."""
         return await asyncio.to_thread(self._start_skills)
+
+    def _update_start_skills(self, dry_run: bool) -> StartSkillsUpdateResult:
+        workfolder = self.state.workfolder
+        try:
+            updatable = updatable_start_skills(workfolder)
+            if dry_run:
+                return StartSkillsUpdateResult(updatable=updatable)
+            update = update_start_skills(workfolder)
+        except SkillFileError as exc:
+            raise ApiException.of(ErrorCode.NOT_ALLOWED, exc.message) from None
+        updated = [n for n, r in update.skills.items() if r.result is SkillUpdate.UPDATED]
+        failed = [n for n, r in update.skills.items() if r.result is SkillUpdate.FAILED]
+        if updated:
+            message = f"Start-Skills aktualisiert: {', '.join(updated)}."
+        else:
+            message = "Kein Start-Skill war zu aktualisieren."
+        if failed:
+            message += f" Nicht aktualisiert: {', '.join(failed)} (Details in der Liste)."
+        return StartSkillsUpdateResult(
+            updatable=updatable, updated=updated, lines=update_lines(update), message=message
+        )
+
+    async def update_start_skills(self, dry_run: bool = False) -> StartSkillsUpdateResult:
+        """Bring unchanged start skills to the current version, like `arr skills update`
+        (W4b-06b, F2): only on a click of the user; a changed start skill, an own group and a
+        missing one stay as they are. `dry_run`: only which ones would be updated."""
+        return await asyncio.to_thread(self._update_start_skills, dry_run)

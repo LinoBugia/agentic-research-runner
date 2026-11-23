@@ -21,7 +21,6 @@ from run_kit import make_workfolder
 from arr.models import RunStatus
 from arr.permissions.types import DecidedBy, TightenedBy, TightenedSource
 from arr.runs.phases import runner as phase_runner
-from arr.runs.topologies import solo as solo_topology
 from arr.service.real_api import RealApi
 
 USER, GATEKEEPER = DecidedBy.USER, DecidedBy.GATEKEEPER
@@ -169,21 +168,24 @@ async def test_a10_without_the_fields_the_lines_are_those_of_main(
 
 
 @pytest.mark.parametrize("tightened", [True, False], ids=["decider-user", "ohne"])
-async def test_a10_decider_user_at_an_agent_holds_in_an_old_topology(
+async def test_a10_decider_user_at_an_agent_holds_in_a_run(
     workfolder: Path, arr_home: Path, tightened: bool
 ) -> None:
+    """S10: `decider: user` at an agent holds in the run (a phases run since W4b-06b; until
+    then the old topology `solo`): the request goes to the user, the model is never asked."""
+    from phases_kit import hand_in, solo
+
+    from arr.runs.phases import runner as phase_runner
+
     agent: dict[str, Any] = {"id": "p", "decider": "user"} if tightened else {"id": "p"}
-    data = {
-        "agents": [agent],
-        "topology": {"kind": "solo", "params": {"require_result": False, "max_turns": 1}},
-    }
+    data = {"agents": [agent], "phases": [solo("arbeit", "p")]}
     case = asking_run(
         workfolder,
         data,
         want=lambda a, _s: inside(a),
         decider="gatekeeper_then_user",
-        topology=solo_topology.run,
-        scripts={"p": {"turns": [{"steps": [{"do": "text", "text": "ok"}]}]}},
+        topology=phase_runner.run,
+        policies={"p": hand_in},
     )
     assert await run(case.mgr) is RunStatus.DONE, errors(case.mgr)
     [asked] = case.asked

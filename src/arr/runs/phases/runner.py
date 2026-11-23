@@ -12,7 +12,7 @@ file (`arr.runs.phases.tasks`), adds every `seed` as version 1 and then runs the
 3. **The gate** without a model (`arr.runs.phases.gates`); a gate `judge` first has its rating
    actions. The result of a gate picks its route (`on_tie` on a tie). A gate `user`, the route
    `escalate`, exhausted phases with `on_exhausted: escalate` and a gate without a result ask
-   the user (`escalate_with_hint`): `continue`, `retry` (with a hint) or `end`.
+   the user (`escalate`): `continue`, `retry` (with a hint) or `end`.
 4. **Bookkeeping**: the valid submission of the phase (Entscheidung 6), the mean scores, the
    run's objections; checkpoints `gate`, `route` and `stage_end`.
 
@@ -20,8 +20,8 @@ Checkpoints (`orchestrator.jsonl`, the contract for W4b-07; `stage` is the phase
 
 - `{phase: "pass_start", attempt, how, agents}`; `how` is `normal`, `retry` or `user_retry`,
 - `{phase: "gate", attempt, gate, value, tie, decision, reason?, score?, scores?, ranking?,
-  results, agent?, missing, valid}`: `decision` `passed`/`failed`/`escalated` as the old
-  topologies write it (`stage_infos` and `summary.md` read it), `value` the result of the gate,
+  results, agent?, missing, valid}`: `decision` `passed`/`failed`/`escalated` (`stage_infos`
+  and `summary.md` read it, as in the checkpoints of old runs), `value` the result of the gate,
   `results` the newest submission of every action of the pass, `valid` the valid submissions
   of the phase,
 - `{phase: "route", attempt, route, entered, exhausted, asked_user?, choice?, hint?}`,
@@ -58,16 +58,18 @@ from arr.permissions.types import EscalationOption
 from arr.plan.read import ACTION_GATE, build_expectation, enter, follow
 from arr.room.types import Submission
 from arr.runs.context import RunContext
+from arr.runs.finalize import one_line
 from arr.runs.phases import chat, moderated, work
 from arr.runs.phases.gates import NO_RATING, GateOutcome, judge_mean, judge_rank, signal
 from arr.runs.phases.inputs import (
+    REASONS,
     build_feedback,
     build_inputs,
     inbox_summary,
     item,
     shown,
 )
-from arr.runs.phases.start import start_issues
+from arr.runs.phases.start import SOURCE, require_task, start_issues
 from arr.runs.phases.state import (
     HOW_NORMAL,
     HOW_RETRY,
@@ -81,7 +83,6 @@ from arr.runs.phases.tasks import KIND_GATE, KIND_WORK, Tasks, load_tasks
 from arr.runs.phases.text import MAX_SUMMARY_CHARS, MAX_TITLE_CHARS, fit_package, line
 from arr.runs.phases.view import ask_again_prompt, continue_prompt, render_assignment
 from arr.runs.phases.wake import Waker, hold
-from arr.runs.topologies import SOURCE, require_task
 
 __all__ = ["OPTIONS", "PASSES", "WAIT_POLL_S", "PhaseRunner", "check", "run"]
 
@@ -108,7 +109,7 @@ MAX_SEED_TITLE = 80
 
 
 def _context_class() -> type:
-    from arr.runs.orchestrator import Orchestrator  # late: the orchestrator imports topologies
+    from arr.runs.orchestrator import Orchestrator  # late: avoids an import cycle
 
     return Orchestrator
 
@@ -506,7 +507,7 @@ class PhaseRunner:
         self, phase: ResolvedPhase, route: Route | None, info: Mapping[str, Any]
     ) -> bool:
         """True if the run leaves `phase` over `next`, also past the end of the plan (its best
-        attempt counts, as `on_fail: continue` of the old `waterfall`); False if it ends there:
+        attempt counts); False if it ends there:
         route `stop`, its own `on_exhausted: stop` or the user's „Beenden“ about this phase
         (W4b-06a.1, Entscheidung 81). `on_exhausted` and the user's choice count only when
         they concern this phase, not a later one the route led into (W4b-06a.3, NP3)."""
@@ -521,7 +522,7 @@ class PhaseRunner:
     async def _stage_end(self, phase: ResolvedPhase, record: PassRecord, ends: bool) -> None:
         """Checkpoint `stage_end` when a phase is left. With a threshold gate the outcome is
         `passed`, `best_accepted` (left over `next`) or `stage_failed` (`ends`: the run ends here
-        because the phase did not pass; then nothing is accepted, as in the old `waterfall`)."""
+        because the phase did not pass; then nothing is accepted)."""
         valid = self.state.valid.get(phase.name, [])
         outcome = "done"
         if phase.gate.type is GateType.JUDGE and phase.gate.rule is GateRule.MEAN:
@@ -550,7 +551,8 @@ class PhaseRunner:
         if self.ctx.stop_requested:
             return EscalationOption.END, None
         summary = inbox_summary(phase, attempt, reason, subs, detail)
-        option, hint = await self.ctx.escalate_with_hint(phase, summary, OPTIONS)
+        why = REASONS[reason].format(phase=phase, reason=one_line(line(detail, 300), 300))
+        option, hint = await self.ctx.escalate(phase, summary, OPTIONS, attempt=attempt, reason=why)
         if self.ctx.stop_requested:
             return EscalationOption.END, None
         return option, hint

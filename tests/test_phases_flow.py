@@ -291,9 +291,27 @@ def test_a11_signal_rows(
         assert outcome.reason
 
 
-def test_a11_verdicts_like_review_aggregate() -> None:
-    from arr.runs.topologies.review import aggregate
+def _review_aggregate(given_verdicts: list[str | None], rule: str) -> str | None:
+    """The rule of the old topology `review` (F6), kept here as the reference after its removal
+    (W4b-06b; word for word from `arr.runs.topologies.review.aggregate` of `main`)."""
+    from collections import Counter
 
+    from arr.submissions.formats import VERDICTS
+
+    given = [v for v in given_verdicts if v is not None]
+    if not given:
+        return None
+    if rule == "unanimous":
+        if len(given) == len(given_verdicts) and all(v == "accept" for v in given):
+            return "accept"
+        return max([*given, "minor"], key=VERDICTS.index)
+    counts = Counter(given)
+    top = max(counts.values())
+    return max((v for v, n in counts.items() if n == top), key=VERDICTS.index)
+
+
+def test_a11_verdicts_like_review_aggregate() -> None:
+    aggregate = _review_aggregate
     for a in [None, *STRICT]:
         for b in [None, *STRICT]:
             for rule in ("majority", "unanimous"):

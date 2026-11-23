@@ -25,12 +25,16 @@ turns:
         action: post_message
         args: { channel: main, kind: answer, reply_to: "${idea.id}", body: "Ja." }
       - do: room
-        action: submit_result
-        args: { kind: idea, title: "Idee A", body: "Text" }
-        save_as: result
+        action: submit
+        args: { status: done, summary: "Idee A", body: "Text" }
+        save_as: work
       - do: room
-        action: submit_rating
-        args: { result_id: "${result.id}", score: 8, comment: "gut", criteria: { clarity: 9 } }
+        action: submit
+        args:
+          status: done
+          summary: "gut"
+          fields:
+            ratings: [{ ref: "${work.id}", score: 8, comment: "gut", criteria: { clarity: 9 } }]
       - do: room
         action: set_status
         args: { status: working, note: "rechnet" }

@@ -193,6 +193,7 @@ from arr.service.api_models import (
     StageStatus,
     StartRunResponse,
     StartSkillsResult,
+    StartSkillsUpdateResult,
     StorageItem,
     StorageParts,
     StorageReport,
@@ -229,7 +230,16 @@ from arr.service.real_api.skill_files import (
     template_files,
     version_of,
 )
-from arr.skills import MAX_SKILL_FILE_BYTES, START_SKILLS, start_skill_files, start_skills_message
+from arr.skills import (
+    MAX_SKILL_FILE_BYTES,
+    START_SKILLS,
+    SkillUpdate,
+    StartSkillsUpdate,
+    StartSkillUpdate,
+    start_skill_files,
+    start_skills_message,
+    update_lines,
+)
 from arr.skills import SKILL_FILE as SKILL_FILE_NAME
 
 __all__ = [
@@ -1508,7 +1518,7 @@ _GROUP_SKILLS: dict[str, dict[str, Any]] = {
         "long": "Mehrere Explorer verfolgen je eine Idee, ein Kritiker prüft im gemeinsamen "
         "Kanal mit. Danach bewertet ein Ranker die Ergebnisse, eine Zusammenfassung schließt "
         "den Run ab.",
-        "topology": TopologyKind.EXPLORATION,
+        "topology": TopologyKind.PHASES,  # the start skill of this name (W4b-06b)
         "runs": 14,
         "agents": 5,
         "params": [
@@ -1565,7 +1575,7 @@ _GROUP_SKILLS: dict[str, dict[str, Any]] = {
         "long": "Ein Stratege plant den Beweis, ein Beweiser arbeitet ihn in Stufen aus. Zwei "
         "Rater bewerten jede Stufe; unter der Grenze gibt es Nacharbeit, nach der letzten "
         "Nacharbeit entscheidest du.",
-        "topology": TopologyKind.WATERFALL,
+        "topology": TopologyKind.PHASES,  # the start skill of this name (W4b-06b)
         "runs": 5,
         "agents": 4,
         "params": [
@@ -1606,7 +1616,7 @@ _GROUP_SKILLS: dict[str, dict[str, Any]] = {
         "long": "Lässt einen Beweis(entwurf) aus dem aktuellen Projekt von mehreren "
         "unabhängigen Judges prüfen. Der Autor arbeitet Einwände nach, bis die Judges "
         "zustimmen oder die Rundenzahl erreicht ist.",
-        "topology": TopologyKind.REVIEW,
+        "topology": TopologyKind.PHASES,  # the start skill of this name (W4b-06b)
         "runs": 4,
         "agents": 4,
         "params": [
@@ -1685,7 +1695,7 @@ _GROUP_SKILLS: dict[str, dict[str, Any]] = {
         "description": "Offene Diskussion",
         "long": "Mehrere Agenten diskutieren eine Frage in Runden. Wer nichts beizutragen hat, "
         "passt; nach der letzten Runde fasst ein Agent den Stand zusammen.",
-        "topology": TopologyKind.ROUNDTABLE,
+        "topology": TopologyKind.PHASES,  # the start skill of this name (W4b-06b)
         "runs": 2,
         "agents": 3,
         "params": [
@@ -7527,7 +7537,7 @@ class MockApi:
         skill = run_input.get("skill") or None
         topology = (
             next((s.topology for s in self.state.skills if s.name == skill), None)
-            or TopologyKind.SOLO
+            or TopologyKind.PHASES  # W4b-06b: a run without a skill is a phases run (F1)
         )
         limits = run_input.get("limits") or {}
         rid = (
@@ -8055,14 +8065,14 @@ class MockApi:
                 kind=SkillKind.GROUP,
                 audience="user",
                 files=sorted(files),
-                topology=TopologyKind.ROUNDTABLE,
+                topology=TopologyKind.PHASES,  # W4b-06b, F3: as `template_files`
                 params=[
                     ParamInfo(
                         name="rounds", type="int", default=2, min=1, max=5, doc="Anzahl der Runden"
                     )
                 ],
                 agents_spec=[{"id": "teilnehmer", "count": 2, "role": "roles/teilnehmer.md"}],
-                channels_spec=[{"name": "main", "members": ["teilnehmer-*"], "mode": "rounds"}],
+                channels_spec=[{"name": "runde", "members": ["teilnehmer-*"], "mode": "rounds"}],
                 agents_count=2,
             )
             what = "Group-Skill"
@@ -8167,6 +8177,22 @@ class MockApi:
             created.append(name)
         return StartSkillsResult(
             created=created, existing=existing, message=start_skills_message(created, existing)
+        )
+
+    async def update_start_skills(self, dry_run: bool = False) -> StartSkillsUpdateResult:
+        """`arr skills update` in memory (W4b-06b, F2): the start skills of the mock are the
+        current ones, so nothing is to update; the lines say so per start skill."""
+        if dry_run:
+            return StartSkillsUpdateResult()
+        names = {s.name for s in self.state.skills}
+        update = StartSkillsUpdate(
+            {
+                n: StartSkillUpdate(SkillUpdate.CURRENT if n in names else SkillUpdate.MISSING)
+                for n in START_SKILLS
+            }
+        )
+        return StartSkillsUpdateResult(
+            lines=update_lines(update), message="Kein Start-Skill war zu aktualisieren."
         )
 
 

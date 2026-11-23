@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from nicegui import ui
 
+from arr.models import TopologyKind
 from arr.service.api_models import (
     AgentState,
     ApprovalItem,
@@ -58,6 +59,11 @@ class TranscriptView:
     @property
     def agent_id(self) -> str:
         return self.agent.id
+
+    @property
+    def phases(self) -> bool:
+        """The run has `topology: phases`: turn separators say „Phase“ (W4b-06b)."""
+        return self.page.detail.run.topology is TopologyKind.PHASES
 
     async def build(self) -> None:
         page = self.page
@@ -138,7 +144,12 @@ class TranscriptView:
         )
         labels = self.page.stage_labels
         inner = "".join(
-            event_html(ev, agent_id=self.agent_id, stage_label=labels.get(ev.data.get("stage")))
+            event_html(
+                ev,
+                agent_id=self.agent_id,
+                stage_label=labels.get(ev.data.get("stage")),
+                phases=self.phases,
+            )
             for ev in events
         )
         return (
@@ -156,7 +167,8 @@ class TranscriptView:
             else:
                 label = self.page.stage_labels.get(ev.data.get("stage"))
                 self.rows[ev.seq] = raw(
-                    event_html(ev, agent_id=self.agent_id, stage_label=label), classes="ev-row"
+                    event_html(ev, agent_id=self.agent_id, stage_label=label, phases=self.phases),
+                    classes="ev-row",
                 )
 
     def _waiting_row(self, ev: TranscriptEvent) -> ui.element:
@@ -194,7 +206,9 @@ class TranscriptView:
             if _waiting(ev) == _waiting(self.events[ev.seq]) and not _waiting(ev):
                 self.events[ev.seq] = ev
                 label = self.page.stage_labels.get(ev.data.get("stage"))
-                old.set_content(event_html(ev, agent_id=self.agent_id, stage_label=label))
+                old.set_content(
+                    event_html(ev, agent_id=self.agent_id, stage_label=label, phases=self.phases)
+                )
                 return
             index = list(self.list.default_slot.children).index(old)
             self._add(ev)

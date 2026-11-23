@@ -20,6 +20,7 @@ from run_kit import (
     make_settings,
     make_workfolder,
     say,
+    solo_phases,
     turns,
     wait,
     write_profiles,
@@ -260,9 +261,10 @@ def test_run_start_agent_carries_the_agents_skills(
             {
                 "project": "demo",
                 "task": "x",
-                "topology": {"kind": "solo"},
+                "topology": {"kind": "phases"},
                 "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
                 "agents": [agent("a", skills=["sympy-check"])],
+                "phases": solo_phases(),
             }
         )
     )
@@ -305,9 +307,10 @@ def test_arr_run_and_the_service_remove_an_old_orphan_at_start(
     run_input = {
         "project": "demo",
         "task": "x",
-        "topology": {"kind": "solo"},
+        "topology": {"kind": "phases"},
         "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
         "agents": [agent("a")],
+        "phases": solo_phases(),
     }
     launch = plan_run_input(RunInput.model_validate(run_input), workfolder=workfolder)
     status = asyncio.run(

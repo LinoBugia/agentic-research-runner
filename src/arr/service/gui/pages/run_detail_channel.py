@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from nicegui import ui
 
-from arr.models import ChannelMode, RunStatus
+from arr.models import ChannelMode, RunStatus, TopologyKind
 from arr.room.types import MessageKind
 from arr.service.api_models import (
     ApiException,
@@ -180,11 +180,13 @@ class ChannelView:
             self.head = raw(self._head_html(), classes="pane-info")
             raw(follow_toggle_html(), tag="span")
         if not info.open:
-            stage = info.opens_at_stage or "einer späteren Stufe"
+            phases = page.detail.run.topology is TopologyKind.PHASES  # W4b-06b: „Phase“
+            word = "Phase" if phases else "Stufe"
+            stage = info.opens_at_stage or f"einer späteren {word}"
             raw(
                 empty_state_html(
                     "lock_clock",
-                    f"#{info.name} öffnet in Stufe „{stage}“",
+                    f"#{info.name} öffnet in {word} „{stage}“",
                     "Bis dahin arbeiten die Mitglieder unabhängig voneinander. Danach erscheinen "
                     "die Nachrichten hier.",
                 ),

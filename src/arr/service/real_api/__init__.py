@@ -82,6 +82,7 @@ from arr.service.api_models import (
     SkillKind,
     StartRunResponse,
     StartSkillsResult,
+    StartSkillsUpdateResult,
     StorageReport,
     ToolchainTestResult,
     TranscriptKind,
@@ -432,6 +433,9 @@ class RealApi:
 
     async def create_start_skills(self) -> StartSkillsResult:
         return await self.catalog.create_start_skills()
+
+    async def update_start_skills(self, dry_run: bool = False) -> StartSkillsUpdateResult:
+        return await self.catalog.update_start_skills(dry_run)
 
     # -- mandate of the supervising agent (W4-04) --------------------------------------------
 

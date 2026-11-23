@@ -20,6 +20,7 @@ from importlib import resources
 from pathlib import Path
 
 import pytest
+from old_runs_kit import add_result
 from service_kit import ServiceProcess, append, make_run_folder, start_service, transcript_line
 from service_kit import make_workfolder as service_workfolder
 from test_codex_backend import play, setup, simple_turn
@@ -120,7 +121,7 @@ async def test_no_external_image_in_any_source_of_agent_text(wf: Path) -> None:
     folder = make_run_folder(wf, status=RunStatus.DONE, agents=["a"], name="Bilder")
     store = RoomStore.create(folder)
     store.for_agent("a").post_message("main", f"Kanal {image}")
-    store.for_agent("a").submit_result(kind="proof", title="Beweis", body=f"Ergebnis {image}")
+    add_result(store, "a", "proof", "Beweis", f"Ergebnis {image}")  # an old run (W4b-06b)
     (folder / "output").mkdir(exist_ok=True)
     (folder / "output" / "summary.md").write_text(f"# Zusammenfassung\n\nSumme {image}\n")
     (folder / "task.md").write_text(f"# Aufgabe\n\nAufgabe {image}\n", "utf-8")

@@ -355,7 +355,7 @@ class ApprovalInbox:
             self._items[item.id] = item
             self._waiters[item.id] = waiter
             self._waiting[item.id] = 1
-            self._write(LogEvent.OPEN, item, note=f"Eskalation in Stufe „{stage}“: {summary}")
+            self._write(LogEvent.OPEN, item, note=f"Eskalation: {summary}")  # W4b-06b
             if self.decider is not None:
                 self._decider_tasks[item.id] = asyncio.create_task(self._run_decider(item))
         try:

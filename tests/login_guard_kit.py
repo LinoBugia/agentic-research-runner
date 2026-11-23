@@ -154,7 +154,7 @@ def _run_input(provider: str, model: str, auth: str, agent: str) -> RunInput:
             "version": 1,
             "project": "demo",
             "task": "W3-06 check",
-            "topology": {"kind": "solo"},
+            "topology": {"kind": "phases"},
             "defaults": {"provider": provider, "model": model, "auth": auth, "effort": "low"},
             "agents": [{"id": agent}],
             "groupchats": [{"name": "main", "members": [agent]}],

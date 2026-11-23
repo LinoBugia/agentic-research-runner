@@ -27,7 +27,6 @@ from run_kit import (
     make_manager,
     make_workfolder,
     post,
-    room,
     wait,
 )
 
@@ -36,7 +35,6 @@ from arr.models import RunStatus
 from arr.runs.compact import PACKAGE_HEADING
 from arr.runs.context import RunContext
 from arr.runs.orchestrator import Orchestrator
-from arr.runs.topologies import solo as solo_topology
 
 PRIVATE = "GEHEIM-NOTIZ-4711"
 
@@ -167,55 +165,6 @@ async def test_a8_reset_session_makes_the_fill_level_unknown(workfolder: Path) -
     manager = await run_phase(workfolder, between)
     assert compacts(manager.run_dir) == []
     assert not prompts(manager.run_dir, "solo")[1].startswith(PACKAGE_HEADING)
-
-
-# --------------------------------------------------------------------------------------------
-# A7: package in an old topology (results instead of submissions)
-# --------------------------------------------------------------------------------------------
-
-
-async def test_a7_package_in_the_old_topology_solo(workfolder: Path) -> None:
-    """The real `solo` topology: turn 1 without a result, over the threshold; before turn 2
-    the note turn; turn 2 (the same prompt, the task) gets the package."""
-    turns = script(
-        [say("noch nichts"), fill(600)],
-        [room("submit_result", kind="proof", title="Beweis", body="b"), fill(10)],
-        note_turns=[good_note()],
-    )
-    manager = make_manager(
-        workfolder, solo_topology.run, {"solo": turns}, agents=[agent("solo", compact=LOW)]
-    )
-    assert await asyncio.wait_for(manager.run(), 30) is RunStatus.DONE
-    sent = prompts(manager.run_dir, "solo")
-    assert len(sent) == 3 and sent[2].startswith(PACKAGE_HEADING)
-    package = sent[2]
-    assert f"### Dein laufender Auftrag\n\n{sent[0]}" in package  # the task, first prompt
-    reminder = manager.room.assignment("solo").prompt
-    assert reminder != sent[0] and package.endswith(reminder), "this turn's prompt follows"
-    assert "### Deine Abgaben\n\nKeine." in package
-    [result] = manager.room.results(agent="solo")
-    assert result.title == "Beweis"
-
-
-async def test_a7_old_results_in_the_package(workfolder: Path) -> None:
-    async def topology(ctx: RunContext) -> None:
-        await ctx.turn("solo", "Sammle Ideen.", stage="ideen")
-        await ctx.turn("solo", "Weiter.", stage="ideen")
-
-    turns = script(
-        [room("submit_result", kind="idea", title="Ansatz B", body="b"), fill(600)],
-        [fill(10)],
-        note_turns=[good_note()],
-    )
-    manager = make_manager(
-        workfolder, topology, {"solo": turns}, agents=[agent("solo", compact=LOW)]
-    )
-    assert await asyncio.wait_for(manager.run(), 30) is RunStatus.DONE
-    package = prompts(manager.run_dir, "solo")[2]
-    [result] = manager.room.results(agent="solo")
-    assert f"- #{result.id} · idea · „Ansatz B“ · Phase ideen" in package
-    assert result.path is None and "Pfad" not in package.split("### Deine eigene Notiz")[0]
-    assert "Sammle Ideen." in package and package.endswith("Weiter.")
 
 
 # --------------------------------------------------------------------------------------------

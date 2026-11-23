@@ -1,0 +1,22 @@
+project: demo
+task: Zeige, dass Lemma A für alle n ≡ 1 mod 4 gilt.
+topology:
+  kind: review
+  params:
+    max_revisions: 1
+defaults:
+  provider: claude
+  model: fake-model
+  auth: fake-auth
+agents:
+  - id: author
+  - id: judge-1
+  - id: judge-2
+groupchats:
+  - name: judges
+    members:
+      - judge-1
+      - judge-2
+    mode: rounds
+    open_from: diskussion
+    anonymous: true

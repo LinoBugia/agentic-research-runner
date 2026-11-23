@@ -1,0 +1,4 @@
+{"seq": 2, "ts": 1795441628.6051872, "raw": {"fake_step": {"do": "room", "action": "submit_result", "args": {"kind": "artifact", "title": "Beweis", "body": "Beweis v1\nZeile 2\n"}, "save_as": null}}}
+{"seq": 3, "ts": 1795441628.606339, "raw": {"fake_step": {"do": "room", "action": "submit_result", "args": {"kind": "artifact", "title": "Beweis", "body": "Beweis v1\nZeile 2\n"}, "save_as": null}}}
+{"seq": 6, "ts": 1795441628.672105, "raw": {"fake_step": {"do": "room", "action": "submit_result", "args": {"kind": "artifact", "title": "Beweis neu", "body": "Beweis v2\nZeile 2\n"}, "save_as": null}}}
+{"seq": 7, "ts": 1795441628.6729321, "raw": {"fake_step": {"do": "room", "action": "submit_result", "args": {"kind": "artifact", "title": "Beweis neu", "body": "Beweis v2\nZeile 2\n"}, "save_as": null}}}

@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "run": "20261004-1000_demo_solo_a004",
+  "results": [
+    {
+      "id": 1,
+      "ts": 1795441628.933644,
+      "agent": "solver",
+      "stage": null,
+      "kind": "proof",
+      "title": "Beweis",
+      "body": "Lemma A gilt.",
+      "path": null,
+      "attempt": 1,
+      "file": "output/results/001-solver-proof.md",
+      "score": null,
+      "ratings": []
+    }
+  ]
+}

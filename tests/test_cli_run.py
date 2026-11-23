@@ -8,13 +8,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from phases_kit import Log, TurnView, hand_in, policy_builders, write_project_tasks
 from run_kit import (
     eventually,
     fake_builders,
     log_entries,
     make_workfolder,
     post,
-    room,
     say,
     turns,
     wait,
@@ -34,7 +34,7 @@ version: 1
 name: M1-Szenario
 project: demo
 task_file: task.md
-topology: {kind: waterfall, params: {pass_score: 6, max_rework: 1}}
+topology: {kind: phases, params: {pass_score: 6, max_visits: 2}}
 limits: {wall_time: 5m, turns_per_agent: 6, budget_usd: 0.5}
 defaults: {provider: claude, model: fake-model, auth: fake-auth, effort: low}
 agents:
@@ -44,56 +44,68 @@ agents:
 groupchats:
   - {name: main, members: [strategist, prover, rater], mode: event}
   - {name: werkstatt, members: [strategist, prover], mode: rounds}
-stages:
-  - {name: strategie, agent: strategist, produces: strategie.md}
-  - {name: beweis, agent: prover, produces: beweis.md}
-raters: [prover, rater]
+phases:
+  - name: strategie
+    topology: solo
+    channels: [main, werkstatt]
+    max_visits: "{{ params.max_visits }}"
+    on_exhausted: stop
+    actions:
+      strategist: {task: tasks/strategie.md, submission: {format: artifact, name: strategie}}
+    gate:
+      type: judge
+      raters: [prover, rater]
+      action: {task: tasks/bewerten.md, submission: {format: rating}}
+      rule: mean
+      pass_score: "{{ params.pass_score }}"
+      routes: {pass: next, fail: retry}
+  - name: beweis
+    topology: solo
+    channels: [main, werkstatt]
+    max_visits: "{{ params.max_visits }}"
+    on_exhausted: stop
+    actions:
+      prover: {task: tasks/beweis.md, submission: {format: artifact, name: beweis}}
+    gate:
+      type: judge
+      raters: [rater]
+      action: {task: tasks/bewerten.md, submission: {format: rating}}
+      rule: mean
+      pass_score: "{{ params.pass_score }}"
+      routes: {pass: next, fail: retry}
 """
+"""The M1 scenario as a phases run (W4b-06b, was `waterfall`): two phases with a gate `judge`
+(mean of the raters, at least `pass_score`), the strategy reworked once."""
+TASKS = {
+    "tasks/strategie.md": "Plane den Beweis.\n",
+    "tasks/beweis.md": "Schreibe den Beweis.\n",
+    "tasks/bewerten.md": "Bewerte die Abgabe.\n",
+}
+SCORES = {("prover", "strategie", 1): 4, ("prover", "strategie", 2): 8}
+SCORES |= {("rater", "strategie", 1): 5, ("rater", "strategie", 2): 7, ("rater", "beweis", 1): 8}
 
 
-def staged(**stages: list[list[dict[str, Any]]]) -> dict[str, Any]:
-    return {
-        "turns": [],
-        "by_stage": {name: {"turns": [{"steps": s} for s in ts]} for name, ts in stages.items()},
-    }
+def m1_policy(view: TurnView) -> list[dict[str, Any]]:
+    """The turns of the M1 scenario: a tool, two channels, a rework of the strategy, ratings of
+    both raters."""
+    if view.expected.get("format") == "rating":
+        score = SCORES[(view.agent, view.stage, view.attempt)]
+        return hand_in(view, score=lambda _v, _r: score, comment="passt")
+    if view.agent == "strategist":
+        if view.attempt > 1:
+            return hand_in(view)
+        tool = {"do": "tool", "name": "Bash", "input": {"command": "python check.py"}}
+        return [
+            {"do": "text", "text": "Ich plane den Beweis."},
+            {**tool, "result": "ok"},
+            post("werkstatt", "Ansatz: Induktion."),
+            *hand_in(view),
+        ]
+    return [post("main", "Der Beweis steht."), *hand_in(view)]
 
 
-def rate(score: float, comment: str = "passt") -> list[dict[str, Any]]:
-    return [
-        room("get_assignment", save_as="job"),
-        room("submit_rating", result_id="${job.context.result_id}", score=score, comment=comment),
-    ]
-
-
-def submit(kind: str, title: str, **args: Any) -> dict[str, Any]:
-    return room("submit_result", kind=kind, title=title, **args)
-
-
-def m1_scripts() -> dict[str, Any]:
-    tool = {"do": "tool", "name": "Bash", "input": {"command": "python check.py"}, "result": "ok"}
-    return {
-        "strategist": staged(
-            strategie=[
-                [
-                    say("Ich plane den Beweis."),
-                    tool,
-                    post("werkstatt", "Ansatz: Induktion."),
-                    submit("strategy", "Strategie", body="Induktion über n."),
-                ],
-                [submit("strategy", "Strategie, überarbeitet", body="Mit Basisfall.")],
-            ]
-        ),
-        "prover": staged(
-            strategie=[rate(4, "Basisfall fehlt"), rate(8)],
-            beweis=[
-                [
-                    post("main", "Der Beweis steht."),
-                    submit("proof", "Beweis", body="Beweis: n = 4k + 1 …"),
-                ]
-            ],
-        ),
-        "rater": staged(strategie=[rate(5, "zu knapp"), rate(7)], beweis=[rate(8, "sauber")]),
-    }
+def m1_builders() -> dict[Any, Any]:
+    return policy_builders({a: m1_policy for a in ("strategist", "prover", "rater")}, Log())
 
 
 @pytest.fixture
@@ -110,8 +122,9 @@ def m1(
     (wf / "arr.yaml").write_text("version: 1\ntoolchain: {run_venv: off}\n", encoding="utf-8")
     (wf / "run.yaml").write_text(M1_RUN_YAML, encoding="utf-8")
     (wf / "task.md").write_text("Zeige Lemma A für n ≡ 1 mod 4.\n", encoding="utf-8")
+    write_project_tasks(wf, TASKS)
     write_profiles(arr_home, {"fake-auth": "claude_oauth", "fake-codex": "codex_chatgpt"})
-    monkeypatch.setattr(launch_module, "BACKEND_BUILDERS", fake_builders(m1_scripts()))
+    monkeypatch.setattr(launch_module, "BACKEND_BUILDERS", m1_builders())
     monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
     monkeypatch.chdir(wf)
     return wf
@@ -134,11 +147,12 @@ def test_arr_run_plays_the_m1_scenario(m1: Path) -> None:
     assert f"Workfolder: {m1}" in out
     assert f"Run {run_dir.name}" in out and f"Ordner: {run_dir}" in out
     assert "● Plan: strategie → beweis" in out
-    assert "▶ strategist: Turn 1 · Stufe „strategie“" in out
+    assert "▶ strategist: Turn 1 · Phase „strategie“" in out
     assert "■ strategist: Turn 1 beendet (ok)" in out
-    assert "● Stufe „strategie“, Versuch 1 (strategist): Nacharbeit, Score 4,5" in out
-    assert "● Stufe „strategie“, Versuch 2 (strategist): bestanden, Score 7,5" in out
-    assert "● Stufe „beweis“ abgeschlossen: bestanden, akzeptiert #3" in out
+    assert "● Phase „strategie“, Durchlauf 1: Gate „judge“ ergibt „fail“ – nicht bestanden, " in out
+    assert "● Phase „strategie“, Durchlauf 1: Route „retry“ → Phase „strategie“" in out
+    assert "● Phase „strategie“, Durchlauf 2: Gate „judge“ ergibt „pass“ – bestanden, " in out
+    assert "● Phase „beweis“ abgeschlossen nach Durchlauf 1: bestanden, gilt: Abgabe #7" in out
     assert "Status: wird abgeschlossen (finalizing)" in out
     assert f"Run {run_dir.name} beendet: abgeschlossen (done)." in out
     assert "Grund: Die Topologie ist regulär durchgelaufen." in out
@@ -146,12 +160,19 @@ def test_arr_run_plays_the_m1_scenario(m1: Path) -> None:
     assert "Secret-Scan: sauber" in out
     summary = (run_dir / "output" / "summary.md").read_text(encoding="utf-8")
     assert "- **Status:** abgeschlossen (done)" in summary
-    assert "| strategie | 1 | strategist | #1 | 4,5 | Nacharbeit |" in summary
+    assert "| strategie | 1 | strategist | #1 | 4,5 | nicht bestanden |" in summary
+    assert "| strategie | 2 | strategist | #4 | 7,5 | bestanden |" in summary
     assert "- `rater`: codex, fake-gpt" in summary
     decisions = [
         e["data"]["decision"] for e in log_entries(run_dir, "checkpoint") if "decision" in e["data"]
     ]
-    assert decisions == ["rework", "passed", "passed"], "at least one rework (M1 1)"
+    assert decisions == ["failed", "passed", "passed"]
+    starts = [
+        (e["data"]["stage"], e["data"]["attempt"], e["data"]["how"])
+        for e in log_entries(run_dir, "checkpoint")
+        if e["data"].get("phase") == "pass_start"
+    ]
+    assert ("strategie", 2, "retry") in starts, f"at least one rework (M1 1): {starts}"
     for name in ("main", "werkstatt"):
         assert (run_dir / "groupchats" / f"{name}.md").is_file()
     [scan] = log_entries(run_dir, "secret_scan")
@@ -168,7 +189,10 @@ def test_arr_run_plays_the_m1_scenario(m1: Path) -> None:
     assert f"Run:       {run_dir.name} (demo, M1-Szenario)" in status.output
     assert "Status:    abgeschlossen (done)" in status.output
     assert "Grund:     Die Topologie ist regulär durchgelaufen." in status.output
-    assert "Zuletzt:   Stufe „beweis“ abgeschlossen: bestanden, akzeptiert #3" in status.output
+    assert (
+        "Zuletzt:   Phase „beweis“ abgeschlossen nach Durchlauf 1: bestanden, gilt: Abgabe #7"
+        in status.output
+    )
     assert "  strategist: 2 Turns, zuletzt ok" in status.output
     assert "  prover: 3 Turns, zuletzt ok" in status.output
     assert "  rater: 3 Turns, zuletzt ok" in status.output
@@ -214,11 +238,12 @@ def test_w3_00_m1_scenario_with_a_run_venv_outside_the_run_folder(
 
 
 def test_arr_run_reports_configuration_errors_in_german_without_traceback(m1: Path) -> None:
-    text = M1_RUN_YAML.replace("params: {pass_score: 6, max_rework: 1}", "params: {}")
+    text = M1_RUN_YAML.replace("params: {pass_score: 6, max_visits: 2}", "params: {}")
     (m1 / "kaputt.yaml").write_text(text, encoding="utf-8")
     result = runner.invoke(app, ["run", "kaputt.yaml"])
     assert result.exit_code == 1
-    assert "params.pass_score" in result.output and "Bestehensgrenze" in result.output
+    assert "params.pass_score" in result.output
+    assert "verweist auf keinen Parameter" in result.output
     assert "Traceback" not in result.output
     assert run_dirs(m1) == [], "checked before prepare_run"
 
@@ -246,14 +271,14 @@ def test_arr_run_exit_code_1_for_a_failed_run(m1: Path) -> None:
 
 
 def test_arr_run_param_overrides_the_topology_parameter(m1: Path) -> None:
-    result = runner.invoke(app, ["run", "run.yaml", "-p", "pass_score=9", "-p", "max_rework=0"])
+    result = runner.invoke(app, ["run", "run.yaml", "-p", "pass_score=9", "-p", "max_visits=1"])
     assert result.exit_code == 0, result.output
     [run_dir] = run_dirs(m1)
     run_yaml = (run_dir / "run.yaml").read_text(encoding="utf-8")
-    assert "pass_score: 9" in run_yaml and "max_rework: 0" in run_yaml
-    assert (
-        "● Stufe „strategie“, Versuch 1 (strategist): nicht bestanden, Score 4,5" in result.output
-    )
+    assert "pass_score: 9" in run_yaml and "max_visits: 1" in run_yaml
+    out = result.output
+    assert "● Phase „strategie“, Durchlauf 1: Gate „judge“ ergibt „fail“ – nicht bestanden" in out
+    assert "Route „retry“ → Ende des Runs (aufgebraucht: strategie)" in out
 
 
 # --------------------------------------------------------------------------------------------
@@ -275,9 +300,11 @@ def test_runs_list_and_status_on_an_empty_or_unknown_workfolder(m1: Path) -> Non
 async def test_runs_stop_from_a_second_process_ends_a_running_run(m1: Path) -> None:
     builders = fake_builders({"a": turns([say("los"), wait(30)])})
     (m1 / "solo.yaml").write_text(
-        "version: 1\nproject: demo\ntask: Los.\ntopology: {kind: solo}\n"
+        "version: 1\nproject: demo\ntask: Los.\ntopology: {kind: phases}\n"
         "defaults: {provider: claude, model: fake-model, auth: fake-auth}\n"
-        "agents: [{id: a}]\n",
+        "agents: [{id: a}]\n"
+        "phases: [{name: arbeit, topology: solo, "
+        "actions: {a: {task: tasks/ohne-skill.md, submission: {format: text}}}}]\n",
         encoding="utf-8",
     )
     lines: list[str] = []

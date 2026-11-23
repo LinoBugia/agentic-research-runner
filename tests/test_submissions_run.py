@@ -1,7 +1,7 @@
 """`submit` in a run: tools per topology, MCP, FakeBackend, finalizer, start (W4b-01 A10, A11).
 
-Runs with `topology: phases` get `submit` and not `submit_result`/`submit_rating`, the five old
-topologies the reverse; since W4b-02b a `phases` run starts (the runner of `arr.runs.phases`). The
+Every run gets `submit` and `assign` (since W4b-06b; `submit_result`/`submit_rating` went with
+the five old topologies); since W4b-02b a `phases` run starts (the runner of `arr.runs.phases`). The
 FakeBackend plays `submit` without a model, and the finalizer writes `submissions.json` and an
 overview of the summaries.
 """
@@ -32,9 +32,7 @@ from arr.room.store import RoomStore
 from arr.runs.context import RunContext
 from arr.runs.finalize import finalize_run
 from arr.runs.launch import plan_launch
-from arr.runs.topologies import AVAILABLE, check_topology, planned_stages
-
-OLD_KINDS = ["solo", "roundtable", "exploration", "waterfall", "review"]
+from arr.runs.topology import check_topology, topology_for
 
 
 def write_run_yaml(run_dir: Path, kind: str) -> None:
@@ -72,11 +70,12 @@ async def tool_list(store: RoomStore, agent_id: str = "prover") -> dict[str, Any
 # --------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", [*OLD_KINDS, None])
-async def test_old_topologies_keep_the_old_tools(tmp_path: Path, kind: str | None) -> None:
-    tools = await tool_list(make_store(tmp_path, kind))
-    assert {"submit_result", "submit_rating"} <= set(tools)
-    assert "submit" not in tools
+async def test_without_run_yaml_the_tools_are_the_same(tmp_path: Path) -> None:
+    """W4b-06b: a room without `run.yaml` offers `submit` and `assign` as a phases run does;
+    `submit_result` and `submit_rating` exist nowhere."""
+    tools = await tool_list(make_store(tmp_path, None))
+    assert {"submit", "assign"} <= set(tools)
+    assert not {"submit_result", "submit_rating"} & set(tools)
 
 
 async def test_phases_offers_submit_instead(tmp_path: Path) -> None:
@@ -88,15 +87,16 @@ async def test_phases_offers_submit_instead(tmp_path: Path) -> None:
     assert {"body", "files", "note_next", "fields"} <= set(schema["properties"])
     fields = schema["properties"]["fields"]["anyOf"][0]
     assert fields["type"] == "object" and fields.get("additionalProperties", True) is True
-    old = await tool_list(make_store(tmp_path, "solo"))
-    assert set(tools) - {"submit", "assign"} == set(old) - {"submit_result", "submit_rating"}
-    assert "assign" not in old  # W4b-04: only a phases run offers it
+    none = await tool_list(make_store(tmp_path, None))
+    assert set(tools) == set(none), "the same list with and without `run.yaml` (W4b-06b)"
 
 
 def test_phases_is_a_topology_kind_and_available() -> None:
     """Since W4b-02b `phases` runs (the runner of `arr.runs.phases`)."""
+    from arr.runs.phases import runner
+
     assert TopologyKind("phases") is TopologyKind.PHASES
-    assert TopologyKind.PHASES in AVAILABLE
+    assert topology_for(TopologyKind.PHASES) is runner.run
 
 
 PHASES_RUN = """\
@@ -124,9 +124,13 @@ def test_a_phases_run_without_phases_is_refused_before_the_start(
         plan_launch(run_file, cwd=workfolder)
     assert "phases: „topology: phases“ braucht mindestens eine Phase." in str(info.value)
     assert list((workfolder / "runs").iterdir()) == [], "nothing was prepared"
-    # counter-check: the same run with `solo` passes the planning
-    run_file.write_text(PHASES_RUN.replace("phases", "solo"), encoding="utf-8")
-    assert plan_launch(run_file, cwd=workfolder).resolved.topology.kind is TopologyKind.SOLO
+    # counter-check: the same run with a phase passes the planning
+    phase = (
+        "phases: [{name: p, topology: solo, "
+        "actions: {a: {task: t.md, submission: {format: text}}}}]\n"
+    )
+    run_file.write_text(PHASES_RUN + phase, encoding="utf-8")
+    assert plan_launch(run_file, cwd=workfolder).resolved.topology.kind is TopologyKind.PHASES
 
 
 # --------------------------------------------------------------------------------------------
@@ -261,33 +265,6 @@ async def test_fake_backend_plays_submit_and_finalizer_lists_submissions(tmp_pat
     assert "Erwartet: done oder not_solved" in transcript
 
 
-async def test_finalizer_adds_nothing_for_old_topologies(tmp_path: Path) -> None:
-    """A11 counter-check, names only: a run of an old topology has the same files below
-    `output/` as before (no `submissions.json`) and no section `Abgaben` in `summary.md`. The
-    contents of these files are checked by `test_finalize.py`, which is unchanged."""
-    workfolder = make_workfolder(tmp_path)
-
-    async def topology(ctx: RunContext) -> None:
-        await ctx.turn("a", "Los.", stage="s")
-
-    manager = make_manager(
-        workfolder,
-        topology,
-        {"a": turns([room("submit_result", kind="proof", title="Beweis", body="…")])},
-        finalizer=finalize_run,
-    )
-    assert await asyncio.wait_for(manager.run(), 30) is RunStatus.DONE
-    out = manager.run_dir / "output"
-    assert sorted(p.name for p in out.iterdir()) == [
-        "ratings.json",
-        "results",
-        "results.json",
-        "summary.md",
-    ]
-    summary = (out / "summary.md").read_text("utf-8")
-    assert "## Ergebnisse" in summary and "## Abgaben" not in summary
-
-
 def test_planned_stages_of_phases_without_phases_is_empty(tmp_path: Path) -> None:
     """Since W4b-02b the plan of a `phases` run is its phases; without any it is empty and
     `check_topology` reports the missing phases."""
@@ -298,7 +275,7 @@ def test_planned_stages_of_phases_without_phases_is_empty(tmp_path: Path) -> Non
         approvals=ApprovalSettings(),
         agents=[AgentConfig(id="a", base_id="a", provider="claude", model="m", auth="p")],
     )
-    assert planned_stages(run) == []
+    assert [p.name for p in run.phases] == []  # the plan of the RunManager
     with pytest.raises(ArrError, match="braucht mindestens eine Phase"):
         check_topology(run)
 

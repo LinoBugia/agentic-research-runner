@@ -63,6 +63,7 @@ __all__ = [
     "tree_digest",
     "update_start_skills",
     "update_lines",
+    "updatable_start_skills",
     "write_claude_plugin",
 ]
 
@@ -1194,3 +1195,33 @@ def update_lines(update: StartSkillsUpdate) -> list[str]:
         else:
             lines.append(f"{name}: {_UPDATE_TEXT[item.result]}")
     return lines
+
+
+def updatable_start_skills(
+    workfolder: str | Path, names: Sequence[str] = START_SKILLS
+) -> list[str]:
+    """The start skills in `<workfolder>/skills/` that `update_start_skills` would bring to the
+    version of this arr: equal byte for byte to an earlier version arr shipped, not to the
+    current one (W4b-06b, F2: the button „Start-Skills aktualisieren“ shows only then). Reads
+    with the same rules, writes nothing. One that cannot be read counts as not updatable;
+    without `skills/` none. Raises `SkillFileError` like `update_start_skills`."""
+    unknown = [n for n in names if n not in START_SKILLS]
+    if unknown:
+        raise SkillFileError(f"„{unknown[0]}“ ist kein Start-Skill.")
+    root = _existing_skills_root(workfolder)
+    if root is None:
+        return []
+    found: list[str] = []
+    try:
+        for name in names:
+            try:
+                digest = _digest_in(root, name)
+            except OSError:
+                continue
+            if digest is None or digest == tree_digest(start_skill_files(name)):
+                continue
+            if digest in {d for _commit, d in EARLIER_DIGESTS.get(name, ())}:
+                found.append(name)
+    finally:
+        os.close(root)
+    return found

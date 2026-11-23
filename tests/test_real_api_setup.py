@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from run_kit import FAST, done, fake_builders, say, turns, wait, write_profiles
+from run_kit import FAST, done, fake_builders, say, solo_phases, turns, wait, write_profiles
 from service_kit import (
     hold_lock,
     make_run_folder,
@@ -85,10 +85,11 @@ BASE = "http://127.0.0.1:8765"
 RUN_INPUT = {
     "project": "demo",
     "task": "Teste arr.",
-    "topology": {"kind": "solo"},
+    "topology": {"kind": "phases"},
     "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
     "agents": [{"id": "a"}],
     "groupchats": [{"name": "main", "members": ["a"]}],
+    "phases": solo_phases(),
 }
 
 

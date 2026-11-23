@@ -524,13 +524,10 @@ class ApprovalCard:
                 classes="small muted hint-note",
             ).mark("phase-hint")
         with ui.element("div").classes("af"):
-            to = self.item.comment_to.id if self.item.comment_to else None
             if phases:
                 self._comment_input(PHASE_HINT_PLACEHOLDER, describedby=f"{item.id}-hint")
-            else:
-                self._comment_input(
-                    f"Kommentar an {to} (optional)" if to else "Kommentar (optional)"
-                )
+            else:  # W4b-06b: the real API never names `comment_to`
+                self._comment_input("Kommentar (optional)")
             with ui.element("div").classes("decide"):
                 self.decide_button = button(
                     "Entscheiden",
@@ -960,8 +957,9 @@ def compact_card(
                 classes="af",
             )
         else:
+            mark = "D" if item.topology is TopologyKind.PHASES else "V"  # as `_escalation_body`
             chips = "".join(
-                f'<span class="att fail">V{a.n} {fmt.score(a.avg_score)}</span>'
+                f'<span class="att fail">{mark}{a.n} {fmt.score(a.avg_score)}</span>'
                 for a in item.attempts
             )
             raw(f'<div class="attempts">{chips}</div>', classes="ab small")

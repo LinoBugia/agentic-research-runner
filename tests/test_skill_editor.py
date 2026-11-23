@@ -56,7 +56,7 @@ DEFAULTS = {"provider": "claude", "model": "fake-model", "auth": "fake-auth"}
 SKILL_MD = "---\nname: {name}\ndescription: Eine Runde zum Testen.\n---\n# Runde\n"
 GROUP_YAML = """kind: research-group
 version: 1
-topology: roundtable
+topology: phases
 params:
   rounds: {{ default: {rounds}, min: 1, max: 4, doc: "Runden" }}
 limits:
@@ -73,7 +73,17 @@ groupchats:
   - name: main
     members: [{members}]
     mode: rounds
+phases:
+  - name: diskussion
+    topology: chat
+    channels: [main]
+    rounds: "{{{{ params.rounds }}}}"
+    actions:
+      m-*: {{ task: tasks/runde.md, submission: {{ format: text }} }}
+      critic: {{ task: tasks/runde.md, submission: {{ format: text }} }}
 """
+"""Since W4b-06b a phases group (was `roundtable`): one phase `chat` in #main; the lines up to
+`groupchats` are unchanged, so the line numbers of the check stay."""
 
 
 @pytest.fixture(autouse=True)
@@ -115,6 +125,8 @@ def group_skill(
     (folder / "SKILL.md").write_text(SKILL_MD.format(name=name), "utf-8")
     (folder / "roles" / "m.md").write_text("# Rolle m\n", "utf-8")
     (folder / "roles" / "critic.md").write_text("# Rolle critic\n", "utf-8")
+    (folder / "tasks").mkdir(exist_ok=True)
+    (folder / "tasks" / "runde.md").write_text("Diskutiere die Aufgabe.\n", "utf-8")
     text = group_yaml or GROUP_YAML.format(
         rounds=rounds, skills=skills, critic_role=critic_role, members=members
     )
@@ -304,7 +316,12 @@ async def test_new_group_skill_passes_the_check_and_can_be_resolved(wf: Path) ->
         CreateSkillRequest(name="beweis-runde", kind="group", description="Zwei prüfen.")
     )
     assert result.skill.valid and result.skill.kind is SkillKind.GROUP
-    assert sorted(result.skill.files) == ["SKILL.md", "group.yaml", "roles/teilnehmer.md"]
+    assert sorted(result.skill.files) == [
+        "SKILL.md",
+        "group.yaml",
+        "roles/teilnehmer.md",
+        "tasks/diskutieren.md",
+    ]
     assert [s.name for s in await api.list_skills(SkillKind.GROUP)] == ["beweis-runde"]
     resolved = await api.resolve_run(
         {"project": "demo", "skill": "beweis-runde", "task": "x", "defaults": DEFAULTS}
@@ -332,7 +349,7 @@ async def test_duplicate_copies_regular_files_and_renames(wf: Path, tmp_path: Pa
     assert result.skill.valid and "name: runde-streng" in (copy / "SKILL.md").read_text()
     assert (copy / "group.yaml").read_bytes() == (folder / "group.yaml").read_bytes()
     assert sorted(result.left_out) == ["link.md", "pipe"]
-    assert sorted(p.name for p in copy.iterdir()) == ["SKILL.md", "group.yaml", "roles"]
+    assert sorted(p.name for p in copy.iterdir()) == ["SKILL.md", "group.yaml", "roles", "tasks"]
     assert "Nicht kopiert" in result.message
 
 
@@ -567,7 +584,8 @@ async def test_resolve_run_fills_the_estimate(wf: Path) -> None:
         {"project": "demo", "skill": "runde", "task": "x", "defaults": DEFAULTS}
     )
     est = result.estimate
-    assert est is not None and est.turns.min == 3 and est.turns.max == 6  # 3 members × 2 rounds
+    # phase `chat`: 3 members × 2 rounds, plus one turn each to hand in (arr.plan.estimate)
+    assert est is not None and est.turns.min == 3 and est.turns.max == 9
     assert est.cost_basis == "budget" and est.cost_usd.max == 2
 
 
@@ -660,7 +678,7 @@ def bomb(levels: int, fan: int = 9) -> str:
     out = [f"a0: &a0 [{', '.join(['x'] * fan)}]"]
     for i in range(1, levels + 1):
         out.append(f"a{i}: &a{i} [{', '.join([f'*a{i - 1}'] * fan)}]")
-    out.append("kind: research-group\nversion: 1\ntopology: roundtable\nagents: []\n")
+    out.append("kind: research-group\nversion: 1\ntopology: phases\nagents: []\n")
     return "\n".join(out)
 
 
@@ -699,7 +717,7 @@ async def test_deep_nesting_in_group_yaml_is_an_issue_not_a_crash(wf: Path) -> N
     bad.mkdir()
     (bad / "SKILL.md").write_text(SKILL_MD.format(name="tief"), "utf-8")
     (bad / "group.yaml").write_text(
-        "kind: research-group\ntopology: roundtable\nagents: " + "[" * 500 + "]" * 500 + "\n"
+        "kind: research-group\ntopology: phases\nagents: " + "[" * 500 + "]" * 500 + "\n"
     )
     api = make_api(wf)
     skill = await api.get_skill("tief")
@@ -733,9 +751,7 @@ async def test_deep_skill_md_in_another_skill_blocks_nothing_else(wf: Path) -> N
 async def test_frontmatter_alias_bomb_is_refused(wf: Path) -> None:
     folder = wf / "skills" / "bombe"
     folder.mkdir(parents=True)
-    head = bomb(7).replace(
-        "kind: research-group\nversion: 1\ntopology: roundtable\nagents: []\n", ""
-    )
+    head = bomb(7).replace("kind: research-group\nversion: 1\ntopology: phases\nagents: []\n", "")
     (folder / "SKILL.md").write_text(
         "---\nname: bombe\ndescription: x\nmetadata:\n  " + head.replace("\n", "\n  ") + "\n---\n",
         "utf-8",

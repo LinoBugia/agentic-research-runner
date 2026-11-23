@@ -485,7 +485,7 @@ async def editor_text(user: User, retries: int = 40) -> str:
 async def test_skills_with_tabs_and_errors() -> None:
     async with gui_user(MockApi()) as user:
         await user.open("/skills/proof-review")
-        html = await see(user, "Ablauf (Topologie Review)")
+        html = await see(user, "Ablauf (Topologie Phasen)")  # W4b-06b: the mock's start skills
         for text in ["judges", "max_revisions", "roles/judge.md", "#judges", "Benutzt von"]:
             assert text in html, text
         assert "/neuer-run?skill=proof-review" in html

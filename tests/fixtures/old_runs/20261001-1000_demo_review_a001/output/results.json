@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "run": "20261001-1000_demo_review_a001",
+  "results": [
+    {
+      "id": 1,
+      "ts": 1795441628.606017,
+      "agent": "author",
+      "stage": "artefakt",
+      "kind": "artifact",
+      "title": "Beweis",
+      "body": "Beweis v1\nZeile 2\n",
+      "path": null,
+      "attempt": 1,
+      "file": "output/results/001-author-artifact.md",
+      "score": null,
+      "ratings": []
+    },
+    {
+      "id": 2,
+      "ts": 1795441628.6219368,
+      "agent": "judge-1",
+      "stage": "pruefung",
+      "kind": "review",
+      "title": "Gutachten",
+      "body": "Urteil: major\n\n## Einwände\n- Lücke in Lemma 2\n\n## Für die nächste Runde\nLemma 2 prüfen",
+      "path": null,
+      "attempt": 1,
+      "file": "output/results/002-judge-1-review.md",
+      "score": null,
+      "ratings": []
+    },
+    {
+      "id": 3,
+      "ts": 1795441628.622987,
+      "agent": "judge-2",
+      "stage": "pruefung",
+      "kind": "review",
+      "title": "Gutachten",
+      "body": "Urteil: minor\n\n## Einwände\n- Tippfehler in Zeile 2\n\n## Für die nächste Runde\nnichts",
+      "path": null,
+      "attempt": 1,
+      "file": "output/results/003-judge-2-review.md",
+      "score": null,
+      "ratings": []
+    },
+    {
+      "id": 4,
+      "ts": 1795441628.672728,
+      "agent": "author",
+      "stage": "revision",
+      "kind": "artifact",
+      "title": "Beweis neu",
+      "body": "Beweis v2\nZeile 2\n",
+      "path": null,
+      "attempt": 1,
+      "file": "output/results/004-author-artifact.md",
+      "score": null,
+      "ratings": []
+    },
+    {
+      "id": 5,
+      "ts": 1795441628.7117639,
+      "agent": "judge-1",
+      "stage": "pruefung",
+      "kind": "review",
+      "title": "Gutachten",
+      "body": "Urteil: accept\n\n## Einwände\n- [E1] behoben: passt jetzt\n\n## Für die nächste Runde\nnichts",
+      "path": null,
+      "attempt": 1,
+      "file": "output/results/005-judge-1-review.md",
+      "score": null,
+      "ratings": []
+    },
+    {
+      "id": 6,
+      "ts": 1795441628.7127638,
+      "agent": "judge-2",
+      "stage": "pruefung",
+      "kind": "review",
+      "title": "Gutachten",
+      "body": "Urteil: accept\n\n## Einwände\n- [E2] behoben\n- [E1] behoben\n\n## Für die nächste Runde\nnichts",
+      "path": null,
+      "attempt": 1,
+      "file": "output/results/006-judge-2-review.md",
+      "score": null,
+      "ratings": []
+    }
+  ]
+}

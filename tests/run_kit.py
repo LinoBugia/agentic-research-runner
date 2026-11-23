@@ -67,7 +67,7 @@ def make_run_input(
     data: dict[str, Any] = {
         "project": "demo",
         "task": "Teste arr.",
-        "topology": {"kind": "solo"},
+        "topology": {"kind": "phases"},
         "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
         "agents": agents,
         "groupchats": groupchats or [],
@@ -263,3 +263,27 @@ def write_profiles(arr_home: Path, profiles: Mapping[str, str]) -> Path:
     path = arr_home / "profiles.yaml"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
+
+
+def seats_of(ctx: RunContext, channel: str) -> Any:
+    """Every member of `channel` discusses (W4b-06b: `discuss` needs seats; without contexts a
+    member is finished only when it is `done`, as the old discussions counted)."""
+    from arr.runs.context import DiscussionSeats
+
+    return DiscussionSeats(members=list(ctx.config.channel(channel).members))
+
+
+def result_message(channel: str, title: str, body: str = "") -> dict[str, Any]:
+    """A message `result` in `channel` (W4b-06b: the way of `submit_result` in discussion tests;
+    it counts as handed in for `done` and `until_result_from`)."""
+    text = f"{title}\n\n{body}".strip()
+    return room("post_message", channel=channel, body=text, kind="result")
+
+
+def solo_phases(agent: str = "a", name: str = "arbeit") -> list[dict[str, Any]]:
+    """The phases of a run of one agent (W4b-06b, instead of the old topology `solo`): one phase
+    `solo` with the assignment of a run without a skill (from arr's package) and a text."""
+    from arr.runs.phases.tasks import NO_SKILL_TASK
+
+    action = {"task": NO_SKILL_TASK, "submission": {"format": "text"}}
+    return [{"name": name, "topology": "solo", "actions": {agent: action}}]

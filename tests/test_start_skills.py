@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from phases_kit import Log, PolicyBackend, TurnView, answer, hand_in
+from phases_kit import Log, TurnView, answer, hand_in, policy_builders
 from run_kit import FAST, log_entries, room, write_profiles
 
 from arr.models import RunInput, RunStatus, TopologyKind, WorkfolderSettings
@@ -218,33 +218,6 @@ def test_a1_check_topology_with_the_defaults_and_the_agreed_standards(name: str)
 # --------------------------------------------------------------------------------------------
 # A2: a fake run per group skill, smallest parameters, until `done`
 # --------------------------------------------------------------------------------------------
-
-
-def policy_builders(policies: dict[str, Any], log: Log) -> dict[Any, Any]:
-    """Replacement for `arr.runs.launch.BACKEND_BUILDERS`: a `PolicyBackend` per agent (W4b-06a
-    A7); every call is recorded under `"calls"` as `(provider, agent_id)`."""
-    from arr.models import Provider
-
-    calls: list[tuple[str, str]] = []
-
-    def builder_for(provider: Provider) -> Any:
-        def build(prepared: Any, **kwargs: Any) -> PolicyBackend:
-            calls.append((provider.value, prepared.id))
-            view = RoomStore(prepared.run_dir).for_agent(prepared.id, prepared.work_dir)
-            return PolicyBackend(
-                prepared.file.config,
-                {"turns": []},
-                run_id=kwargs.get("run_id", prepared.run_dir.name),
-                room=view,
-                policy=policies[prepared.id],
-                log=log,
-            )
-
-        return build
-
-    builders: dict[Any, Any] = {p: builder_for(p) for p in Provider}
-    builders["calls"] = calls
-    return builders
 
 
 def discussing(view: TurnView) -> list[dict[str, Any]]:

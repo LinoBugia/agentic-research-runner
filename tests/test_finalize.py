@@ -1,5 +1,9 @@
 """Finalizer and `changes.diff` (W2-04 A6-A8): the M1 scenario with FakeBackend through the real
-RunManager, robustness after stop, limit, error and a half finished setup, idempotency."""
+RunManager, robustness after stop, limit, error and a half finished setup, idempotency.
+
+Since W4b-06b the runs are phases runs (the M1 scenario as two phases with a gate `judge`, one
+rework); a phases run writes no `results.json`/`ratings.json` and no „## Ergebnisse“, its
+submissions are in `submissions.json` and „## Abgaben“."""
 
 import asyncio
 import json
@@ -9,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from phases_kit import TurnView, hand_in, manager, say, solo
 from run_kit import (
     agent,
     channel,
@@ -18,9 +23,6 @@ from run_kit import (
     make_run_input,
     make_settings,
     make_workfolder,
-    post,
-    room,
-    say,
     turns,
     wait,
 )
@@ -33,7 +35,7 @@ from arr.runs.eventlog import read_events
 from arr.runs.finalize import changes_diff, finalize_run
 from arr.runs.manager import RunManager
 from arr.runs.prepare import PreparedRun, prepare_run
-from arr.runs.topologies import check_topology, topology_for
+from arr.runs.topology import check_topology
 
 TASK = "Zeige, dass Lemma A für alle n ≡ 1 mod 4 gilt."
 
@@ -43,26 +45,12 @@ def workfolder(tmp_path: Path) -> Path:
     return make_workfolder(tmp_path)
 
 
-def staged(**stages: list[list[dict[str, Any]]]) -> dict[str, Any]:
-    return {
-        "turns": [],
-        "by_stage": {name: {"turns": [{"steps": s} for s in ts]} for name, ts in stages.items()},
-    }
-
-
-def rate(score: float, comment: str = "passt") -> list[dict[str, Any]]:
-    return [
-        room("get_assignment", save_as="job"),
-        room("submit_rating", result_id="${job.context.result_id}", score=score, comment=comment),
-    ]
-
-
-def submit(kind: str, title: str, **args: Any) -> dict[str, Any]:
-    return room("submit_result", kind=kind, title=title, **args)
-
-
 def tool(command: str, result: str) -> dict[str, Any]:
     return {"do": "tool", "name": "Bash", "input": {"command": command}, "result": result}
+
+
+def text(body: str) -> dict[str, Any]:
+    return {"do": "text", "text": body}
 
 
 def files(folder: Path) -> dict[str, bytes]:
@@ -89,73 +77,85 @@ def finalizer_output(run_dir: Path) -> dict[str, bytes]:
 # --------------------------------------------------------------------------------------------
 
 
-def m1_manager(workfolder: Path) -> RunManager:
-    holder: list[RunManager] = []
-
-    async def topology(ctx: RunContext) -> None:
-        prepared = holder[0].prepared
-        assert prepared is not None
-        strategist = prepared.agents["strategist"].work_dir
-        (strategist / "strategie.md").write_text("Induktion über n.\n", "utf-8")
-        notes = strategist / "notes.md"
-        notes.write_text(notes.read_text("utf-8") + "Lemma B folgt aus A.\n", "utf-8")
-        prover = prepared.agents["prover"].work_dir
-        (prover / "beweis.md").write_text("Beweis: n = 4k + 1 …\n", "utf-8")
-        (prover / "check.py").unlink()
-        await topology_for("waterfall")(ctx)
-
-    scripts = {
-        "strategist": staged(
-            strategie=[
-                [
-                    say("Ich plane den Beweis."),
-                    tool("python check.py", "ok"),
-                    post("werkstatt", "Ansatz: Induktion über n."),
-                    submit("strategy", "Strategie", path="strategie.md"),
-                ],
-                [submit("strategy", "Strategie, überarbeitet", body="Induktion mit Basis n = 1.")],
-            ]
-        ),
-        "prover": staged(
-            strategie=[rate(4, "Basisfall fehlt"), rate(8)],
-            beweis=[
-                [
-                    tool("cat beweis.md", "Beweis: n = 4k + 1 …"),
-                    post("main", "Der Beweis steht, siehe Anhang.", refs=["beweis.md"]),
-                    post("werkstatt", "Danke für die Strategie."),
-                    submit("proof", "Beweis", path="beweis.md"),
-                ]
-            ],
-        ),
-        "rater": staged(strategie=[rate(5, "zu knapp"), rate(7)], beweis=[rate(8, "sauber")]),
-    }
-    manager = make_manager(
-        workfolder,
-        topology,
-        scripts,
-        agents=[
-            agent("strategist"),
-            agent("prover"),
-            agent("rater", provider="codex", model="fake-gpt", auth="fake-codex"),
-        ],
-        groupchats=[
-            channel("main", ["strategist", "prover", "rater"]),
-            channel("werkstatt", ["strategist", "prover"]),
-        ],
-        run_extra={
-            "task": TASK,
-            "topology": {"kind": "waterfall", "params": {"pass_score": 6, "max_rework": 1}},
-            "stages": [
-                {"name": "strategie", "agent": "strategist", "produces": "strategie.md"},
-                {"name": "beweis", "agent": "prover", "produces": "beweis.md"},
-            ],
-            "raters": ["prover", "rater"],
+def judged(name: str, actor: str, raters: list[str]) -> dict[str, Any]:
+    """A phase `solo` whose artifact `name` a gate `judge` rates (mean, 6), at most two
+    passes, retried below the threshold."""
+    return {
+        **solo(name, actor),
+        "channels": ["main", "werkstatt"],
+        "max_visits": 2,
+        "on_exhausted": "next",
+        "actions": {
+            actor: {"task": f"tasks/{name}.md", "submission": {"format": "artifact", "name": name}}
         },
+        "gate": {
+            "type": "judge",
+            "raters": raters,
+            "action": {"task": "tasks/bewerten.md", "submission": {"format": "rating"}},
+            "rule": "mean",
+            "pass_score": 6,
+            "routes": {"pass": "next", "fail": "retry"},
+        },
+    }
+
+
+M1_GROUP = {
+    "agents": [
+        {"id": "strategist"},
+        {"id": "prover"},
+        {"id": "rater", "provider": "codex", "model": "fake-gpt", "auth": "fake-codex"},
+    ],
+    "channels": [
+        channel("main", ["strategist", "prover", "rater"]),
+        channel("werkstatt", ["strategist", "prover"]),
+    ],
+    "phases": [
+        judged("strategie", "strategist", ["prover", "rater"]),
+        judged("beweis", "prover", ["rater"]),
+    ],
+}
+SCORES = {("prover", "strategie", 1): 4, ("prover", "strategie", 2): 8}
+SCORES |= {("rater", "strategie", 1): 5, ("rater", "strategie", 2): 7, ("rater", "beweis", 1): 8}
+
+
+def m1_policy(view: TurnView) -> list[dict[str, Any]]:
+    """The turns of the M1 scenario: tools, two channels, an attachment, files changed and
+    removed, a rework of the strategy, ratings of both raters."""
+    if view.expected.get("format") == "rating":
+        score = SCORES[(view.agent, view.stage, view.attempt)]
+        return hand_in(view, score=lambda _v, _r: score, comment="passt")
+    work = view.work_dir
+    if view.agent == "strategist":
+        steps: list[dict[str, Any]] = []
+        if view.attempt == 1:
+            notes = work / "notes.md"
+            notes.write_text(notes.read_text("utf-8") + "Lemma B folgt aus A.\n", "utf-8")
+            steps = [
+                text("Ich plane den Beweis."),
+                tool("python check.py", "ok"),
+                say("werkstatt", "Ansatz: Induktion über n."),
+            ]
+        return [*steps, *hand_in(view)]
+    (work / "check.py").unlink(missing_ok=True)
+    (work / "notiz.md").write_text("Beweis: n = 4k + 1 …\n", "utf-8")
+    return [
+        tool("cat notiz.md", "Beweis: n = 4k + 1 …"),
+        say("main", "Der Beweis steht, siehe Anhang.", refs=["notiz.md"]),
+        say("werkstatt", "Danke für die Strategie."),
+        *hand_in(view),
+    ]
+
+
+def m1_manager(workfolder: Path) -> RunManager:
+    mgr, _log = manager(
+        workfolder,
+        M1_GROUP,
+        {a: m1_policy for a in ("strategist", "prover", "rater")},
+        task=TASK,
         finalizer=finalize_run,
     )
-    check_topology(manager.resolved)
-    holder.append(manager)
-    return manager
+    check_topology(mgr.resolved)
+    return mgr
 
 
 async def test_m1_scenario_run_folder_is_complete(workfolder: Path) -> None:
@@ -168,14 +168,14 @@ async def test_m1_scenario_run_folder_is_complete(workfolder: Path) -> None:
     decisions = [
         e["data"]["decision"] for e in log_entries(run_dir, "checkpoint") if "decision" in e["data"]
     ]
-    assert decisions == ["rework", "passed", "passed"]
+    assert decisions == ["failed", "passed", "passed"]
 
     # M1 2: the run folder of docs/02 §4
     for name in ("run.yaml", "run.input.yaml", "task.md", "meta.json", "orchestrator.jsonl"):
         assert (run_dir / name).is_file(), name
     for name in ("approvals.jsonl", "usage.json"):
         assert (run_dir / name).is_file(), name
-    for name in ("base", "skills", "agents", "groupchats/attachments", "output/results"):
+    for name in ("base", "skills", "agents", "groupchats/attachments", "output/submissions"):
         assert (run_dir / name).is_dir(), name
     assert (run_dir / "task.md").read_text("utf-8") == TASK
     for agent_id in ("strategist", "prover", "rater"):
@@ -206,9 +206,9 @@ async def test_m1_scenario_run_folder_is_complete(workfolder: Path) -> None:
         assert markdown.startswith(f"# #{name}") and lines
         assert all(json.loads(line)["channel"] == name for line in lines)
     main = (run_dir / "groupchats" / "main.md").read_text("utf-8")
-    assert "Der Beweis steht, siehe Anhang." in main and "- Anhang: [beweis.md](" in main
+    assert "Der Beweis steht, siehe Anhang." in main and "- Anhang: [notiz.md](" in main
     assert "Ansatz: Induktion" not in main, "werkstatt is a separate channel"
-    [attachment] = list((run_dir / "groupchats" / "attachments" / "main").glob("*/beweis.md"))
+    [attachment] = list((run_dir / "groupchats" / "attachments" / "main").glob("*/notiz.md"))
     assert attachment.read_text("utf-8").startswith("Beweis:")
 
     # changes.diff against base/, without the files written by arr
@@ -220,40 +220,34 @@ async def test_m1_scenario_run_folder_is_complete(workfolder: Path) -> None:
     assert "--- a/check.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-print('ok')\n" in prover_diff
     assert (run_dir / "agents" / "rater" / "changes.diff").read_text("utf-8") == ""
 
-    # results, ratings
-    results = json.loads((run_dir / "output" / "results.json").read_text("utf-8"))
-    assert [(r["id"], r["stage"], r["attempt"], r["score"]) for r in results["results"]] == [
-        (1, "strategie", 1, 4.5),
-        (2, "strategie", 2, 7.5),
-        (3, "beweis", 1, 8.0),
+    # submissions (W4b-06b: no results.json, no ratings.json)
+    output = run_dir / "output"
+    assert not (output / "results.json").exists() and not (output / "ratings.json").exists()
+    subs = json.loads((output / "submissions.json").read_text("utf-8"))["submissions"]
+    work = [(s["agent"], s["stage"], s["attempt"], s["version"]) for s in subs if s["name"]]
+    assert work == [
+        ("strategist", "strategie", 1, 1),
+        ("strategist", "strategie", 2, 2),
+        ("prover", "beweis", 1, 1),
     ]
-    assert [r["file"] for r in results["results"]] == [
-        "output/results/001-strategist-strategy.md",
-        "output/results/002-strategist-strategy.md",
-        "output/results/003-prover-proof.md",
-    ]
-    assert (run_dir / "output/results/001-strategist-strategy.md").read_text("utf-8") == (
-        "Induktion über n.\n"
-    ), "the submitted file itself"
-    second = (run_dir / "output/results/002-strategist-strategy.md").read_text("utf-8")
-    assert second.startswith("# Strategie, überarbeitet\n\nErgebnis #2 · `strategist`")
-    assert "Induktion mit Basis n = 1." in second and "- `prover`: 8" in second
-    ratings = json.loads((run_dir / "output" / "ratings.json").read_text("utf-8"))
-    assert len(ratings["ratings"]) == 5
-    assert {r["rater"] for r in ratings["ratings"] if r["result_id"] == 3} == {"rater"}
+    ratings = [s for s in subs if s["format"] == "rating"]
+    assert len(ratings) == 5 and {s["agent"] for s in ratings if s["stage"] == "beweis"} == {
+        "rater"
+    }
+    assert (output / "strategie" / "v2" / "diff.patch").is_file(), "the rework as a diff"
 
     # usage.json and summary.md
     usage = json.loads((run_dir / "usage.json").read_text("utf-8"))
     assert set(usage["by_agent"]) == {"strategist", "prover", "rater"}
-    summary = (run_dir / "output" / "summary.md").read_text("utf-8")
+    summary = (output / "summary.md").read_text("utf-8")
     assert summary.startswith(f"# Zusammenfassung – {manager.prepared.run_id}")
     assert "- **Status:** abgeschlossen (done)" in summary
     assert "- **Grund:** Die Topologie ist regulär durchgelaufen." in summary
-    assert "| strategie | 1 | strategist | #1 | 4,5 | Nacharbeit |" in summary
-    assert "| strategie | 2 | strategist | #2 | 7,5 | bestanden |" in summary
-    assert "- **beweis:** bestanden, akzeptiert: #3, Score 8, 1 Versuch" in summary
-    assert "- [#3 Beweis](results/003-prover-proof.md) · `prover` · proof" in summary
-    assert "· Ø 8 (1 Rating) · ✓ akzeptiert" in summary
+    assert "| strategie | 1 |" in summary and "| 4,5 | nicht bestanden |" in summary
+    assert "| strategie | 2 |" in summary and "| 7,5 | bestanden |" in summary
+    assert "- **beweis:** bestanden, akzeptiert: #" in summary and "Score 8, 1 Versuch" in summary
+    assert "## Abgaben" in summary and "strategie v2" in summary
+    assert "## Ergebnisse" not in summary
     assert "- `rater`: codex, fake-gpt" in summary
     assert "## Usage" in summary and "- Gesamt: " in summary
     assert "Schritt des Finalizers gescheitert" not in summary and "Symlink" not in summary
@@ -278,18 +272,24 @@ async def test_m1_scenario_finalizer_is_idempotent(workfolder: Path) -> None:
 # --------------------------------------------------------------------------------------------
 
 
-def solo_manager(workfolder: Path, script: dict[str, Any], **run_extra: Any) -> RunManager:
-    kwargs = {k: run_extra.pop(k) for k in ("backend_factory",) if k in run_extra}
-    manager = make_manager(
+def steps(*items: dict[str, Any]) -> Any:
+    """A policy that plays the same steps in every turn."""
+    return lambda _view: list(items)
+
+
+def solo_manager(
+    workfolder: Path, policy: Any, *, task: str = TASK, limits: Any = None
+) -> RunManager:
+    """A phases run of one agent `a` in one phase `arbeit` with the finalizer."""
+    mgr, _log = manager(
         workfolder,
-        topology_for("solo"),
-        {"a": script},
-        run_extra={"topology": {"kind": "solo"}, "task": TASK, **run_extra},
+        {"agents": [{"id": "a"}], "phases": [solo("arbeit", "a")]},
+        {"a": policy},
+        task=task,
+        limits=limits,
         finalizer=finalize_run,
     )
-    if "backend_factory" in kwargs:
-        manager.backend_factory = kwargs["backend_factory"]
-    return manager
+    return mgr
 
 
 def summary(manager: RunManager) -> str:
@@ -297,34 +297,32 @@ def summary(manager: RunManager) -> str:
 
 
 async def test_finalizer_after_stop_mid_turn(workfolder: Path) -> None:
-    manager = solo_manager(workfolder, turns([say("Ich fange an."), wait(30)]))
+    manager = solo_manager(workfolder, steps(text("Ich fange an."), wait(30)))
     running = asyncio.create_task(manager.run())
     await eventually(
         lambda: manager.orchestrator is not None and bool(manager.orchestrator._active)
     )
     manager.stop()
     assert await asyncio.wait_for(running, 10) is RunStatus.STOPPED
-    text = summary(manager)
-    assert "- **Status:** gestoppt (stopped)" in text
-    assert "- **Grund:** Der User hat den Run gestoppt." in text
-    assert "Keine Ergebnisse abgegeben." in text
+    text_ = summary(manager)
+    assert "- **Status:** gestoppt (stopped)" in text_
+    assert "- **Grund:** Der User hat den Run gestoppt." in text_
+    assert "Keine Ergebnisse abgegeben." not in text_ and "## Abgaben" not in text_
     transcript = (manager.run_dir / "agents" / "a" / "transcript.md").read_text("utf-8")
     assert "Ich fange an." in transcript and "interrupted" in transcript
-    assert json.loads((manager.run_dir / "output" / "results.json").read_text("utf-8")) == {
+    assert json.loads((manager.run_dir / "output" / "submissions.json").read_text("utf-8")) == {
         "version": 1,
         "run": manager.run_dir.name,
-        "results": [],
+        "submissions": [],
     }
 
 
 async def test_finalizer_after_a_limit(workfolder: Path) -> None:
-    manager = solo_manager(
-        workfolder, turns([say("…")], repeat_last=True), limits={"turns_per_agent": 1}
-    )
+    manager = solo_manager(workfolder, steps(text("…")), limits={"turns_per_agent": 1})
     assert await asyncio.wait_for(manager.run(), 10) is RunStatus.DONE
-    text = summary(manager)
-    assert "- **Status:** abgeschlossen (done)" in text
-    assert "- **Grund:** Limit: Die Zahl der Turns pro Agent ist erreicht." in text
+    text_ = summary(manager)
+    assert "- **Status:** abgeschlossen (done)" in text_
+    assert "- **Grund:** Limit: Die Zahl der Turns pro Agent ist erreicht." in text_
 
 
 async def test_status_after_a_limit_and_a_topology_that_does_not_stop(workfolder: Path) -> None:
@@ -337,7 +335,7 @@ async def test_status_after_a_limit_and_a_topology_that_does_not_stop(workfolder
     manager = make_manager(
         workfolder,
         stubborn,
-        {"a": turns([say("ok")])},
+        {"a": turns([text("ok")])},
         run_extra={"task": TASK, "limits": {"wall_time": 0.3}},
         finalizer=finalize_run,
         stop_grace_s=0.2,
@@ -345,30 +343,31 @@ async def test_status_after_a_limit_and_a_topology_that_does_not_stop(workfolder
     assert await asyncio.wait_for(manager.run(), 10) is RunStatus.DONE
     [error] = log_entries(manager.run_dir, "error")
     assert error["data"]["where"] == "topology"
-    text = summary(manager)
-    assert "- **Status:** abgeschlossen (done)" in text
-    assert "- **Grund:** Limit: Die Gesamtlaufzeit des Runs ist erreicht." in text
-    assert f"- {error['data']['message']}" in text, "kept as a hint"
+    text_ = summary(manager)
+    assert "- **Status:** abgeschlossen (done)" in text_
+    assert "- **Grund:** Limit: Die Gesamtlaufzeit des Runs ist erreicht." in text_
+    assert f"- {error['data']['message']}" in text_, "kept as a hint"
 
 
 async def test_finalizer_after_an_error(workfolder: Path) -> None:
-    manager = solo_manager(workfolder, turns(), task=" ")
+    manager = solo_manager(workfolder, steps(), task=" ")
     assert await asyncio.wait_for(manager.run(), 10) is RunStatus.FAILED
-    text = summary(manager)
-    assert "- **Status:** fehlgeschlagen (failed)" in text
-    assert "- **Grund:** Fehler: Der Run hat keinen Auftrag: task.md ist leer." in text
-    assert "- **Dauer:**" in text
+    text_ = summary(manager)
+    assert "- **Status:** fehlgeschlagen (failed)" in text_
+    assert "- **Grund:** Fehler: Der Run hat keinen Auftrag: task.md ist leer." in text_
+    assert "- **Dauer:**" in text_
 
 
 async def test_finalizer_after_a_failed_setup(workfolder: Path) -> None:
     def broken_factory(prepared: Any) -> Any:
         raise RuntimeError("Backend nicht startbar")
 
-    manager = solo_manager(workfolder, turns(), backend_factory=broken_factory)
+    manager = solo_manager(workfolder, steps())
+    manager.backend_factory = broken_factory
     assert await asyncio.wait_for(manager.run(), 10) is RunStatus.FAILED
-    text = summary(manager)
-    assert "- **Grund:** Fehler: Backend nicht startbar" in text
-    assert "- **Dauer:** nicht gestartet" in text
+    text_ = summary(manager)
+    assert "- **Grund:** Fehler: Backend nicht startbar" in text_
+    assert "- **Dauer:** nicht gestartet" in text_
     assert (manager.run_dir / "agents" / "a" / "transcript.md").is_file()
     assert (manager.run_dir / "usage.json").is_file()
 
@@ -387,15 +386,16 @@ async def test_finalizer_on_a_half_prepared_run(workfolder: Path) -> None:
     prepared = prepared_only(workfolder)  # no room, no transcripts, no status entries
     await finalize_run(prepared)
     run_dir = prepared.run_dir
-    for name in ("output/summary.md", "output/results.json", "output/ratings.json", "usage.json"):
+    for name in ("output/summary.md", "output/submissions.json", "usage.json"):
         assert (run_dir / name).is_file(), name
+    assert not (run_dir / "output" / "results.json").exists()
     for agent_id in ("a", "b"):
         assert (run_dir / "agents" / agent_id / "transcript.md").is_file()
         assert (run_dir / "agents" / agent_id / "changes.diff").read_text("utf-8") == ""
-    text = (run_dir / "output" / "summary.md").read_text("utf-8")
-    assert "- **Dauer:** nicht gestartet" in text
-    assert "- Die Gruppenchat-Datenbank fehlt (der Run wurde nicht fertig vorbereitet)." in text
-    assert "Schritt des Finalizers gescheitert" not in text
+    text_ = (run_dir / "output" / "summary.md").read_text("utf-8")
+    assert "- **Dauer:** nicht gestartet" in text_
+    assert "- Die Gruppenchat-Datenbank fehlt (der Run wurde nicht fertig vorbereitet)." in text_
+    assert "Schritt des Finalizers gescheitert" not in text_
     assert not (run_dir / "groupchats" / "room.sqlite").exists(), "nothing is created"
 
 
@@ -406,77 +406,53 @@ async def test_a_failing_step_does_not_stop_the_others(
         raise RuntimeError("kaputt")
 
     monkeypatch.setattr(finalize_module, "write_transcript_md", broken)
-    manager = solo_manager(workfolder, turns([submit("note", "Ergebnis", body="42")]))
+    manager = solo_manager(workfolder, lambda view: hand_in(view, summary="Ergebnis", body="42"))
     assert await asyncio.wait_for(manager.run(), 10) is RunStatus.DONE
     run_dir = manager.run_dir
     assert not (run_dir / "agents" / "a" / "transcript.md").exists()
-    for name in ("groupchats", "output/results.json", "usage.json", "agents/a/changes.diff"):
+    for name in ("groupchats", "output/submissions.json", "usage.json", "agents/a/changes.diff"):
         assert (run_dir / name).exists(), name
-    text = summary(manager)
-    assert "- Schritt des Finalizers gescheitert: Transkripte: RuntimeError: kaputt" in text
-    assert "- [#1 Ergebnis](results/001-a-note.md)" in text
-    assert "- Gesamt: 1 Turn, 0 Tokens ein, 0 aus, 1 Turn ohne Kosten" in text  # W2-04.1 Punkt 7
+    text_ = summary(manager)
+    assert "- Schritt des Finalizers gescheitert: Transkripte: RuntimeError: kaputt" in text_
+    assert "- **#1** · `a` · text · done · Phase arbeit, Durchlauf 1" in text_
+    assert "- Gesamt: 1 Turn, 0 Tokens ein, 0 aus, 1 Turn ohne Kosten" in text_  # W2-04.1 P. 7
     [error] = [e for e in log_entries(run_dir, "error") if e["data"].get("where") == "finalizer"]
     assert error["data"]["step"] == "Transkripte" and error["data"]["message"] == "kaputt"
 
 
-async def test_summary_lists_a_summarizer_and_a_failed_stage(workfolder: Path) -> None:
-    scripts = {
-        "a": {
-            "turns": [{"steps": [post("main", "Mein Beitrag")]}],
-            "by_stage": {
-                "zusammenfassung": {
-                    "turns": [{"steps": [submit("summary", "Fazit", body="Alles klar.")]}]
-                }
-            },
+async def test_summary_lists_a_failed_stage(workfolder: Path) -> None:
+    """W2-04.1 B6 on a phases run: a phase whose gate `judge` fails ends the run there
+    (`on_exhausted: stop`); the summary names the phase, its outcome and no later phase."""
+    phase = {
+        **solo("skizze", "a"),
+        "max_visits": 1,
+        "on_exhausted": "stop",
+        "gate": {
+            "type": "judge",
+            "raters": ["b"],
+            "action": {"task": "tasks/bewerten.md", "submission": {"format": "rating"}},
+            "rule": "mean",
+            "pass_score": 6,
+            "routes": {"pass": "next", "fail": "retry"},
         },
-        "b": turns([post("main", "Meiner auch")]),
     }
-    manager = make_manager(
-        workfolder,
-        topology_for("roundtable"),
-        scripts,
-        groupchats=[channel("main", ["a", "b"], mode="rounds")],
-        run_extra={
-            "task": TASK,
-            "topology": {"kind": "roundtable", "params": {"rounds": 1, "summarizer": "a"}},
-        },
-        finalizer=finalize_run,
-    )
-    assert await asyncio.wait_for(manager.run(), 10) is RunStatus.DONE
-    text = summary(manager)
-    assert "## Zusammenfassung von a\n\n**Fazit**\n\nAlles klar." in text
 
-    # W2-04.1 B6: a stage that fails with `on_fail: stop`
-    rate_low = [
-        room("get_assignment", save_as="job"),
-        room("submit_rating", result_id="${job.context.result_id}", score=3, comment="Lücke"),
-    ]
-    failed = make_manager(
+    def policy(view: TurnView) -> list[dict[str, Any]]:
+        return hand_in(view, score=3, comment="Lücke")
+
+    failed, _log = manager(
         workfolder,
-        topology_for("waterfall"),
-        {
-            "a": staged(skizze=[[submit("note", "Skizze", body="…")]]),
-            "b": staged(skizze=[rate_low]),
-        },
-        run_extra={
-            "task": TASK,
-            "topology": {"kind": "waterfall", "params": {"max_rework": 0, "on_fail": "stop"}},
-            "stages": [{"name": "skizze", "agent": "a"}, {"name": "beweis", "agent": "b"}],
-            "raters": ["a", "b"],
-            "rubric": {"pass_score": 6},
-        },
+        {"agents": [{"id": "a"}, {"id": "b"}], "phases": [phase, solo("beweis", "b")]},
+        {"a": policy, "b": policy},
         finalizer=finalize_run,
     )
     assert await asyncio.wait_for(failed.run(), 10) is RunStatus.DONE
-    text = summary(failed)
-    assert "- **Status:** abgeschlossen (done)" in text
-    assert "- **Grund:** Die Stufe „skizze“ wurde nicht bestanden (stage_failed)." in text
-    assert "| skizze | 1 | a | #1 | 3 | nicht bestanden |" in text
-    assert (
-        "- **skizze:** nicht bestanden, Run beendet, akzeptiert: keins, Score 3, 1 Versuch" in text
-    )
-    assert "beweis" not in text.split("## Stufen")[1].split("## Ergebnisse")[0]
+    text_ = summary(failed)
+    assert "- **Status:** abgeschlossen (done)" in text_
+    assert "- **Grund:** Die Phase „skizze“ wurde nicht bestanden (stage_failed)." in text_
+    assert "| skizze | 1 |" in text_ and "| 3 | nicht bestanden |" in text_
+    assert "- **skizze:** nicht bestanden, Run beendet, akzeptiert: keins, Score 3" in text_
+    assert "beweis" not in text_.split("## Stufen")[1].split("## Abgaben")[0]
 
 
 # --------------------------------------------------------------------------------------------
@@ -684,13 +660,15 @@ async def test_changes_diff_for_shared_empty_and_copy_exclude_links(workfolder: 
 async def test_w2_05_summary_names_turns_that_ended_with_an_error(workfolder: Path) -> None:
     """A failed Codex login (`login_hint`) and every other turn error reach summary.md."""
     hint = "Profil „chatgpt-x“ neu anmelden: uv run arr auth codex-login chatgpt-x (401)"
-    script = turns(
-        [say("Ich versuche es."), {"do": "error", "message": hint}],
-        [submit("note", "Zweiter Versuch", body="Jetzt klappt es.")],
-    )
-    manager = solo_manager(workfolder, script)
+
+    def policy(view: TurnView) -> list[dict[str, Any]]:
+        if view.turn == 1:
+            return [text("Ich versuche es."), {"do": "error", "message": hint}]
+        return hand_in(view, summary="Zweiter Versuch", body="Jetzt klappt es.")
+
+    manager = solo_manager(workfolder, policy)
     assert await asyncio.wait_for(manager.run(), 10) is RunStatus.DONE
-    text = summary(manager)
-    assert "## Hinweise" in text
-    assert f"- Turn 1 von `a` endete mit Fehler: {hint}" in text
-    assert "Turn 2 von `a`" not in text
+    found = summary(manager)
+    assert "## Hinweise" in found
+    assert f"- Turn 1 von `a` endete mit Fehler: {hint}" in found
+    assert "Turn 2 von `a`" not in found

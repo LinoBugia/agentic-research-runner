@@ -48,6 +48,7 @@ from arr.models import (
     RunInput,
     RunStatus,
     Starter,
+    TopologyKind,
     WorkfolderSettings,
 )
 from arr.permissions.gatekeeper import run_profiles
@@ -79,7 +80,12 @@ from arr.runs.secret_scan import (
     record_scan,
     scan_run_dir,
 )
-from arr.runs.topologies import check_topology, topology_for
+from arr.runs.topology import (
+    GROUP_SOURCE,
+    check_topology,
+    refuse_old_topology,
+    topology_for,
+)
 from arr.settings import app_dir
 from arr.skills import discover_skills
 from arr.workfolder import (
@@ -340,12 +346,18 @@ def plan_run_input(
 ) -> Launch:
     """Check a run given as data (the service's `start_run`, W3-01) like `plan_launch`.
 
-    `arr.yaml` → group skill → project → resolve with `params` → `check_topology` →
-    `profiles.yaml`; nothing is created. `source` names the origin in error messages.
+    `arr.yaml` → group skill → an old topology of `run.yaml` or the group is refused with
+    its message, before the resolution can hide it (W4b-06b §6.1) → project → resolve with
+    `params` → `check_topology` → `profiles.yaml`; nothing is created. `source` names the
+    origin in error messages.
     """
     root = Path(workfolder).expanduser().absolute()
     settings = load_workfolder_settings(root)
+    if run_input.topology is not None:
+        refuse_old_topology(run_input.topology.kind, source=source)
     group_spec = _group_spec(root, run_input, source)
+    if group_spec is not None:
+        refuse_old_topology(group_spec.topology, path="topology", source=GROUP_SOURCE)
     project = project_dir(root, run_input.project)
     resolved = resolve_run(
         run_input,
@@ -828,6 +840,7 @@ CHANNEL_WAIT_TEXT = {
 END_TURN_TEXT = {
     "nobody": "wartete 5 min ohne neue Nachricht",
     "capacity": "ein anderer Agent wartet auf seinen Platz",
+    "assignment_cancelled": "sein Auftrag wurde abgebrochen",  # W4b-04, a phase `moderated`
 }
 END_TEXT = {
     "all_done": "alle fertig",
@@ -956,7 +969,7 @@ def _describe_entry(
                 word = status
             return f"Status: {word} ({status})"
         case "checkpoint":
-            return "● " + describe_checkpoint(data)
+            return "● " + describe_checkpoint(data, phases=phases)
         case "turn":
             text = f"▶ {data.get('agent')}: Turn {data.get('turn')}"
             where = "Phase" if phases else "Stufe"
@@ -1013,7 +1026,8 @@ def _describe_entry(
             text = f"Privater Kanal #{_line_text(channel, 80)} geöffnet"
             return text + (f": nur {owner} und du" if owner else "")
         case "channel_open":
-            return f"Kanal #{data.get('channel')} geöffnet (Stufe „{data.get('stage')}“)"
+            word = "Phase" if phases else "Stufe"  # W4b-06b: old runs keep „Stufe“
+            return f"Kanal #{data.get('channel')} geöffnet ({word} „{data.get('stage')}“)"
         case "discussion_start":
             return f"Diskussion in #{data.get('channel')} beginnt ({data.get('mode')})"
         case "discussion_end":
@@ -1030,7 +1044,7 @@ def _describe_entry(
             if first.startswith("Phase „"):  # a phases run: phase and pass come first
                 return f"Eskalation: {first}{more}"
             return f"Eskalation in Stufe „{data.get('stage')}“: {first}{more}"
-        case "escalation_decided" if "hint" in data:  # a phases run (`escalate_with_hint`)
+        case "escalation_decided" if "hint" in data:  # a phases run (always since W4b-06b)
             option = str(data.get("option"))
             text = f"Eskalation in Phase „{stage}“ entschieden: "
             text += _CHOICE_TEXT.get(option, _line_text(option, 40))
@@ -1194,9 +1208,10 @@ async def follow_run(
     report(f"Ordner: {run_dir}")
     log = _Tail(run_dir / ORCHESTRATOR_LOG)
     approvals = _Tail(run_dir / "approvals.jsonl")
+    phases = manager.resolved.topology.kind is TopologyKind.PHASES  # always since W4b-06b
     while True:
         for entry in log.read():
-            line = describe_entry(entry, run_dir)
+            line = describe_entry(entry, run_dir, phases=phases)
             if line:
                 report(line)
         for entry in approvals.read():

@@ -15,8 +15,9 @@ from typing import Any
 import pytest
 from nicegui import ElementFilter
 from nicegui.testing import User
-from run_kit import FAST, fake_builders, say, turns, wait, write_profiles
+from run_kit import FAST, fake_builders, say, solo_phases, turns, wait, write_profiles
 from service_kit import append, hold_lock, make_run_folder, make_workfolder
+from test_approvals import write_tasks
 from test_gui import gui_user
 from test_gui_real import page_html, see
 
@@ -40,7 +41,7 @@ def wf(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     arr_home.mkdir(parents=True, exist_ok=True)
     write_profiles(arr_home, {"fake-auth": "claude_oauth", "fake-codex": "codex_chatgpt"})
     monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
-    return make_workfolder(tmp_path)
+    return write_tasks(make_workfolder(tmp_path))  # for the escalation of a phase
 
 
 def run_input(agent: dict[str, Any]) -> dict[str, Any]:
@@ -48,9 +49,10 @@ def run_input(agent: dict[str, Any]) -> dict[str, Any]:
         "project": "demo",
         "name": "Testlauf",
         "task": "Teste arr.",
-        "topology": {"kind": "solo"},
+        "topology": {"kind": "phases"},
         "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
         "agents": [agent],
+        "phases": solo_phases(agent["id"]),
     }
 
 
@@ -213,7 +215,8 @@ async def test_a6_escalation_card_with_real_data(wf: Path) -> None:
             await user.open("/freigaben")
             html = await see(user, item.title)
             assert "Noch ein Versuch" in html and "Run beenden" in html
-            assert "Zu dünn." in html
+            # the escalation of a phase shows the submissions and the score per pass
+            assert "#1 w (text, done): Skizze" in html and "D1" in html and "2,0" in html
             assert page_html(user)
     finally:
         await svc.__aexit__()
@@ -365,18 +368,19 @@ async def test_w3_09_a3_question_card_with_an_answer_field_reaches_the_agent(wf:
     card goes to the agent, whose `wait_for_messages` ends with it."""
     from run_kit import events, post, room
 
-    ask = post("main", "@user Welches Höhenband hat Vorrang, 10–35 oder 35–60?", kind="question")
+    # a phases run asks the user in the private channel (W4b-03)
+    ask = post("user.a", "@user Welches Höhenband hat Vorrang, 10–35 oder 35–60?", kind="question")
     # the turn goes on after the answer, so the stop at the end meets a running run
     script = turns([ask, room("wait_for_messages", seconds=20), say("danke"), wait(30)])
     async with service(wf, {"a": script}) as (user, api):
         started = await api.start_run(question_run({"id": "a"}))
         item = await open_item(api)
         assert item.type.value == "question" and item.agent is not None and item.agent.id == "a"
-        assert item.channel == "main" and "Höhenband" in (item.question_text or "")
+        assert item.channel == "user.a" and "Höhenband" in (item.question_text or "")
         await user.open(f"/freigaben/{item.id}")
         html = await see(user, "a fragt dich")
-        assert "Welches Höhenband hat Vorrang" in html and "#main" in html
-        assert "Deine Antwort geht als Nachricht an a in den Kanal" in html
+        assert "Welches Höhenband hat Vorrang" in html
+        assert "Deine Antwort geht als Antwort an a in euren privaten Kanal" in html
         with user.client:
             [send] = list(ElementFilter(marker="answer-send"))
             assert "disabled" in send._props, "no answer without a text"
@@ -413,7 +417,7 @@ async def test_w3_09_1_b6_a_failed_post_leaves_the_question_open(
     from arr.room.store import RoomStore
     from arr.service.api_models import ApiException
 
-    ask = post("main", "@user Welches Band?", kind="question")
+    ask = post("user.a", "@user Welches Band?", kind="question")
     script = turns([ask, room("wait_for_messages", seconds=20), say("danke"), wait(30)])
     async with service(wf, {"a": script}) as (_user, api):
         started = await api.start_run(question_run({"id": "a"}))

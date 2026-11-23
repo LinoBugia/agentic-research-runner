@@ -532,7 +532,7 @@ class NeuerRunPage:
                     if skill is None and name:
                         sub = "Diesen Skill gibt es im Workfolder nicht mehr."
                     elif skill is None:
-                        sub = "Ein Agent, Topologie solo. Weitere Agenten kommen später."
+                        sub = "Ein Agent, eine Phase."  # W4b-06b, F1
                     else:
                         n = skill.agents_count or "?"
                         sub = f"{skill.description} · {n} Agent{'' if n == 1 else 'en'}"

@@ -88,7 +88,7 @@ from arr.runs.prepare import (
     load_run_meta,
     prepare_run,
 )
-from arr.runs.topologies import planned_stages
+from arr.runs.topology import refuse_old_topology
 from arr.venvs import ensure_run_venvs_dir
 from arr.workfolder import load_workfolder_settings
 
@@ -275,8 +275,9 @@ class RunManager:
     `topology`, `backend_factory`, `decider` and `finalizer` come from outside (W2-04,
     W2-05). The factory is called after room, PolicyEngine (with all profiles) and inbox are
     set up; `manager.inbox` and `manager.room` are available to it then. `stages` are the
-    planned stages for the checkpoint `plan` (default: the names of `run.yaml stages`, else
-    the phases the topology reports, e.g. those of `review` and `exploration`, W4-03 F2).
+    planned stages for the checkpoint `plan` (default: the phases of the run, in their order).
+    A run of an old topology never starts, not even with a topology function of its own
+    (`ConfigError` with `old_topology_message`, W4b-06b §6.1).
     `gates` are the `ProfileGate`s shared by all runs of a process (the service, W3-01):
     missing profiles are added, so concurrency and rate-limit pauses of a profile hold across
     runs. `lock` is the `RunLock` the caller already holds; without one the manager takes the
@@ -312,6 +313,7 @@ class RunManager:
         lock: RunLock | None = None,
         gatekeeper_model: GatekeeperModelFactory | None = None,
     ) -> None:
+        refuse_old_topology(resolved.topology.kind)
         self.workfolder = Path(workfolder).expanduser().absolute()
         self.run_input = run_input
         self.resolved = resolved
@@ -320,7 +322,7 @@ class RunManager:
         self.settings = settings or load_workfolder_settings(self.workfolder)
         self.decider = decider
         self.finalizer = finalizer
-        self.stages = list(stages) if stages is not None else planned_stages(resolved)
+        self.stages = list(stages) if stages is not None else [p.name for p in resolved.phases]
         self.pacing = pacing or PacingSettings()
         self.stop_grace_s = stop_grace_s
         self.venv_with_pip = venv_with_pip

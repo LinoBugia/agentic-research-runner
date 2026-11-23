@@ -539,7 +539,8 @@ NEW_METHODS = {
 async def test_a12_new_methods_are_not_abstract_and_name_their_order() -> None:
     assert not set(NEW_METHODS) & RunContext.__abstractmethods__
     names = list(vars(RunContext))
-    assert names.index("read_output") < min(names.index(n) for n in NEW_METHODS)
+    # the last method of the old interface (W4b-06b: `read_output` was dead code and is gone)
+    assert names.index("shown_name") < min(names.index(n) for n in NEW_METHODS)
 
     class Ctx(RunContext):
         pass
@@ -577,12 +578,14 @@ def test_a13_message_names_the_template_and_is_not_switched_on() -> None:
     assert set(TEMPLATES) == set(TopologyKind) - {TopologyKind.PHASES}
     assert old_topology_message("phases") is None and old_topology_message("xyz") is None
     src = Path(arr.plan.__file__).parent.parent
-    users = [
-        p.relative_to(src)
+    users = sorted(
+        p.relative_to(src).as_posix()
         for p in src.rglob("*.py")
-        if "old_topology_message" in p.read_text(encoding="utf-8") and p.parent.name != "plan"
-    ]
-    assert users == [], "W4b-06 switches the message on, not W4b-02a"
+        if "import old_topology_message" in p.read_text(encoding="utf-8")
+        and p.parent.name != "plan"
+    )
+    # W4b-06b switched it on: one place builds the refusal (`refuse_old_topology`)
+    assert users == ["runs/topology.py"], users
     # the old topologies still load and resolve (A2)
     old = validate_model(GroupSpec, {"topology": "review", "agents": [{"id": "a"}]})
     assert old.topology is TopologyKind.REVIEW

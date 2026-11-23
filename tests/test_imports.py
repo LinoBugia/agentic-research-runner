@@ -1,4 +1,5 @@
 import importlib
+import importlib.util
 import inspect
 import pkgutil
 
@@ -22,7 +23,8 @@ def test_package_tree_is_complete() -> None:
         "arr.cli",
         "arr.log",
         "arr.settings",
-        "arr.runs.topologies.review",
+        "arr.runs.topology",
+        "arr.runs.phases.runner",
         "arr.backends.codex",
         "arr.permissions.gatekeeper",
         "arr.room.store",
@@ -34,6 +36,21 @@ def test_package_tree_is_complete() -> None:
         "arr.permissions.types",
     }
     assert expected <= set(MODULES)
+
+
+def test_the_old_topologies_are_gone() -> None:
+    """W4b-06b: `arr.runs.topologies` is removed; its helpers live in `arr.runs.topology` and
+    `arr.runs.phases.start`."""
+    assert not [m for m in MODULES if m.startswith("arr.runs.topologies")]
+    # W4b-06b.1 (N1): a leftover `__pycache__/` would make it a namespace package; what counts
+    # is that there is no source and no regular package (no `__init__.py`)
+    spec = importlib.util.find_spec("arr.runs.topologies")
+    assert spec is None or spec.origin is None, spec
+    from arr.runs.phases.start import SOURCE, require_task
+    from arr.runs.topology import check_topology, topology_for
+
+    assert SOURCE == "run.yaml" and callable(require_task)
+    assert callable(check_topology) and callable(topology_for)
 
 
 @pytest.mark.parametrize("name", MODULES)

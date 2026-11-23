@@ -1,0 +1,12 @@
+{"seq": 2, "ts": 1795441628.621269, "raw": {"fake_step": {"do": "room", "action": "submit_result", "args": {"kind": "review", "title": "Gutachten", "body": "Urteil: major\n\n## Einwände\n- Lücke in Lemma 2\n\n## Für die nächste Runde\nLemma 2 prüfen"}, "save_as": null}}}
+{"seq": 3, "ts": 1795441628.6222231, "raw": {"fake_step": {"do": "room", "action": "submit_result", "args": {"kind": "review", "title": "Gutachten", "body": "Urteil: major\n\n## Einwände\n- Lücke in Lemma 2\n\n## Für die nächste Runde\nLemma 2 prüfen"}, "save_as": null}}}
+{"seq": 6, "ts": 1795441628.649656, "raw": {"fake_step": {"do": "room", "action": "post_message", "args": {"channel": "judges", "body": "Gelesen."}, "save_as": null}}}
+{"seq": 7, "ts": 1795441628.650743, "raw": {"fake_step": {"do": "room", "action": "post_message", "args": {"channel": "judges", "body": "Gelesen."}, "save_as": null}}}
+{"seq": 8, "ts": 1795441628.650788, "raw": {"fake_step": {"do": "room", "action": "set_status", "args": {"status": "done"}, "save_as": null}}}
+{"seq": 9, "ts": 1795441628.651762, "raw": {"fake_step": {"do": "room", "action": "set_status", "args": {"status": "done"}, "save_as": null}}}
+{"seq": 12, "ts": 1795441628.711008, "raw": {"fake_step": {"do": "room", "action": "submit_result", "args": {"kind": "review", "title": "Gutachten", "body": "Urteil: accept\n\n## Einwände\n- [E1] behoben: passt jetzt\n\n## Für die nächste Runde\nnichts"}, "save_as": null}}}
+{"seq": 13, "ts": 1795441628.712071, "raw": {"fake_step": {"do": "room", "action": "submit_result", "args": {"kind": "review", "title": "Gutachten", "body": "Urteil: accept\n\n## Einwände\n- [E1] behoben: passt jetzt\n\n## Für die nächste Runde\nnichts"}, "save_as": null}}}
+{"seq": 16, "ts": 1795441628.73952, "raw": {"fake_step": {"do": "room", "action": "post_message", "args": {"channel": "judges", "body": "Gelesen."}, "save_as": null}}}
+{"seq": 17, "ts": 1795441628.740365, "raw": {"fake_step": {"do": "room", "action": "post_message", "args": {"channel": "judges", "body": "Gelesen."}, "save_as": null}}}
+{"seq": 18, "ts": 1795441628.7403882, "raw": {"fake_step": {"do": "room", "action": "set_status", "args": {"status": "done"}, "save_as": null}}}
+{"seq": 19, "ts": 1795441628.741187, "raw": {"fake_step": {"do": "room", "action": "set_status", "args": {"status": "done"}, "save_as": null}}}

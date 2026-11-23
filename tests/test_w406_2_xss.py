@@ -18,6 +18,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
+from old_runs_kit import add_result
 from service_kit import append, make_run_folder, transcript_line
 from test_gui_real import see
 from test_gui_runs_real import make_api, real_user, wf
@@ -139,7 +140,7 @@ async def test_no_handler_in_chat_transcript_result_and_task(wf: Path) -> None:
     folder = make_run_folder(wf, status=RunStatus.DONE, agents=["a"], name="XSS")
     store = RoomStore.create(folder)
     store.for_agent("a").post_message("main", f"Kanal {payload}")
-    store.for_agent("a").submit_result(kind="proof", title="Beweis", body=f"Ergebnis {payload}")
+    add_result(store, "a", "proof", "Beweis", f"Ergebnis {payload}")  # as an old run left it
     (folder / "task.md").write_text(f"# Aufgabe\n\nAufgabe {payload}\n", "utf-8")
     lines = [
         transcript_line(1, "a", folder.name, "turn_start", {"turn": 1, "prompt": "Los."}),

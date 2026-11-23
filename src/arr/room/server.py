@@ -187,46 +187,30 @@ def _clock(ts: float) -> str:
 
 
 USER_MAY_NOT_ANSWER = (
-    "Deine Frage an den User ist noch offen, und er antwortet vielleicht lange nicht. Warte "
-    "nicht länger auf ihn, auch nicht mit `wait_until`: Arbeite mit einer begründeten Annahme "
-    "weiter und nenne sie in deinem Ergebnis. Antwortet er später, weckt dich das; prüfe dann "
-    "deine Annahme."
-)
-"""V10 (c), User 09.11.: on a question to the user, advise a reasoned assumption, not a
-long wait. Advice only: a `wait_until` is still accepted (option a is not decided)."""
-
-USER_WAITED_LONG = (
-    "Beachte: Deine Frage an den User ist noch offen, und er antwortet vielleicht lange nicht. "
-    "Warte danach nicht noch einmal auf ihn: Arbeite besser mit einer begründeten Annahme weiter "
-    "und nenne sie in deinem Ergebnis. Eine späte Antwort weckt dich auch dann; prüfe dann deine "
-    "Annahme."
-)
-"""The answer to a `wait_until` while the agent's question to the user is open (V10): the
-wait stands, the turn ends as usual, and the advice is for the turn after it."""
-
-USER_MAY_NOT_ANSWER_PHASES = (
     "Deine Frage an den User ist noch offen, und er antwortet vielleicht lange nicht. Brauchst "
     "du die Antwort, warte einmal mit `wait_until` bis zu fünf Minuten; eine Antwort des Users "
-    "(in deinem privaten Kanal auch eine Notiz) beendet das Warten. Antwortet er bis dahin "
-    "nicht, arbeite mit einer begründeten Annahme weiter und nenne sie in deiner Abgabe."
+    "oder eine Nachricht von ihm in deinem privaten Kanal beendet das Warten. Antwortet er bis "
+    "dahin nicht, arbeite mit einer begründeten Annahme weiter und nenne sie in deiner Abgabe."
 )
-"""`USER_MAY_NOT_ANSWER` in a run with phases (W4b-06a, Entscheidung 69): there the agent may
-wait for the user once with `wait_until`, at most five minutes."""
+"""V10 (W4b-06a, Entscheidung 69): on an open question to the user, one wait with `wait_until`
+of at most five minutes, then a reasoned assumption. One version since W4b-06b; every message
+of the user in the private channel ends the wait (W4b-04 NR2)."""
 
-USER_WAITED_LONG_PHASES = (
+USER_WAITED_LONG = (
     "Beachte: Deine Frage an den User ist noch offen. Warte auf ihn höchstens fünf Minuten und "
     "nur einmal: Antwortet er bis dahin nicht, arbeite mit einer begründeten Annahme weiter und "
     "nenne sie in deiner Abgabe. Gibst du ab, gilt deine Frage als erledigt."
 )
-"""`USER_WAITED_LONG` in a run with phases (W4b-06a, Entscheidungen 67 and 69)."""
+"""The answer to a `wait_until` while the agent's question to the user is open (V10;
+W4b-06a, Entscheidungen 67 and 69). One version since W4b-06b."""
 
 
-def render_wait(outcome: WaitOutcome, *, asked_user: bool = False, phases: bool = False) -> str:
+def render_wait(outcome: WaitOutcome, *, asked_user: bool = False) -> str:
     """Result of `wait_for_messages`: why it ended, how long it waited, the new messages.
 
     `asked_user`: a question of the agent to the user is open; then „nobody answers“ advises
-    a reasoned assumption instead of `wait_until` (V10); in a run with `phases` one wait with
-    `wait_until` of at most five minutes first (Entscheidung 69).
+    one wait with `wait_until` of at most five minutes, then a reasoned assumption (V10,
+    Entscheidung 69).
     """
     waited = f"nach {outcome.waited_s:.0f} s"
     if outcome.ended_by is WaitEnd.MESSAGE:
@@ -238,7 +222,7 @@ def render_wait(outcome: WaitOutcome, *, asked_user: bool = False, phases: bool 
         return (
             f"Warten beendet {waited}: Niemand antwortet, du hast in diesem Turn "
             f"{STREAK_MAX_S / 60:.0f} min ohne neue Nachricht an dich gewartet. "
-            f"{USER_MAY_NOT_ANSWER_PHASES if phases else USER_MAY_NOT_ANSWER} Rufst du "
+            f"{USER_MAY_NOT_ANSWER} Rufst du "
             "`wait_for_messages` noch einmal auf, beendet arr deinen Turn."
         )
     if outcome.ended_by is WaitEnd.NOBODY:
@@ -273,11 +257,10 @@ def render_wait_until(
     result_from: str | None = None,
     *,
     asked_user: bool = False,
-    phases: bool = False,
 ) -> str:
     """Answer of `wait_until`: end the turn now, arr wakes the agent. With a question of the
-    agent to the user open, the wait is accepted, but the answer advises against a long one
-    (V10); in a run with `phases` it allows one of at most five minutes (Entscheidung 69)."""
+    agent to the user open, the wait is accepted, and the answer allows one of at most five
+    minutes (V10, Entscheidung 69)."""
     minutes = max(1, round((until - time.time()) / 60))
     reasons = ["eine Nachricht an dich kommt"]
     if file:
@@ -289,7 +272,7 @@ def render_wait_until(
         f"sobald {' oder '.join(reasons)}, spätestens um {_clock(until)} (in {minutes} min)."
     )
     if asked_user:
-        text += f" {USER_WAITED_LONG_PHASES if phases else USER_WAITED_LONG}"
+        text += f" {USER_WAITED_LONG}"
     return text
 
 
@@ -349,10 +332,10 @@ class RoomServer(MCPServer):
 def build_server(room: AgentRoom) -> MCPServer:
     """MCP server with the room tools of docs/06 §9 bound to `room.agent_id`.
 
-    A run with the topology `phases` gets `submit` and not `submit_result`/`submit_rating`,
-    the five old topologies the reverse (W4b-01). Since W4b-03 no run offers `vote`, `call_vote`,
-    `give_floor`, `pin` or `close_discussion` (Entscheidung 11, 12, 27): gates read submissions,
-    and the topology `moderated` (W4b-04) replaces the moderator.
+    Every run offers `submit` and `assign` (also without `run.yaml`); `submit_result` and
+    `submit_rating` are gone with the old topologies (W4b-06b). Since W4b-03 no run offers
+    `vote`, `call_vote`, `give_floor`, `pin` or `close_discussion` (Entscheidung 11, 12, 27):
+    gates read submissions, and the topology `moderated` (W4b-04) replaces the moderator.
     """
     server = RoomServer(room)
 
@@ -386,7 +369,7 @@ def build_server(room: AgentRoom) -> MCPServer:
 
     @server.tool(
         description="Nachricht in einen deiner Kanäle schreiben. `kind`: note, idea, claim, "
-        "proof, objection, question, answer, proposal, decision (nur Moderator), result, pass. "
+        "proof, objection, question, answer, proposal, result, pass. "
         "`to`: Adressaten (leer = alle), `user` für den User; `@name` und `@user` im Text "
         "adressieren genauso. Eine `question` mit `to` bleibt offen, bis der Adressat mit "
         "`answer` und `reply_to` antwortet; eine Frage an den User beantwortet nur der User. "
@@ -431,11 +414,8 @@ def build_server(room: AgentRoom) -> MCPServer:
 
         return _respond(room, "set_status", call)
 
-    if room.store.uses_phases():
-        _add_submit(server, room)
-        _add_assign(server, room)  # W4b-04: every agent of a phases run; the room checks who
-    else:
-        _add_old_submit_tools(server, room)
+    _add_submit(server, room)
+    _add_assign(server, room)  # W4b-04: every agent; the room checks who may
 
     limit = wait_max_s()
 
@@ -457,7 +437,7 @@ def build_server(room: AgentRoom) -> MCPServer:
             log.exception("agent %s: wait_for_messages failed", room.agent_id)
             raise ToolError(await asyncio.to_thread(_with_footer, room, INTERNAL_ERROR)) from None
         asked = outcome.ended_by is WaitEnd.NOBODY and await asyncio.to_thread(room.asked_the_user)
-        text = render_wait(outcome, asked_user=asked, phases=room.store.uses_phases())
+        text = render_wait(outcome, asked_user=asked)
         return await asyncio.to_thread(_with_footer, room, text)
 
     def _wait_until(minutes: float, until_file: str | None, result_from: str | None) -> str:
@@ -469,7 +449,6 @@ def build_server(room: AgentRoom) -> MCPServer:
                 state.file,
                 shown,
                 asked_user=room.asked_the_user(),
-                phases=room.store.uses_phases(),
             )
 
         return _respond(room, "wait_until", call)
@@ -548,7 +527,7 @@ def render_submission(sub: Submission) -> str:
 
 
 def _add_submit(server: MCPServer, room: AgentRoom) -> None:
-    """`submit` of the phase toolkit (W4b-01), instead of `submit_result`/`submit_rating`."""
+    """`submit` of the phase toolkit (W4b-01), the only way to hand in (W4b-06b)."""
 
     @server.tool(description=SUBMIT_DESCRIPTION)
     def submit(
@@ -609,7 +588,7 @@ def render_delegation(room: AgentRoom, given: Delegation) -> str:
 
 
 def _add_assign(server: MCPServer, room: AgentRoom) -> None:
-    """`assign` of a phase `moderated` (W4b-04), offered beside `submit` in every phases run;
+    """`assign` of a phase `moderated` (W4b-04), offered beside `submit` in every run;
     `AgentRoom.assign` refuses everyone but the lead."""
 
     @server.tool(description=ASSIGN_DESCRIPTION)
@@ -617,37 +596,6 @@ def _add_assign(server: MCPServer, room: AgentRoom) -> None:
         return _respond(
             room, "assign", lambda: render_delegation(room, room.assign(agent, task, format))
         )
-
-
-def _add_old_submit_tools(server: MCPServer, room: AgentRoom) -> None:
-    """`submit_result` and `submit_rating` of the five old topologies (until W4b-06)."""
-
-    @server.tool(
-        description="Ergebnis der aktuellen Stufe abgeben, z. B. Idee, Lemma, Beweis oder "
-        "Gutachten. Inhalt in `body` oder als Datei `path` relativ zu deinem Arbeitsordner."
-    )
-    def submit_result(
-        kind: str, title: str, body: str | None = None, path: str | None = None
-    ) -> str:
-        def call() -> str:
-            r = room.submit_result(kind, title, body, path)
-            text = f"Ergebnis #{r.id} abgegeben (Stufe {r.stage or '–'}, Versuch {r.attempt})."
-            return text + (f" Datei: {r.path}" if r.path else "")
-
-        return _respond(room, "submit_result", call)
-
-    @server.tool(
-        description="Ein Ergebnis bewerten: `score` auf der Skala der Rubrik, `comment` als "
-        "Begründung, optional `criteria` mit Punkten pro Kriterium."
-    )
-    def submit_rating(
-        result_id: int, score: float, comment: str, criteria: dict[str, float] | None = None
-    ) -> str:
-        def call() -> str:
-            r = room.submit_rating(result_id, score, comment, criteria)
-            return f"Bewertung #{r.id} für Ergebnis #{r.result_id} gespeichert ({r.score:g})."
-
-        return _respond(room, "submit_rating", call)
 
 
 def main() -> None:

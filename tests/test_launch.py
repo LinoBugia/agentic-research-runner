@@ -63,23 +63,31 @@ SOLO = """\
 version: 1
 project: demo
 task: Teste arr.
-topology: {kind: solo}
+topology: {kind: phases}
 limits: {wall_time: 2m}
 defaults: {provider: claude, model: fake-model, auth: fake-auth}
 agents: [{id: a}]
 groupchats: [{name: main, members: [a]}]
+phases:
+  - name: arbeit
+    topology: solo
+    actions: {a: {task: tasks/ohne-skill.md, submission: {format: text}}}
 """
 
 MIXED = """\
 version: 1
 project: demo
 task: Teste arr.
-topology: {kind: solo, params: {agent: a}}
+topology: {kind: phases}
 limits: {wall_time: 2m, budget_usd: 0.5}
 defaults: {provider: claude, model: fake-model, auth: fake-auth}
 agents:
   - {id: a}
   - {id: gpt, provider: codex, model: fake-gpt, auth: fake-codex}
+phases:
+  - name: arbeit
+    topology: solo
+    actions: {a: {task: tasks/ohne-skill.md, submission: {format: text}}}
 """
 
 
@@ -136,12 +144,13 @@ def test_load_profiles_without_the_file_gives_a_hint(arr_home: Path) -> None:
 
 
 def test_plan_checks_the_topology_before_any_folder_exists(workfolder: Path) -> None:
-    broken = SOLO.replace("topology: {kind: solo}", "topology: {kind: waterfall}")
-    broken += "stages: [{name: s, agent: a}]\nraters: [a]\n"
+    """W4b-06b: a phases run; `check_topology` (the plan check) finds the key that does not
+    fit the phase, before `prepare_run`."""
+    broken = SOLO.replace("topology: solo\n", "topology: solo\n    isolated: true\n")
     run_file = write_run(workfolder, broken)
     with pytest.raises(ConfigError) as info:
         plan_launch(run_file, cwd=workfolder)
-    assert "params.pass_score" in str(info.value)
+    assert "phases[0].isolated" in str(info.value) and "nur bei „parallel“" in str(info.value)
     assert list((workfolder / "runs").iterdir()) == [], "nothing was prepared"
 
 
@@ -152,11 +161,16 @@ def test_plan_loads_the_group_skill_and_the_param_overrides(workfolder: Path) ->
         "---\nname: demo-group\ndescription: Demo-Gruppe.\n---\n\nDemo.\n", encoding="utf-8"
     )
     (skill / "roles" / "worker.md").write_text("Du arbeitest.\n", encoding="utf-8")
+    (skill / "tasks").mkdir()
+    (skill / "tasks" / "arbeit.md").write_text("Bearbeite die Aufgabe.\n", encoding="utf-8")
     (skill / "group.yaml").write_text(
-        "kind: research-group\nversion: 1\ntopology: solo\n"
+        "kind: research-group\nversion: 1\ntopology: phases\n"
         "params:\n  max_turns: {default: 3, min: 1, max: 5}\n"
         "defaults: {provider: claude, model: fake-model, auth: fake-auth}\n"
-        "agents: [{id: a, role: roles/worker.md}]\n",
+        "agents: [{id: a, role: roles/worker.md}]\n"
+        "phases:\n  - name: arbeit\n    topology: solo\n    actions:\n"
+        "      a: {task: tasks/arbeit.md, submission: {format: text}, "
+        "turns: '{{ params.max_turns }}'}\n",
         encoding="utf-8",
     )
     run_file = write_run(workfolder, "version: 1\nproject: demo\nskill: demo-group\ntask: Los.\n")
@@ -207,7 +221,7 @@ async def test_factory_builds_the_backend_per_provider_with_profile_and_limits(
     assert calls[("claude", "a")]["limits"].budget_usd == 0.5
     assert manager.finalizer is not None, "finalizer always set"
     assert (manager.run_dir / "output" / "summary.md").is_file()
-    assert manager.stages == [], "no own stages= (plan comes from run.yaml)"
+    assert manager.stages == ["arbeit"], "no own stages= (the phases of run.yaml)"
 
 
 async def test_run_launch_marks_interrupted_runs_and_scans(workfolder: Path) -> None:

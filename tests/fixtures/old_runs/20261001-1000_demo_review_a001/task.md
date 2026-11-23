@@ -1,0 +1,1 @@
+Zeige, dass Lemma A für alle n ≡ 1 mod 4 gilt.

@@ -121,7 +121,7 @@ def test_a8_escalation_and_other_events() -> None:
         title="Stufe",
         run=ApprovalRunRef(id="r1", name="Ramsey", project="demo", gui_url="http://x"),
         stage="skizze",
-        topology=TopologyKind.WATERFALL,
+        topology=TopologyKind.PHASES,
         options=[EscalationOptionInfo(key="end", label="Run beenden", help="…")],
     )
     text = message_for(created(item), 0.0)
@@ -135,7 +135,7 @@ def run_event(status: RunStatus, previous: RunStatus | None) -> RunStatusEvent:
         id="r1",
         name="Collatz",
         project="demo",
-        topology=TopologyKind.SOLO,
+        topology=TopologyKind.PHASES,
         status=status,
         active=status.is_active,
         starter=Starter.GUI,

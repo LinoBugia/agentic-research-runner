@@ -21,14 +21,18 @@ AGENT_TOOLS = {
     "post_message",
     "get_attachment",
     "set_status",
-    "submit_result",
-    "submit_rating",
+    "submit",  # W4b-06b: every run, also without `run.yaml`
+    "assign",
     "get_assignment",
     "wait_for_messages",
     "wait_until",
 }
-REMOVED_TOOLS = {"vote", "give_floor", "call_vote", "pin", "close_discussion"}
-"""Gone for every run since W4b-03 (§6.7, Entscheidung 11, 12, 27)."""
+REMOVED_TOOLS = {
+    *("vote", "give_floor", "call_vote", "pin", "close_discussion"),
+    *("submit_result", "submit_rating"),
+}
+"""Gone for every run since W4b-03 (§6.7, Entscheidung 11, 12, 27); the old tools to hand in
+since W4b-06b."""
 FOOTER = re.compile(r"\n\n---\nungelesen: (nichts|.+)$")
 
 
@@ -45,8 +49,6 @@ def store(tmp_path: Path) -> RoomStore:
             GroupChatConfig(
                 name="seminar",
                 members=["critic", "explorer-1"],
-                mode="moderated",
-                moderator="critic",
             ),
             GroupChatConfig(name="private", members=["judge-1"]),
         ]
@@ -86,7 +88,8 @@ async def tool_names(store: RoomStore, agent: str) -> set[str]:
 
 
 async def test_tool_list_has_no_vote_and_no_moderator_tools(store: RoomStore) -> None:
-    """W4b-03 A15: the moderator of a channel gets the same tools as everybody (old run)."""
+    """W4b-03 A15: every agent gets the same tools (no moderator tools); without `run.yaml`
+    every agent gets `submit` and `assign` (W4b-06b)."""
     assert await tool_names(store, "explorer-1") == AGENT_TOOLS
     assert await tool_names(store, "critic") == AGENT_TOOLS
     assert not (await tool_names(store, "critic")) & REMOVED_TOOLS
@@ -107,7 +110,6 @@ async def test_all_agent_tools_over_mcp_with_footer(store: RoomStore) -> None:
 
         channels = await e1.ok("list_channels")
         assert "#main – event, offen, 1 Nachricht, 1 ungelesen" in channels
-        assert "Moderator: critic" in channels
 
         assert "[#1 orchestrator · note · #main] (angeheftet)" in await e1.ok("read_messages")
         assert e1.footers[-1] == "ungelesen: nichts"
@@ -150,17 +152,17 @@ async def test_all_agent_tools_over_mcp_with_footer(store: RoomStore) -> None:
         assert '"k": 1' in assignment
         assert await critic.ok("get_assignment") == "Noch kein Auftrag."
 
-        result = await e1.ok("submit_result", kind="idea", title="2-adisch", path="lemma.md")
-        result_id = int(re.search(r"#(\d+)", result).group(1))
-        assert f"output/results/{result_id:03d}-explorer-1-idea.md" in result
-        rated = await critic.ok(
-            "submit_rating", result_id=result_id, score=8, comment="gut", criteria={"Tiefe": 7}
+        store.add_assignment(
+            "explorer-1", 2, "Gib ab.", stage="explore", context={"submission": {"format": "text"}}
         )
-        assert rated.endswith(f"für Ergebnis #{result_id} gespeichert (8).")
+        handed = await e1.ok("submit", status="done", summary="2-adisch", files=["lemma.md"])
+        assert handed.startswith("Abgabe #1 angenommen"), handed
+        assert "output/submissions/001-explore-explorer-1" in handed
         assert await e1.ok("set_status", status="done", note="fertig") == "Status gesetzt: done."
 
     assert {s.agent: s.status for s in store.agent_states()} == {"explorer-1": "done"}
-    assert store.ratings()[0].criteria == {"Tiefe": 7}
+    [sub] = store.submissions()
+    assert (sub.agent, sub.summary, sub.files) == ("explorer-1", "2-adisch", ["lemma.md"])
 
 
 async def test_removed_tools_cannot_be_called_over_mcp(store: RoomStore) -> None:
@@ -266,8 +268,8 @@ async def test_wrong_argument_types_are_german(store: RoomStore) -> None:
         assert await agent.error("post_message", body="x") == (
             "Ungültige Argumente für „post_message“: „channel“ fehlt."
         )
-        text = await agent.error("submit_rating", result_id=1, score=5, comment="x", criteria=[1])
-        assert "„criteria“ muss ein Objekt sein" in text
+        text = await agent.error("submit", status="done", summary="x", fields=[1])
+        assert "„fields“ muss ein Objekt sein" in text
     assert agent.footers[-1] == "ungelesen: #main 1, #seminar 1"
     assert all("validation error" not in f for f in agent.footers)
     assert [m.sender for m in store.messages("main")] == ["orchestrator"]
