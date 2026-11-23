@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "run": "20261003-1000_demo_waterfall_a003",
+  "results": [
+    {
+      "id": 1,
+      "ts": 1795441628.8551,
+      "agent": "p",
+      "stage": "skizze",
+      "kind": "note",
+      "title": "S",
+      "body": "Inhalt",
+      "path": null,
+      "attempt": 1,
+      "file": "output/results/001-p-note.md",
+      "score": 3.0,
+      "ratings": [
+        1
+      ]
+    },
+    {
+      "id": 2,
+      "ts": 1795441628.872263,
+      "agent": "p",
+      "stage": "skizze",
+      "kind": "note",
+      "title": "S",
+      "body": "Inhalt",
+      "path": null,
+      "attempt": 2,
+      "file": "output/results/002-p-note.md",
+      "score": 7.0,
+      "ratings": [
+        2
+      ]
+    },
+    {
+      "id": 3,
+      "ts": 1795441628.88932,
+      "agent": "r",
+      "stage": "beweis",
+      "kind": "note",
+      "title": "B",
+      "body": "Inhalt",
+      "path": null,
+      "attempt": 1,
+      "file": "output/results/003-r-note.md",
+      "score": 8.0,
+      "ratings": [
+        3
+      ]
+    }
+  ]
+}

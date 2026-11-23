@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "run": "20261004-1000_demo_solo_a004",
+  "total": {
+    "usage": {
+      "input": null,
+      "output": null,
+      "cache_read": null,
+      "cache_write": null,
+      "reasoning": null,
+      "cost_usd": null,
+      "cost_kind": null
+    },
+    "turns": 1,
+    "cost_billed_usd": 0.0,
+    "cost_estimated_usd": 0.0,
+    "cost_unknown_turns": 1
+  },
+  "by_agent": {
+    "solver": {
+      "usage": {
+        "input": null,
+        "output": null,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null,
+        "cost_usd": null,
+        "cost_kind": null
+      },
+      "turns": 1,
+      "cost_billed_usd": 0.0,
+      "cost_estimated_usd": 0.0,
+      "cost_unknown_turns": 1,
+      "profile": "fake-auth",
+      "provider": "claude",
+      "models": {
+        "fake-model": {
+          "usage": {
+            "input": null,
+            "output": null,
+            "cache_read": null,
+            "cache_write": null,
+            "reasoning": null,
+            "cost_usd": null,
+            "cost_kind": null
+          },
+          "turns": 1,
+          "cost_billed_usd": 0.0,
+          "cost_estimated_usd": 0.0,
+          "cost_unknown_turns": 1
+        }
+      }
+    }
+  },
+  "by_model": {
+    "fake-model": {
+      "usage": {
+        "input": null,
+        "output": null,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null,
+        "cost_usd": null,
+        "cost_kind": null
+      },
+      "turns": 1,
+      "cost_billed_usd": 0.0,
+      "cost_estimated_usd": 0.0,
+      "cost_unknown_turns": 1
+    }
+  },
+  "by_profile": {
+    "fake-auth": {
+      "usage": {
+        "input": null,
+        "output": null,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null,
+        "cost_usd": null,
+        "cost_kind": null
+      },
+      "turns": 1,
+      "cost_billed_usd": 0.0,
+      "cost_estimated_usd": 0.0,
+      "cost_unknown_turns": 1
+    }
+  },
+  "by_phase": {}
+}

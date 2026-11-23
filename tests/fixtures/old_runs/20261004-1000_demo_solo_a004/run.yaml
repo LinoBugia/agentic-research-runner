@@ -1,0 +1,64 @@
+version: 1
+name:
+project: demo
+skill:
+task:
+task_file: task.md
+topology:
+  kind: solo
+  params: {}
+rubric:
+stages: []
+raters: []
+limits:
+  wall_time: 2h
+  turns_per_agent: 40
+  budget_usd: 20.0
+approvals:
+  decider: user
+  timeout: 20m
+  gatekeeper:
+agents:
+  - id: solver
+    base_id: solver
+    replica:
+    provider: claude
+    model: fake-model
+    auth: fake-auth
+    effort:
+    role:
+    skills: []
+    workspace:
+      mode: copy
+      name:
+    tools:
+      shell: true
+      web: false
+    read_dirs: []
+    channels:
+      - main
+    compact:
+      at: 60%
+    decider:
+groupchats:
+  - name: main
+    purpose:
+    members:
+      - solver
+    mode: event
+    order: parallel
+    moderator:
+    open_from:
+    anonymous: false
+    wake_on:
+      - mention
+      - question
+    debounce_s: 20.0
+    max_wakeups_per_agent: 12
+    quiet_after_s: 300.0
+    idle_after_s: 30.0
+    max_message_chars: 3000
+    summary_every: 15
+phases: []
+formats: {}
+seed: {}

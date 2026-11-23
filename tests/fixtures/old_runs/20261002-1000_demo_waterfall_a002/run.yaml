@@ -1,0 +1,102 @@
+version: 1
+name:
+project: demo
+skill:
+task:
+task_file: task.md
+topology:
+  kind: waterfall
+  params:
+    pass_score: 6
+    max_rework: 0
+    on_fail: escalate
+rubric:
+  scale:
+    - 1.0
+    - 10.0
+  pass_score:
+  criteria:
+    - korrektheit
+    - klarheit
+stages:
+  - name: skizze
+    agent: p
+    produces:
+  - name: beweis
+    agent: r
+    produces:
+raters:
+  - q
+limits:
+  wall_time: 2h
+  turns_per_agent: 40
+  budget_usd: 20.0
+approvals:
+  decider: user
+  timeout: 20m
+  gatekeeper:
+agents:
+  - id: p
+    base_id: p
+    replica:
+    provider: claude
+    model: fake-model
+    auth: fake-auth
+    effort:
+    role:
+    skills: []
+    workspace:
+      mode: copy
+      name:
+    tools:
+      shell: true
+      web: false
+    read_dirs: []
+    channels: []
+    compact:
+      at: 60%
+    decider:
+  - id: q
+    base_id: q
+    replica:
+    provider: claude
+    model: fake-model
+    auth: fake-auth
+    effort:
+    role:
+    skills: []
+    workspace:
+      mode: copy
+      name:
+    tools:
+      shell: true
+      web: false
+    read_dirs: []
+    channels: []
+    compact:
+      at: 60%
+    decider:
+  - id: r
+    base_id: r
+    replica:
+    provider: claude
+    model: fake-model
+    auth: fake-auth
+    effort:
+    role:
+    skills: []
+    workspace:
+      mode: copy
+      name:
+    tools:
+      shell: true
+      web: false
+    read_dirs: []
+    channels: []
+    compact:
+      at: 60%
+    decider:
+groupchats: []
+phases: []
+formats: {}
+seed: {}

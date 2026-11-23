@@ -1,0 +1,12 @@
+{"seq": 2, "ts": 1795441628.86204, "raw": {"fake_step": {"do": "room", "action": "get_assignment", "args": {}, "save_as": "job"}}}
+{"seq": 3, "ts": 1795441628.862398, "raw": {"fake_step": {"do": "room", "action": "get_assignment", "args": {}, "save_as": "job"}}}
+{"seq": 4, "ts": 1795441628.862432, "raw": {"fake_step": {"do": "room", "action": "submit_rating", "args": {"result_id": "${job.context.result_id}", "score": 3, "comment": "passt", "criteria": {}}, "save_as": null}}}
+{"seq": 5, "ts": 1795441628.8633, "raw": {"fake_step": {"do": "room", "action": "submit_rating", "args": {"result_id": "${job.context.result_id}", "score": 3, "comment": "passt", "criteria": {}}, "save_as": null}}}
+{"seq": 8, "ts": 1795441628.878638, "raw": {"fake_step": {"do": "room", "action": "get_assignment", "args": {}, "save_as": "job"}}}
+{"seq": 9, "ts": 1795441628.879, "raw": {"fake_step": {"do": "room", "action": "get_assignment", "args": {}, "save_as": "job"}}}
+{"seq": 10, "ts": 1795441628.879037, "raw": {"fake_step": {"do": "room", "action": "submit_rating", "args": {"result_id": "${job.context.result_id}", "score": 7, "comment": "passt", "criteria": {}}, "save_as": null}}}
+{"seq": 11, "ts": 1795441628.879914, "raw": {"fake_step": {"do": "room", "action": "submit_rating", "args": {"result_id": "${job.context.result_id}", "score": 7, "comment": "passt", "criteria": {}}, "save_as": null}}}
+{"seq": 14, "ts": 1795441628.896123, "raw": {"fake_step": {"do": "room", "action": "get_assignment", "args": {}, "save_as": "job"}}}
+{"seq": 15, "ts": 1795441628.896611, "raw": {"fake_step": {"do": "room", "action": "get_assignment", "args": {}, "save_as": "job"}}}
+{"seq": 16, "ts": 1795441628.896641, "raw": {"fake_step": {"do": "room", "action": "submit_rating", "args": {"result_id": "${job.context.result_id}", "score": 8, "comment": "gut", "criteria": {"korrektheit": 8, "klarheit": 7}}, "save_as": null}}}
+{"seq": 17, "ts": 1795441628.8976388, "raw": {"fake_step": {"do": "room", "action": "submit_rating", "args": {"result_id": "${job.context.result_id}", "score": 8, "comment": "gut", "criteria": {"korrektheit": 8, "klarheit": 7}}, "save_as": null}}}

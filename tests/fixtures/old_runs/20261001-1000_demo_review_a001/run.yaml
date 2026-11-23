@@ -1,0 +1,107 @@
+version: 1
+name:
+project: demo
+skill:
+task:
+task_file: task.md
+topology:
+  kind: review
+  params:
+    max_revisions: 1
+rubric:
+stages: []
+raters: []
+limits:
+  wall_time: 2h
+  turns_per_agent: 40
+  budget_usd: 20.0
+approvals:
+  decider: user
+  timeout: 20m
+  gatekeeper:
+agents:
+  - id: author
+    base_id: author
+    replica:
+    provider: claude
+    model: fake-model
+    auth: fake-auth
+    effort:
+    role:
+    skills: []
+    workspace:
+      mode: copy
+      name:
+    tools:
+      shell: true
+      web: false
+    read_dirs: []
+    channels: []
+    compact:
+      at: 60%
+    decider:
+  - id: judge-1
+    base_id: judge-1
+    replica:
+    provider: claude
+    model: fake-model
+    auth: fake-auth
+    effort:
+    role:
+    skills: []
+    workspace:
+      mode: copy
+      name:
+    tools:
+      shell: true
+      web: false
+    read_dirs: []
+    channels:
+      - judges
+    compact:
+      at: 60%
+    decider:
+  - id: judge-2
+    base_id: judge-2
+    replica:
+    provider: claude
+    model: fake-model
+    auth: fake-auth
+    effort:
+    role:
+    skills: []
+    workspace:
+      mode: copy
+      name:
+    tools:
+      shell: true
+      web: false
+    read_dirs: []
+    channels:
+      - judges
+    compact:
+      at: 60%
+    decider:
+groupchats:
+  - name: judges
+    purpose:
+    members:
+      - judge-1
+      - judge-2
+    mode: rounds
+    order: parallel
+    moderator:
+    open_from: diskussion
+    anonymous: true
+    wake_on:
+      - mention
+      - question
+    debounce_s: 20.0
+    max_wakeups_per_agent: 12
+    quiet_after_s: 300.0
+    idle_after_s: 30.0
+    max_message_chars: 3000
+    summary_every: 15
+phases: []
+formats: {}
+seed: {}

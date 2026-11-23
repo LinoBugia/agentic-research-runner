@@ -1,0 +1,219 @@
+{
+  "version": 1,
+  "run": "20261001-1000_demo_review_a001",
+  "total": {
+    "usage": {
+      "input": null,
+      "output": null,
+      "cache_read": null,
+      "cache_write": null,
+      "reasoning": null,
+      "cost_usd": null,
+      "cost_kind": null
+    },
+    "turns": 10,
+    "cost_billed_usd": 0.0,
+    "cost_estimated_usd": 0.0,
+    "cost_unknown_turns": 10
+  },
+  "by_agent": {
+    "author": {
+      "usage": {
+        "input": null,
+        "output": null,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null,
+        "cost_usd": null,
+        "cost_kind": null
+      },
+      "turns": 2,
+      "cost_billed_usd": 0.0,
+      "cost_estimated_usd": 0.0,
+      "cost_unknown_turns": 2,
+      "profile": "fake-auth",
+      "provider": "claude",
+      "models": {
+        "fake-model": {
+          "usage": {
+            "input": null,
+            "output": null,
+            "cache_read": null,
+            "cache_write": null,
+            "reasoning": null,
+            "cost_usd": null,
+            "cost_kind": null
+          },
+          "turns": 2,
+          "cost_billed_usd": 0.0,
+          "cost_estimated_usd": 0.0,
+          "cost_unknown_turns": 2
+        }
+      }
+    },
+    "judge-1": {
+      "usage": {
+        "input": null,
+        "output": null,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null,
+        "cost_usd": null,
+        "cost_kind": null
+      },
+      "turns": 4,
+      "cost_billed_usd": 0.0,
+      "cost_estimated_usd": 0.0,
+      "cost_unknown_turns": 4,
+      "profile": "fake-auth",
+      "provider": "claude",
+      "models": {
+        "fake-model": {
+          "usage": {
+            "input": null,
+            "output": null,
+            "cache_read": null,
+            "cache_write": null,
+            "reasoning": null,
+            "cost_usd": null,
+            "cost_kind": null
+          },
+          "turns": 4,
+          "cost_billed_usd": 0.0,
+          "cost_estimated_usd": 0.0,
+          "cost_unknown_turns": 4
+        }
+      }
+    },
+    "judge-2": {
+      "usage": {
+        "input": null,
+        "output": null,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null,
+        "cost_usd": null,
+        "cost_kind": null
+      },
+      "turns": 4,
+      "cost_billed_usd": 0.0,
+      "cost_estimated_usd": 0.0,
+      "cost_unknown_turns": 4,
+      "profile": "fake-auth",
+      "provider": "claude",
+      "models": {
+        "fake-model": {
+          "usage": {
+            "input": null,
+            "output": null,
+            "cache_read": null,
+            "cache_write": null,
+            "reasoning": null,
+            "cost_usd": null,
+            "cost_kind": null
+          },
+          "turns": 4,
+          "cost_billed_usd": 0.0,
+          "cost_estimated_usd": 0.0,
+          "cost_unknown_turns": 4
+        }
+      }
+    }
+  },
+  "by_model": {
+    "fake-model": {
+      "usage": {
+        "input": null,
+        "output": null,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null,
+        "cost_usd": null,
+        "cost_kind": null
+      },
+      "turns": 10,
+      "cost_billed_usd": 0.0,
+      "cost_estimated_usd": 0.0,
+      "cost_unknown_turns": 10
+    }
+  },
+  "by_profile": {
+    "fake-auth": {
+      "usage": {
+        "input": null,
+        "output": null,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null,
+        "cost_usd": null,
+        "cost_kind": null
+      },
+      "turns": 10,
+      "cost_billed_usd": 0.0,
+      "cost_estimated_usd": 0.0,
+      "cost_unknown_turns": 10
+    }
+  },
+  "by_phase": {
+    "artefakt": {
+      "usage": {
+        "input": null,
+        "output": null,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null,
+        "cost_usd": null,
+        "cost_kind": null
+      },
+      "turns": 1,
+      "cost_billed_usd": 0.0,
+      "cost_estimated_usd": 0.0,
+      "cost_unknown_turns": 1
+    },
+    "revision": {
+      "usage": {
+        "input": null,
+        "output": null,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null,
+        "cost_usd": null,
+        "cost_kind": null
+      },
+      "turns": 1,
+      "cost_billed_usd": 0.0,
+      "cost_estimated_usd": 0.0,
+      "cost_unknown_turns": 1
+    },
+    "pruefung": {
+      "usage": {
+        "input": null,
+        "output": null,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null,
+        "cost_usd": null,
+        "cost_kind": null
+      },
+      "turns": 4,
+      "cost_billed_usd": 0.0,
+      "cost_estimated_usd": 0.0,
+      "cost_unknown_turns": 4
+    },
+    "diskussion": {
+      "usage": {
+        "input": null,
+        "output": null,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null,
+        "cost_usd": null,
+        "cost_kind": null
+      },
+      "turns": 4,
+      "cost_billed_usd": 0.0,
+      "cost_estimated_usd": 0.0,
+      "cost_unknown_turns": 4
+    }
+  }
+}

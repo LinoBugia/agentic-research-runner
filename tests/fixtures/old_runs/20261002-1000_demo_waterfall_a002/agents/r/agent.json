@@ -1,0 +1,39 @@
+{
+  "config": {
+    "id": "r",
+    "base_id": "r",
+    "replica": null,
+    "provider": "claude",
+    "model": "fake-model",
+    "auth": "fake-auth",
+    "effort": null,
+    "role": null,
+    "skills": [],
+    "workspace": {
+      "mode": "copy",
+      "name": null
+    },
+    "tools": {
+      "shell": true,
+      "web": false
+    },
+    "read_dirs": [],
+    "channels": [],
+    "compact": {
+      "at": "60%"
+    },
+    "decider": null
+  },
+  "work_dir": "agents/r/work",
+  "role_file": "agents/r/role.md",
+  "context_file": "agents/r/context.md",
+  "plugin_dir": null,
+  "skill_ids": [],
+  "generated_paths": [
+    "AGENTS.md"
+  ],
+  "path_prepend": [],
+  "base_python": null,
+  "run_venv": "off",
+  "copy_method": "clone"
+}

@@ -1,0 +1,19 @@
+{"ts": 1795441628.7708108, "kind": "status", "data": {"status": "preparing"}}
+{"ts": 1795441628.793091, "kind": "status", "data": {"status": "running"}}
+{"ts": 1795441628.7931268, "kind": "checkpoint", "data": {"stage": "plan", "stages": ["skizze", "beweis"]}}
+{"ts": 1795441628.797454, "kind": "turn", "data": {"agent": "p", "turn": 1, "stage": "skizze"}}
+{"ts": 1795441628.8017862, "kind": "agent_done", "data": {"agent": "p", "reason": "result", "turn": 1}}
+{"ts": 1795441628.802249, "kind": "turn_end", "data": {"agent": "p", "turn": 1, "status": "ok", "cost_usd": null, "results": [1]}}
+{"ts": 1795441628.8052218, "kind": "turn", "data": {"agent": "q", "turn": 1, "stage": "skizze"}}
+{"ts": 1795441628.810282, "kind": "turn_end", "data": {"agent": "q", "turn": 1, "status": "ok", "cost_usd": null, "results": []}}
+{"ts": 1795441628.8120818, "kind": "checkpoint", "data": {"stage": "skizze", "attempt": 1, "agent": "p", "result": 1, "score": 3.0, "ratings": 1, "decision": "escalated"}}
+{"ts": 1795441628.81213, "kind": "escalation", "data": {"stage": "skizze", "summary": "Stufe „skizze“ (p): 1 Versuche nicht bestanden (Scores: 3,0; Bestehensgrenze 6). Noch ein Versuch, trotzdem weiter mit dem besten Versuch oder den Run beenden?", "options": ["retry", "continue", "end"]}}
+{"ts": 1795441628.812163, "kind": "pause", "data": {"reason": "escalation"}}
+{"ts": 1795441628.812377, "kind": "status", "data": {"status": "paused"}}
+{"ts": 1795441628.812732, "kind": "resume", "data": {"reason": "escalation"}}
+{"ts": 1795441628.812911, "kind": "status", "data": {"status": "running"}}
+{"ts": 1795441628.8129349, "kind": "escalation_decided", "data": {"stage": "skizze", "option": "end", "by_user": true}}
+{"ts": 1795441628.812963, "kind": "checkpoint", "data": {"stage": "skizze", "phase": "stage_end", "outcome": "stage_failed", "reason": "stage_failed", "accepted": null, "score": 3.0, "attempts": 1}}
+{"ts": 1795441628.8131871, "kind": "status", "data": {"status": "finalizing"}}
+{"ts": 1795441628.819124, "kind": "cleanup", "data": {"removed": ["scratch"], "failed": [], "parked": "retired/.trash/4748cae80b3446028fc53e787747d389", "where": "finalizer"}}
+{"ts": 1795441628.819656, "kind": "status", "data": {"status": "done"}}

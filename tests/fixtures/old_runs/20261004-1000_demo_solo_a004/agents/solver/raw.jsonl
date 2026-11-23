@@ -1,0 +1,4 @@
+{"seq": 2, "ts": 1795441628.931863, "raw": {"fake_step": {"do": "room", "action": "post_message", "args": {"channel": "main", "body": "Ich fange an."}, "save_as": null}}}
+{"seq": 3, "ts": 1795441628.932867, "raw": {"fake_step": {"do": "room", "action": "post_message", "args": {"channel": "main", "body": "Ich fange an."}, "save_as": null}}}
+{"seq": 4, "ts": 1795441628.932895, "raw": {"fake_step": {"do": "room", "action": "submit_result", "args": {"kind": "proof", "title": "Beweis", "body": "Lemma A gilt."}, "save_as": null}}}
+{"seq": 5, "ts": 1795441628.933889, "raw": {"fake_step": {"do": "room", "action": "submit_result", "args": {"kind": "proof", "title": "Beweis", "body": "Lemma A gilt."}, "save_as": null}}}

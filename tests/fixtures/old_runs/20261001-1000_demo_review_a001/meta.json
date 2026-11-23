@@ -1,0 +1,17 @@
+{
+  "run_id": "20261001-1000_demo_review_a001",
+  "status": "done",
+  "starter": "cli",
+  "project": "demo",
+  "skill": null,
+  "name": null,
+  "created": 1795441628.560883,
+  "started": 1795441628.599338,
+  "ended": 1795441628.7630908,
+  "arr_version": "0.1.0",
+  "sdk_versions": {
+    "claude-agent-sdk": "0.2.174",
+    "openai-codex": "0.163.0"
+  },
+  "run_venv": null
+}

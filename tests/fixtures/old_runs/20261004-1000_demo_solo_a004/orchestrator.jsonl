@@ -1,0 +1,10 @@
+{"ts": 1795441628.9140952, "kind": "status", "data": {"status": "preparing"}}
+{"ts": 1795441628.9258869, "kind": "status", "data": {"status": "running"}}
+{"ts": 1795441628.925929, "kind": "checkpoint", "data": {"stage": "plan", "stages": []}}
+{"ts": 1795441628.931756, "kind": "turn", "data": {"agent": "solver", "turn": 1, "stage": null}}
+{"ts": 1795441628.937568, "kind": "agent_done", "data": {"agent": "solver", "reason": "result", "turn": 1}}
+{"ts": 1795441628.938019, "kind": "turn_end", "data": {"agent": "solver", "turn": 1, "status": "ok", "cost_usd": null, "results": [1]}}
+{"ts": 1795441628.938068, "kind": "checkpoint", "data": {"stage": "arbeit", "agent": "solver", "turns": 1, "results": [1], "decision": "passed"}}
+{"ts": 1795441628.9383411, "kind": "status", "data": {"status": "finalizing"}}
+{"ts": 1795441628.942859, "kind": "cleanup", "data": {"removed": ["scratch"], "failed": [], "parked": "retired/.trash/cdc9c3dad3974c64905fc448992f1e9f", "where": "finalizer"}}
+{"ts": 1795441628.9433851, "kind": "status", "data": {"status": "done"}}

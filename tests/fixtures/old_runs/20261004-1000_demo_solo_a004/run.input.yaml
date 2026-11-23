@@ -1,0 +1,15 @@
+project: demo
+task: Zeige, dass Lemma A für alle n ≡ 1 mod 4 gilt.
+topology:
+  kind: solo
+  params: {}
+defaults:
+  provider: claude
+  model: fake-model
+  auth: fake-auth
+agents:
+  - id: solver
+groupchats:
+  - name: main
+    members:
+      - solver

@@ -1,0 +1,30 @@
+project: demo
+task: Zeige, dass Lemma A für alle n ≡ 1 mod 4 gilt.
+topology:
+  kind: waterfall
+  params:
+    pass_score: 6
+    max_rework: 1
+rubric:
+  scale:
+    - 1.0
+    - 10.0
+  criteria:
+    - korrektheit
+    - klarheit
+defaults:
+  provider: claude
+  model: fake-model
+  auth: fake-auth
+agents:
+  - id: p
+  - id: q
+  - id: r
+groupchats: []
+stages:
+  - name: skizze
+    agent: p
+  - name: beweis
+    agent: r
+raters:
+  - q

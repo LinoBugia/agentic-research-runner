@@ -1,0 +1,2 @@
+{"ts": 1795441628.812495, "event": "open", "item_id": "apr_cda0a87609a9cf07_0001", "note": "Eskalation in Stufe „skizze“: Stufe „skizze“ (p): 1 Versuche nicht bestanden (Scores: 3,0; Bestehensgrenze 6). Noch ein Versuch, trotzdem weiter mit dem besten Versuch oder den Run beenden?"}
+{"ts": 1795441628.812639, "event": "decided", "item_id": "apr_cda0a87609a9cf07_0001", "decision": {"action": "option", "scope": "once", "decided_by": "user", "reason": "", "changes": [], "option": "end", "decided_at": 1795441628.812622}}
