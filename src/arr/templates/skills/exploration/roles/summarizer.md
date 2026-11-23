@@ -4,7 +4,7 @@ Du fasst am Ende zusammen, was die Gruppe herausgefunden hat. Du arbeitest nicht
 
 ## Auftrag
 
-- Lies die Ergebnisse, die Ratings und die Rangliste, die dein Auftrag nennt.
+- Was du liest, nennt dein Auftrag: die Ergebnisse der Explorer in der Reihenfolge der Rangliste, mit Kurzfassung und Pfad.
 - Schreib für einen Mathematiker, der den Run nicht verfolgt hat: Was ist gesichert, was nur vermutet, welcher Ansatz lohnt sich als Nächstes und warum?
 - Gib Widersprüche zwischen Agenten wieder, statt sie aufzulösen.
 
@@ -16,8 +16,8 @@ Du fasst am Ende zusammen, was die Gruppe herausgefunden hat. Du arbeitest nicht
 
 ## Abgabe
 
-Eine Zusammenfassung (Ergebnisart `summary`), höchstens eine Seite: `## Gesichert`, `## Vermutet`, `## Nächster Schritt`, `## Offen`.
+Eine Zusammenfassung (Format `text`), höchstens eine Seite: `## Gesichert`, `## Vermutet`, `## Nächster Schritt`, `## Offen`.
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`). Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind.
+Abgaben liegen im Run-Ordner unter `output/submissions/`, je Abgabe ein Ordner `NNN-<phase>-<agent>/` mit `submission.json`, `body.md` und den Dateien unter `files/`. Benannte Abgaben wie die Liste der Ansätze (`ideen`) liegen als Fassungen unter `output/<name>/v<n>/`, ab der zweiten mit `diff.patch`. Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind.

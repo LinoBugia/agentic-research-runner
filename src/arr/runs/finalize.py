@@ -63,6 +63,7 @@ from arr.usage import RunUsage, UsageTotal, compute_run_usage, write_usage_json
 __all__ = [
     "DiffResult",
     "changes_diff",
+    "failed_stage_text",
     "clean_up_after_scan",
     "finalize_run",
     "last_turn_error",
@@ -837,6 +838,24 @@ def _result_markdown(result: Result, ratings: Iterable[Rating]) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
+def failed_stage_text(entries: Sequence[Mapping[str, Any]]) -> str | None:
+    """The reason of a run that ended at a stage that did not pass, None otherwise: the old
+    topologies write a checkpoint with `reason: stage_failed` (wording unchanged), a phases
+    run a `stage_end` with `outcome: stage_failed` (W4b-06a.1, Entscheidung 81)."""
+    checkpoints = [e["data"] for e in entries if e["kind"] == "checkpoint"]
+    for data in checkpoints:
+        if data.get("reason") == "stage_failed":
+            return f"Die Stufe „{data.get('stage')}“ wurde nicht bestanden (stage_failed)."
+    for data in checkpoints:
+        if (
+            data.get("phase") == "stage_end"
+            and data.get("outcome") == "stage_failed"
+            and "valid" in data  # the old topologies write no `valid`
+        ):
+            return f"Die Phase „{data.get('stage')}“ wurde nicht bestanden (stage_failed)."
+    return None
+
+
 def _status_and_reason(
     meta: RunMeta, entries: Sequence[Mapping[str, Any]]
 ) -> tuple[RunStatus, str]:
@@ -851,14 +870,7 @@ def _status_and_reason(
     ran = any(
         e["kind"] == "status" and e["data"].get("status") == RunStatus.RUNNING for e in entries
     )
-    failed_stage = next(
-        (
-            e["data"].get("stage")
-            for e in entries
-            if e["kind"] == "checkpoint" and e["data"].get("reason") == "stage_failed"
-        ),
-        None,
-    )
+    failed = failed_stage_text(entries)
     if meta.status.is_final:
         status = meta.status
     elif stops or (not ran and not errors):
@@ -876,8 +888,8 @@ def _status_and_reason(
     elif limits:
         kind = str(limits[0].get("limit"))
         reason = "Limit: " + _LIMIT_TEXT.get(kind, kind)
-    elif failed_stage:
-        reason = f"Die Stufe „{failed_stage}“ wurde nicht bestanden (stage_failed)."
+    elif failed:
+        reason = failed
     else:
         reason = "Die Topologie ist regulär durchgelaufen."
     return status, reason

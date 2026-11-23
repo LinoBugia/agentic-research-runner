@@ -1,0 +1,182 @@
+{
+ "template": "exploration",
+ "case": "kanal",
+ "params": {
+  "exchange": "channel"
+ },
+ "turns": [
+  [
+   "ideen",
+   1,
+   {
+    "ideator": 1
+   }
+  ],
+  [
+   "exploration-kanal",
+   1,
+   {
+    "explorer-1": 4,
+    "explorer-2": 2,
+    "ranker-1": 1
+   }
+  ],
+  [
+   "zusammenfassung",
+   1,
+   {
+    "summarizer": 1
+   }
+  ]
+ ],
+ "sight": [
+  [
+   "ideen",
+   1,
+   {
+    "ideator": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    }
+   }
+  ],
+  [
+   "exploration-kanal",
+   1,
+   {
+    "explorer-1": {
+     "eingaben": [
+      "eintrag"
+     ],
+     "kanaele": [
+      "werkstatt"
+     ],
+     "versiegelt": false,
+     "texte": [
+      "Idee 1",
+      "Idee 3"
+     ]
+    },
+    "explorer-2": {
+     "eingaben": [
+      "eintrag"
+     ],
+     "kanaele": [
+      "werkstatt"
+     ],
+     "versiegelt": false,
+     "texte": [
+      "Idee 2"
+     ]
+    },
+    "ranker-1": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": [
+      "Idee 1",
+      "Idee 2",
+      "Idee 3"
+     ]
+    }
+   }
+  ],
+  [
+   "zusammenfassung",
+   1,
+   {
+    "summarizer": {
+     "eingaben": [
+      "ideen",
+      "ideen-inhalt",
+      "staende"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": [
+      "Idee 1",
+      "Idee 2",
+      "Idee 3"
+     ]
+    }
+   }
+  ]
+ ],
+ "submissions": {
+  "exploration-kanal/explorer-1": {
+   "format": "text",
+   "count": 4
+  },
+  "exploration-kanal/explorer-2": {
+   "format": "text",
+   "count": 2
+  },
+  "exploration-kanal/ranker-1": {
+   "format": "rating",
+   "count": 3
+  },
+  "ideen/ideator": {
+   "format": "list",
+   "count": 3
+  },
+  "zusammenfassung/summarizer": {
+   "format": "text",
+   "count": 1
+  }
+ },
+ "items": {},
+ "gates": [
+  [
+   "exploration-kanal",
+   "ranked"
+  ]
+ ],
+ "stage_ends": [],
+ "ranking": [
+  1,
+  2,
+  3
+ ],
+ "end": {
+  "status": "done",
+  "how": "ende",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": []
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "exploration-kanal",
+   "explorer-1",
+   "text"
+  ],
+  [
+   "exploration-kanal",
+   "explorer-2",
+   "text"
+  ],
+  [
+   "exploration-kanal",
+   "ranker-1",
+   "rating"
+  ],
+  [
+   "ideen",
+   "ideator",
+   "list"
+  ],
+  [
+   "zusammenfassung",
+   "summarizer",
+   "text"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}

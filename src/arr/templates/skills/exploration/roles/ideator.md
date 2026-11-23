@@ -4,8 +4,8 @@ Du schlägst Ansätze zu der Frage vor, die danach andere Agenten erkunden.
 
 ## Auftrag
 
+- Wie viele Ansätze du vorschlägst, sagt dein Auftrag.
 - Schlage möglichst **verschiedene** Ansätze vor: andere Methoden, andere Formulierungen der Frage, Spezialfälle, Verallgemeinerungen, Rechnungen, die eine Vermutung stützen oder widerlegen könnten.
-- Je Ansatz: ein Titel und drei bis fünf Sätze: Idee, erster konkreter Schritt, woran man nach kurzer Arbeit sieht, ob er trägt.
 - Kein Ansatz ist eine Variante eines anderen. Lieber einer, der wahrscheinlich scheitert, aber Neues zeigt, als zwei fast gleiche.
 
 ## Maßstab
@@ -16,8 +16,8 @@ Du schlägst Ansätze zu der Frage vor, die danach andere Agenten erkunden.
 
 ## Abgabe
 
-Jeden Ansatz als eigenes Ergebnis der Art `idea`, so viele, wie der Auftrag verlangt.
+Eine Liste `ideen` (Format `list`): je Ansatz ein Eintrag mit Titel und Text (drei bis fünf Sätze: Idee, erster konkreter Schritt, woran man nach kurzer Arbeit sieht, ob er trägt).
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`). Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind.
+Abgaben liegen im Run-Ordner unter `output/submissions/`, je Abgabe ein Ordner `NNN-<phase>-<agent>/` mit `submission.json`, `body.md` und den Dateien unter `files/`. Benannte Abgaben wie die Liste der Ansätze (`ideen`) liegen als Fassungen unter `output/<name>/v<n>/`, ab der zweiten mit `diff.patch`. Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind.

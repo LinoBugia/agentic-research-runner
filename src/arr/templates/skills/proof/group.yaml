@@ -1,7 +1,9 @@
+# Start skill `proof` as phases (W4b-06a): one phase per stage, rated by a gate `judge`.
+# `max_attempts` = 1 + reworks; `on_fail` is the route after the last attempt.
 kind: research-group
 version: 1
 description: Beweis in Stufen entwickeln, Strategie, Skizze, Beweis, mit Ratings und Nacharbeit
-topology: waterfall
+topology: phases
 
 params:
   pass_score:
@@ -9,15 +11,15 @@ params:
     min: 1
     max: 10
     doc: "Mindest-Score (Mittel der Rater, Skala 1–10), ab dem eine Stufe angenommen ist"
-  max_rework:
-    default: 1
-    min: 0
-    max: 1
-    doc: "Nacharbeiten je Stufe, wenn der Score zu niedrig ist"
+  max_attempts:
+    default: 2
+    min: 1
+    max: 2
+    doc: "Versuche je Stufe (1 + Nacharbeiten), solange der Score zu niedrig ist"
   on_fail:
-    default: continue
-    choices: [continue, stop, escalate]
-    doc: "Stufe nicht bestanden: continue nimmt den besten Versuch, stop beendet den Run, escalate fragt dich in der GUI"
+    default: next
+    choices: [next, stop, escalate]
+    doc: "Stufe nicht bestanden: next nimmt den besten Versuch, stop beendet den Run, escalate fragt dich"
   n_raters:
     default: 2
     min: 1
@@ -54,9 +56,45 @@ agents:
       - { provider: claude, model: claude-sonnet-5-5 }
       - { provider: codex }
 
-stages:
-  - { name: strategie, agent: strategist, produces: strategie.md }
-  - { name: skizze, agent: prover, produces: skizze.md }
-  - { name: beweis, agent: prover, produces: beweis.md }
+phases:
+  - name: strategie
+    topology: solo
+    max_visits: "{{ params.max_attempts }}"
+    on_exhausted: "{{ params.on_fail }}"
+    actions:
+      strategist: { task: tasks/strategie.md, submission: { format: artifact, name: strategie }, turns: 1 }
+    gate:
+      type: judge
+      raters: [rater-*]
+      action: { task: tasks/bewerten.md, submission: { format: rating }, turns: 1 }
+      rule: mean
+      pass_score: "{{ params.pass_score }}"
+      routes: { pass: next, fail: retry }
 
-raters: [rater-*]
+  - name: skizze
+    topology: solo
+    max_visits: "{{ params.max_attempts }}"
+    on_exhausted: "{{ params.on_fail }}"
+    actions:
+      prover: { task: tasks/skizze.md, submission: { format: artifact, name: skizze }, turns: 1 }
+    gate:
+      type: judge
+      raters: [rater-*]
+      action: { task: tasks/bewerten.md, submission: { format: rating }, turns: 1 }
+      rule: mean
+      pass_score: "{{ params.pass_score }}"
+      routes: { pass: next, fail: retry }
+
+  - name: beweis
+    topology: solo
+    max_visits: "{{ params.max_attempts }}"
+    on_exhausted: "{{ params.on_fail }}"
+    actions:
+      prover: { task: tasks/beweis.md, submission: { format: artifact, name: beweis }, turns: 1 }
+    gate:
+      type: judge
+      raters: [rater-*]
+      action: { task: tasks/bewerten.md, submission: { format: rating }, turns: 1 }
+      rule: mean
+      pass_score: "{{ params.pass_score }}"
+      routes: { pass: next, fail: retry }

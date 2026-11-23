@@ -10,6 +10,7 @@ See docs/03-skills-und-research-groups.md §1-3 and docs/spikes/S1_claude.md §3
 import contextlib
 import difflib
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -41,6 +42,9 @@ __all__ = [
     "START_SKILLS",
     "SkillInfo",
     "StartSkills",
+    "SkillUpdate",
+    "StartSkillUpdate",
+    "StartSkillsUpdate",
     "check_research_skills",
     "copy_skill_tree",
     "discover_skills",
@@ -56,6 +60,9 @@ __all__ = [
     "snapshot_skills",
     "start_skill_files",
     "start_skills_message",
+    "tree_digest",
+    "update_start_skills",
+    "update_lines",
     "write_claude_plugin",
 ]
 
@@ -833,3 +840,357 @@ def start_skills_message(created: Sequence[str], existing: Sequence[str]) -> str
             f"Alle Start-Skills sind schon da ({', '.join(existing)}). arr hat nichts verändert."
         )
     return " ".join(parts)
+
+
+# --------------------------------------------------------------------------------------------
+# Updating unchanged start skills (W4b-06a, B1 of W4-06)
+# --------------------------------------------------------------------------------------------
+
+
+def tree_digest(files: dict[str, bytes]) -> str:
+    """Checksum of a skill tree: sorted relative POSIX paths with their contents (the files of
+    `start_skill_files`; names starting with `.` or `_` are not part of a tree)."""
+    digest = hashlib.sha256()
+    for rel in sorted(files):
+        data = files[rel]
+        path = rel.encode("utf-8")
+        digest.update(len(path).to_bytes(8, "big") + path + len(data).to_bytes(8, "big") + data)
+    return digest.hexdigest()
+
+
+CURRENT_DIGESTS: dict[str, tuple[str, str]] = {
+    ARR_SKILL: ("c82f909", "ef12554041a5820b4665cf46c5b70e9c7d7035175f432bf2276a371c3d2557f7"),
+    "exploration": (
+        "25eeb52",
+        "b7f69ed596b701188bc34a9c8f2e2148843f03cebf9703a67c161b30c65e4d15",
+    ),
+    "latex-writeup": (
+        "81cb75e",
+        "44dcbbcbe1a996f725eb9651dd08fc636317eb1d2db965349471d73f957d1f36",
+    ),
+    "proof": ("a3da52c", "64fa3add21db893a9b036f1bd551c4c65c817adc1beabcdf1de2aa5b2439c7af"),
+    "proof-review": (
+        "25eeb52",
+        "9bf889c9ed0160186c33f9c708a461da2bbe4aa0cfa60d903e3f980f3dcf31b8",
+    ),
+    "roundtable": ("a3da52c", "d30453152f47d9dafc6937a9710ddcd7aea61a861cfdbefbff599f303c21cd2f"),
+    "sympy-check": (
+        "1fccb85",
+        "324a9f2a829f7c2d99a48935685fcd14fb70d67107713f07a8c2a8d396c1a342",
+    ),
+}
+"""The version of each start skill this arr ships: (where it came from, `tree_digest` of
+`start_skill_files`). `tests/test_templates_update.py` holds the checksums: whoever changes a
+start skill moves the old entry into `EARLIER_DIGESTS` and enters the new one here."""
+
+EARLIER_DIGESTS: dict[str, tuple[tuple[str, str], ...]] = {
+    ARR_SKILL: (
+        ("81cb75e", "1e6af18c02255b66e4341b2fab99056ca23f2be2454b6b6c068f82489df93d0e"),
+        ("fe2b0aa", "7bdf5f9ad35848d60c125d753211a0f46bb13a29c97e209a5261ce74790ed791"),
+    ),
+    "exploration": (
+        ("81cb75e", "1e75c86906f2aa5df9ad048ec99061b7277e4adaf00e243bad6cbc00fb093fbc"),
+        ("fe2b0aa", "3e2b880fe8767073315bd617b94bf0d8b1ecbc5caa0352622756210ccb5772c1"),
+        ("5676589", "f764620e80d26be632aebf15d200c6969166b8332962b62c1185db79a4a49c25"),
+    ),
+    "latex-writeup": (),
+    "proof": (
+        ("81cb75e", "fdff9f91315ee4bf859a0430734b3ca57b6c69cb44db2b1cd57852d5e141c634"),
+        ("fe2b0aa", "e119ffc82f7c1a0d1e573b81fc91897f6faccbb9a73fab67aa6cc779e4a7d006"),
+        ("5676589", "f4e5a3693120877bd34f5f693aa71dc6862680cff7bb795cf5860aa77a4110d4"),
+    ),
+    "proof-review": (
+        ("81cb75e", "16d762f430ac361593eea3d330b18f02297ddc3c5c2639a0e0712ac823647a23"),
+        ("fe2b0aa", "bd11f3df4eac44d744a92dbb084c918c9cbb4e8fdb2ac9ffcdd9f52402477866"),
+        ("5676589", "c2f3f09a0f31bddee83a3ee35b2c949393ffcbf4c0849caebfc146c9286a5cd0"),
+        ("f12039f", "844329d6889123651a9ea400a1a523162695ff3fb6fd1842be0c7ea7fbf09891"),
+    ),
+    "roundtable": (
+        ("81cb75e", "b9c0ebd140a928e733c69d5108cfd3d0aa7dda597106023b538ced2ab2d2d772"),
+        ("fe2b0aa", "b2ada940d002bea12fa8443587a395bbe9225012bb4781ec9e704bbc776977d1"),
+        ("5676589", "b9584cdb638802d17c1395cb3bdde4890d925f02201f242f87327401a9e9a387"),
+    ),
+    "sympy-check": (
+        ("81cb75e", "9f1d68ac74189e3923a4b0b2f6e769ea2e55cc1646a96cc4bc7b68a9ccb949bc"),
+        ("fe2b0aa", "118aff87e23bf5a05ff80297a20305f1a897a81c825664768bd84f59353bc4cf"),
+        ("5676589", "e77e972f1a6ebd9f15172c097e830af41798c4ee5a34e612a3bd78667c29619c"),
+        ("34b7a1f", "2516e120b0a79bc6176d28c3437841fd605d8bfd56b04e0459293794b6ffec63"),
+    ),
+}
+"""Every earlier version of each start skill arr shipped since W4-05 (`81cb75e`): (commit,
+checksum), computed once from the Git history of `src/arr/templates/skills/<name>/` and
+`src/arr/templates/project/arr-skill.md` (each commit that changed them; the same checksum
+counts once, with its first commit). A folder equal to one of them was never changed by the
+user and is replaced by `update_start_skills`."""
+
+
+class SkillUpdate(StrEnum):
+    """What `update_start_skills` did with a start skill."""
+
+    UPDATED = "updated"
+    """It was an earlier version of arr; now it is the current one."""
+    CURRENT = "current"
+    """It is the current version already."""
+    CHANGED = "changed"
+    """It matches no version arr shipped (changed by the user, own files beside the shipped
+    ones, or not a plain folder): left as it is."""
+    MISSING = "missing"
+    """There is none; it is not created (that is „Start-Skills anlegen“)."""
+    FAILED = "failed"
+    """A read or write failed; the start skill is as before (`StartSkillUpdate.note` says)."""
+
+
+@dataclass(frozen=True, slots=True)
+class StartSkillUpdate:
+    """The result for one start skill. `note`: with `UPDATED` the hidden folder of the old
+    version that could not be removed (empty if none), with `FAILED` the German reason."""
+
+    result: SkillUpdate
+    note: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class StartSkillsUpdate:
+    """Result of `update_start_skills`: one entry per start skill, in the order asked."""
+
+    skills: dict[str, StartSkillUpdate]
+
+    @property
+    def results(self) -> dict[str, SkillUpdate]:
+        return {name: item.result for name, item in self.skills.items()}
+
+    @property
+    def failed(self) -> bool:
+        return any(item.result is SkillUpdate.FAILED for item in self.skills.values())
+
+
+_UPDATE_TEXT = {
+    SkillUpdate.UPDATED: "aktualisiert",
+    SkillUpdate.CURRENT: "schon aktuell",
+    SkillUpdate.CHANGED: "von dir geändert, bleibt unverändert",
+    SkillUpdate.MISSING: "fehlt, wird nicht angelegt (das geht über „Start-Skills anlegen“)",
+}
+
+IGNORED_NAMES = frozenset({".DS_Store", "__pycache__"})
+"""Names below a start skill that `update_start_skills` neither compares nor keeps (Finder
+and Python leave them). Every other name starting with `.` or `_` is a file of the user: the
+skill then counts as changed and is never replaced (W4b-06a.1, H1)."""
+
+
+class _Irregular(Exception):
+    """A link, a file instead of a folder, anything but plain files and folders, or an own
+    file of the user (a name starting with `.` or `_`, except `IGNORED_NAMES`)."""
+
+
+class _OldKept(OSError):
+    """The swap failed and the old version could not be put back: it lies under `kept`."""
+
+    def __init__(self, cause: OSError, kept: str) -> None:
+        super().__init__(cause.errno, cause.strerror or str(cause))
+        self.kept = kept
+
+
+def _read_tree(parent: int, name: str) -> dict[str, bytes] | None:
+    """The files below `parent/name`, read through descriptors without following any link;
+    None if there is nothing. Raises `_Irregular` for anything but plain files and folders
+    (links included), for an own file of the user and for a tree too big to be a skill."""
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        raise _Irregular(name)
+    files: dict[str, bytes] = {}
+    total = 0
+
+    def walk(folder: int, prefix: str) -> None:
+        nonlocal total
+        for entry in sorted(os.listdir(folder)):
+            if entry in IGNORED_NAMES:
+                continue
+            if entry.startswith((".", "_")):
+                raise _Irregular(entry)  # arr ships no such name: the user's own file
+            mode = os.stat(entry, dir_fd=folder, follow_symlinks=False).st_mode
+            if stat.S_ISDIR(mode):
+                sub = os.open(entry, _DIR_FLAGS, dir_fd=folder)
+                try:
+                    walk(sub, f"{prefix}{entry}/")
+                finally:
+                    os.close(sub)
+            elif stat.S_ISREG(mode):
+                fd = os.open(
+                    entry, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=folder
+                )
+                try:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        raise _Irregular(entry)
+                    chunks = []
+                    while chunk := os.read(fd, 1 << 16):
+                        total += len(chunk)
+                        if total > 8 * MAX_SKILL_FILE_BYTES:
+                            raise _Irregular(entry)  # no start skill is this big
+                        chunks.append(chunk)
+                finally:
+                    os.close(fd)
+                files[f"{prefix}{entry}"] = b"".join(chunks)
+            else:
+                raise _Irregular(entry)
+
+    try:
+        folder = os.open(name, _DIR_FLAGS, dir_fd=parent)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+            raise _Irregular(name) from None
+        raise
+    try:
+        walk(folder, "")
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+            raise _Irregular(name) from None
+        raise
+    finally:
+        os.close(folder)
+    return files
+
+
+def _digest_in(root: int, name: str) -> str | None:
+    """`tree_digest` of `skills/<name>`; None if missing; `""` if it is no plain tree."""
+    try:
+        files = _read_tree(root, name)
+    except _Irregular:
+        return ""
+    return None if files is None else tree_digest(files)
+
+
+def _swap(root: int, name: str, new: str) -> str:
+    """Put the folder `new` (hidden, below `root`) in place of `name`; the old one goes to a
+    hidden name first and is removed after. On a failure of the swap the old one is back in
+    place (`_OldKept` if even that fails). Returns the hidden name of the old version if it
+    could not be removed after the swap (W4b-06a.1, M3), else `""`."""
+    old = f".{name}.arr-{secrets.token_hex(6)}.old"
+    os.rename(name, old, src_dir_fd=root, dst_dir_fd=root)
+    try:
+        os.rename(new, name, src_dir_fd=root, dst_dir_fd=root)
+    except BaseException as exc:  # also Ctrl-C between the two renames (W4b-06a.3, NP4)
+        try:
+            os.rename(old, name, src_dir_fd=root, dst_dir_fd=root)
+        except OSError:
+            log.error("Start-Skill %s: alte Fassung liegt unter skills/%s", name, old)
+            if isinstance(exc, OSError):
+                raise _OldKept(exc, old) from None
+        raise
+    try:
+        _remove_tree(root, old)
+    except OSError:
+        log.warning("Start-Skill %s: alte Fassung bleibt unter skills/%s", name, old)
+    return old if _exists(root, old) else ""
+
+
+def _update_one(root: int, name: str) -> StartSkillUpdate:
+    found = _digest_in(root, name)
+    if found is None:
+        return StartSkillUpdate(SkillUpdate.MISSING)
+    files = start_skill_files(name)
+    if found == tree_digest(files):
+        return StartSkillUpdate(SkillUpdate.CURRENT)
+    shipped = {digest for _commit, digest in EARLIER_DIGESTS.get(name, ())}
+    if found not in shipped:
+        return StartSkillUpdate(SkillUpdate.CHANGED)
+    temp = f".{name}.arr-{secrets.token_hex(6)}.tmp"
+    os.mkdir(temp, 0o755, dir_fd=root)
+    try:
+        folder = os.open(temp, _DIR_FLAGS, dir_fd=root)
+        try:
+            _write_tree(folder, files)
+        finally:
+            os.close(folder)
+        if _digest_in(root, name) != found:  # changed meanwhile: never replaced
+            _remove_tree(root, temp)
+            return StartSkillUpdate(SkillUpdate.CHANGED)
+        kept = _swap(root, name, temp)
+    except BaseException:
+        _remove_tree(root, temp)
+        raise
+    return StartSkillUpdate(SkillUpdate.UPDATED, kept)
+
+
+def _existing_skills_root(workfolder: str | Path) -> int | None:
+    """Descriptor of `<workfolder>/skills`, None if there is none (updating creates nothing,
+    W4b-06a.1 N2); it must not be a link."""
+    try:
+        base = os.open(Path(workfolder), os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise SkillFileError(f"Der Workfolder ist nicht lesbar ({exc.strerror or exc}).") from None
+    try:
+        return os.open(SKILLS_DIR, _DIR_FLAGS, dir_fd=base)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+            raise SkillFileError(SKILLS_LINK) from None
+        raise SkillFileError(
+            f"Der Ordner {SKILLS_DIR} ließ sich nicht öffnen ({exc.strerror or exc})."
+        ) from None
+    finally:
+        os.close(base)
+
+
+def update_start_skills(
+    workfolder: str | Path, names: Sequence[str] = START_SKILLS
+) -> StartSkillsUpdate:
+    """Bring unchanged start skills in `<workfolder>/skills/` to the version of this arr.
+
+    A start skill equal byte for byte to an earlier version arr shipped (`EARLIER_DIGESTS`) is
+    replaced by the current one: built in a hidden folder next to it, its checksum read once
+    more right before the swap, no link followed; on a failure the old version stays complete.
+    One that matches no shipped version (changed by the user, an own file with `.` or `_`, a
+    link, a file) is never touched; a missing one is not created, nor is `skills/`. A failure
+    at one start skill is reported for it and the others are still done (W4b-06a.1 N1).
+    Raises `SkillFileError` with a German message for a name that is no start skill (before
+    reading anything) or a `skills/` that cannot be opened.
+    """
+    unknown = [n for n in names if n not in START_SKILLS]
+    if unknown:
+        raise SkillFileError(f"„{unknown[0]}“ ist kein Start-Skill.")
+    root = _existing_skills_root(workfolder)
+    if root is None:
+        return StartSkillsUpdate({n: StartSkillUpdate(SkillUpdate.MISSING) for n in names})
+    out: dict[str, StartSkillUpdate] = {}
+    try:
+        for name in names:
+            try:
+                out[name] = _update_one(root, name)
+            except _OldKept as exc:
+                out[name] = StartSkillUpdate(
+                    SkillUpdate.FAILED,
+                    f"ließ sich nicht aktualisieren ({exc.strerror}). Die bisherige Fassung liegt "
+                    f"unter {SKILLS_DIR}/{exc.kept}; benenne sie zurück in „{name}“.",
+                )
+            except OSError as exc:
+                out[name] = StartSkillUpdate(
+                    SkillUpdate.FAILED,
+                    f"ließ sich nicht aktualisieren ({exc.strerror or exc}). Die bisherige "
+                    "Fassung ist unverändert.",
+                )
+    finally:
+        os.close(root)
+    updated = [n for n, r in out.items() if r.result is SkillUpdate.UPDATED]
+    if updated:
+        log.info("Start-Skills aktualisiert: %s", ", ".join(updated))
+    return StartSkillsUpdate(out)
+
+
+def update_lines(update: StartSkillsUpdate) -> list[str]:
+    """One German line per start skill for `arr skills update`."""
+    lines = []
+    for name, item in update.skills.items():
+        if item.result is SkillUpdate.FAILED:
+            lines.append(f"{name}: {item.note}")
+        elif item.result is SkillUpdate.UPDATED and item.note:
+            lines.append(
+                f"{name}: aktualisiert; die alte Fassung liegt noch unter "
+                f"{SKILLS_DIR}/{item.note}, lösche sie selbst."
+            )
+        else:
+            lines.append(f"{name}: {_UPDATE_TEXT[item.result]}")
+    return lines

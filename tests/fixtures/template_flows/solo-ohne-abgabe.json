@@ -1,0 +1,48 @@
+{
+ "template": "solo",
+ "case": "ohne-abgabe",
+ "params": {
+  "max_turns": 3
+ },
+ "turns": [
+  [
+   "arbeit",
+   1,
+   {
+    "worker": 3
+   }
+  ]
+ ],
+ "sight": [
+  [
+   "arbeit",
+   1,
+   {
+    "worker": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    }
+   }
+  ]
+ ],
+ "submissions": {},
+ "items": {},
+ "gates": [],
+ "stage_ends": [],
+ "ranking": [],
+ "end": {
+  "status": "done",
+  "how": "ende",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": []
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "summary.md"
+  ]
+ ]
+}

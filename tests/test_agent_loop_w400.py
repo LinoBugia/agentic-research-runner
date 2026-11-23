@@ -31,10 +31,12 @@ from arr.runs.orchestrator import WORKED_ON
 D1, D2 = "diskutant-1", "diskutant-2"
 BACKENDS = ["claude.md", "codex.md"]
 USER_WAIT = (
-    "Auf den User wartest du nur mit `wait_for_messages`, nie mit `wait_until`: Antwortet er "
-    "nicht, arbeite mit einer begründeten Annahme weiter und nenne sie in deinem Ergebnis. Eine "
-    "späte Antwort weckt dich; prüfe dann deine Annahme."
+    "In einem Run ohne Phasen wartest du auf den User nur mit `wait_for_messages`, nie mit "
+    "`wait_until`: Antwortet er nicht, arbeite mit einer begründeten Annahme weiter und nenne sie "
+    "in deinem Ergebnis. Eine späte Antwort weckt dich; prüfe dann deine Annahme."
 )
+"""V10 in the prompts: since W4b-06a for runs without phases (there the agent may wait for
+the user once with `wait_until`, at most five minutes, Entscheidung 69)."""
 
 
 def prompt_text(name: str) -> str:

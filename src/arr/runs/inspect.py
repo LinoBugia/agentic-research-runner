@@ -18,6 +18,7 @@ from typing import Any
 
 from arr.errors import ArrError
 from arr.models import RunStatus
+from arr.runs.finalize import failed_stage_text
 from arr.runs.orchestrator import OrchestratorLog, stopped_text
 from arr.runs.prepare import RunMeta, load_run_meta
 from arr.usage import USAGE_FILE, RunUsage
@@ -253,14 +254,7 @@ def run_reason(meta: RunMeta, entries: Sequence[Mapping[str, Any]]) -> str:
     ran = any(
         e["kind"] == "status" and e["data"].get("status") == RunStatus.RUNNING for e in entries
     )
-    failed_stage = next(
-        (
-            e["data"].get("stage")
-            for e in entries
-            if e["kind"] == "checkpoint" and e["data"].get("reason") == "stage_failed"
-        ),
-        None,
-    )
+    failed = failed_stage_text(entries)
     if status is RunStatus.STOPPED:
         return stopped_text(entries, ran=ran)
     if status is RunStatus.FAILED:
@@ -272,8 +266,8 @@ def run_reason(meta: RunMeta, entries: Sequence[Mapping[str, Any]]) -> str:
         if limits:
             kind = str(limits[0].get("limit"))
             return "Limit: " + LIMIT_TEXT.get(kind, kind)
-        if failed_stage:
-            return f"Die Stufe „{failed_stage}“ wurde nicht bestanden (stage_failed)."
+        if failed:
+            return failed
         return "Die Topologie ist regulär durchgelaufen."
     if status is RunStatus.PAUSED:
         reasons = [e["data"].get("reason") for e in entries if e["kind"] == "pause"]

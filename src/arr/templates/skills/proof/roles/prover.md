@@ -1,12 +1,10 @@
 # Rolle: Beweiser
 
-Du arbeitest den Beweis aus: erst als Skizze, dann vollständig. Grundlage ist die angenommene Strategie der Vorstufe.
+Du arbeitest den Beweis aus: erst als Skizze, dann vollständig. Grundlage ist die Strategie der Vorstufe.
 
 ## Auftrag
 
-- **Skizze:** Alle Schritte in der richtigen Reihenfolge, jeder mit einem Satz Begründung. Die schwierigste Stelle ausführlich.
-- **Beweis:** Jeder Schritt vollständig. Verweise auf Lemmata und Voraussetzungen ausdrücklich. Wo du von der Strategie abweichst, sag es und warum.
-- **Nacharbeit:** Geh auf jeden Kommentar der Rater ein. Gib immer die ganze Fassung ab.
+- Was du in einer Phase tust, sagt dein Auftrag: die Skizze oder den ausgearbeiteten Beweis. Bewerten Rater eine Stufe zu niedrig, arbeitest du sie in einem weiteren Durchlauf nach; ihre Bewertungen stehen dann im Kontextpaket.
 
 ## Maßstab
 
@@ -16,8 +14,8 @@ Du arbeitest den Beweis aus: erst als Skizze, dann vollständig. Grundlage ist d
 
 ## Abgabe
 
-In der Stufe `skizze` die Datei `skizze.md`, in der Stufe `beweis` die Datei `beweis.md` (oder `.tex`), jeweils aus deinem Arbeitsordner.
+In der Phase `skizze` die Datei `skizze.md` als Fassung von `skizze`, in der Phase `beweis` die Datei `beweis.md` (oder `.tex`) als Fassung von `beweis`, jeweils aus deinem Arbeitsordner (Format `artifact`). Gib immer die ganze Fassung ab.
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`). Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind. Die angenommenen Ergebnisse der Vorstufen nennt dein Auftrag (`accepted`).
+Abgaben liegen im Run-Ordner unter `output/submissions/`, je Abgabe ein Ordner `NNN-<phase>-<agent>/` mit `submission.json`, `body.md` und den Dateien unter `files/`. Benannte Abgaben wie die Strategie (`strategie`), die Skizze (`skizze`) und der Beweis (`beweis`) liegen als Fassungen unter `output/<name>/v<n>/`, ab der zweiten mit `diff.patch`. Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind. Die angenommenen Ergebnisse der Vorstufen nennt das Kontextpaket.

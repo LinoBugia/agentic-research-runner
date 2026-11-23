@@ -1,0 +1,1 @@
+Bewerte jedes Ergebnis der Explorer, das das Kontextpaket nennt (Pfad und Text), einzeln nach den Kriterien der Rubrik. Jedes Ergebnis nennt den Titel des Ansatzes, den es erkundet. Prüfe die genannten Belege stichprobenartig nach. Aus den Scores entsteht die Rangliste der Ansätze.

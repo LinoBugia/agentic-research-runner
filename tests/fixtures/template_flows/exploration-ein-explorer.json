@@ -1,0 +1,156 @@
+{
+ "template": "exploration",
+ "case": "ein-explorer",
+ "params": {
+  "n_explorers": 1,
+  "n_ideas": 2
+ },
+ "turns": [
+  [
+   "ideen",
+   1,
+   {
+    "ideator": 1
+   }
+  ],
+  [
+   "exploration",
+   1,
+   {
+    "explorer-1": 4,
+    "ranker-1": 1
+   }
+  ],
+  [
+   "zusammenfassung",
+   1,
+   {
+    "summarizer": 1
+   }
+  ]
+ ],
+ "sight": [
+  [
+   "ideen",
+   1,
+   {
+    "ideator": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    }
+   }
+  ],
+  [
+   "exploration",
+   1,
+   {
+    "explorer-1": {
+     "eingaben": [
+      "eintrag"
+     ],
+     "kanaele": [],
+     "versiegelt": true,
+     "texte": [
+      "Idee 1",
+      "Idee 2"
+     ]
+    },
+    "ranker-1": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": [
+      "Idee 1",
+      "Idee 2"
+     ]
+    }
+   }
+  ],
+  [
+   "zusammenfassung",
+   1,
+   {
+    "summarizer": {
+     "eingaben": [
+      "ideen",
+      "ideen-inhalt",
+      "staende"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": [
+      "Idee 1",
+      "Idee 2"
+     ]
+    }
+   }
+  ]
+ ],
+ "submissions": {
+  "exploration/explorer-1": {
+   "format": "text",
+   "count": 4
+  },
+  "exploration/ranker-1": {
+   "format": "rating",
+   "count": 2
+  },
+  "ideen/ideator": {
+   "format": "list",
+   "count": 2
+  },
+  "zusammenfassung/summarizer": {
+   "format": "text",
+   "count": 1
+  }
+ },
+ "items": {},
+ "gates": [
+  [
+   "exploration",
+   "ranked"
+  ]
+ ],
+ "stage_ends": [],
+ "ranking": [
+  1,
+  2
+ ],
+ "end": {
+  "status": "done",
+  "how": "ende",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": []
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "exploration",
+   "explorer-1",
+   "text"
+  ],
+  [
+   "exploration",
+   "ranker-1",
+   "rating"
+  ],
+  [
+   "ideen",
+   "ideator",
+   "list"
+  ],
+  [
+   "zusammenfassung",
+   "summarizer",
+   "text"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}

@@ -1,7 +1,10 @@
+# Start skill `exploration` as phases (W4b-06a). `exchange` switches between three variants
+# of the phase `exploration`. `zusammenfassung` names the list `ideen` as an input: given ideas
+# (seed) are no submission of a phase, the standard inputs would not reach them (W4b-06a.2).
 kind: research-group
 version: 1
 description: Ansätze zu einer Frage breit erkunden und bewerten
-topology: exploration
+topology: phases
 
 params:
   ideas:
@@ -28,15 +31,13 @@ params:
     doc: "Anzahl der Explorer, abwechselnd Claude und ChatGPT"
   n_rankers:
     default: 1
-    min: 0
+    min: 1
     max: 3
-    doc: "Anzahl der Ranker (0: keine Rangliste)"
-  ideator:
-    default: ideator
-    doc: "Agent, der die Ansätze vorschlägt"
+    doc: "Anzahl der Ranker, mindestens einer"
   summarizer:
     default: summarizer
-    doc: "Agent, der am Ende zusammenfasst"
+    choices: [summarizer, none]
+    doc: "summarizer: der Agent summarizer fasst am Ende zusammen; none: keine Zusammenfassung"
 
 rubric:
   scale: [1, 10]
@@ -44,7 +45,7 @@ rubric:
 
 limits:
   wall_time: 1h
-  turns_per_agent: 12
+  turns_per_agent: 16
   budget_usd: 5
 
 defaults:
@@ -71,8 +72,76 @@ agents:
     model: claude-haiku-5-5
     effort: medium
 
-groupchats:
+channels:
   - name: werkstatt
     purpose: "Austausch der Explorer (nur bei exchange: channel)"
     members: [explorer-*]
     mode: rounds
+
+seed:
+  ideen: { param: ideas }
+
+phases:
+  - name: ideen
+    topology: solo
+    when: { param: ideas, equals: [] }
+    actions:
+      ideator: { task: tasks/ideen.md, submission: { format: list, name: ideen }, turns: 1 }
+
+  - name: exploration
+    topology: parallel
+    when: { param: exchange, equals: none }
+    isolated: true
+    over: ideen
+    repeat: "{{ params.turns_per_idea }}"
+    actions:
+      explorer-*: { task: tasks/ausarbeiten.md, submission: { format: text }, turns: 1 }
+    gate:
+      type: judge
+      raters: [ranker-*]
+      action: { task: tasks/ranking.md, submission: { format: rating }, turns: 1 }
+      rule: rank
+      routes: { ranked: next }
+
+  - name: exploration-digest
+    topology: parallel
+    when: { param: exchange, equals: digest }
+    isolated: true
+    over: ideen
+    repeat: "{{ params.turns_per_idea }}"
+    inputs:
+      - { peers: summary }
+    actions:
+      explorer-*: { task: tasks/ausarbeiten.md, submission: { format: text }, turns: 1 }
+    gate:
+      type: judge
+      raters: [ranker-*]
+      action: { task: tasks/ranking.md, submission: { format: rating }, turns: 1 }
+      rule: rank
+      routes: { ranked: next }
+
+  - name: exploration-kanal
+    topology: parallel
+    when: { param: exchange, equals: channel }
+    over: ideen
+    repeat: "{{ params.turns_per_idea }}"
+    channels: [werkstatt]
+    actions:
+      explorer-*: { task: tasks/ausarbeiten.md, submission: { format: text }, turns: 1 }
+    gate:
+      type: judge
+      raters: [ranker-*]
+      action: { task: tasks/ranking.md, submission: { format: rating }, turns: 1 }
+      rule: rank
+      routes: { ranked: next }
+
+  - name: zusammenfassung
+    topology: solo
+    when: { param: summarizer, equals: summarizer }
+    inputs:
+      - { name: ideen, content: full }
+      - { from: exploration }
+      - { from: exploration-digest }
+      - { from: exploration-kanal }
+    actions:
+      summarizer: { task: tasks/zusammenfassen.md, submission: { format: text }, turns: 1 }

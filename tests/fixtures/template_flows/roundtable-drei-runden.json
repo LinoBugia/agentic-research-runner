@@ -1,0 +1,101 @@
+{
+ "template": "roundtable",
+ "case": "drei-runden",
+ "params": {
+  "rounds": 3
+ },
+ "turns": [
+  [
+   "diskussion",
+   1,
+   {
+    "diskutant-1": 3,
+    "diskutant-2": 3,
+    "summarizer": 1
+   }
+  ],
+  [
+   "zusammenfassung",
+   1,
+   {
+    "summarizer": 1
+   }
+  ]
+ ],
+ "sight": [
+  [
+   "diskussion",
+   1,
+   {
+    "diskutant-1": {
+     "eingaben": [],
+     "kanaele": [
+      "runde"
+     ],
+     "versiegelt": false,
+     "texte": []
+    },
+    "diskutant-2": {
+     "eingaben": [],
+     "kanaele": [
+      "runde"
+     ],
+     "versiegelt": false,
+     "texte": []
+    },
+    "summarizer": {
+     "eingaben": [],
+     "kanaele": [
+      "runde"
+     ],
+     "versiegelt": false,
+     "texte": []
+    }
+   }
+  ],
+  [
+   "zusammenfassung",
+   1,
+   {
+    "summarizer": {
+     "eingaben": [
+      "verlauf"
+     ],
+     "kanaele": [
+      "runde"
+     ],
+     "versiegelt": false,
+     "texte": []
+    }
+   }
+  ]
+ ],
+ "submissions": {
+  "zusammenfassung/summarizer": {
+   "format": "text",
+   "count": 1
+  }
+ },
+ "items": {},
+ "gates": [],
+ "stage_ends": [],
+ "ranking": [],
+ "end": {
+  "status": "done",
+  "how": "ende",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": []
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "zusammenfassung",
+   "summarizer",
+   "text"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}

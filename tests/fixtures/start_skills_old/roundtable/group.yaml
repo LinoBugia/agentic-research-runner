@@ -1,0 +1,49 @@
+kind: research-group
+version: 1
+description: Offene Diskussion mehrerer Agenten zu einer Frage, mit Zusammenfassung
+topology: roundtable
+
+params:
+  rounds:
+    default: 3
+    min: 1
+    max: 6
+    doc: "Anzahl der Diskussionsrunden"
+  n_diskutanten:
+    default: 2
+    min: 2
+    max: 5
+    doc: "Anzahl der Diskutanten, abwechselnd Claude und ChatGPT"
+  summarizer:
+    default: summarizer
+    doc: "Agent, der die Diskussion am Ende zusammenfasst"
+
+limits:
+  wall_time: 45m
+  turns_per_agent: 10
+  budget_usd: 3
+
+defaults:
+  provider: claude
+  model: claude-sonnet-5-5
+  effort: high
+  workspace: { mode: copy }
+
+agents:
+  - id: diskutant
+    count: "{{ params.n_diskutanten }}"
+    role: roles/diskutant.md
+    skills: [sympy-check]
+    mix:
+      - { provider: claude, model: claude-sonnet-5-5 }
+      - { provider: codex }
+  - id: summarizer
+    role: roles/summarizer.md
+    model: claude-haiku-5-5
+    effort: medium
+
+groupchats:
+  - name: runde
+    purpose: "Gemeinsame Diskussion der Frage"
+    members: [diskutant-*, summarizer]
+    mode: rounds
