@@ -36,7 +36,7 @@ A group is built from a few parts, so that you can compose one to fit a problem:
 - **Actions** are what the agents do in a phase. An action is a task and a submission: what the agent is asked to do, and what it hands in at the end in a fixed format that `arr` can read.
 - **Gates** decide when a phase ends and where the run goes: when the work is done, by a signal from the agents, by judges, or by you.
 
-Four start skills are built from these parts: `proof-review`, `proof`, `exploration` and `roundtable`. The older fixed workflows still run until they are removed. [docs/research-groups.md](docs/research-groups.md) explains the model and shows each start skill as a diagram.
+Every run is built from these parts; the older fixed workflows are gone. Four start skills come with `arr`: `proof-review`, `proof`, `exploration` and `roundtable`. [docs/research-groups.md](docs/research-groups.md) explains the model and shows each start skill as a diagram.
 
 ## Security
 
