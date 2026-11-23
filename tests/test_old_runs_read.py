@@ -22,6 +22,7 @@ from old_runs_kit import (
     SOLO,
     WATERFALL,
     WATERFALL_FAILED,
+    differences,
     readings,
     restore,
 )
@@ -50,10 +51,9 @@ def expected(name: str) -> dict[str, Any]:
 @pytest.mark.parametrize("name", NAMES)
 async def test_an_old_run_reads_as_on_main(wf: Path, name: str) -> None:
     found = await readings(make_api(wf), wf, name)
-    want = expected(name)
-    for key in want:
-        assert found[key] == want[key], f"{name}: {key} differs from main"
-    assert found.keys() == want.keys()
+    # times within a millisecond (the room's `REAL` values come back from SQL text slightly
+    # differently per platform, `old_runs_kit.TIME_TOLERANCE_S`); everything else exactly
+    assert differences(found, expected(name)) == [], f"{name} differs from main"
 
 
 async def test_the_old_wording_stays(wf: Path) -> None:
@@ -110,3 +110,31 @@ async def test_the_run_page_of_an_old_review(wf: Path, monkeypatch: pytest.Monke
         assert "Urteil: major" in html
         await user.open(f"/runs/{WATERFALL_FAILED}")
         await see(user, "Die Stufe „skizze“ wurde nicht bestanden", retries=200)
+
+
+def test_differences_allows_only_a_time_off_by_less_than_a_millisecond() -> None:
+    """The comparison of the snapshots (counter-check): a time off in the seventh decimal stays
+    equal, one off by a second is a difference, and so is every other changed value."""
+    import copy
+
+    want = expected(SOLO)
+    [agent] = want["list_agents"]
+    assert isinstance(agent["state_since"], float)
+
+    def changed(key: str, value: Any) -> list[str]:
+        found = copy.deepcopy(want)
+        found["list_agents"][0][key] = value
+        return differences(found, want)
+
+    assert differences(copy.deepcopy(want), want) == []
+    assert changed("state_since", agent["state_since"] + 3e-7) == []
+    assert changed("state_since", agent["state_since"] + 1.0) != []
+    assert changed("id", agent["id"] + "x") != []
+    assert changed("turn", agent["turn"] + 1) != []
+    assert changed("turn", float(agent["turn"])) != [], "the type counts as well"
+    found = copy.deepcopy(want)
+    found["get_run"]["run"]["limits"]["budget_usd"] += 3e-7  # not a time: exact
+    assert differences(found, want) != []
+    found = copy.deepcopy(want)
+    del found["list_agents"][0]["state_since"]
+    assert differences(found, want) != []
