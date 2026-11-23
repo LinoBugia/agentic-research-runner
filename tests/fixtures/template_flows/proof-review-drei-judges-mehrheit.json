@@ -1,0 +1,212 @@
+{
+ "template": "proof-review",
+ "case": "drei-judges-mehrheit",
+ "params": {
+  "judges": 3
+ },
+ "turns": [
+  [
+   "fassung",
+   1,
+   {
+    "author": 1
+   }
+  ],
+  [
+   "pruefung",
+   1,
+   {
+    "judge-1": 1,
+    "judge-2": 1,
+    "judge-3": 1
+   }
+  ],
+  [
+   "diskussion",
+   1,
+   {
+    "judge-1": 1,
+    "judge-2": 1,
+    "judge-3": 1
+   }
+  ]
+ ],
+ "sight": [
+  [
+   "fassung",
+   1,
+   {
+    "author": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    }
+   }
+  ],
+  [
+   "pruefung",
+   1,
+   {
+    "judge-1": {
+     "eingaben": [
+      "beweis"
+     ],
+     "kanaele": [],
+     "versiegelt": true,
+     "texte": []
+    },
+    "judge-2": {
+     "eingaben": [
+      "beweis"
+     ],
+     "kanaele": [],
+     "versiegelt": true,
+     "texte": []
+    },
+    "judge-3": {
+     "eingaben": [
+      "beweis"
+     ],
+     "kanaele": [],
+     "versiegelt": true,
+     "texte": []
+    }
+   }
+  ],
+  [
+   "diskussion",
+   1,
+   {
+    "judge-1": {
+     "eingaben": [
+      "beweis",
+      "einwaende",
+      "gutachten"
+     ],
+     "kanaele": [
+      "judges"
+     ],
+     "versiegelt": false,
+     "texte": []
+    },
+    "judge-2": {
+     "eingaben": [
+      "beweis",
+      "einwaende",
+      "gutachten"
+     ],
+     "kanaele": [
+      "judges"
+     ],
+     "versiegelt": false,
+     "texte": []
+    },
+    "judge-3": {
+     "eingaben": [
+      "beweis",
+      "einwaende",
+      "gutachten"
+     ],
+     "kanaele": [
+      "judges"
+     ],
+     "versiegelt": false,
+     "texte": []
+    }
+   }
+  ]
+ ],
+ "submissions": {
+  "diskussion/judge-1": {
+   "format": "review",
+   "count": 1
+  },
+  "diskussion/judge-2": {
+   "format": "review",
+   "count": 1
+  },
+  "diskussion/judge-3": {
+   "format": "review",
+   "count": 1
+  },
+  "fassung/author": {
+   "format": "artifact",
+   "count": 1
+  },
+  "pruefung/judge-1": {
+   "format": "review",
+   "count": 1
+  },
+  "pruefung/judge-2": {
+   "format": "review",
+   "count": 1
+  },
+  "pruefung/judge-3": {
+   "format": "review",
+   "count": 1
+  }
+ },
+ "items": {
+  "beweis": {
+   "versions": 1,
+   "last_by": "author"
+  }
+ },
+ "gates": [
+  [
+   "diskussion",
+   "accept"
+  ]
+ ],
+ "stage_ends": [],
+ "ranking": [],
+ "end": {
+  "status": "done",
+  "how": "stopp",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": []
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "diskussion",
+   "judge-1",
+   "review"
+  ],
+  [
+   "diskussion",
+   "judge-2",
+   "review"
+  ],
+  [
+   "diskussion",
+   "judge-3",
+   "review"
+  ],
+  [
+   "fassung",
+   "author",
+   "artifact"
+  ],
+  [
+   "pruefung",
+   "judge-1",
+   "review"
+  ],
+  [
+   "pruefung",
+   "judge-2",
+   "review"
+  ],
+  [
+   "pruefung",
+   "judge-3",
+   "review"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}

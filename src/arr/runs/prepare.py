@@ -42,6 +42,7 @@ from arr.models import (
     RunStatus,
     RunVenvMode,
     Starter,
+    TopologyKind,
     WorkfolderSettings,
     WorkspaceMode,
 )
@@ -95,6 +96,19 @@ DEFAULT_ROLE = (
     "Du bist ein Research-Agent in diesem Run. Für dich ist keine Rolle festgelegt: "
     "Bearbeite die Aufgabe selbstständig und gib deine Ergebnisse mit `submit_result` ab.\n"
 )
+"""The role of an agent without one, in a run without phases."""
+DEFAULT_ROLE_PHASES = (
+    "Du bist ein Research-Agent in diesem Run. Für dich ist keine Rolle festgelegt: "
+    "Bearbeite deinen Auftrag selbstständig und gib mit `submit` ab.\n"
+)
+"""The role of an agent without one in a run with phases (W4b-06a): its room offers `submit`."""
+
+
+def default_role(resolved: ResolvedRun) -> str:
+    """The role text of an agent without a role, for the kind of run."""
+    return DEFAULT_ROLE_PHASES if resolved.topology.kind is TopologyKind.PHASES else DEFAULT_ROLE
+
+
 ALWAYS_EXCLUDED = (".claude/skills", ".agents/skills", "/.mcp.json", "/AGENTS.override.md")
 """Never copied into `base/` and the working copies.
 
@@ -534,6 +548,12 @@ def _team_items(resolved: ResolvedRun, agent: AgentConfig) -> list[str]:
         items.append(
             "- In anonymen Kanälen kennst du die anderen nur als „Mitglied A/B/…“, sie dich auch."
         )
+    from arr.room.store import channel_aliases  # the room imports this module
+
+    for channel in resolved.groupchats:  # B2 (W4-06): the agent's own alias, as the room has it
+        own = channel_aliases(channel).get(agent.id) if channel.anonymous else None
+        if own:
+            items.append(f"- In #{channel.name} heißt du „{own}“.")
     return items
 
 
@@ -577,8 +597,9 @@ def _research_block(
                 items.append(f"  - `{name}`" + (f": {purpose}" if purpose else ""))
         else:
             items.append("- Du bist in keinem Gruppenchat.")
+    tool = "submit" if resolved.topology.kind is TopologyKind.PHASES else "submit_result"
     items.append(
-        "- Ergebnisse gibst du mit `submit_result` ab. Dateien in diesem Ordner sind "
+        f"- Ergebnisse gibst du mit `{tool}` ab. Dateien in diesem Ordner sind "
         "Arbeitsmaterial; erst was du abgibst, zählt als Ergebnis."
     )
     template = Template(read_template("run", "research-agent-block.md"))
@@ -1305,7 +1326,7 @@ def _build_run(
         if role_source is not None:
             shutil.copyfile(role_source, agent_dir / "role.md")
         else:
-            (agent_dir / "role.md").write_text(DEFAULT_ROLE, encoding="utf-8")
+            (agent_dir / "role.md").write_text(default_role(resolved), encoding="utf-8")
 
         mode = agent.workspace.mode
         generated: list[str] = []

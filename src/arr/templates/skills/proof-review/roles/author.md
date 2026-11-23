@@ -4,8 +4,7 @@ Du schreibst den Beweis, den unabhängige Judges prüfen, und überarbeitest ihn
 
 ## Auftrag
 
-- **Erste Fassung:** Kommt der Beweis nicht aus dem Projekt, schreibst du ihn nach der Aufgabe. Lege ihn als Datei in deinem Arbeitsordner an (z. B. `beweis.md` oder `beweis.tex`) und gib die Datei ab.
-- **Überarbeitung:** Der Auftrag nennt Urteil, Einwände mit Status und die Gutachten. Behebe jeden offenen Einwand oder begründe kurz, warum er nicht zutrifft. Gib immer die ganze neue Fassung ab, nicht nur eine Liste von Änderungen.
+- Was du in einer Phase tust, sagt dein Auftrag: die erste Fassung schreiben (sie entfällt, wenn der Beweis aus dem Projekt kommt) oder eine Fassung nach dem Urteil der Judges überarbeiten.
 - **Aussage ändern** nur, wenn sie so nicht stimmt. Dann steht das am Anfang der Fassung, z. B. „Abgeschwächt: gilt nur für n ≤ 39“.
 
 ## Maßstab
@@ -16,8 +15,8 @@ Du schreibst den Beweis, den unabhängige Judges prüfen, und überarbeitest ihn
 
 ## Abgabe
 
-Eine Fassung des Beweises als Datei (Ergebnisart `artifact`). Am Ende der Fassung je eine kurze Zeile pro behandeltem Einwand, sonst nichts (keine Prüfnotizen): in Markdown unter `## Änderungen` (`[E2] behoben: …`), in einer `.tex`-Fassung als Kommentarzeilen (`% [E2] behoben: …`), damit die Datei übersetzbar bleibt.
+Jede Fassung ist eine neue Fassung von `beweis` (Format `artifact`): immer die ganze Datei, nicht nur eine Liste von Änderungen. Am Ende der Fassung je eine kurze Zeile pro behandeltem Einwand, sonst nichts (keine Prüfnotizen): in Markdown unter `## Änderungen` (`[E2] behoben: …`), in einer `.tex`-Fassung als Kommentarzeilen (`% [E2] behoben: …`), damit die Datei übersetzbar bleibt.
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`). Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind. Die Fassungen des Beweises legt arr unter `output/artifacts/v<n>/` ab.
+Abgaben liegen im Run-Ordner unter `output/submissions/`, je Abgabe ein Ordner `NNN-<phase>-<agent>/` mit `submission.json`, `body.md` und den Dateien unter `files/`. Benannte Abgaben wie der Beweis (`beweis`) liegen als Fassungen unter `output/<name>/v<n>/`, ab der zweiten mit `diff.patch`. Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind.

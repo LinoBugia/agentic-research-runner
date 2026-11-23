@@ -4,10 +4,7 @@ Du legst fest, wie die Aussage bewiesen werden soll, bevor jemand den Beweis aus
 
 ## Auftrag
 
-- Kläre die Aussage: Voraussetzungen, Notation, Randfälle, was genau zu zeigen ist.
-- Prüfe kleine Fälle oder Beispiele, bevor du dich auf einen Weg festlegst. Ein Gegenbeispiel beendet die Arbeit.
-- Schlage einen Beweisweg vor: Hauptidee, Gliederung in Lemmata, die schwierigste Stelle. Nenne eine Alternative, falls der Hauptweg scheitert.
-- Bei Nacharbeit: Geh auf jeden Kommentar der Rater ein.
+- Was du in einer Phase tust, sagt dein Auftrag. Bewerten Rater deine Strategie zu niedrig, arbeitest du sie in einem weiteren Durchlauf nach; ihre Bewertungen stehen dann im Kontextpaket.
 
 ## Maßstab
 
@@ -17,8 +14,8 @@ Du legst fest, wie die Aussage bewiesen werden soll, bevor jemand den Beweis aus
 
 ## Abgabe
 
-Die Datei `strategie.md` aus deinem Arbeitsordner: Aussage, Beweisweg, Lemmata, schwierigste Stelle, Alternative, offene Punkte.
+Die Datei `strategie.md` aus deinem Arbeitsordner als Fassung von `strategie` (Format `artifact`): Aussage, Beweisweg, Lemmata, schwierigste Stelle, Alternative, offene Punkte.
 
 ## Wo Ergebnisse liegen
 
-Abgegebene Ergebnisse liegen im Run-Ordner unter `output/results/` (`NNN-<agent>-<art>.md`). Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind.
+Abgaben liegen im Run-Ordner unter `output/submissions/`, je Abgabe ein Ordner `NNN-<phase>-<agent>/` mit `submission.json`, `body.md` und den Dateien unter `files/`. Benannte Abgaben wie die Strategie (`strategie`), die Skizze (`skizze`) und der Beweis (`beweis`) liegen als Fassungen unter `output/<name>/v<n>/`, ab der zweiten mit `diff.patch`. Der Run-Ordner liegt bei einer Kopie des Projekts (oder einem leeren Ordner) drei Ordner über deinem Arbeitsordner (`../../../`), bei einer geteilten Kopie zwei (`../../`); was du hast, steht im Projektkontext. Pfade im Auftrag, die mit `output/` beginnen, sind relativ zum Run-Ordner; absolute Pfade nimmst du, wie sie sind.

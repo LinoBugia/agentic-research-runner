@@ -1,0 +1,187 @@
+{
+ "template": "proof-review",
+ "case": "ohne-diskussion",
+ "params": {
+  "discussion_rounds": 0
+ },
+ "turns": [
+  [
+   "fassung",
+   1,
+   {
+    "author": 1
+   }
+  ],
+  [
+   "pruefung-allein",
+   1,
+   {
+    "judge-1": 1,
+    "judge-2": 1
+   }
+  ],
+  [
+   "revision",
+   1,
+   {
+    "author": 1
+   }
+  ],
+  [
+   "pruefung-allein",
+   2,
+   {
+    "judge-1": 1,
+    "judge-2": 1
+   }
+  ]
+ ],
+ "sight": [
+  [
+   "fassung",
+   1,
+   {
+    "author": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    }
+   }
+  ],
+  [
+   "pruefung-allein",
+   1,
+   {
+    "judge-1": {
+     "eingaben": [
+      "beweis"
+     ],
+     "kanaele": [],
+     "versiegelt": true,
+     "texte": []
+    },
+    "judge-2": {
+     "eingaben": [
+      "beweis"
+     ],
+     "kanaele": [],
+     "versiegelt": true,
+     "texte": []
+    }
+   }
+  ],
+  [
+   "revision",
+   1,
+   {
+    "author": {
+     "eingaben": [
+      "beweis",
+      "einwaende",
+      "gutachten"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    }
+   }
+  ],
+  [
+   "pruefung-allein",
+   2,
+   {
+    "judge-1": {
+     "eingaben": [
+      "beweis",
+      "einwaende"
+     ],
+     "kanaele": [],
+     "versiegelt": true,
+     "texte": []
+    },
+    "judge-2": {
+     "eingaben": [
+      "beweis",
+      "einwaende"
+     ],
+     "kanaele": [],
+     "versiegelt": true,
+     "texte": []
+    }
+   }
+  ]
+ ],
+ "submissions": {
+  "fassung/author": {
+   "format": "artifact",
+   "count": 1
+  },
+  "pruefung-allein/judge-1": {
+   "format": "review",
+   "count": 2
+  },
+  "pruefung-allein/judge-2": {
+   "format": "review",
+   "count": 2
+  },
+  "revision/author": {
+   "format": "artifact",
+   "count": 1
+  }
+ },
+ "items": {
+  "beweis": {
+   "versions": 2,
+   "last_by": "author"
+  }
+ },
+ "gates": [
+  [
+   "pruefung-allein",
+   "minor"
+  ],
+  [
+   "pruefung-allein",
+   "accept"
+  ]
+ ],
+ "stage_ends": [],
+ "ranking": [],
+ "end": {
+  "status": "done",
+  "how": "stopp",
+  "reason": "- **Grund:** Die Topologie ist regulär durchgelaufen.",
+  "stage_lines": []
+ },
+ "resets": {
+  "judge-1": 1,
+  "judge-2": 1
+ },
+ "fresh_folders": {},
+ "files": [
+  [
+   "fassung",
+   "author",
+   "artifact"
+  ],
+  [
+   "pruefung-allein",
+   "judge-1",
+   "review"
+  ],
+  [
+   "pruefung-allein",
+   "judge-2",
+   "review"
+  ],
+  [
+   "revision",
+   "author",
+   "artifact"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}

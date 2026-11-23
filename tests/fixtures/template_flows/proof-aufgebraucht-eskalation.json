@@ -1,0 +1,240 @@
+{
+ "template": "proof",
+ "case": "aufgebraucht-eskalation",
+ "params": {
+  "on_fail": "escalate"
+ },
+ "turns": [
+  [
+   "strategie",
+   1,
+   {
+    "strategist": 1,
+    "rater-1": 1,
+    "rater-2": 1
+   }
+  ],
+  [
+   "skizze",
+   1,
+   {
+    "prover": 1,
+    "rater-1": 1,
+    "rater-2": 1
+   }
+  ],
+  [
+   "skizze",
+   2,
+   {
+    "prover": 1,
+    "rater-1": 1,
+    "rater-2": 1
+   }
+  ]
+ ],
+ "sight": [
+  [
+   "strategie",
+   1,
+   {
+    "strategist": {
+     "eingaben": [],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    },
+    "rater-1": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    },
+    "rater-2": {
+     "eingaben": [
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    }
+   }
+  ],
+  [
+   "skizze",
+   1,
+   {
+    "prover": {
+     "eingaben": [
+      "vorstufen"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    },
+    "rater-1": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    },
+    "rater-2": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    }
+   }
+  ],
+  [
+   "skizze",
+   2,
+   {
+    "prover": {
+     "eingaben": [
+      "bewertungen",
+      "vorstufen"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    },
+    "rater-1": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    },
+    "rater-2": {
+     "eingaben": [
+      "vorstufen",
+      "zu-bewerten"
+     ],
+     "kanaele": [],
+     "versiegelt": false,
+     "texte": []
+    }
+   }
+  ]
+ ],
+ "submissions": {
+  "skizze/prover": {
+   "format": "artifact",
+   "count": 2
+  },
+  "skizze/rater-1": {
+   "format": "rating",
+   "count": 2
+  },
+  "skizze/rater-2": {
+   "format": "rating",
+   "count": 2
+  },
+  "strategie/rater-1": {
+   "format": "rating",
+   "count": 1
+  },
+  "strategie/rater-2": {
+   "format": "rating",
+   "count": 1
+  },
+  "strategie/strategist": {
+   "format": "artifact",
+   "count": 1
+  }
+ },
+ "items": {
+  "skizze": {
+   "versions": 2,
+   "last_by": "prover"
+  },
+  "strategie": {
+   "versions": 1,
+   "last_by": "strategist"
+  }
+ },
+ "gates": [
+  [
+   "strategie",
+   "pass"
+  ],
+  [
+   "skizze",
+   "fail"
+  ],
+  [
+   "skizze",
+   "fail"
+  ]
+ ],
+ "stage_ends": [
+  [
+   "strategie",
+   "passed",
+   1
+  ],
+  [
+   "skizze",
+   "stage_failed",
+   null
+  ]
+ ],
+ "ranking": [],
+ "end": {
+  "status": "done",
+  "how": "stopp",
+  "reason": "- **Grund:** Die Stufe „skizze“ wurde nicht bestanden (stage_failed).",
+  "stage_lines": [
+   "- **strategie:** bestanden, akzeptiert: #n, Score 8, 1 Versuch",
+   "- **skizze:** nicht bestanden, Run beendet, akzeptiert: keins, Score 6, 2 Versuche"
+  ]
+ },
+ "resets": {},
+ "fresh_folders": {},
+ "files": [
+  [
+   "skizze",
+   "prover",
+   "artifact"
+  ],
+  [
+   "skizze",
+   "rater-1",
+   "rating"
+  ],
+  [
+   "skizze",
+   "rater-2",
+   "rating"
+  ],
+  [
+   "strategie",
+   "rater-1",
+   "rating"
+  ],
+  [
+   "strategie",
+   "rater-2",
+   "rating"
+  ],
+  [
+   "strategie",
+   "strategist",
+   "artifact"
+  ],
+  [
+   "summary.md"
+  ]
+ ]
+}
