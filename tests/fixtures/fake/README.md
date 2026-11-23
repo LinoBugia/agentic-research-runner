@@ -5,8 +5,8 @@ Abschlussbericht W1-04 §3.
 
 | Datei | Inhalt |
 |---|---|
-| `explorer.yaml` | Rolle Explorer: denkt, rechnet (Tool), postet eine Idee, gibt ein Ergebnis ab, meldet `done` |
+| `explorer.yaml` | Rolle Explorer: denkt, rechnet (Tool), postet eine Idee, gibt sie mit `submit` ab, meldet `done` |
 | `critic.yaml` | Rolle Kritiker: liest das Postfach, widerspricht, stellt eine Frage; Turn 2 beantwortet eine Frage an ihn |
-| `rater.yaml` | Rolle Rater: liest den Auftrag, bewertet das Ergebnis aus dem Kontextpaket, stimmt ab |
+| `rater.yaml` | Rolle Rater: liest den Auftrag, bewertet die Abgabe aus `context.rate` mit `submit` (Format `rating`) |
 | `all_steps.yaml` | alle Schritt-Arten in einem Turn (Test A3) |
 | `transcript_sample.jsonl` / `.md` | festes Transkript und seine gerenderte Fassung (Snapshot-Test), mit offenem Turn mittendrin, Neustart eines Turns und offenem letzten Turn |

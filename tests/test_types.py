@@ -40,7 +40,6 @@ from arr.room.types import (
     Rating,
     Result,
     RoomAPI,
-    Vote,
 )
 from arr.runs.context import AgentHandle, RunContext
 
@@ -51,12 +50,14 @@ ROOM_TOOLS = [  # docs/06-gruppenchats.md §9
     "post_message",
     "get_attachment",
     "set_status",
-    "submit_result",
-    "submit_rating",
+    "submit",  # W4b-06b: `SubmitAPI` went into `RoomAPI`
     "get_assignment",
     "wait_until",  # docs/09 §4.3
 ]
-REMOVED_TOOLS = ["vote", "give_floor", "call_vote", "pin", "close_discussion"]  # W4b-03 §6.7
+REMOVED_TOOLS = [
+    *("vote", "give_floor", "call_vote", "pin", "close_discussion"),  # W4b-03 §6.7
+    *("submit_result", "submit_rating"),  # W4b-06b
+]
 
 
 def fields(model: Any) -> set[str]:
@@ -141,7 +142,9 @@ def test_room_types() -> None:
     assert {"name", "members", "mode", "open", "anonymous"} <= fields(ChannelInfo)
     assert {"agent", "stage", "kind", "title", "body", "path", "attempt"} <= fields(Result)
     assert {"rater", "result_id", "score", "criteria", "comment"} <= fields(Rating)
-    assert {"proposal_id", "agent", "choice", "reason"} <= fields(Vote)
+    import arr.room.types as room_types
+
+    assert not hasattr(room_types, "Vote") and not hasattr(room_types, "SubmitAPI")  # W4b-06b
     assert {"agent", "turn", "stage", "prompt", "context"} <= fields(Assignment)
     assert RoomAPI._is_protocol  # type: ignore[attr-defined]
     for tool in ROOM_TOOLS:

@@ -1,6 +1,6 @@
 """FakeBackend: an `AgentBackend` that plays a script instead of calling a model.
 
-It lets the orchestrator and the topologies be tested without tokens (docs/01-architektur.md §3,
+It lets the orchestrator and the phase runner be tested without tokens (docs/01-architektur.md §3,
 Codeplan W1-04). The behavior comes from a `FakeScript`, given as YAML or as Python data:
 one entry per turn, each a list of steps (text, thinking, tool call with result, room action,
 usage, rate limit, error, delay). The events are the same `AgentEvent`s as those of the real
@@ -96,7 +96,7 @@ from arr.errors import ArrError
 from arr.models import AgentConfig, AgentStatus, Provider, StrictModel
 from arr.resolve import load_yaml_model, validate_model
 from arr.room.store import AgentRoom
-from arr.room.types import AssignAPI, MessageKind, RoomAPI, RoomError, SubmitAPI
+from arr.room.types import AssignAPI, MessageKind, RoomAPI, RoomError
 from arr.room.waiting import WAIT_MAX_S, wait_for_messages
 from arr.runs.compact import NOTE_HEADING
 
@@ -152,9 +152,7 @@ class RoomAction(StrEnum):
     POST_MESSAGE = "post_message"
     GET_ATTACHMENT = "get_attachment"
     SET_STATUS = "set_status"
-    SUBMIT_RESULT = "submit_result"
-    SUBMIT_RATING = "submit_rating"
-    SUBMIT = "submit"  # W4b-01: `SubmitAPI`, the tool of the phase toolkit
+    SUBMIT = "submit"  # W4b-01, the only way to hand in since W4b-06b
     ASSIGN = "assign"  # W4b-04: `AssignAPI`, the tool of the lead of a phase `moderated`
     GET_ASSIGNMENT = "get_assignment"
     WAIT_UNTIL = "wait_until"
@@ -702,13 +700,6 @@ class FakeBackend:
                 f"„{self.config.id}“ ist kein RoomAPI zugewiesen (Parameter room)."
             )
         api: type = RoomAPI
-        if step.action is RoomAction.SUBMIT:
-            api = SubmitAPI
-            if not isinstance(self.room, SubmitAPI):
-                raise FakeScriptError(
-                    f"Das Skript ruft „submit“ auf, aber das Room von „{self.config.id}“ kennt "
-                    "es nicht (SubmitAPI)."
-                )
         if step.action is RoomAction.ASSIGN:
             api = AssignAPI
             if not isinstance(self.room, AssignAPI):

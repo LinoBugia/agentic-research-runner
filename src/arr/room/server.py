@@ -349,10 +349,10 @@ class RoomServer(MCPServer):
 def build_server(room: AgentRoom) -> MCPServer:
     """MCP server with the room tools of docs/06 §9 bound to `room.agent_id`.
 
-    A run with the topology `phases` gets `submit` and not `submit_result`/`submit_rating`,
-    the five old topologies the reverse (W4b-01). Since W4b-03 no run offers `vote`, `call_vote`,
-    `give_floor`, `pin` or `close_discussion` (Entscheidung 11, 12, 27): gates read submissions,
-    and the topology `moderated` (W4b-04) replaces the moderator.
+    Every run offers `submit` and `assign` (also without `run.yaml`); `submit_result` and
+    `submit_rating` are gone with the old topologies (W4b-06b). Since W4b-03 no run offers
+    `vote`, `call_vote`, `give_floor`, `pin` or `close_discussion` (Entscheidung 11, 12, 27):
+    gates read submissions, and the topology `moderated` (W4b-04) replaces the moderator.
     """
     server = RoomServer(room)
 
@@ -386,7 +386,7 @@ def build_server(room: AgentRoom) -> MCPServer:
 
     @server.tool(
         description="Nachricht in einen deiner Kanäle schreiben. `kind`: note, idea, claim, "
-        "proof, objection, question, answer, proposal, decision (nur Moderator), result, pass. "
+        "proof, objection, question, answer, proposal, result, pass. "
         "`to`: Adressaten (leer = alle), `user` für den User; `@name` und `@user` im Text "
         "adressieren genauso. Eine `question` mit `to` bleibt offen, bis der Adressat mit "
         "`answer` und `reply_to` antwortet; eine Frage an den User beantwortet nur der User. "
@@ -431,11 +431,8 @@ def build_server(room: AgentRoom) -> MCPServer:
 
         return _respond(room, "set_status", call)
 
-    if room.store.uses_phases():
-        _add_submit(server, room)
-        _add_assign(server, room)  # W4b-04: every agent of a phases run; the room checks who
-    else:
-        _add_old_submit_tools(server, room)
+    _add_submit(server, room)
+    _add_assign(server, room)  # W4b-04: every agent; the room checks who may
 
     limit = wait_max_s()
 
@@ -548,7 +545,7 @@ def render_submission(sub: Submission) -> str:
 
 
 def _add_submit(server: MCPServer, room: AgentRoom) -> None:
-    """`submit` of the phase toolkit (W4b-01), instead of `submit_result`/`submit_rating`."""
+    """`submit` of the phase toolkit (W4b-01), the only way to hand in (W4b-06b)."""
 
     @server.tool(description=SUBMIT_DESCRIPTION)
     def submit(
@@ -609,7 +606,7 @@ def render_delegation(room: AgentRoom, given: Delegation) -> str:
 
 
 def _add_assign(server: MCPServer, room: AgentRoom) -> None:
-    """`assign` of a phase `moderated` (W4b-04), offered beside `submit` in every phases run;
+    """`assign` of a phase `moderated` (W4b-04), offered beside `submit` in every run;
     `AgentRoom.assign` refuses everyone but the lead."""
 
     @server.tool(description=ASSIGN_DESCRIPTION)
@@ -617,37 +614,6 @@ def _add_assign(server: MCPServer, room: AgentRoom) -> None:
         return _respond(
             room, "assign", lambda: render_delegation(room, room.assign(agent, task, format))
         )
-
-
-def _add_old_submit_tools(server: MCPServer, room: AgentRoom) -> None:
-    """`submit_result` and `submit_rating` of the five old topologies (until W4b-06)."""
-
-    @server.tool(
-        description="Ergebnis der aktuellen Stufe abgeben, z. B. Idee, Lemma, Beweis oder "
-        "Gutachten. Inhalt in `body` oder als Datei `path` relativ zu deinem Arbeitsordner."
-    )
-    def submit_result(
-        kind: str, title: str, body: str | None = None, path: str | None = None
-    ) -> str:
-        def call() -> str:
-            r = room.submit_result(kind, title, body, path)
-            text = f"Ergebnis #{r.id} abgegeben (Stufe {r.stage or '–'}, Versuch {r.attempt})."
-            return text + (f" Datei: {r.path}" if r.path else "")
-
-        return _respond(room, "submit_result", call)
-
-    @server.tool(
-        description="Ein Ergebnis bewerten: `score` auf der Skala der Rubrik, `comment` als "
-        "Begründung, optional `criteria` mit Punkten pro Kriterium."
-    )
-    def submit_rating(
-        result_id: int, score: float, comment: str, criteria: dict[str, float] | None = None
-    ) -> str:
-        def call() -> str:
-            r = room.submit_rating(result_id, score, comment, criteria)
-            return f"Bewertung #{r.id} für Ergebnis #{r.result_id} gespeichert ({r.score:g})."
-
-        return _respond(room, "submit_rating", call)
 
 
 def main() -> None:

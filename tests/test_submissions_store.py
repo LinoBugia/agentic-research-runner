@@ -23,7 +23,7 @@ from arr.errors import ArrError
 from arr.models import GroupChatConfig, Rubric
 from arr.room import store as store_module
 from arr.room.store import AgentRoom, RoomStore
-from arr.room.types import RoomError, Submission, SubmitAPI
+from arr.room.types import RoomAPI, RoomError, Submission
 
 AGENTS = ["prover", "judge-1", "judge-2", "lead"]
 
@@ -97,7 +97,8 @@ def digest(folder: Path) -> dict[str, str]:
 
 
 def test_agent_room_offers_submit(store: RoomStore) -> None:
-    assert isinstance(room(store, "prover"), SubmitAPI)
+    assert isinstance(room(store, "prover"), RoomAPI)  # `submit` is part of it (W4b-06b)
+    assert not hasattr(room(store, "prover"), "submit_result")
 
 
 def test_every_builtin_format_is_accepted_and_filed(store: RoomStore) -> None:
@@ -408,7 +409,7 @@ def test_diff_runs_in_its_own_process_with_a_time_limit(
 
 
 def test_sealed_stage_until_release(store: RoomStore) -> None:
-    store.seal("pruefung", "judges")
+    store.seal("pruefung")
     expect(store, "judge-1", stage="pruefung", format="review")
     expect(store, "judge-2", stage="pruefung", format="review", name="gutachten")
     one = room(store, "judge-1").submit(
@@ -780,7 +781,7 @@ def test_m1_a_folder_a_row_points_to_is_never_moved(store: RoomStore) -> None:
 
 
 def test_m1_a_kill_in_the_middle_of_release(store: RoomStore) -> None:
-    store.seal("pruefung", "judges")
+    store.seal("pruefung")
     for agent in ("judge-1", "judge-2"):
         expect(store, agent, stage="pruefung", format="text")
         room(store, agent).submit("done", f"von {agent}", body="x")
@@ -795,23 +796,6 @@ def test_m1_a_kill_in_the_middle_of_release(store: RoomStore) -> None:
     ]
     folders_have_rows(store)
     assert list((store.run_dir / "groupchats/sealed").iterdir()) == []
-
-
-def test_m1_a_kill_in_the_middle_of_release_of_result_files(store: RoomStore) -> None:
-    """The same for the result files of `submit_result` (W4-03)."""
-    store.seal("pruefung", "judges")
-    for agent in ("judge-1", "judge-2"):
-        store.add_assignment(agent, 1, "x", stage="pruefung")
-        write(store, agent, "gutachten.md", f"von {agent}\n")
-        room(store, agent).submit_result("review", "Gutachten", path="gutachten.md")
-    kill_after_rename(store, "release-results")
-    released = store.release("pruefung")
-    assert [r.path for r in released] == [
-        "output/results/001-mitglied-a-review.md",
-        "output/results/002-mitglied-b-review.md",
-    ]
-    assert all((store.run_dir / r.path).is_file() for r in released)
-    assert not any(store.is_sealed(r.id) for r in released)
 
 
 def test_m1_release_with_nothing_left_says_it_is_an_arr_error(store: RoomStore) -> None:
@@ -1027,7 +1011,7 @@ def test_n1_a_release_during_the_diff_does_not_falsify_it(
     """Another process releases the stage after the previous version was read and before the
     diff reads its folder: the diff is made again and names v1, not `/dev/null`. Without the
     intervention (counter-check) the same diff comes out at once."""
-    store.seal("pruefung", "judges")
+    store.seal("pruefung")
     expect(store, "judge-1", stage="pruefung", format="text", name="g")
     room(store, "judge-1").submit("done", "v1", body="Zeile A\nZeile B\n")
     real = store_module.version_diff
@@ -1078,7 +1062,7 @@ def test_n4_a_rest_at_the_later_place_of_a_sealed_submission(store: RoomStore) -
     rest = store.run_dir / "output/submissions/001-pruefung-mitglied-a"
     rest.mkdir(parents=True)
     (rest / "submission.json").write_text('{"rest": true}')
-    store.seal("pruefung", "judges")
+    store.seal("pruefung")
     expect(store, "judge-1", stage="pruefung", format="text")
     sub = room(store, "judge-1").submit("done", "versiegelt", body="x")
     assert sub.sealed and sub.path == "groupchats/sealed/submission-001"

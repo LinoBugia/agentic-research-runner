@@ -20,9 +20,8 @@ from arr.room.types import (
     Inbox,
     Message,
     MessageKind,
-    Rating,
-    Result,
     RoomError,
+    Submission,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "fake"
@@ -35,8 +34,7 @@ class StubRoom:
         self._agent_id = agent_id
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.messages: list[Message] = []
-        self.results: list[Result] = []
-        self.ratings: list[Rating] = []
+        self.submissions: list[Submission] = []
         self.status: tuple[AgentStatus, str] | None = None
         self.open_questions = open_questions or []
         self.assignment: Assignment | None = None
@@ -104,42 +102,32 @@ class StubRoom:
         self._record("set_status", status=status, note=note)
         self.status = (status, note)
 
-    def submit_result(
-        self, kind: str, title: str, body: str | None = None, path: str | None = None
-    ) -> Result:
-        self._record("submit_result", kind=kind, title=title, body=body, path=path)
-        result = Result(
-            id=len(self.results) + 1,
+    def submit(
+        self,
+        status: str,
+        summary: str,
+        body: str | None = None,
+        files: list[str] | None = None,
+        note_next: str | None = None,
+        fields: dict[str, Any] | None = None,
+    ) -> Submission:
+        self._record(
+            "submit", status=status, summary=summary, body=body, files=files, fields=fields
+        )
+        submission = Submission(
+            id=len(self.submissions) + 1,
             ts=1.0,
             agent=self._agent_id,
-            kind=kind,
-            title=title,
+            shown_as=self._agent_id,
+            format="rating" if fields and "ratings" in fields else "text",
+            status=status,
+            summary=summary,
             body=body,
+            fields=fields or {},
+            path=f"output/submissions/{len(self.submissions) + 1:03d}",
         )
-        self.results.append(result)
-        return result
-
-    def submit_rating(
-        self,
-        result_id: int,
-        score: float,
-        comment: str,
-        criteria: dict[str, float] | None = None,
-    ) -> Rating:
-        self._record(
-            "submit_rating", result_id=result_id, score=score, comment=comment, criteria=criteria
-        )
-        rating = Rating(
-            id=len(self.ratings) + 1,
-            ts=1.0,
-            rater=self._agent_id,
-            result_id=result_id,
-            score=score,
-            criteria=criteria or {},
-            comment=comment,
-        )
-        self.ratings.append(rating)
-        return rating
+        self.submissions.append(submission)
+        return submission
 
     def get_assignment(self) -> Assignment | None:
         self._record("get_assignment")
@@ -356,8 +344,7 @@ async def test_all_step_kinds_script_plays_and_calls_the_room() -> None:
         "tool_result",
         "tool_call",  # Bash, failing
         "tool_result",
-        *["tool_call", "tool_result"]
-        * 6,  # 3x post_message, submit_result, submit_rating, set_status
+        *["tool_call", "tool_result"] * 6,  # 3x post_message, 2x submit (text, rating), set_status
         "rate_limit",
         "usage",
         "error",
@@ -372,17 +359,18 @@ async def test_all_step_kinds_script_plays_and_calls_the_room() -> None:
         "post_message",
         "post_message",
         "post_message",
-        "submit_result",
-        "submit_rating",
+        "submit",
+        "submit",
         "set_status",
     ]
     idea, question, answer = room.messages
     assert (idea.kind, idea.body) == (MessageKind.IDEA, "Idee A")
     assert (question.kind, question.to, question.open) == (MessageKind.QUESTION, ["critic-1"], True)
     assert (answer.kind, answer.reply_to) == (MessageKind.ANSWER, idea.id)  # ${idea.id} resolved
-    assert room.results[0].title == "Idee A"
-    rating = room.ratings[0]
-    assert (rating.result_id, rating.score, rating.criteria) == (1, 8, {"clarity": 9})
+    work, rating = room.submissions
+    assert (work.summary, work.body) == ("Idee A", "Text")
+    [entry] = rating.fields["ratings"]
+    assert (entry["ref"], entry["score"], entry["criteria"]) == (1, 8, {"clarity": 9})
     assert room.status == (AgentStatus.WORKING, "rechnet")
     # enum arguments arrive as enums, not as bare strings
     assert isinstance(room.calls[0][1]["kind"], MessageKind)
@@ -534,12 +522,12 @@ async def test_references_walk_dicts_and_lists() -> None:
 # --------------------------------------------------------------------------------------------
 
 
-async def test_explorer_script_posts_an_idea_submits_a_result_and_answers_later() -> None:
+async def test_explorer_script_posts_an_idea_hands_it_in_and_answers_later() -> None:
     room = StubRoom("explorer-1")
     backend = await started(FIXTURES / "explorer.yaml", room)
     first = await play(backend, "Stufe 1")
     assert [m.kind for m in room.messages] == [MessageKind.IDEA]
-    assert room.results[0].kind == "idea"
+    assert room.submissions[0].summary == "2-adische Darstellung"
     assert room.status == (AgentStatus.DONE, "Idee abgegeben")
     assert first[-1].data["cost_kind"] == "estimated"
 
@@ -560,18 +548,19 @@ async def test_critic_script_objects_and_asks() -> None:
     assert room.messages[1].to == ["explorer-1"] and room.messages[1].open
 
 
-async def test_rater_script_rates_the_result_from_the_assignment_context() -> None:
+async def test_rater_script_rates_the_submission_from_the_assignment_context() -> None:
     room = StubRoom("judge-1")
     room.assignment = Assignment(
         agent="judge-1",
         turn=1,
         prompt="Bewerte",
-        context={"result_ids": [4], "proposal_id": 9},
+        context={"rate": [4]},
         ts=1.0,
     )
     backend = await started(FIXTURES / "rater.yaml", room, agent="judge-1")
     await play(backend)
-    assert room.ratings[0].result_id == 4 and room.ratings[0].score == 7.5
+    [entry] = room.submissions[0].fields["ratings"]
+    assert entry["ref"] == 4 and entry["score"] == 7.5
 
 
 # --------------------------------------------------------------------------------------------

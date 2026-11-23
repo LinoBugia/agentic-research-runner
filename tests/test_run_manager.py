@@ -74,6 +74,9 @@ def statuses(run_dir: Path) -> list[str]:
 # --------------------------------------------------------------------------------------------
 
 
+CONTEXT = {"attempt": 2, "submission": {"format": "text"}}
+
+
 async def test_lifecycle_writes_every_status_to_meta_json(workfolder: Path) -> None:
     seen: list[RunStatus] = []
     finalizer = Finalizer()
@@ -81,10 +84,11 @@ async def test_lifecycle_writes_every_status_to_meta_json(workfolder: Path) -> N
 
     async def topology(ctx: RunContext) -> None:
         seen.append(load_run_meta(manager.run_dir).status)
-        outcome = await ctx.turn("solo", "Rechne.", stage="arbeit", context={"attempt": 2})
+        outcome = await ctx.turn("solo", "Rechne.", stage="arbeit", context=CONTEXT)
         assert outcome.status is TurnStatus.OK and outcome.text == "fertig"
-        assert [r.title for r in outcome.results] == ["Ergebnis"]
-        assert outcome.results[0].attempt == 2 and outcome.usage.cost_usd == 0.01
+        [sub] = ctx.submissions()  # W4b-06b: `submit` instead of `submit_result`
+        assert (sub.summary, sub.attempt, sub.stage) == ("Ergebnis", 2, "arbeit")
+        assert outcome.usage.cost_usd == 0.01
         manager.pause()
         seen.append(load_run_meta(manager.run_dir).status)
         manager.resume()
@@ -93,7 +97,7 @@ async def test_lifecycle_writes_every_status_to_meta_json(workfolder: Path) -> N
     script = turns(
         [
             say("fertig"),
-            room("submit_result", kind="idea", title="Ergebnis", body="x"),
+            room("submit", status="done", summary="Ergebnis", body="x"),
             cost(0.01),
         ]
     )
@@ -118,7 +122,7 @@ async def test_lifecycle_writes_every_status_to_meta_json(workfolder: Path) -> N
     assert (assignment.stage, assignment.prompt, assignment.context) == (
         "arbeit",
         "Rechne.",
-        {"attempt": 2},
+        CONTEXT,
     )
     session = json.loads((run_dir / "agents" / "solo" / "session.json").read_text())
     assert session == {"session_id": "fake-solo"}
@@ -546,7 +550,9 @@ async def test_escalate_pauses_waits_for_the_user_and_continues(workfolder: Path
 
         pending = asyncio.create_task(other_turn())
         options = [EscalationOption.RETRY, EscalationOption.CONTINUE, EscalationOption.END]
-        chosen.append(await ctx.escalate("beweis", "Ø 5,5 nach 2 Versuchen", options))
+        chosen.append(
+            await ctx.escalate("beweis", "Ø 5,5 nach 2 Versuchen", options, attempt=2, reason="x")
+        )
         await pending
 
     manager = make_manager(workfolder, topology, {"a": turns(), "b": turns([say("ok")])})
@@ -582,13 +588,20 @@ async def test_escalate_pauses_waits_for_the_user_and_continues(workfolder: Path
         ),
     )
     assert await running is RunStatus.DONE
-    assert chosen == [EscalationOption.CONTINUE]
+    assert chosen == [(EscalationOption.CONTINUE, None)]
     assert later["outcome"].status is TurnStatus.OK
     [b_turn] = intervals(manager.run_dir, "b")
     assert b_turn[0] >= decided_at
     assert statuses(manager.run_dir)[1:4] == ["running", "paused", "running"]
+    [asked] = log_entries(manager.run_dir, "escalation")
+    assert (asked["data"]["attempt"], asked["data"]["reason"]) == (2, "x")
     [decided] = log_entries(manager.run_dir, "escalation_decided")
-    assert decided["data"] == {"stage": "beweis", "option": "continue", "by_user": True}
+    assert decided["data"] == {
+        "stage": "beweis",
+        "option": "continue",
+        "by_user": True,
+        "hint": False,
+    }, "one escalation since W4b-06b: `hint` always"
 
 
 async def test_escalate_ends_with_end_on_stop(workfolder: Path) -> None:
@@ -602,7 +615,7 @@ async def test_escalate_ends_with_end_on_stop(workfolder: Path) -> None:
     await eventually(lambda: manager.inbox is not None and len(manager.inbox.pending()) == 1)
     manager.stop()
     assert await running is RunStatus.STOPPED
-    assert chosen == [EscalationOption.END]
+    assert chosen == [(EscalationOption.END, None)]
     assert manager.inbox.items()[0].status is ApprovalStatus.OBSOLETE
 
 
@@ -624,12 +637,17 @@ async def test_checkpoint_plan_at_start_and_further_checkpoints(workfolder: Path
     assert entries[first_checkpoint - 1]["data"] == {"status": "running"}
 
 
-async def test_default_plan_comes_from_run_yaml_stages(workfolder: Path) -> None:
+async def test_default_plan_comes_from_the_phases(workfolder: Path) -> None:
+    """The plan is the phases of the run (W4b-06b: no `stages`, no `planned_stages`)."""
+
     async def topology(ctx: RunContext) -> None:
         pass
 
-    stages = [{"name": "skizze", "agent": "a"}, {"name": "beweis", "agent": "a"}]
-    manager = make_manager(workfolder, topology, {"a": turns()}, run_extra={"stages": stages})
+    action = {"task": "t.md", "submission": {"format": "text"}}
+    phases = [
+        {"name": n, "topology": "solo", "actions": {"a": action}} for n in ("skizze", "beweis")
+    ]
+    manager = make_manager(workfolder, topology, {"a": turns()}, run_extra={"phases": phases})
     assert await manager.run() is RunStatus.DONE
     plan = log_entries(manager.run_dir, "checkpoint")[0]["data"]
     assert plan == {"stage": "plan", "stages": ["skizze", "beweis"]}

@@ -12,7 +12,7 @@ file (`arr.runs.phases.tasks`), adds every `seed` as version 1 and then runs the
 3. **The gate** without a model (`arr.runs.phases.gates`); a gate `judge` first has its rating
    actions. The result of a gate picks its route (`on_tie` on a tie). A gate `user`, the route
    `escalate`, exhausted phases with `on_exhausted: escalate` and a gate without a result ask
-   the user (`escalate_with_hint`): `continue`, `retry` (with a hint) or `end`.
+   the user (`escalate`): `continue`, `retry` (with a hint) or `end`.
 4. **Bookkeeping**: the valid submission of the phase (Entscheidung 6), the mean scores, the
    run's objections; checkpoints `gate`, `route` and `stage_end`.
 
@@ -58,9 +58,11 @@ from arr.permissions.types import EscalationOption
 from arr.plan.read import ACTION_GATE, build_expectation, enter, follow
 from arr.room.types import Submission
 from arr.runs.context import RunContext
+from arr.runs.finalize import one_line
 from arr.runs.phases import chat, moderated, work
 from arr.runs.phases.gates import NO_RATING, GateOutcome, judge_mean, judge_rank, signal
 from arr.runs.phases.inputs import (
+    REASONS,
     build_feedback,
     build_inputs,
     inbox_summary,
@@ -549,7 +551,8 @@ class PhaseRunner:
         if self.ctx.stop_requested:
             return EscalationOption.END, None
         summary = inbox_summary(phase, attempt, reason, subs, detail)
-        option, hint = await self.ctx.escalate_with_hint(phase, summary, OPTIONS)
+        why = REASONS[reason].format(phase=phase, reason=one_line(line(detail, 300), 300))
+        option, hint = await self.ctx.escalate(phase, summary, OPTIONS, attempt=attempt, reason=why)
         if self.ctx.stop_requested:
             return EscalationOption.END, None
         return option, hint

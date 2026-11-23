@@ -143,7 +143,8 @@ class Inbox(Record):
 
 
 class Result(Record):
-    """A result submitted with `submit_result` (docs/01 §5, table `result` in docs/02 §5).
+    """A result an old topology's `submit_result` wrote (docs/01 §5, table `result` in docs/02
+    §5). Since W4b-06b no run writes one; old rooms keep them readable.
 
     `kind` is free text such as `idea`, `exploration`, `review`, `proof`; `path` is relative
     to the run folder (copied to `output/results/`).
@@ -161,7 +162,8 @@ class Result(Record):
 
 
 class Rating(Record):
-    """A rating of a result with `submit_rating` (docs/01 §5, table `rating` in docs/02 §5)."""
+    """A rating of a result with the old `submit_rating` (docs/01 §5, table `rating` in docs/02
+    §5). Since W4b-06b no run writes one; old rooms keep them readable."""
 
     id: int
     ts: float
@@ -201,17 +203,6 @@ class Submission(Record):
     fields: dict[str, Any] = Field(default_factory=dict)
     path: str
     sealed: bool = False
-
-
-class Vote(Record):
-    """A vote on a proposal (docs/06 §7, table `vote` in docs/02 §5). Since W4b-03 agents cannot
-    vote any more; old rooms keep their votes readable."""
-
-    proposal_id: int
-    agent: str
-    choice: VoteChoice
-    reason: str = ""
-    ts: float
 
 
 class Assignment(Record):
@@ -385,16 +376,6 @@ class RoomAPI(Protocol):
         """Report the own status, typically `working` or `done` with a short summary."""
         ...
 
-    def submit_result(
-        self,
-        kind: str,
-        title: str,
-        body: str | None = None,
-        path: str | None = None,
-    ) -> Result:
-        """Submit a result for the current stage; `path` is relative to the working folder."""
-        ...
-
     def wait_until(
         self,
         minutes: float,
@@ -409,29 +390,6 @@ class RoomAPI(Protocol):
         """
         ...
 
-    def submit_rating(
-        self,
-        result_id: int,
-        score: float,
-        comment: str,
-        criteria: dict[str, float] | None = None,
-    ) -> Rating:
-        """Rate a result on the scale and criteria of the rubric."""
-        ...
-
-    def get_assignment(self) -> Assignment | None:
-        """Current assignment with stage and context package, or None before the first turn."""
-        ...
-
-
-@runtime_checkable
-class SubmitAPI(Protocol):
-    """The room tool `submit` of the phase toolkit (docs/10 §4.3, W4b-01), bound to one agent.
-
-    Kept apart from `RoomAPI` while the old tools `submit_result` and `submit_rating` live
-    (until W4b-06): a run offers either `submit` or the old ones, never both.
-    """
-
     def submit(
         self,
         status: str,
@@ -442,7 +400,13 @@ class SubmitAPI(Protocol):
         fields: dict[str, Any] | None = None,
     ) -> Submission:
         """Hand in the submission the newest assignment expects (`context["submission"]`);
-        `RoomError` with every problem in German if it does not fit."""
+        `RoomError` with every problem in German if it does not fit (docs/10 §4.3, W4b-01).
+        Since W4b-06b the only way to hand in: `submit_result`/`submit_rating` are gone and
+        `SubmitAPI` went into this protocol."""
+        ...
+
+    def get_assignment(self) -> Assignment | None:
+        """Current assignment with stage and context package, or None before the first turn."""
         ...
 
 
@@ -450,9 +414,9 @@ class SubmitAPI(Protocol):
 class AssignAPI(Protocol):
     """The room tool `assign` of a phase `moderated` (W4b-04, docs/10 §4.5), bound to one agent.
 
-    Kept apart from `RoomAPI` and `SubmitAPI`: every agent of a `phases` run is offered it (the
-    tool list is fixed per room server process), the room refuses it for anyone but the lead of
-    a running phase `moderated`.
+    Kept apart from `RoomAPI`: every agent of a run is offered it (the tool list is fixed per
+    room server process), the room refuses it for anyone but the lead of a running phase
+    `moderated`.
     """
 
     def assign(self, agent: str, task: str, format: str) -> Delegation:

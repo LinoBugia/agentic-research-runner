@@ -200,11 +200,20 @@ class RunContext(ABC):
 
     @abstractmethod
     async def escalate(
-        self, stage: str, summary: str, options: Sequence[EscalationOption]
-    ) -> EscalationOption:
+        self,
+        stage: str,
+        summary: str,
+        options: Sequence[EscalationOption],
+        *,
+        attempt: int | None = None,
+        reason: str | None = None,
+    ) -> tuple[EscalationOption, str | None]:
         """Pause the run, put an escalation into the approval inbox and wait for the user.
 
-        Used by `waterfall` with `on_fail: escalate` (docs/03 §4.4). Returns the chosen option.
+        Returns the chosen option and the user's hint (`Decision.comment`, e.g. with „noch ein
+        Durchlauf“; W4b-02b §6.7), None without one. `attempt` and `reason` (the pass and why
+        the phase asks) go into the log entry `escalation`. Called by the phase runner; since
+        W4b-06b the only escalation (`escalate_with_hint` went into it).
         """
 
     @abstractmethod
@@ -269,10 +278,9 @@ class RunContext(ABC):
         """
 
     @abstractmethod
-    def seal_results(self, stage: str, channel: str | None = None) -> None:
-        """Results submitted in `stage` from now on stay hidden from every other agent, in
-        the room and as files, until `release_results(stage)` (F4). File names use the
-        aliases of `channel` if it is anonymous."""
+    def seal_results(self, stage: str) -> None:
+        """Submissions of `stage` from now on stay hidden from every other agent, in the room
+        and as files, until `release_results(stage)` (F4)."""
 
     @abstractmethod
     def release_results(self, stage: str) -> list[Result]:
@@ -373,13 +381,6 @@ class RunContext(ABC):
     # -- W4b-02b: what the phase runner needs besides the signatures of W4b-02a ------------
     #
     # Not abstract: the defaults keep the test contexts of the old topologies working.
-
-    async def escalate_with_hint(
-        self, stage: str, summary: str, options: Sequence[EscalationOption]
-    ) -> tuple[EscalationOption, str | None]:
-        """Like `escalate`, and the user's hint with it (`Decision.comment`, e.g. with
-        „noch ein Durchlauf“; W4b-02b §6.7). The default gives no hint."""
-        return await self.escalate(stage, summary, options), None
 
     def channel_messages(self, channel: str) -> list[Message]:
         """Every message of `channel`, oldest first, as arr reads them (an input

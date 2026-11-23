@@ -89,8 +89,8 @@ SEALED_DIR = f"{ROOM_DIR}/sealed"
 """Result files of a sealed stage (W4-03 F4): beside `room.sqlite`, readable for no agent (the
 read profile denies the run folder, the policy names it a hard block) until `release`."""
 STAGING_DIR = f"{ROOM_DIR}/staging"
-"""Where `submit_result` copies a file first; readable for no agent, so a sealed result never
-passes through `output/` (W4-03 F4)."""
+"""Where `submit` prepares a submission first; readable for no agent, so a sealed submission
+never passes through `output/` (W4-03 F4)."""
 SUBMISSIONS_DIR = "output/submissions"
 """Unnamed submissions: `<nr>-<phase>-<agent or alias>/` (docs/10 §4.12, W4b-01)."""
 OUTPUT_DIR = "output"
@@ -872,16 +872,15 @@ class RoomStore:
     # Sealed stages (W4-03 F4: independent reviews)
     # ----------------------------------------------------------------------------------------
 
-    def seal(self, stage: str, channel: str | None = None) -> None:
-        """Results submitted in `stage` from now on stay hidden: their files go to
-        `SEALED_DIR`, readable for no agent, until `release(stage)`. `channel` names the
-        anonymous channel whose aliases the file names use (else the first anonymous channel
-        of the agent, else its ID)."""
+    def seal(self, stage: str) -> None:
+        """Submissions of `stage` from now on stay hidden: their files go to `SEALED_DIR`,
+        readable for no agent, until `release(stage)`. The column `channel` of `sealed_stage`
+        stays empty (the old topologies named the alias channel of their result files there)."""
         with self._write() as con:
             con.execute(
                 "INSERT INTO sealed_stage(stage, channel, ts) VALUES(?,?,?) "
                 "ON CONFLICT(stage) DO UPDATE SET channel=excluded.channel, ts=excluded.ts",
-                (stage, channel, _now()),
+                (stage, None, _now()),
             )
 
     def sealed_stages(self) -> dict[str, str | None]:
@@ -972,28 +971,6 @@ class RoomStore:
                 os.rename(source, target)
             con.execute("UPDATE submission SET path=final_path WHERE id=?", (row["id"],))
             con.execute("DELETE FROM sealed_submission WHERE submission_id=?", (row["id"],))
-
-    def result_text(self, result_id: int, max_bytes: int) -> str:
-        """Body of a result and the start of its file (also a sealed one) as text, for arr's
-        own reading (verdicts, digests): together at most `max_bytes` characters (W4-03.1 H2:
-        `body` is as long as the agent wants), never through a link."""
-        result = self.result(result_id)
-        body = (result.body or "")[:max_bytes]
-        if not result.path or len(body) >= max_bytes:
-            return body
-        try:
-            fd = os.open(self.run_dir / result.path, _FILE_FLAGS)
-        except OSError:
-            return body
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                return body
-            data = os.read(fd, max_bytes)
-        finally:
-            os.close(fd)
-        text = data.decode("utf-8", errors="replace")
-        return (f"{body}\n\n{text}" if body else text)[:max_bytes]
 
     def _resolved(self) -> ResolvedRun | None:
         if not hasattr(self, "_run"):
@@ -2986,18 +2963,6 @@ class AgentRoom:
                 if address(m, self.agent_id, sender_of) is not None
             ]
 
-    def _file_label(self, con: sqlite3.Connection, channel: str | None) -> str:
-        """How my result files are named: by my alias in `channel` or, without it, in my
-        first anonymous channel (also a closed one), else by my ID (W4-03 F4)."""
-        channels = self._my_channels(con)
-        if channel is not None:
-            channels = [ch for ch in channels if ch.name == channel] + channels
-        for ch in channels:
-            if ch.anonymous and ch.members.get(self.agent_id):
-                alias = str(ch.members[self.agent_id])
-                return "".join(c if c.isalnum() else "-" for c in alias.casefold())
-        return self.agent_id
-
     @staticmethod
     def _sealed(con: sqlite3.Connection, stage: str | None) -> tuple[bool, str | None]:
         if stage is None:
@@ -3009,129 +2974,11 @@ class AgentRoom:
             return False, None
         return (True, found["channel"]) if found is not None else (False, None)
 
-    def submit_result(
-        self,
-        kind: str,
-        title: str,
-        body: str | None = None,
-        path: str | None = None,
-    ) -> Result:
-        """Submit a result; a file in `path` is copied to `output/results/NNN-<name>-<kind>`.
-
-        `<name>` is my alias if I am in an anonymous channel, else my ID (W4-03 F4). The copy
-        is made in `STAGING_DIR` first; in a sealed stage (`RoomStore.seal`) the file stays in
-        `SEALED_DIR` until the stage is released, so no other agent can read it before.
-        """
-        self.not_in_note_turn()
-        if not kind.strip() or not title.strip():
-            raise RoomError("„kind“ und „title“ dürfen nicht leer sein.")
-        if not (body and body.strip()) and not path:
-            raise RoomError("Gib den Inhalt in „body“ an oder eine Datei in „path“.")
-        run_dir = self.store.run_dir
-        staged: Path | None = None
-        final: Path | None = None
-        suffix = ""
-        if path:
-            staging = run_dir / STAGING_DIR
-            staging.mkdir(parents=True, exist_ok=True)
-            staged = staging / f".staging-{uuid.uuid4().hex}"
-            suffix = Path(self._copy_source(path, staged)).suffix
-        try:
-            with self.store._write() as con:
-                assignment = self.store._latest_assignment(con, self.agent_id)
-                stage = assignment.stage if assignment else None
-                attempt = 1
-                if assignment and isinstance(assignment.context.get("attempt"), int):
-                    attempt = max(1, assignment.context["attempt"])
-                sealed, channel = self._sealed(con, stage)
-                cur = con.execute(
-                    "INSERT INTO result(ts, agent, stage, kind, title, body, path, attempt) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
-                    (_now(), self.agent_id, stage, kind, title, body, None, attempt),
-                )
-                result_id = cur.lastrowid
-                assert result_id is not None
-                if sealed:
-                    con.execute(
-                        "INSERT INTO sealed_result(result_id, stage) VALUES(?,?)",
-                        (result_id, stage),
-                    )
-                if staged is not None:
-                    folder = run_dir / (SEALED_DIR if sealed else RESULTS_DIR)
-                    folder.mkdir(parents=True, exist_ok=True)
-                    safe_kind = "".join(c if c.isalnum() or c in "-_" else "-" for c in kind)
-                    label = self._file_label(con, channel)
-                    final = folder / f"{result_id:03d}-{label}-{safe_kind}{suffix}"
-                    staged.rename(final)
-                    staged = None
-                    rel = final.relative_to(run_dir).as_posix()
-                    con.execute("UPDATE result SET path=? WHERE id=?", (rel, result_id))
-                row = con.execute("SELECT * FROM result WHERE id=?", (result_id,)).fetchone()
-                result = _row_to_result(row)
-            final = None  # committed
-            return result
-        finally:
-            for leftover in (staged, final):
-                if leftover is not None:
-                    leftover.unlink(missing_ok=True)
-
     def copy_file(self, rel: str, target: Path) -> str:
         """Copy a regular file of my working folder to `target` (no link followed, no FIFO,
         no hardlink, at most `MAX_ATTACHMENT_BYTES`); returns its name. `RoomError` with a
         German reason otherwise. For arr's own copies, e.g. versions of an artifact (W4-03)."""
         return self._copy_source(rel, target)
-
-    def submit_rating(
-        self,
-        result_id: int,
-        score: float,
-        comment: str,
-        criteria: dict[str, float] | None = None,
-    ) -> Rating:
-        """Rate a result of another agent; a second rating of the same result replaces the first.
-
-        `score` and the values in `criteria` must lie on the scale of the rubric; with
-        criteria in the rubric only those names are allowed.
-        """
-        self.not_in_note_turn()
-        criteria = dict(criteria or {})
-        self._check_score("score", score)
-        known = self.rubric.criteria
-        unknown = sorted(set(criteria) - set(known)) if known else []
-        if unknown:
-            raise RoomError(
-                f"Unbekannte Kriterien: {', '.join(unknown)}. Die Rubrik kennt: {', '.join(known)}."
-            )
-        for name, value in criteria.items():
-            self._check_score(f"criteria[„{name}“]", value)
-        with self.store._write() as con:
-            row = con.execute("SELECT agent FROM result WHERE id=?", (result_id,)).fetchone()
-            if row is None:
-                raise RoomError(f"Das Ergebnis #{result_id} gibt es nicht.")
-            if row["agent"] == self.agent_id:
-                raise RoomError("Eigene Ergebnisse kannst du nicht bewerten.")
-            con.execute(
-                "INSERT INTO rating(ts, rater, result_id, score, criteria, comment) "
-                "VALUES(?,?,?,?,?,?) ON CONFLICT(rater, result_id) DO UPDATE SET "
-                "ts=excluded.ts, score=excluded.score, criteria=excluded.criteria, "
-                "comment=excluded.comment",
-                (_now(), self.agent_id, result_id, score, json.dumps(criteria), comment),
-            )
-            new = con.execute(
-                "SELECT * FROM rating WHERE rater=? AND result_id=?", (self.agent_id, result_id)
-            ).fetchone()
-            return _row_to_rating(new)
-
-    def _check_score(self, what: str, value: float) -> None:
-        low, high = self.rubric.scale
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, int | float)
-            or not math.isfinite(value)
-        ):
-            raise RoomError(f"„{what}“ muss eine Zahl sein (Skala {low:g} bis {high:g}).")
-        if not low <= value <= high:
-            raise RoomError(f"„{what}“ = {value:g} liegt außerhalb der Skala {low:g} bis {high:g}.")
 
     def get_assignment(self) -> Assignment | None:
         """Current assignment with stage and context package."""
@@ -3143,7 +2990,7 @@ class AgentRoom:
 
     def _shown_label(self, con: sqlite3.Connection, channel: str | None) -> str:
         """How my submissions show me: my alias in `channel` or, without it, in my first
-        anonymous channel (also a closed one), else my ID (the rule of `_file_label`)."""
+        anonymous channel (also a closed one), else my ID (W4-03 F4)."""
         channels = self._my_channels(con)
         if channel is not None:
             channels = [ch for ch in channels if ch.name == channel] + channels
@@ -3472,7 +3319,7 @@ class AgentRoom:
         Head and `fields` are checked at once against the expected format (`check_submission`);
         `RoomError` names every problem in German, and the agent can try again in the same
         turn. Files are copied from my working folder by the rules of attachments
-        (`_copy_source`). Stage and attempt come from the assignment, as for `submit_result`.
+        (`_copy_source`). Stage and attempt come from the assignment.
         Every accepted submission is filed once (`RoomStore._publish`); in a sealed stage it
         stays in `SEALED_DIR` until `release`.
         """

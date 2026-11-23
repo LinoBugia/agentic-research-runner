@@ -1,4 +1,4 @@
-# Rolle Explorer: eine Idee entwickeln, im Kanal teilen, als Ergebnis abgeben.
+# Rolle Explorer: eine Idee entwickeln, im Kanal teilen, mit `submit` abgeben.
 version: 1
 cost_kind: estimated
 turns:
@@ -19,10 +19,10 @@ turns:
           body: "Idee: 2-adische Darstellung der Stoppzeiten."
         save_as: posted
       - do: room
-        action: submit_result
+        action: submit
         args:
-          kind: idea
-          title: "2-adische Darstellung"
+          status: done
+          summary: "2-adische Darstellung"
           body: "Skizze: Stoppzeiten über die Binärdarstellung abschätzen."
         save_as: result
       - do: room

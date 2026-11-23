@@ -1148,18 +1148,34 @@ class Orchestrator(RunContext):
                 self.log.write("channel_open", channel=name, stage=stage)
 
     async def escalate(
-        self, stage: str, summary: str, options: Sequence[EscalationOption]
-    ) -> EscalationOption:
-        """Pause the run, ask the user in the approval inbox and wait (docs/07 §6).
+        self,
+        stage: str,
+        summary: str,
+        options: Sequence[EscalationOption],
+        *,
+        attempt: int | None = None,
+        reason: str | None = None,
+    ) -> tuple[EscalationOption, str | None]:
+        """Pause the run, ask the user in the approval inbox and wait (docs/07 §6); the chosen
+        option and the user's hint (`Decision.comment`).
 
         New turns wait meanwhile; running turns go on. Only the user can decide, once (E15).
         Afterwards the run continues (unless the user paused it as well). After a stop, or
-        when the escalation becomes obsolete, the answer is `end`.
+        when the escalation becomes obsolete, the answer is `end` without a hint. The log
+        entry `escalation` carries `attempt` and `reason`, `escalation_decided` always `hint`
+        (W4b-06b: one method; `escalate_with_hint` went into it).
         """
         if self.stop_requested:
-            return EscalationOption.END
+            return EscalationOption.END, None
         choices = [EscalationOption(o).value for o in options]
-        self.log.write("escalation", stage=stage, summary=summary, options=choices)
+        self.log.write(
+            "escalation",
+            stage=stage,
+            summary=summary,
+            options=choices,
+            attempt=attempt,
+            reason=reason,
+        )
         self.pause("escalation")
         try:
             decision = await self.inbox.ask_escalation(self.run_id, stage, summary, options)
@@ -1167,8 +1183,15 @@ class Orchestrator(RunContext):
             self.resume("escalation")
         option = decision.option if decision is not None and decision.option else None
         chosen = option or EscalationOption.END
-        self.log.write("escalation_decided", stage=stage, option=chosen.value, by_user=bool(option))
-        return chosen
+        hint = decision.comment if decision is not None and option is not None else None
+        self.log.write(
+            "escalation_decided",
+            stage=stage,
+            option=chosen.value,
+            by_user=bool(option),
+            hint=bool(hint),
+        )
+        return chosen, hint
 
     # ----------------------------------------------------------------------------------------
     # Discussion phases (docs/06 §5)
@@ -1309,12 +1332,11 @@ class Orchestrator(RunContext):
         if error is not None:
             raise error
 
-    def seal_results(self, stage: str, channel: str | None = None) -> None:
-        """Hide the results of `stage` until `release_results` (F4)."""
-        if channel is not None:
-            self._channel_config(channel)
-        self.room.seal(stage, channel)
-        self.log.write("results_sealed", stage=stage, channel=channel)
+    def seal_results(self, stage: str) -> None:
+        """Hide the submissions of `stage` until `release_results` (F4). The log entry keeps
+        its key `channel` (always empty since W4b-06b; the old topologies named one)."""
+        self.room.seal(stage)
+        self.log.write("results_sealed", stage=stage, channel=None)
 
     def release_results(self, stage: str) -> list[Result]:
         """Release the sealed results of `stage` (F4); returns them."""
@@ -1473,36 +1495,6 @@ class Orchestrator(RunContext):
             fields=fields,
             stage=stage,
         )
-
-    async def escalate_with_hint(
-        self, stage: str, summary: str, options: Sequence[EscalationOption]
-    ) -> tuple[EscalationOption, str | None]:
-        """`escalate` with the user's hint (`Decision.comment`) for the phase runner. Like
-        `escalate`: pause, inbox item without deadline, `end` after a stop.
-
-        This doubles `escalate` on purpose: `waterfall` keeps the old method until W4b-06
-        removes it; then `escalate` should become a call of this one. Until then a change to
-        the escalation (W4b-07, W4b-09) belongs into both."""
-        if self.stop_requested:
-            return EscalationOption.END, None
-        choices = [EscalationOption(o).value for o in options]
-        self.log.write("escalation", stage=stage, summary=summary, options=choices)
-        self.pause("escalation")
-        try:
-            decision = await self.inbox.ask_escalation(self.run_id, stage, summary, options)
-        finally:
-            self.resume("escalation")
-        option = decision.option if decision is not None and decision.option else None
-        chosen = option or EscalationOption.END
-        hint = decision.comment if decision is not None and option is not None else None
-        self.log.write(
-            "escalation_decided",
-            stage=stage,
-            option=chosen.value,
-            by_user=bool(option),
-            hint=bool(hint),
-        )
-        return chosen, hint
 
     def channel_messages(self, channel: str) -> list[Message]:
         """Every message of `channel`, oldest first (input `channel:` of a phase)."""
