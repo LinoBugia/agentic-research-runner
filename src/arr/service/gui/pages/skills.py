@@ -16,7 +16,6 @@ from urllib.parse import quote
 
 from nicegui import ui
 
-from arr.models import TopologyKind
 from arr.service.api_client import ApiClient
 from arr.service.api_models import (
     ApiException,
@@ -71,50 +70,16 @@ TAB_FILES = {"skill": "SKILL.md", "yaml": "group.yaml"}
 """Tabs that are the editor of one file."""
 ROLE_MISSING = re.compile(r"^Rolle (\S+) nicht gefunden\.")
 ROLE_TEMPLATE = (
-    "# Rolle: {name}\n\nBeschreibe hier, was dieser Agent tut, worauf er achtet und wie er sein "
-    "Ergebnis abgibt (`submit_result`).\n"
+    "# Rolle: {name}\n\nBeschreibe hier, was dieser Agent tut, worauf er achtet und wie er seine "
+    "Arbeit abgibt (`submit`).\n"
 )
 UNSAVED = (
     "Du hast ungespeicherte Änderungen an {path}. Speichere oder verwirf sie zuerst, dann geht "
     "es hier weiter."
 )
 
-# Flow of each topology in plain words (docs/03 §4, docs/08 §6.5 table of the progress bar)
-FLOW = {
-    TopologyKind.EXPLORATION: (
-        [
-            ("Ideen", "je Explorer eine"),
-            ("Exploration", "Turns je Idee"),
-            ("Bewertung", "ranker"),
-            ("Zusammenfassung", "summary.md"),
-        ],
-        None,
-    ),
-    TopologyKind.WATERFALL: (
-        [
-            ("Strategie", "strategist"),
-            ("Skizze", "prover"),
-            ("Beweis", "prover"),
-            ("Zusammenfassung", "summary.md"),
-        ],
-        "Unter der Bestehensgrenze: Nacharbeit. Nach der letzten Nacharbeit entscheidest du "
-        "(Noch ein Versuch, Trotzdem weiter, Run beenden).",
-    ),
-    TopologyKind.REVIEW: (
-        [
-            ("Artefakt", "Autor oder Datei"),
-            ("Prüfung", "Judges unabhängig"),
-            ("Diskussion", "#judges öffnet"),
-            ("Urteil", "nach verdict"),
-        ],
-        "Nicht akzeptiert und Revisionen übrig: Der Autor überarbeitet, dann zurück zu 1.",
-    ),
-    TopologyKind.ROUNDTABLE: (
-        [("Runde 1 … R", "alle der Reihe nach"), ("Zusammenfassung", "summary.md")],
-        "Wer nichts beizutragen hat, passt. Nach der letzten Runde wird zusammengefasst.",
-    ),
-    TopologyKind.SOLO: ([("Arbeit", "ein Agent"), ("Ergebnis", "summary.md")], None),
-}
+NO_PLAN = "Der Ablauf steht im Phasenplan."
+"""The overview of a group with phases whose plan does not resolve (unchanged since W4b-07)."""
 CHECKED = Status("st-ok", "check", "geprüft")
 
 
@@ -131,21 +96,6 @@ def skill_item_html(skill: SkillInfo, selected: bool) -> str:
         f'<div class="t">{esc(skill.name)}{flag}</div>'
         f'<div class="d">{esc(skill.description)}{use}</div></a>'
     )
-
-
-def flow_html(topology: TopologyKind) -> str:
-    if topology not in FLOW:  # `phases`: the overview shows the phase plan instead
-        return '<p class="small muted">Der Ablauf steht im Phasenplan.</p>'
-    stages, loop = FLOW[topology]
-    first = 0 if topology in (TopologyKind.REVIEW, TopologyKind.EXPLORATION) else 1
-    items = "".join(
-        f'<li><span class="nm">{i + first} · {esc(name)}</span><span class="sub">{esc(sub)}</span>'
-        "</li>"
-        for i, (name, sub) in enumerate(stages)
-    )
-    note = f'<p class="small muted">{esc(loop)}</p>' if loop else ""
-    label = f"Ablauf der Topologie {TOPOLOGY_LABEL[topology]}"
-    return f'<ol class="skill-flow" aria-label="{esc(label)}">{items}</ol>{note}'
 
 
 def params_html(skill: SkillInfo) -> str:
@@ -261,6 +211,9 @@ class SkillsPage:
         self.editor: SkillEditor | None = None
         self.skill: SkillInfo | None = None
         self.renders = 0
+        self.update_lines: list[str] = []
+        """The lines of the last „Start-Skills aktualisieren“ (W4b-06b, F2), shown above the
+        list until the page is opened again."""
 
     async def build(self) -> None:
         with self.frame.content:
@@ -342,6 +295,20 @@ class SkillsPage:
                         classes="btn sk-new",
                         title="Fehlt: " + ", ".join(missing),
                     ).mark("start-skills")
+                updatable = await self._updatable()
+                if updatable:
+                    button(
+                        "Start-Skills aktualisieren",
+                        self._update_start_skills,
+                        classes="btn sk-new",
+                        title="Unverändert, frühere Fassung: " + ", ".join(updatable),
+                    ).mark("update-start-skills")
+                if self.update_lines:
+                    items = "".join(f"<li>{esc(line)}</li>" for line in self.update_lines)
+                    raw(
+                        '<div class="small" id="start-skills-lines" role="status">'
+                        f"<b>Start-Skills aktualisieren</b><ul>{items}</ul></div>"
+                    )
                 self.list_box = raw("", tag="div", classes="list")
             self.detail = ui.element("div")
         self._render_list(skills, selected)
@@ -503,7 +470,6 @@ class SkillsPage:
                 "Übersicht. Die Fehler stehen unter „Prüfung“.</p>"
             )
             return
-        topology = skill.topology
         if skill.phase_plan is not None:
             raw(
                 '<h3>Phasenplan</h3><p class="small muted">Mit den Standardwerten der Parameter. '
@@ -511,9 +477,11 @@ class SkillsPage:
                 + phase_table_html(skill.phase_plan, skill=skill.name)
             )
             flow = ""
-        else:
-            label = TOPOLOGY_LABEL.get(topology, str(topology))
-            flow = f"<h3>Ablauf (Topologie {esc(label)})</h3>{flow_html(topology)}"
+        else:  # an old group gets the message of W4b-06b (`_check_group`), no flow of its own
+            old = [i.message for i in skill.issues if i.field == "topology"]
+            label = TOPOLOGY_LABEL.get(skill.topology, str(skill.topology))
+            text = old[0] if old else NO_PLAN
+            flow = f'<h3>Ablauf (Topologie {esc(label)})</h3><p class="small muted">{esc(text)}</p>'
         raw(
             '<div class="grid-2e"><div>'
             f"{flow}"
@@ -723,8 +691,8 @@ class SkillsPage:
                     (
                         "group",
                         "Group-Skill",
-                        "Startbare Research-Group: SKILL.md, group.yaml (Topologie roundtable, "
-                        "zwei Agenten) und eine Rolle",
+                        "Startbare Research-Group in Phasen: zwei Agenten diskutieren; SKILL.md, "
+                        "group.yaml, eine Rolle und ein Auftrag",
                     ),
                     ("tool", "Werkzeug-Skill", "Nur eine SKILL.md, für Agenten und Claude Code"),
                 ):
@@ -764,6 +732,26 @@ class SkillsPage:
             return None
 
         self.dialog.open("Neuer Skill", "Skill anlegen", build, submit)
+
+    async def _updatable(self) -> list[str]:
+        """The start skills „Start-Skills aktualisieren“ would update; none if arr cannot
+        tell (the button then stays away)."""
+        try:
+            return (await self.api.update_start_skills(dry_run=True)).updatable
+        except ApiException:
+            return []
+
+    async def _update_start_skills(self) -> None:
+        """Bring unchanged start skills to the current version (W4b-06b, F2), like `arr skills
+        update`: changed ones stay; the lines show what happened to each."""
+        try:
+            result = await self.api.update_start_skills()
+        except ApiException as exc:
+            self.frame.toast(exc.error.message, error=True)
+            return
+        self.update_lines = result.lines
+        self.frame.toast(result.message)
+        await self._load()
 
     async def _create_start_skills(self) -> None:
         """Create the missing start skills; skills with the same name stay as they are."""

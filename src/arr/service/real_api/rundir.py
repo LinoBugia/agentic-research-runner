@@ -1173,7 +1173,7 @@ def run_summary(
             label=current,
         )
     tokens, cost, kind = run_usage(record)
-    topology = peek.topology if peek is not None else _start_topology(record) or TopologyKind.SOLO
+    topology = peek.topology if peek is not None else _start_topology(record) or TopologyKind.PHASES
     skill = meta.skill
     name = meta.name or f"{skill or topology.value} · {meta.project}"
     agent_count = peek.agent_count if peek is not None else len(record.agents)
@@ -2102,16 +2102,13 @@ def run_results(record: RunRecord, resolved: ResolvedRun | None = None) -> RunRe
     summary = record.summary_md
     phases = resolved is not None and resolved.topology.kind is TopologyKind.PHASES
     submissions = submission_infos(record, store) if phases and store is not None else []
-    if phases:
+    if phases or resolved is None:  # W4b-06b: every new run is a phases run
         empty = (
             "Noch keine Abgabe. Agenten geben ihre Arbeit mit submit ab; die Abgaben erscheinen "
             "hier nach Phase und Durchlauf."
         )
-    else:
-        empty = (
-            "Noch kein Ergebnis. Agenten geben Ergebnisse über den Gruppenchat ab "
-            "(submit_result); sie erscheinen hier mit ihren Bewertungen."
-        )
+    else:  # an old run without results
+        empty = "Noch kein Ergebnis. Ergebnisse erscheinen hier mit ihren Bewertungen."
     return RunResults(
         items=items,
         summary_md=summary,

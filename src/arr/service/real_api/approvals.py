@@ -77,7 +77,6 @@ from arr.service.api_models import (
     EscalatedByInfo,
     EscalationOptionInfo,
     Estimate,
-    LastRating,
     LimitsInfo,
     PhasePlan,
     RiskInfo,
@@ -96,7 +95,6 @@ from arr.service.real_api.rundir import (
     model_label,
     role_label,
     run_alive,
-    run_results,
     stage_infos,
     vendor_of,
 )
@@ -612,36 +610,16 @@ class ApprovalReader:
         stage = str(data.get("stage") or "") or None
         keys = [EscalationOption(o) for o in data.get("options") or list(EscalationOption)]
         peek = record.peek()
-        if peek is not None and peek.topology is TopologyKind.PHASES:
+        if peek is None or peek.topology is TopologyKind.PHASES:  # W4b-06b: no old fallback
             return self._phase_escalation(record, lines, common, data, stage, keys)
-        attempts: list[Attempt] = []
-        ratings: list[LastRating] = []
-        result_id = None
-        worker = "Der Agent"
-        if common["status"] is ApprovalStatus.OPEN:
-            resolved = record.load_resolved()
-            for info in stage_infos(record, resolved):
-                if info.key == stage:
-                    attempts = info.attempts
-            if resolved is not None:
-                worker = next((s.agent for s in resolved.stages if s.name == stage), worker)
-            of_stage = [r for r in run_results(record, resolved).items if r.stage == stage]
-            if of_stage:
-                result_id = of_stage[-1].id
-                ratings = [
-                    LastRating(rater=r.rater, score=r.score, comment=r.comment)
-                    for r in of_stage[-1].ratings
-                ]
+        # an old run (before W4b-06b): its escalation is decided or closed, never open again
         return ApprovalItem(
             type=ApprovalType.ESCALATION,
-            title=item_title(lines.opened, stage=stage, attempts=len(attempts)),
-            topology=peek.topology if peek is not None else TopologyKind.WATERFALL,
+            title=item_title(lines.opened, stage=stage, attempts=0),
+            topology=peek.topology,
             stage=stage,
             reason=data.get("summary") or lines.opened.get("note"),
-            attempts=attempts,
-            last_ratings=ratings,
-            options=_option_infos(keys, worker, stage),
-            result_id=result_id,
+            options=_old_option_infos(keys, stage),
             **common,
         )
 
@@ -655,16 +633,22 @@ class ApprovalReader:
         keys: list[EscalationOption],
     ) -> ApprovalItem:
         """Gate `user` and escalations of a phases run (W4b-07 §6.8): head „Phase „x“ ·
-        Durchlauf n“ and the reason from the first line of `summary` (`inbox_summary`), the
-        rest of `summary` as plain lines, options that name what happens; no score chips but at
-        a gate `judge` with `mean`. The hint goes to every participant only with „Noch ein
-        Versuch“; `comment_to` stays empty."""
+        Durchlauf n“ and the reason from the fields `attempt` and `reason` of the log entry
+        (W4b-06b), for an entry without them from the first line of `summary`
+        (`inbox_summary`); the rest of `summary` as plain lines, options that name what
+        happens; no score chips but at a gate `judge` with `mean`. The hint goes to every
+        participant only with „Noch ein Versuch“; `comment_to` stays empty."""
         summary = data.get("summary")
         text = summary if isinstance(summary, str) else ""
         first, *rest = text.split("\n") if text else [""]
         match = _PHASE_HEAD.match(first)
         attempt = int(match.group(2)) if match else None
         reason = one_line(match.group(3), 300) if match else None
+        logged_attempt = data.get("attempt")
+        if isinstance(logged_attempt, int) and not isinstance(logged_attempt, bool):
+            attempt = logged_attempt
+        if isinstance(data.get("reason"), str) and data["reason"].strip():
+            reason = one_line(data["reason"], 300)
         resolved = record.load_resolved()
         attempts: list[Attempt] = []
         if resolved is not None and stage:
@@ -739,13 +723,15 @@ def _phase_option_infos(
     return [EscalationOptionInfo(key=k, label=texts[k][0], help=texts[k][1]) for k in keys]
 
 
-def _option_infos(
-    keys: Iterable[EscalationOption], worker: str, stage: str | None
+def _old_option_infos(
+    keys: Iterable[EscalationOption], stage: str | None
 ) -> list[EscalationOptionInfo]:
+    """The options of an escalation of an old run, as `main` read a decided one before
+    W4b-06b (its agent was named only while the item was open, which no old run is now)."""
     texts = {
         EscalationOption.RETRY: (
             "Noch ein Versuch",
-            f"Die Nacharbeit wird um 1 erhöht. {worker} überarbeitet die Stufe.",
+            "Die Nacharbeit wird um 1 erhöht. Der Agent überarbeitet die Stufe.",
         ),
         EscalationOption.CONTINUE: (
             "Trotzdem weiter",

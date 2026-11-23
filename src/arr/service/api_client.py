@@ -61,6 +61,7 @@ from arr.service.api_models import (
     SkillKind,
     StartRunResponse,
     StartSkillsResult,
+    StartSkillsUpdateResult,
     StorageReport,
     ToolchainTestResult,
     TranscriptKind,
@@ -490,4 +491,10 @@ class ApiClient(Protocol):
     async def create_start_skills(self) -> StartSkillsResult:
         """Create the missing start skills (`POST /api/skills/start`, W4-05); skills with the
         same name are never overwritten and named in `existing`."""
+        ...
+
+    async def update_start_skills(self, dry_run: bool = False) -> StartSkillsUpdateResult:
+        """Bring unchanged start skills to the current version, like `arr skills update`
+        (`POST /api/skills/start/update`, W4b-06b, F2); a changed one is never touched. With
+        `dry_run` only which ones would be updated (`updatable`), nothing is written."""
         ...

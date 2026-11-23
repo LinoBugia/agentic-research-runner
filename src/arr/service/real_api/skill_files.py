@@ -458,6 +458,10 @@ description: {description}
 ## Wann sinnvoll
 - …
 
+## Ablauf
+Eine Phase `diskussion`: zwei Teilnehmer diskutieren die Aufgabe in `#runde` und geben je ein
+Fazit ab (Format `text`). Den Auftrag liest du in `tasks/diskutieren.md`.
+
 ## Vorbereitung
 Schreibe eine task.md mit der Frage und dem, worauf die Agenten achten sollen.
 
@@ -470,7 +474,7 @@ Schreibe eine task.md mit der Frage und dem, worauf die Agenten achten sollen.
 GROUP_YAML = """kind: research-group
 version: 1
 description: {description_yaml}
-topology: roundtable
+topology: phases
 
 params:
   rounds: {{ default: 2, min: 1, max: 5, doc: "Anzahl der Runden" }}
@@ -480,18 +484,34 @@ agents:
     count: 2
     role: roles/teilnehmer.md
 
-groupchats:
-  - name: main
+channels:
+  - name: runde
     purpose: "Gemeinsame Diskussion der Aufgabe"
     members: [teilnehmer-*]
     mode: rounds
+
+phases:
+  - name: diskussion
+    topology: chat
+    channels: [runde]
+    rounds: "{{{{ params.rounds }}}}"
+    actions:
+      teilnehmer-*: {{ task: tasks/diskutieren.md, submission: {{ format: text }} }}
 """
+"""The group of a new skill (W4b-06b, F3): the smallest phases group, two `teilnehmer`, the
+channel `#runde`, one phase `diskussion` (`chat`, `rounds` as parameter), submission `text`."""
 
 GROUP_ROLE = """# Rolle: Teilnehmer
 
-Du diskutierst die Aufgabe mit den anderen Teilnehmern im Kanal #main. Lies die neuen
-Nachrichten, bring eigene Überlegungen ein und prüfe die Beiträge der anderen kritisch.
-Gib dein Ergebnis mit `submit_result` ab, sobald es steht.
+Du diskutierst die Aufgabe mit dem anderen Teilnehmer im Kanal #runde. Lies die neuen
+Nachrichten, bring eigene Überlegungen ein und prüfe die Beiträge des anderen kritisch.
+Gib dein Fazit mit `submit` ab, sobald es steht.
+"""
+
+GROUP_TASK = """Diskutiere die Aufgabe des Runs mit dem anderen Teilnehmer in `#runde`.
+
+Ist dein Teil erledigt, gib dein Fazit mit `submit` ab (Format `text`): was gesichert ist, was
+vermutet, was offen bleibt. Mit der Abgabe bist du mit deinem Teil fertig.
 """
 
 
@@ -501,7 +521,8 @@ def _yaml_text(value: str) -> str:
 
 
 def template_files(name: str, kind: str, description: str) -> dict[str, str]:
-    """The files of a new skill: `tool` (only SKILL.md) or `group` (roundtable, one role)."""
+    """The files of a new skill: `tool` (only SKILL.md) or `group` (the smallest phases group:
+    one phase `diskussion`, one role, one assignment; W4b-06b, F3)."""
     description = " ".join(description.split()) or "Neuer Skill"
     title = name.replace("-", " ").capitalize()
     fields = {
@@ -515,6 +536,7 @@ def template_files(name: str, kind: str, description: str) -> dict[str, str]:
             SKILL_FILE: GROUP_SKILL_MD.format(**fields),
             "group.yaml": GROUP_YAML.format(**fields),
             "roles/teilnehmer.md": GROUP_ROLE,
+            "tasks/diskutieren.md": GROUP_TASK,
         }
     return {SKILL_FILE: TOOL_SKILL_MD.format(**fields)}
 

@@ -1,4 +1,5 @@
 {
+ "approvals": [],
  "describe_checkpoint": [
   "Plan: artefakt → pruefung → diskussion → urteil → revision → zusammenfassung",
   "Checkpoint „artefakt“ (version=1, path=output/artifacts/v1/artefakt.md, source=result_text, result=1)",

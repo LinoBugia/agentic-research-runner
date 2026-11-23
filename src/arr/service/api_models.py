@@ -2447,7 +2447,8 @@ class SaveSkillFileResult(ApiModel):
 
 class CreateSkillRequest(ApiModel):
     """A new skill from the built-in template (`POST /api/skills`): `tool` has only SKILL.md,
-    `group` SKILL.md, a `group.yaml` with topology `roundtable` and one role."""
+    `group` SKILL.md, a `group.yaml` with `topology: phases` (one phase `diskussion` of two
+    agents, W4b-06b), one role and one assignment."""
 
     name: str
     kind: Literal["tool", "group"]
@@ -2552,6 +2553,20 @@ class StartSkillsResult(ApiModel):
     created: list[str] = Field(default_factory=list)
     existing: list[str] = Field(default_factory=list)
     message: str
+
+
+class StartSkillsUpdateResult(ApiModel):
+    """Unchanged start skills brought to the current version (`update_start_skills`,
+    W4b-06b, F2): `updatable` the start skills that equal an earlier version arr shipped
+    (before the update; with `dry_run` the only answer, the button shows only then), `updated`
+    those the update replaced, `lines` one German line per start skill as `arr skills update`
+    prints them (`arr.skills.update_lines`, empty with `dry_run`), `message` a German
+    sentence."""
+
+    updatable: list[str] = Field(default_factory=list)
+    updated: list[str] = Field(default_factory=list)
+    lines: list[str] = Field(default_factory=list)
+    message: str = ""
 
 
 # --------------------------------------------------------------------------------------------

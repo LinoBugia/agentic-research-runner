@@ -112,8 +112,9 @@ def normalized(value: Any, workfolder: Path) -> Any:
 async def readings(api: Any, workfolder: Path, name: str) -> dict[str, Any]:
     """What the reading code gives for the old run `name` (normalized, for the snapshots):
     `get_run`, `get_results`, `get_log`, `list_channels`, `list_agents`, the line of every log
-    entry (`describe_entry`, `describe_checkpoint`), `run_reason`, and `read_results`,
-    `read_run_summary` of Claude Code (`UserApi`). The run's size on disk is left out."""
+    entry (`describe_entry`, `describe_checkpoint`), `run_reason`, `read_results` and
+    `read_run_summary` of Claude Code (`UserApi`), the items of the approval inbox. The run's
+    size on disk is left out."""
     from arr.runs.inspect import describe_checkpoint, run_reason
     from arr.runs.launch import describe_entry
     from arr.runs.orchestrator import OrchestratorLog
@@ -136,6 +137,9 @@ async def readings(api: Any, workfolder: Path, name: str) -> dict[str, Any]:
         "run_reason": run_reason(load_run_meta(run_dir), entries),
         "read_results": await users.read_results("demo", name),
         "read_run_summary": await users.read_run_summary("demo", name),
+        "approvals": [
+            i.model_dump(mode="json") for i in await api.list_approvals(run_id=name, status=None)
+        ],
     }
     found["get_run"]["run"].pop("size", None)  # bytes of the room's SQLite files vary
     return normalized(found, workfolder)

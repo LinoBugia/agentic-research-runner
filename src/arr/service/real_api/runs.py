@@ -39,6 +39,7 @@ from arr.models import (
     RunInput,
     RunStatus,
     Starter,
+    TopologyKind,
     WorkfolderSettings,
 )
 from arr.permissions.policy import REDACTED, _redact_data, redact
@@ -49,6 +50,7 @@ from arr.room.types import Message as RoomMessage
 from arr.runs.launch import Launch, plan_run_input, request_stop, reserve_run, run_launch
 from arr.runs.manager import RunManager, set_run_status
 from arr.runs.orchestrator import OrchestratorLog
+from arr.runs.phases.tasks import NO_SKILL_TASK
 from arr.runs.prepare import _check_codex_toolchain, _make_plan, load_run_meta
 from arr.service.api_client import count_active, count_runs_waiting
 from arr.service.api_models import (
@@ -148,6 +150,26 @@ STANDARD_MODELS = {Provider.CLAUDE: "claude-sonnet-5-5", Provider.CODEX: "gpt-5.
 """Model of a run from the form while `arr.yaml` has no standard for the provider."""
 SOLO_AGENT = "solver"
 """The one agent of a run without a skill (docs/08 §5.4 „Ohne Skill“)."""
+NO_SKILL_PHASE = "arbeit"
+NO_SKILL_NAME = "ohne Skill"
+"""The name of a run without a skill when it has none of its own (`<this> · <project>`)."""
+
+
+def without_skill(data: dict[str, Any]) -> None:
+    """A run without a skill (W4b-06b, F1): a phases run with the agent `solver` and one
+    phase `arbeit` (`solo`, submission `text`, `turns` as standard); its assignment comes from
+    arr's package (`NO_SKILL_TASK`)."""
+    data["topology"] = {"kind": "phases"}
+    data["agents"] = [{"id": SOLO_AGENT}]
+    data["phases"] = [
+        {
+            "name": NO_SKILL_PHASE,
+            "topology": "solo",
+            "actions": {SOLO_AGENT: {"task": NO_SKILL_TASK, "submission": {"format": "text"}}},
+        }
+    ]
+
+
 DELIVERY_POLL_S = 0.25
 DELIVERY_POLL_MAX_S = 1.0
 _AGENT_PATH = re.compile(r"agents\[(\d+)\]\.(\w+)")
@@ -193,8 +215,7 @@ def form_input(
         if not data.get(key):
             data.pop(key, None)
     if "skill" not in data:
-        data["topology"] = {"kind": "solo"}
-        data["agents"] = [{"id": SOLO_AGENT}]
+        without_skill(data)
         params = {}
     return data, params, {k: v for k, v in overrides.items() if v}
 
@@ -683,8 +704,7 @@ def request_data(
                 raise _issue(f"overrides.{key}", f"„{key}“ ist eine Zuordnung.")
             data[key] = _deep_merge(data.get(key) or {}, overrides[key])
     if not data.get("skill") and not data.get("agents") and not data.get("topology"):
-        data["topology"] = {"kind": "solo"}
-        data["agents"] = [{"id": SOLO_AGENT}]
+        without_skill(data)
     if not data.get("task"):
         raise _issue("task", TASK_MISSING)
     return data, params, agents
@@ -905,9 +925,13 @@ class RunsArea:
         project = resolved.project if resolved is not None else (meta.project if meta else "")
         skill = resolved.skill if resolved is not None else (meta.skill if meta else None)
         topology = resolved.topology.kind if resolved is not None else None
-        name = (meta.name if meta else None) or (
-            f"{skill or (topology.value if topology else 'solo')} · {project}"
-        )
+        if skill:
+            fallback = skill
+        elif topology is TopologyKind.PHASES:
+            fallback = NO_SKILL_NAME  # W4b-06b: a run without a skill
+        else:  # an old run keeps its name
+            fallback = topology.value if topology else "solo"
+        name = (meta.name if meta else None) or f"{fallback} · {project}"
         task = record.task_md
         task_md = redact(task) if task is not None else None
         if resolved is None:

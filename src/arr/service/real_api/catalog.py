@@ -71,6 +71,7 @@ from arr.service.api_models import (
     SkillKind,
     SkillUsage,
     StartSkillsResult,
+    StartSkillsUpdateResult,
 )
 from arr.service.real_api import skill_files
 from arr.service.real_api.base import ServiceState, not_found
@@ -84,12 +85,16 @@ from arr.skills import (
     SkillAudience,
     SkillCatalog,
     SkillFileError,
+    SkillUpdate,
     check_research_skills,
     discover_skills,
     install_start_skills,
     read_text_file,
     skills_for_user_agent,
     start_skills_message,
+    updatable_start_skills,
+    update_lines,
+    update_start_skills,
 )
 from arr.skills import SkillInfo as CoreSkill
 from arr.workfolder import (
@@ -864,7 +869,8 @@ class CatalogArea:
         return self._created(request.name, f"{what} „{request.name}“ angelegt.", [])
 
     async def create_skill(self, request: CreateSkillRequest) -> SkillChangeResult:
-        """A new skill from the built-in template (tool: SKILL.md; group: roundtable)."""
+        """A new skill from the built-in template (tool: SKILL.md; group: the smallest phases
+        group with one phase `diskussion`, W4b-06b)."""
         return await asyncio.to_thread(self._create, request)
 
     def _duplicate(self, name: str, request: DuplicateSkillRequest) -> SkillChangeResult:
@@ -910,3 +916,30 @@ class CatalogArea:
         """Create the missing start skills (W4-05); a skill with the same name is never
         overwritten, also when it is broken (`arr.skills.install_start_skills`)."""
         return await asyncio.to_thread(self._start_skills)
+
+    def _update_start_skills(self, dry_run: bool) -> StartSkillsUpdateResult:
+        workfolder = self.state.workfolder
+        try:
+            updatable = updatable_start_skills(workfolder)
+            if dry_run:
+                return StartSkillsUpdateResult(updatable=updatable)
+            update = update_start_skills(workfolder)
+        except SkillFileError as exc:
+            raise ApiException.of(ErrorCode.NOT_ALLOWED, exc.message) from None
+        updated = [n for n, r in update.skills.items() if r.result is SkillUpdate.UPDATED]
+        failed = [n for n, r in update.skills.items() if r.result is SkillUpdate.FAILED]
+        if updated:
+            message = f"Start-Skills aktualisiert: {', '.join(updated)}."
+        else:
+            message = "Kein Start-Skill war zu aktualisieren."
+        if failed:
+            message += f" Nicht aktualisiert: {', '.join(failed)} (Details in der Liste)."
+        return StartSkillsUpdateResult(
+            updatable=updatable, updated=updated, lines=update_lines(update), message=message
+        )
+
+    async def update_start_skills(self, dry_run: bool = False) -> StartSkillsUpdateResult:
+        """Bring unchanged start skills to the current version, like `arr skills update`
+        (W4b-06b, F2): only on a click of the user; a changed start skill, an own group and a
+        missing one stay as they are. `dry_run`: only which ones would be updated."""
+        return await asyncio.to_thread(self._update_start_skills, dry_run)
