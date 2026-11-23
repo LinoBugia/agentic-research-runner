@@ -164,12 +164,12 @@ phases:
 
 @pytest.mark.parametrize("kind", list(TopologyKind))
 def test_a1_every_topology_in_every_function(kind: TopologyKind) -> None:
+    """Old kinds as well: old runs stay readable (W4b-06b §6.6); `flow_html` of the skills page
+    is gone with the old topologies (an old group shows `old_topology_message`)."""
     from arr.service.gui.components.stage_bar import stage_bar_html
-    from arr.service.gui.pages.skills import flow_html
     from arr.service.gui.texts import TOPOLOGY, TOPOLOGY_LABEL
 
     assert TOPOLOGY[kind] and TOPOLOGY_LABEL[kind]
-    assert "<ol" in flow_html(kind) or "Phasenplan" in flow_html(kind)
     stages = [StageInfo(key="a", index=1, label="a", status=StageStatus.RUNNING)]
     assert 'class="stagebar"' in stage_bar_html(stages, kind)
     item = ApprovalItem(

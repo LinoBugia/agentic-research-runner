@@ -17,7 +17,18 @@ from typing import Any
 import pytest
 from nicegui import ui
 from nicegui.testing.user import User
-from run_kit import FAST, done, fake_builders, post, say, turns, wait, write_profiles
+from run_kit import (
+    FAST,
+    done,
+    fake_builders,
+    post,
+    room,
+    say,
+    solo_phases,
+    turns,
+    wait,
+    write_profiles,
+)
 from service_kit import (
     append,
     hold_lock,
@@ -49,11 +60,15 @@ from arr.service.real_api.rundir import counts_as_active
 
 BASE = "http://test"
 GROUP = (
-    "kind: research-group\nversion: 1\ntopology: roundtable\n"
+    "kind: research-group\nversion: 1\ntopology: phases\n"
     "params:\n  rounds: {default: 2, min: 1, max: 5, doc: Runden}\n"
     "agents:\n  - {id: m, count: 2}\n"
     "groupchats:\n  - {name: main, members: [m-*]}\n"
+    "phases:\n  - name: diskussion\n    topology: chat\n    channels: [main]\n"
+    "    rounds: '{{ params.rounds }}'\n"
+    "    actions: {m-*: {task: tasks/runde.md, submission: {format: text}}}\n"
 )
+"""Since W4b-06b a phases group (was `roundtable`): one phase `chat` in #main."""
 FORM: dict[str, Any] = {
     "project": "demo",
     "skill": "runde",
@@ -63,7 +78,10 @@ FORM: dict[str, Any] = {
     "agents": {},
     "limits": {},
 }
-ANSWERS = {"m-1": turns([say("eins"), done()]), "m-2": turns([say("zwei"), done()])}
+ANSWERS = {
+    "m-1": turns([say("eins"), room("submit", status="done", summary="eins", body="Fazit eins")]),
+    "m-2": turns([say("zwei"), room("submit", status="done", summary="zwei", body="Fazit zwei")]),
+}
 
 
 @pytest.fixture
@@ -86,6 +104,8 @@ def wf(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     group.mkdir(parents=True)
     (group / "SKILL.md").write_text("---\nname: runde\ndescription: Eine Runde.\n---\n# Runde\n")
     (group / "group.yaml").write_text(GROUP)
+    (group / "tasks").mkdir()
+    (group / "tasks" / "runde.md").write_text("Diskutiere die Aufgabe.\n", "utf-8")
     return workfolder
 
 
@@ -215,9 +235,10 @@ async def test_a_run_file_as_input_still_works(wf: Path) -> None:
         {
             "project": "demo",
             "task": "Los.",
-            "topology": {"kind": "solo"},
+            "topology": {"kind": "phases"},
             "agents": [{"id": "a"}],
             "defaults": {"model": "fake-model", "auth": "fake-auth"},
+            "phases": solo_phases(),
         }
     )
     assert not resolved.errors and resolved.agents[0].id == "a"
@@ -367,9 +388,11 @@ async def test_list_follows_a_run_of_a_second_process_live(
     tmp_path: Path, wf: Path, arr_home: Path
 ) -> None:
     (wf / "solo.yaml").write_text(
-        "version: 1\nname: Aus dem Terminal\nproject: demo\ntask: Los.\ntopology: {kind: solo}\n"
+        "version: 1\nname: Aus dem Terminal\nproject: demo\ntask: Los.\ntopology: {kind: phases}\n"
         "defaults: {provider: claude, model: fake-model, auth: fake-auth}\n"
-        "agents: [{id: a}]\n",
+        "agents: [{id: a}]\n"
+        "phases: [{name: arbeit, topology: solo, "
+        "actions: {a: {task: tasks/ohne-skill.md, submission: {format: text}}}}]\n",
         encoding="utf-8",
     )
     api = make_api(wf)
@@ -656,11 +679,11 @@ async def test_handoff_text_can_be_copied_when_the_run_is_over(wf: Path) -> None
 
 
 async def test_channel_opens_on_the_page_when_its_stage_begins(wf: Path) -> None:
-    channels = [
-        {"name": "main", "members": ["a"]},
-        {"name": "spaeter", "members": ["a"], "open_from": "zwei"},
-    ]
+    """Since W4b-06b on a phases run: the runner holds a channel outside its phases and opens
+    it when the phase begins (was `open_from` of an old topology)."""
+    channels = [{"name": "main", "members": ["a"]}, {"name": "spaeter", "members": ["a"]}]
     folder = make_run_folder(wf, status=RunStatus.RUNNING, agents=["a"], channels=channels)
+    RoomStore(folder).hold_channel("spaeter")  # as the runner does in phase „eins“
     lock = hold_lock(folder)
     log = folder / "orchestrator.jsonl"
     checkpoint = {"ts": time.time(), "kind": "checkpoint"}
@@ -669,13 +692,13 @@ async def test_channel_opens_on_the_page_when_its_stage_begins(wf: Path) -> None
     try:
         async with real_user(make_api(wf)) as user:
             await user.open(f"/runs/{folder.name}?kanal=spaeter")
-            await see(user, "#spaeter öffnet in Stufe")
+            await see(user, "#spaeter öffnet in Phase")
             RoomStore(folder).open_channel("spaeter")
-            start = {**checkpoint, "data": {"stage": "zwei", "phase": "stage_start"}}
-            append(log, json.dumps(start) + "\n")
+            start = {"stage": "zwei", "phase": "pass_start", "attempt": 1, "how": "normal"}
+            append(log, json.dumps({**checkpoint, "data": start}) + "\n")
 
             async def opened() -> bool:
-                return "öffnet in Stufe" not in page_html(user)
+                return "öffnet in Phase" not in page_html(user)
 
             await until(opened, within=10, what="channel opened")
             await see(user, "Live folgen")
@@ -771,7 +794,7 @@ async def test_summary_appears_on_the_open_results_view_when_the_run_ends(wf: Pa
 EVENT_FORM: dict[str, Any] = {
     "project": "demo",
     "task": "Teste arr.",
-    "topology": {"kind": "roundtable", "params": {"channel": "main"}},
+    "topology": {"kind": "phases"},
     "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
     "agents": [{"id": "a"}, {"id": "b"}],
     "groupchats": [
@@ -783,7 +806,19 @@ EVENT_FORM: dict[str, Any] = {
             "quiet_after_s": 30,
         }
     ],
+    "phases": [
+        {
+            "name": "diskussion",
+            "topology": "chat",
+            "channels": ["main"],
+            "actions": {
+                agent: {"task": "tasks/ohne-skill.md", "submission": {"format": "text"}}
+                for agent in ("a", "b")
+            },
+        }
+    ],
 }
+"""Since W4b-06b a phases run (was `roundtable` in #main, event mode): one phase `chat`."""
 
 
 async def test_message_wakes_an_agent_with_visible_delivery_and_the_answer_appears(

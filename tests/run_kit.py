@@ -278,3 +278,12 @@ def result_message(channel: str, title: str, body: str = "") -> dict[str, Any]:
     it counts as handed in for `done` and `until_result_from`)."""
     text = f"{title}\n\n{body}".strip()
     return room("post_message", channel=channel, body=text, kind="result")
+
+
+def solo_phases(agent: str = "a", name: str = "arbeit") -> list[dict[str, Any]]:
+    """The phases of a run of one agent (W4b-06b, instead of the old topology `solo`): one phase
+    `solo` with the assignment of a run without a skill (from arr's package) and a text."""
+    from arr.runs.phases.tasks import NO_SKILL_TASK
+
+    action = {"task": NO_SKILL_TASK, "submission": {"format": "text"}}
+    return [{"name": name, "topology": "solo", "actions": {agent: action}}]

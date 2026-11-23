@@ -24,9 +24,11 @@ from service_kit import make_run_folder, make_workfolder, start_run_process, tra
 from arr.errors import ArrError
 from arr.models import AuthProfile, ProfilesFile, RunStatus
 from arr.resolve import load_yaml_model
+from arr.room.store import private_channel
 from arr.runs.inspect import run_status
 from arr.runs.launch import LiveFactory, plan_launch, refuse_disabled, run_launch
 from arr.runs.orchestrator import OrchestratorLog
+from arr.runs.phases.tasks import NO_SKILL_TASK
 from arr.runs.prepare import load_run_meta
 from arr.runs.secret_scan import SCAN_KIND
 from arr.service.api_models import ApiException, CreateProfileRequest, ErrorCode, RunAction
@@ -35,24 +37,31 @@ from arr.service.real_api.profile_usage import NOTE
 from arr.usage import AgentUsage, RunUsage, UsageTotal
 
 BASE = "http://127.0.0.1:8765"
+ACTION = {"task": NO_SKILL_TASK, "submission": {"format": "text"}}
+"""The one action of the phases run below: the assignment of a run without a skill (F1)."""
 SOLO = """\
 version: 1
 project: demo
 task: Teste arr.
-topology: {kind: solo}
+topology: {kind: phases}
 limits: {wall_time: 2m}
 defaults: {provider: claude, model: fake-model, auth: fake-auth}
 agents: [{id: a}]
 groupchats: [{name: main, members: [a]}]
+phases:
+  - name: arbeit
+    topology: solo
+    actions: {a: {task: tasks/ohne-skill.md, submission: {format: text}}}
 """
 RUN_INPUT = {
     "version": 1,
     "project": "demo",
     "task": "Teste arr.",
-    "topology": {"kind": "solo"},
+    "topology": {"kind": "phases"},
     "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
     "agents": [{"id": "a"}],
     "groupchats": [{"name": "main", "members": ["a"]}],
+    "phases": [{"name": "arbeit", "topology": "solo", "actions": {"a": ACTION}}],
 }
 LONG = {"a": turns([say("x"), wait(60)])}
 
@@ -389,7 +398,7 @@ async def test_one_blocked_profile_of_several_is_enough(wf: Path, arr_home: Path
     mixed = SOLO.replace(
         "agents: [{id: a}]\ngroupchats: [{name: main, members: [a]}]",
         "agents: [{id: a}, {id: b, auth: fake-b}]\ngroupchats: [{name: main, members: [a, b]}]",
-    ).replace("topology: {kind: solo}", "topology: {kind: solo, params: {agent: a}}")
+    )
     lines: list[str] = []
     running = await launch_with(wf, LONG | {"b": LONG["a"]}, lines, mixed)
     await eventually(lambda: any(line.startswith("▶ a: Turn 1") for line in lines), within=15)
@@ -921,7 +930,7 @@ async def test_w4_00_1_b4_an_open_item_closes_with_the_not_aus_note(
     """The open question to the user becomes `obsolete` with the reason of the Not-Aus, not
     „Der Run wurde gestoppt.“ (R13)."""
     lines: list[str] = []
-    ask = post("main", "@user Welches Band?", kind="question")
+    ask = post(private_channel("a"), "@user Welches Band?", kind="question")
     running = await launch_with(wf, {"a": turns([ask, wait(60)])}, lines)
 
     def asked() -> bool:

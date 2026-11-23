@@ -500,12 +500,15 @@ def test_the_task_heading_aufgabe_stands_once() -> None:
 # --- W3-10.1 point 8: limits of the skill, effort of the preview, `$x$5` ------------------------
 
 STRICT = (
-    "kind: research-group\nversion: 1\ntopology: roundtable\n"
+    "kind: research-group\nversion: 1\ntopology: phases\n"
     "params:\n  rounds: {default: 2, min: 1, max: 5, doc: Runden}\n"
     "defaults: {effort: high}\n"
     "limits: {turns_per_agent: 4}\n"
     "agents:\n  - {id: m, count: 2}\n"
     "groupchats:\n  - {name: main, members: [m-*]}\n"
+    "phases:\n  - name: diskussion\n    topology: chat\n    channels: [main]\n"
+    "    rounds: '{{ params.rounds }}'\n"
+    "    actions: {m-*: {task: tasks/runde.md, submission: {format: text}}}\n"
 )
 
 
@@ -514,6 +517,8 @@ def strict_skill(wf: Path) -> None:
     group.mkdir(parents=True)
     (group / "SKILL.md").write_text("---\nname: streng\ndescription: Streng.\n---\n# Streng\n")
     (group / "group.yaml").write_text(STRICT)
+    (group / "tasks").mkdir()
+    (group / "tasks" / "runde.md").write_text("Diskutiere die Aufgabe.\n", "utf-8")
 
 
 async def test_repeat_keeps_a_limit_equal_to_the_standard_over_the_skill(wf: Path) -> None:

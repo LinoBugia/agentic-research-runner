@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from phases_kit import Log, TurnView, hand_in, policy_builders, write_project_tasks
 from run_kit import FAST, done, fake_builders, post, room, say, turns, wait, write_profiles
 from run_kit import cost as usage_cost
 from service_kit import append, hold_lock, make_run_folder, make_workfolder, transcript_line
@@ -28,7 +29,6 @@ from arr.service.api_models import (
     DecisionRequest,
     ErrorCode,
     PostMessageRequest,
-    ResultStatus,
     RunAction,
     RunFilter,
     SkillKind,
@@ -60,33 +60,53 @@ RUN_INPUT: dict[str, Any] = {
     "project": "demo",
     "name": "Testlauf",
     "task": "Teste arr.",
-    "topology": {"kind": "roundtable", "params": {"rounds": 1, "channel": "main"}},
+    "topology": {"kind": "phases"},
     "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
     "agents": [{"id": "a"}, {"id": "b"}],
     "groupchats": [{"name": "main", "members": ["a", "b"], "mode": "rounds"}],
+    "phases": [
+        {
+            "name": "diskussion",
+            "topology": "solo",
+            "channels": ["main"],
+            "actions": {"a": {"task": "tasks/idee.md", "submission": {"format": "text"}}},
+            "gate": {
+                "type": "judge",
+                "raters": ["b"],
+                "action": {"task": "tasks/bewerten.md", "submission": {"format": "rating"}},
+                "rule": "mean",
+                "pass_score": 6,
+                "routes": {"pass": "next", "fail": "stop"},
+            },
+        }
+    ],
 }
-SCRIPTS = {
-    "a": turns(
-        [
-            say("Ich fange an."),
-            TOOL,
-            post("main", "Idee 1: Zerlege n.", kind="idea"),
-            room("submit_result", kind="idea", title="Idee 1", body="Zerlege n in Primfaktoren."),
-            usage_cost(0.01),
-            wait(0.05),
-            done(),
-        ]
-    ),
-    "b": turns(
-        [
-            say("hi"),
-            post("main", "Was meinst du mit zerlegen?", kind="question", to=["a"]),
-            room("submit_rating", result_id=1, score=8, comment="gut"),
-            usage_cost(0.02),
-            done(),
-        ]
-    ),
-}
+"""Since W4b-06b a phases run (was `roundtable`): `a` hands in an idea, `b` rates it at the
+gate `judge`; one result with one rating, as before."""
+TASKS = {"tasks/idee.md": "Finde eine Idee.\n", "tasks/bewerten.md": "Bewerte die Idee.\n"}
+
+
+def idea(view: TurnView) -> list[dict[str, Any]]:
+    return [
+        say("Ich fange an."),
+        TOOL,
+        post("main", "Idee 1: Zerlege n.", kind="idea"),
+        *hand_in(view, summary="Idee 1", body="Zerlege n in Primfaktoren."),
+        usage_cost(0.01),
+        wait(0.05),
+    ]
+
+
+def rating(view: TurnView) -> list[dict[str, Any]]:
+    return [
+        say("hi"),
+        post("main", "Was meinst du mit zerlegen?", kind="question", to=["a"]),
+        *hand_in(view, score=8, comment="gut"),
+        usage_cost(0.02),
+    ]
+
+
+POLICIES = {"a": idea, "b": rating}
 
 
 @pytest.fixture
@@ -94,14 +114,16 @@ def wf(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     arr_home.mkdir(parents=True, exist_ok=True)
     write_profiles(arr_home, {"fake-auth": "claude_oauth"})
     monkeypatch.setattr("arr.auth._keyring_get", lambda service, account: None)
-    return make_workfolder(tmp_path)
+    folder = make_workfolder(tmp_path)
+    write_project_tasks(folder, TASKS)
+    return folder
 
 
 def make_api(wf: Path, scripts: dict[str, Any] | None = None) -> RealApi:
     return RealApi(
         wf,
         base_url=BASE,
-        builders=fake_builders(scripts or SCRIPTS),
+        builders=fake_builders(scripts) if scripts else policy_builders(POLICIES, Log()),
         manager_kwargs={"pacing": FAST},
     )
 
@@ -208,27 +230,31 @@ async def test_run_started_in_the_service_is_mapped_everywhere(wf: Path) -> None
         assert a.state is AgentDisplayState.DONE and a.turn == 1 and a.turns_limit == 40
         assert a.cost_usd == pytest.approx(0.01) and a.tokens == 15
         assert a.model_label == "fake-model" and a.auth_profile == "fake-auth"
-        assert a.results_count == 1 and agents["b"].ratings_count == 1
+        # a phases run counts every `submit` as a result, the rating as well (W4b-07)
+        assert a.results_count == 1 and agents["b"].results_count == 1
         assert a.open_questions_to == 1 and a.activity is not None
         assert a.activity.kind is ActivityKind.DONE
         assert a.work_dir.endswith("agents/a/work") and a.channels == ["main"]
 
-        [channel] = await api.list_channels(run_id)
+        listed = {c.name: c for c in await api.list_channels(run_id)}
+        assert set(listed) == {"main", "user.a", "user.b"}, "a phases run has private channels"
+        channel = listed["main"]
         assert channel.name == "main" and channel.message_count == 3
         assert channel.open_questions == 1 and channel.pinned == [1]
-        assert channel.last_message_id == 3
+        assert channel.last_message_id == 5, "ids 2 and 3 are the briefs of the private channels"
         assert [m.agent for m in channel.members] == ["a", "b"]
 
         messages = await api.get_messages(run_id, "main")
         assert [m.sender for m in messages.items] == ["orchestrator", "a", "b"]
+        assert [m.id for m in messages.items] == [1, 4, 5]
         assert messages.total == 3 and messages.older_count == 0
         assert messages.items[2].open and messages.items[2].to == ["a"]
         window = await api.get_messages(run_id, "main", limit=1)
-        assert [m.id for m in window.items] == [3] and window.older_count == 2
-        before = await api.get_messages(run_id, "main", before_id=3, limit=5)
-        assert [m.id for m in before.items] == [1, 2]
+        assert [m.id for m in window.items] == [5] and window.older_count == 2
+        before = await api.get_messages(run_id, "main", before_id=5, limit=5)
+        assert [m.id for m in before.items] == [1, 4]
         since = await api.get_messages(run_id, "main", since_id=1, limit=5)
-        assert [m.id for m in since.items] == [2, 3]
+        assert [m.id for m in since.items] == [4, 5]
 
         transcript = await api.get_transcript(run_id, "a")
         kinds = [e.kind for e in transcript.items]
@@ -252,10 +278,13 @@ async def test_run_started_in_the_service_is_mapped_everywhere(wf: Path) -> None
         ]
 
         results = await api.get_results(run_id)
-        [result] = results.items
-        assert result.title == "Idee 1" and result.kind.value == "idea" and result.agent == "a"
-        assert [r.rater for r in result.ratings] == ["b"] and result.avg_score == 8
-        assert result.status is ResultStatus.ACCEPTED and results.summary_md is not None
+        assert results.items == [], "no old results in a phases run"
+        idea_sub, rating_sub = results.submissions
+        assert (idea_sub.summary, idea_sub.agent, idea_sub.action) == ("Idee 1", "a", "work")
+        assert idea_sub.body_excerpt == "Zerlege n in Primfaktoren."
+        assert idea_sub.score == 8 and idea_sub.accepted
+        assert rating_sub.agent == "b" and rating_sub.fields["ratings"][0]["ref"] == idea_sub.id
+        assert results.summary_md is not None
 
         log = [entry.text for entry in await api.get_log(run_id)]
         assert "Status: läuft (running)" in log
@@ -348,17 +377,17 @@ async def test_pause_resume_and_stop_act_on_own_runs(wf: Path) -> None:
 
 
 async def test_resume_is_not_offered_and_refused_while_an_escalation_is_open(wf: Path) -> None:
-    """Only the card decides an escalation (docs/07 §6, docs/08 §6.7). A real waterfall: the first
-    stage fails, the second waits behind the user's own pause, so „Fortsetzen“ comes back."""
+    """Only the card decides an escalation (docs/07 §6, docs/08 §6.7). A real escalation of a
+    phase (since W4b-06b; was `waterfall`): the gate of the first phase fails and asks the
+    user, the second phase waits behind the user's own pause, so „Fortsetzen“ comes back."""
     job = room("get_assignment", save_as="job")
 
     def rate(score: int) -> dict[str, Any]:
-        rating = room(
-            "submit_rating", result_id="${job.context.result_id}", score=score, comment="Geprüft."
-        )
+        ratings = [{"ref": "${job.context.submission.rate.0}", "score": score, "comment": "ok"}]
+        rating = room("submit", status="done", summary="Geprüft.", fields={"ratings": ratings})
         return {"turns": [{"steps": [job, rating, done()]}], "repeat_last": True}
 
-    submit = room("submit_result", kind="sketch", title="Skizze", body="Text.")
+    submit = room("submit", status="done", summary="Skizze", body="Text.")
     work = {"turns": [{"steps": [submit, done()]}], "repeat_last": True}
     scripts = {
         "w": {"turns": [], "by_stage": {"skizze": work, "beweis": work}},
@@ -366,18 +395,32 @@ async def test_resume_is_not_offered_and_refused_while_an_escalation_is_open(wf:
     }
     api = make_api(wf, scripts)
     await api.start()
+
+    def judged(name: str, on_exhausted: str) -> dict[str, Any]:
+        return {
+            "name": name,
+            "topology": "solo",
+            "max_visits": 1,
+            "on_exhausted": on_exhausted,
+            "actions": {"w": {"task": "tasks/idee.md", "submission": {"format": "text"}}},
+            "gate": {
+                "type": "judge",
+                "raters": ["r"],
+                "action": {"task": "tasks/bewerten.md", "submission": {"format": "rating"}},
+                "rule": "mean",
+                "pass_score": 6,
+                "routes": {"pass": "next", "fail": "retry"},
+            },
+        }
+
     try:
         run_input = {
             "project": "demo",
             "task": "Teste arr.",
-            "topology": {
-                "kind": "waterfall",
-                "params": {"on_fail": "escalate", "max_rework": 0, "pass_score": 6},
-            },
+            "topology": {"kind": "phases"},
             "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
             "agents": [{"id": "w"}, {"id": "r"}],
-            "stages": [{"name": "skizze", "agent": "w"}, {"name": "beweis", "agent": "w"}],
-            "raters": ["r"],
+            "phases": [judged("skizze", "escalate"), judged("beweis", "stop")],
         }
         run_id = (await api.start_run(run_input)).run_id
         await until_status(api, run_id, RunStatus.PAUSED)
@@ -487,7 +530,7 @@ async def test_skill_card_sums_count(wf: Path, agents: str, params: str, expecte
     group.mkdir(parents=True)
     (group / "SKILL.md").write_text("---\nname: zaehlt\ndescription: Zählt.\n---\n# Z\n", "utf-8")
     (group / "group.yaml").write_text(
-        f"kind: research-group\nversion: 1\ntopology: roundtable\n{params}agents:\n  - {agents}\n",
+        f"kind: research-group\nversion: 1\ntopology: phases\n{params}agents:\n  - {agents}\n",
         "utf-8",
     )
     skill = await make_api(wf).get_skill("zaehlt")
@@ -580,10 +623,13 @@ async def test_catalog_lists_projects_skills_and_profiles_without_secrets(wf: Pa
         "---\nname: runde\ndescription: Eine Runde.\n---\n# Runde\n", "utf-8"
     )
     (group / "group.yaml").write_text(
-        "kind: research-group\nversion: 1\ntopology: roundtable\n"
+        "kind: research-group\nversion: 1\ntopology: phases\n"
         "params:\n  rounds: {default: 2, min: 1, max: 5, doc: Runden}\n"
         "agents:\n  - {id: m-1}\n  - {id: m-2}\n"
-        "groupchats:\n  - {name: main, members: [m-1, m-2]}\n",
+        "groupchats:\n  - {name: main, members: [m-1, m-2]}\n"
+        "phases:\n  - name: runde\n    topology: chat\n    channels: [main]\n"
+        "    rounds: '{{ params.rounds }}'\n"
+        "    actions: {m-*: {task: tasks/runde.md, submission: {format: text}}}\n",
         "utf-8",
     )
     api = make_api(wf)
@@ -603,7 +649,7 @@ async def test_catalog_lists_projects_skills_and_profiles_without_secrets(wf: Pa
     assert skills["runde"].params[0].type == "int" and skills["runde"].params[0].max == 5
     assert [s.name for s in await api.list_skills(SkillKind.GROUP)] == ["runde"]
     file = await api.get_skill_file("runde", "group.yaml")
-    assert file.language == "yaml" and "roundtable" in file.content
+    assert file.language == "yaml" and "topology: chat" in file.content
     with pytest.raises(ApiException):
         await api.get_skill_file("runde", "../../arr.yaml")
     [profile] = await api.list_profiles()
