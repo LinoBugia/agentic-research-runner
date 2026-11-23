@@ -578,7 +578,7 @@ async def test_a3_run_c_result_without_done_ends_with_all_done_at_once(workfolde
     assert reasons == {D1: "reported", D2: "result"}
 
 
-async def test_submit_result_finishes_but_an_open_own_question_keeps_working(
+async def test_a_result_finishes_but_an_open_own_question_keeps_working(
     workfolder: Path,
 ) -> None:
     submit = result_message("main", "Ansatz", "Induktion")

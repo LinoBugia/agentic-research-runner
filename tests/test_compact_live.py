@@ -95,7 +95,7 @@ def manager_for(provider: str, model: str, auth: str, topology: Any) -> RunManag
         {
             "project": "probe",
             "task": "Probe",
-            "topology": {"kind": "solo"},
+            "topology": {"kind": "phases"},
             "defaults": {"provider": provider, "model": model, "auth": auth, "effort": "low"},
             "agents": [{"id": "solo", "compact": {"at": 1000}}],
             "limits": {"budget_usd": 0.5, "turns_per_agent": 8},

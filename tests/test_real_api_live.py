@@ -78,9 +78,11 @@ async def test_run_of_a_second_process_appears_live_and_can_be_stopped(
     tmp_path: Path, wf: Path, arr_home: Path
 ) -> None:
     (wf / "solo.yaml").write_text(
-        "version: 1\nproject: demo\ntask: Los.\ntopology: {kind: solo}\n"
+        "version: 1\nproject: demo\ntask: Los.\ntopology: {kind: phases}\n"
         "defaults: {provider: claude, model: fake-model, auth: fake-auth}\n"
-        "agents: [{id: a}]\n",
+        "agents: [{id: a}]\n"
+        "phases: [{name: arbeit, topology: solo, "
+        "actions: {a: {task: tasks/ohne-skill.md, submission: {format: text}}}}]\n",
         encoding="utf-8",
     )
     api = RealApi(wf, base_url=BASE)

@@ -79,7 +79,7 @@ def test_codex_live_smoke(monkeypatch: pytest.MonkeyPatch, request: pytest.Fixtu
         {
             "project": "smoke",
             "task": "Smoke",
-            "topology": {"kind": "solo"},
+            "topology": {"kind": "phases"},
             "defaults": {"provider": "codex", "model": MODEL, "auth": AUTH, "effort": "low"},
             "agents": [{"id": "gpt-1"}],
             "groupchats": [{"name": "main", "members": ["gpt-1"]}],

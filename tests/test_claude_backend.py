@@ -110,7 +110,7 @@ def setup(tmp_path: Path, arr_home: Path) -> Setup:
         {
             "project": "p",
             "task": "Test",
-            "topology": {"kind": "solo"},
+            "topology": {"kind": "phases"},
             "defaults": {
                 "provider": "claude",
                 "model": "claude-haiku-5-5",

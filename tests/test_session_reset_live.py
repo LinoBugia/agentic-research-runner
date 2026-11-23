@@ -64,7 +64,7 @@ def prepared(provider: str, model: str, auth: str, request: pytest.FixtureReques
         {
             "project": "probe",
             "task": "Probe",
-            "topology": {"kind": "solo"},
+            "topology": {"kind": "phases"},
             "defaults": {"provider": provider, "model": model, "auth": auth, "effort": "low"},
             "agents": [{"id": "judge-1"}],
         }

@@ -286,7 +286,7 @@ def test_role_from_the_project_when_there_is_no_skill(
         del data["skill"]
         data["agents"] = [{"id": "solo", "role": "roles/solo.md"}]
         data["groupchats"] = []
-        data["topology"] = {"kind": "solo"}
+        data["topology"] = {"kind": "phases"}
 
     result = prepare(workfolder, settings, solo)
     assert result.run_id.startswith("20261025-1305_collatz_custom_")
