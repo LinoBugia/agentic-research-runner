@@ -118,9 +118,13 @@ def test_usage_addition() -> None:
 
 def test_run_context_is_abstract() -> None:
     assert inspect.isabstract(RunContext)
-    expected = {"turn", "turns", "post", "results", "ratings", "checkpoint", "escalate"}
+    expected = {"turn", "turns", "post", "checkpoint", "escalate"}
     expected |= {"run_id", "config", "params", "agents", "stop_requested"}
     assert expected <= RunContext.__abstractmethods__
+    # W4b-06b: the results and ratings of the old topologies are gone from the context
+    assert not {"results", "ratings", "result_text", "save_output", "read_output"} & set(
+        vars(RunContext)
+    )
     with pytest.raises(TypeError):
         RunContext()  # type: ignore[abstract]
 

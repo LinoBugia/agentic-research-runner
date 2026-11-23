@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 import pytest
-from run_kit import say, turns, wait, write_profiles
+from run_kit import say, solo_phases, turns, wait, write_profiles
 from service_kit import (
     free_port,
     make_workfolder,
@@ -28,10 +28,11 @@ from arr.service.state import read_service_info, recent_workfolders
 RUN_INPUT = {
     "project": "demo",
     "task": "Teste arr.",
-    "topology": {"kind": "solo"},
+    "topology": {"kind": "phases"},
     "defaults": {"provider": "claude", "model": "fake-model", "auth": "fake-auth"},
     "agents": [{"id": "a"}],
     "groupchats": [{"name": "main", "members": ["a"]}],
+    "phases": solo_phases(),
 }
 
 

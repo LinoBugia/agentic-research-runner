@@ -439,7 +439,7 @@ async def _hold_for_user_questions(
                 answered.append(question)
         if answered:
             if config.mode is ChannelMode.EVENT:
-                await _answered_in_event(orch, config, stage, outcome, rounds, seats)
+                await _answered_in_event(orch, config, stage, outcome, rounds, answered, seats)
             else:
                 for question in answered:
                     await _wake_for_answer(orch, config, stage, question, outcome, seats)
@@ -466,11 +466,13 @@ async def _answered_in_event(
     stage: str | None,
     outcome: DiscussionOutcome,
     rounds: int,
+    answered: list[Any],
     seats: DiscussionSeats,
 ) -> None:
     """N2 (W4-06.2): in `event` an answer leads back into the event discussion, without a
     kick-off. The answer is an unread direct message to the asker, so L15 wakes it; what it
-    writes then wakes others as during the discussion (L13)."""
+    writes then wakes others as during the discussion (L13). `answered` names the questions
+    (the counter-check of W4-06.2 N2 wakes their askers itself)."""
     more = await _EventDiscussion(orch, config, stage, False, rounds, seats).run()
     outcome.outcomes += more.outcomes
     outcome.wakeups.update(more.wakeups)

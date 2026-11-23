@@ -61,7 +61,8 @@ async def test_a7_waits_show_reason_and_time_left(wf: Path) -> None:
             [done()],
         ),
         # b answers after 6 s: a window in which a slow page still shows the wait
-        "b": turns([wait(6), post("main", "Ja.", kind="answer", reply_to=2), done()]),
+        # #4: in a phases run #2 and #3 are the briefs of the private channels
+        "b": turns([wait(6), post("main", "Ja.", kind="answer", reply_to=4), done()]),
     }
     api = make_api(wf, scripts)
     async with real_user(api) as user:
@@ -224,14 +225,23 @@ def test_w3_09_card_of_a_finished_agent_says_reachable() -> None:
 
 async def test_w3_09_1_b9_m35_reachable_only_while_a_discussion_runs(wf: Path) -> None:
     """The API sets `reachable` for a finished agent while the discussion of its channel runs
-    (M35), not in the summary afterwards, when nobody is woken (B9), and not after the run."""
-    summary = room("submit_result", kind="summary", title="Zusammenfassung", body="Kurz.")
+    (M35), not in the summary afterwards, when nobody is woken (B9), and not after the run.
+    Since W4b-06b the summary is a phase `solo` after the phase `chat`, as in the start skill
+    `roundtable`."""
+
+    def hand_in(text: str) -> dict[str, Any]:
+        return room("submit", status="done", summary=text, body=text)
+
     scripts = {
-        "a": turns([wait(3), post("main", "Mein Teil.", kind="result")], [wait(3), summary]),
-        "b": turns([post("main", "Teil b.", kind="result")]),
+        "a": turns([wait(3), hand_in("Mein Teil.")], [wait(3), hand_in("Zusammenfassung")]),
+        "b": turns([hand_in("Teil b.")]),
     }
     data = form()
-    data["topology"]["params"]["summarizer"] = "a"
+    action = {"task": "tasks/ohne-skill.md", "submission": {"format": "text"}}
+    data["phases"] = [
+        {**data["phases"][0], "actions": {"a": action, "b": action}},
+        {"name": "zusammenfassung", "topology": "solo", "actions": {"a": action}},
+    ]
     api = make_api(wf, scripts)
     async with real_user(api):
         run_id = (await api.start_run(data)).run_id

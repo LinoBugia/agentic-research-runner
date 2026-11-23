@@ -271,7 +271,7 @@ def test_agent_without_role_gets_the_default_text(
 
     result = prepare(workfolder, settings, no_role)
     text = (result.run_dir / "agents" / "ranker" / "role.md").read_text("utf-8")
-    assert "submit_result" in text
+    assert "gib mit `submit` ab" in text and "submit_result" not in text  # one version
     assert load_agent_file(result.run_dir, "ranker").role_file == "agents/ranker/role.md"
 
 
@@ -600,7 +600,7 @@ def test_block_swap_in_every_working_copy(run: PreparedRun, workfolder: Path) ->
         assert f"`{run.run_id}`" in claude
         assert f"Du bist `{agent_id}` (Rolle: `explorer`)" in claude
         assert "Kopie** des Projekts „collatz“" in claude
-        assert "`submit_result`" in claude
+        assert "`submit`" in claude and "submit_result" not in claude
         assert "- `main`: Zwischenstände teilen, Ansätze gegenseitig prüfen" in claude
 
     ranker = (run.agents["ranker"].work_dir / "AGENTS.md").read_text("utf-8")

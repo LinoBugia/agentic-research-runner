@@ -335,7 +335,8 @@ async def test_load_cards_show_no_scenario_text() -> None:
             assert leaked == [], (item.id, leaked)
         escalation = _card_html(user, "apr_1206")
         assert "Wasserfall · Stufe Konstruktion" in escalation
-        assert "Kommentar an prover (optional)" in escalation
+        # W4b-06b: the real API never sets `comment_to`, the card has one comment field
+        assert "Kommentar (optional)" in escalation and "Kommentar an" not in escalation
         assert "Inhalt geht an</dt><dd><b>OpenAI</b>" in _card_html(user, "apr_1203")
 
 

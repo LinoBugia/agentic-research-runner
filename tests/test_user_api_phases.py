@@ -434,13 +434,23 @@ async def test_describe_skill_gives_the_phase_plan(wf: Path) -> None:
     assert rows["beweis"]["field"] == "phases[2]" and rows["beweis"]["line"]
 
 
-async def test_describe_skill_of_an_old_group_has_no_plan(tmp_path: Path, arr_home: Path) -> None:
-    from mcp_kit import group_skill
+def old_group(workfolder: Path) -> None:
+    """A group of an old topology (W4b-06b: refused with `old_topology_message`)."""
+    folder = workfolder / "skills" / "alt"
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text("---\nname: alt\ndescription: Alt.\n---\n# Alt\n", "utf-8")
+    (folder / "group.yaml").write_text(
+        "kind: research-group\nversion: 1\ntopology: roundtable\nagents: [{id: m}]\n", "utf-8"
+    )
 
+
+async def test_describe_skill_of_an_old_group_has_no_plan(tmp_path: Path, arr_home: Path) -> None:
     workfolder = make_workfolder(tmp_path)
-    group_skill(workfolder)
-    answer = await UserApi(make_api(workfolder)).describe_skill("demo", "runde")
+    old_group(workfolder)
+    answer = await UserApi(make_api(workfolder)).describe_skill("demo", "alt")
     assert "phase_plan" not in answer
+    [issue] = answer["check"]["issues"]
+    assert not answer["check"]["valid"] and "„roundtable“ gibt es nicht mehr" in issue["message"]
 
 
 async def test_the_plan_texts_reach_claude_code_as_one_line_each() -> None:
@@ -515,10 +525,15 @@ async def test_estimate_run_gives_the_plan_the_tightening_and_the_warnings(wf: P
 
 
 async def test_estimate_run_of_an_old_group_has_no_plan(tmp_path: Path, arr_home: Path) -> None:
+    """Since W4b-06b an old group gets the message instead of an estimate (§6.1)."""
+    from arr.service.user_api import ToolProblem
+
     write_profiles(arr_home, {"fake-auth": "claude_oauth"})
     workfolder = prepare_workfolder(make_workfolder(tmp_path))
-    answer = await UserApi(make_api(workfolder)).estimate_run("demo", skill="runde")
-    assert "phase_plan" not in answer and "warnings" not in answer
+    old_group(workfolder)
+    with pytest.raises(ToolProblem) as info:
+        await UserApi(make_api(workfolder)).estimate_run("demo", skill="alt")
+    assert "„roundtable“ gibt es nicht mehr" in str(info.value)
 
 
 # --------------------------------------------------------------------------------------------

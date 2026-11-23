@@ -22,11 +22,15 @@ SOLO = """\
 version: 1
 project: demo
 task: Teste arr.
-topology: {kind: solo}
+topology: {kind: phases}
 limits: {wall_time: 2m}
 defaults: {provider: claude, model: fake-model, auth: fake-auth}
 agents: [{id: a}]
 groupchats: [{name: main, members: [a]}]
+phases:
+  - name: arbeit
+    topology: solo
+    actions: {a: {task: tasks/ohne-skill.md, submission: {format: text}}}
 """
 
 OLD_LAYOUT = [
@@ -37,8 +41,10 @@ OLD_LAYOUT = [
     r"agents/a/(agent\.json|role\.md|context\.md|transcript\.jsonl|raw\.jsonl|session\.json)",
     r"agents/a/(transcript\.md|changes\.diff|shell-env\.sh)",
     r"agents/a/(blobs|work|plugin)(/.*)?",
+    r"tasks(/.*)?",
 ]
-"""Every path a run folder of a solo run had before W4b-05a (`main` 8185f8d)."""
+"""Every path a run folder of a solo run had before W4b-05a (`main` 8185f8d); since W4b-06b
+the run is a phases run, which files its assignments under `tasks/` (W4b-02b)."""
 
 
 def _there(path: Path) -> bool:

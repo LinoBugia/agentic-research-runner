@@ -194,14 +194,17 @@ def test_codex_app_server_calls_submit_with_nested_fields(monkeypatch: pytest.Mo
         print("Codex, abgelegt:", json.dumps(filed, ensure_ascii=False))
 
 
-def test_without_phases_the_app_server_offers_no_submit(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Counter-check with the real app-server (A10): in a `solo` run the `exec` cell finds no
-    `tools.mcp__arr_room__submit`; the room tools it does find include `submit_result`."""
+def test_every_run_offers_submit_and_no_submit_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Counter-check with the real app-server (A10), since W4b-06b the other way round (A3):
+    every run offers `submit`, none `submit_result`. The cell asks for `submit_result`, finds
+    no such tool and lists the room tools it does find."""
     with kit.open_lab("codex") as lab:
-        api = McpResponsesApi([("submit", SUBMIT)], stop_when_room_seen=True)
+        api = McpResponsesApi([("submit_result", SUBMIT)], stop_when_room_seen=True)
         monkeypatch.setattr(kit, "FakeResponsesApi", lambda _script: api)
         kit.run_codex_backend(lab, [])
-        print("Codex ohne phases, Room-Werkzeuge:", api.offered)
-        assert api.answers == [] and api.offered
-        assert "mcp__arr_room__submit_result" in api.offered
-        assert "mcp__arr_room__submit" not in api.offered
+        print("Codex im Labor-Run, Room-Werkzeuge:", api.offered)
+        assert "mcp__arr_room__submit" in api.offered
+        assert not {"mcp__arr_room__submit_result", "mcp__arr_room__submit_rating"} & set(
+            api.offered
+        )
+        assert api.answers == []

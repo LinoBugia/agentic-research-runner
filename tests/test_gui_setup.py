@@ -396,7 +396,7 @@ async def test_e4_in_a_workfolder_made_in_the_gui_needs_no_file(wf: Path, tmp_pa
             await see(user, "1 · Projekt und Skill")
             user.find(marker="radio-skill-").trigger("change")
             clicks.count += 1
-            await see(user, "Ein Agent, Topologie solo")
+            await see(user, "Ein Agent, eine Phase.")
             user.find(marker="field-task_md").trigger("input", "# Aufgabe\n\nFrage")
             html = await see(user, "In diesem Workfolder fehlen Standards", retries=120)
             assert "fake-auth" in html and "Claude Sonnet 5.5" in html and "in arr.yaml" not in html

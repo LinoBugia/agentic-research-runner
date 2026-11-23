@@ -228,17 +228,19 @@ def test_a2_the_wait_for_a_result_in_log_and_api() -> None:
 def test_a5_fixed_protocol_explains_addresses_done_and_waiting(name: str) -> None:
     text = prompt_text(name)
     assert "`@name`" in text and "`@user`" in text and "nur er antwortet" in text
-    assert "ansprechbar" in text and "Jede Nachricht an dich weckt dich" in text
+    assert "ansprechbar" in text and "wenn eine Nachricht an dich kommt" in text  # one version
     assert 'until_result_from="<name>"' in text and "Teil" in text
     assert "macOS" in text and "`timeout`" in text, "V2: no GNU timeout"
     assert "Rolle" in text and "anderen Agenten" in text
 
 
 def test_a5_the_research_block_names_own_part_and_the_others(tmp_path: Path) -> None:
+    """Since W4b-06b on a phases run: the only part left is summarizing (`summarizer`); the
+    parts of the old topologies (stage, rating, moderating) went with them."""
     data = {
         "project": "demo",
         "task": "x",
-        "topology": {"kind": "waterfall"},
+        "topology": {"kind": "phases", "params": {"summarizer": "judge-1"}},
         "limits": {},
         "approvals": {},
         "agents": [
@@ -250,21 +252,19 @@ def test_a5_the_research_block_names_own_part_and_the_others(tmp_path: Path) -> 
              "auth": "p", "channels": ["blind"]},
         ],
         "groupchats": [
-            {"name": "main", "members": ["author", "judge-1"], "mode": "moderated",
-             "moderator": "judge-1"},
+            {"name": "main", "members": ["author", "judge-1"], "mode": "rounds"},
             {"name": "blind", "members": ["judge-2", "author"], "anonymous": True},
         ],
-        "stages": [{"name": "beweis", "agent": "author", "produces": "proof.md"}],
-        "raters": ["judge-1", "judge-2"],
     }  # fmt: skip
     resolved = ResolvedRun.model_validate(data)
     judge = _research_block("r1", resolved, resolved.agents[1], WorkspaceMode.COPY)
     assert "Du bist `judge-1` (Rolle: `judge`)." in judge
-    assert "- Dein Teil: bewertet Ergebnisse; moderiert #main." in judge
-    assert "`author` (Rolle: `author`; Stufe „beweis“, liefert `proof.md`)" in judge
-    assert "`judge-2` (Rolle: `judge`; bewertet Ergebnisse)" in judge
+    assert "- Dein Teil: fasst die Diskussion zusammen." in judge
+    assert "`author` (Rolle: `author`)" in judge
+    assert "`judge-2` (Rolle: `judge`)" in judge
     author = _research_block("r1", resolved, resolved.agents[0], WorkspaceMode.COPY)
     assert "judge-2" not in author, "an anonymous channel hides who is behind the alias"
+    assert "`judge-1` (Rolle: `judge`; fasst die Diskussion zusammen)" in author
     assert "nur als „Mitglied A/B/…“" in author
 
 
@@ -425,7 +425,8 @@ async def test_a2_until_result_from_wakes_at_the_result(workfolder: Path) -> Non
     assert waits["result_from"] == D2 and waits["until"] > time.time() - took + 20
     assert wakes(manager) == [(D1, ["result_from"])]
     prompt = turn_starts(manager.run_dir, D1)[1]["data"]["prompt"]
-    assert f"{D2} hat ein Ergebnis abgegeben" in prompt and "„Lemma B“" in prompt
+    assert f"{D2} hat ein Ergebnis abgegeben" in prompt  # W4b-06b: a message `result`
+    assert f"Ergebnis von {D2} (Nachricht #" in prompt and "Lemma B" in prompt
     assert "Beweis durch Induktion." in prompt
 
 
@@ -860,7 +861,7 @@ async def test_w3_09_1_b11_m47_an_older_result_does_not_wake(workfolder: Path) -
                 and e["data"]["reasons"] == ["result_from"]]  # fmt: skip
     woken = [p for p in prompts_of(manager, D1) if "hat ein Ergebnis abgegeben" in p]
     assert result and len(woken) == 1
-    assert "„Neu“" in woken[0] and "„Alt“" not in woken[0]
+    assert "Neu\n\nneu" in woken[0] and "Alt\n\nalt" not in woken[0]
 
 
 def test_w3_09_1_b11_new_result_looks_only_after_the_mark(tmp_path: Path) -> None:
@@ -1008,7 +1009,7 @@ async def test_w4_00_b14_a_result_in_the_waiting_turn_counts(
         assert first == ["result_missing"] and "ohne ein neues Ergebnis" in woken
         return
     assert first == ["result_from"]
-    assert f"{D2} hat ein Ergebnis abgegeben" in woken and "„Früh“" in woken
+    assert f"{D2} hat ein Ergebnis abgegeben" in woken and "Früh\n\nfrüh" in woken
     assert "ohne ein neues Ergebnis" not in woken
 
 

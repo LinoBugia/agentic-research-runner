@@ -184,9 +184,9 @@ async def test_n2_in_event_mode_the_asker_can_wake_another_member_after_the_answ
     monkeypatch.setattr(waiting, "STREAK_MAX_S", 30.0)
     if old:
 
-        async def w4061(orch, config, stage, context, outcome, rounds, answered):  # noqa: ANN001
+        async def w4061(orch, config, stage, outcome, rounds, answered, seats):  # noqa: ANN001
             for question in answered:  # the hold's own wake-up, as in W4-06.1
-                await pacing._wake_for_answer(orch, config, stage, context, question, outcome)
+                await pacing._wake_for_answer(orch, config, stage, question, outcome, seats)
 
         monkeypatch.setattr(pacing, "_answered_in_event", w4061)
 

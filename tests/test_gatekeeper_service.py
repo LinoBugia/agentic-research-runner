@@ -49,6 +49,9 @@ def wf(tmp_path: Path, arr_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     folder = make_workfolder(tmp_path)
     (folder / "mandates").mkdir()
     (folder / "mandates" / "standard.md").write_text(standard_text(), "utf-8")
+    tasks = folder / "projects" / "demo" / "tasks"  # the phase `chat` of `run_input`
+    tasks.mkdir(parents=True, exist_ok=True)
+    (tasks / "runde.md").write_text("Auftrag runde.\n", "utf-8")
     return folder
 
 
