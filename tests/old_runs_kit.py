@@ -103,6 +103,44 @@ def add_rating(
         con.close()
 
 
+TIME_KEYS = frozenset(
+    {"ts", "created_at", "decided_at", "started_at", "ended_at", "status_since", "since",
+     "state_since"}
+)  # fmt: skip
+"""Keys whose values are times (seconds since the epoch) in the readings of the old runs."""
+TIME_TOLERANCE_S = 0.001
+"""How far a time may be off. The room lies in `room.sql` as text: `iterdump` writes a `REAL`
+with 21 significant digits (`1.79544162893734799979e+09`), and SQLite turns that text back into
+a double with its own conversion, which does not round alike on every platform and version (the
+CI on Linux read `…7117639` where macOS reads `…7117636`). Every other value is compared
+exactly."""
+
+
+def differences(found: Any, want: Any, path: str = "") -> list[str]:
+    """Where `found` differs from `want`: times (`TIME_KEYS`) by more than `TIME_TOLERANCE_S`,
+    every other value at all (also its type)."""
+    if isinstance(want, dict) and isinstance(found, dict):
+        out = [f"{path}.{k}: missing or extra" for k in found.keys() ^ want.keys()]
+        for key in want.keys() & found.keys():
+            out += differences(found[key], want[key], f"{path}.{key}")
+        return out
+    if isinstance(want, list) and isinstance(found, list):
+        if len(found) != len(want):
+            return [f"{path}: {len(found)} items instead of {len(want)}"]
+        return [
+            d
+            for i, (f, w) in enumerate(zip(found, want, strict=True))
+            for d in differences(f, w, f"{path}[{i}]")
+        ]
+    key = path.rsplit(".", 1)[-1].split("[")[0]
+    times = isinstance(want, float) and isinstance(found, float) and key in TIME_KEYS
+    if times and abs(found - want) <= TIME_TOLERANCE_S:
+        return []
+    if not times and type(found) is type(want) and found == want:
+        return []
+    return [f"{path}: {found!r} instead of {want!r}"]
+
+
 def normalized(value: Any, workfolder: Path) -> Any:
     """`value` as JSON with the workfolder replaced by `@@WORKFOLDER@@` (for the snapshots)."""
     text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
