@@ -1,6 +1,6 @@
 # Research groups: agents, phases, actions and gates
 
-> **Status: design, partly built.** Today `arr` ships five fixed group types (`solo`, `roundtable`, `waterfall`, `review`, `exploration`). This document describes the model they are being rebuilt on, so that you can compose your own groups from the same parts. It records where the design is going, not only what the code does today. The notation of the group file is settled for the first version. Built so far: the submission tool with its formats and checks, the result folder with versions and diffs, the group file itself (its model, the checks and the estimate of turns), the folders (scratch folder, fresh work folders with retired ones, an agent's own record closed to it), the renewal of a full context with a handover note (see [Context](#context)), which already works in the five fixed group types, and the phase runner for phases with the topologies `solo`, `parallel` and `chat` (actions, `over`, `repeat`, isolated phases, gates with routes, inputs, channels per phase, the private channel to you, agents on standby, `folder: fresh` and `context: compact`), and `decider: user` for a phase or an agent (see [The supervising agent](#the-supervising-agent)). A group file with `topology: phases` runs if it uses only these; a phase with `moderated` is refused before the start, with the reason. Votes in channels and the moderator tools are gone for all runs; gates read submissions. The phase runner has been tested with a test backend only, not yet with real models. The GUI shows runs and skills with phases: the phase plan as a table (skills page, run detail, run-start card), a progress bar over loops with the result of each pass, usage and the estimate per phase, the fill level of each agent's context, submissions under „Ergebnisse“, gate `user` and escalations with a hint field, and the private channel of each agent as „privat · <agent>“. Claude Code gets the same plan from `describe_skill` and `estimate_run` and the JSON Schema of a group from `group_schema`. Sealed submissions and the private note `note_next` are hidden in „Ergebnisse“ and in `read_results`, but an agent's transcript keeps every `submit` call in full, also for Claude Code (`read_transcript`); this limit is open. The five fixed group types still run on their own code.
+> **Status: design, partly built.** `arr` ships four group start skills built from this model: `proof-review`, `proof`, `exploration` and `roundtable` (see [The start skills](#the-start-skills)). The five older fixed group types (`solo`, `roundtable`, `waterfall`, `review`, `exploration`) still run on their own code until they are removed; a run without a skill still starts as `solo`. This document describes the model, so that you can compose your own groups from the same parts. It records where the design is going, not only what the code does today. The notation of the group file is settled for the first version. Built so far: the submission tool with its formats and checks, the result folder with versions and diffs, the group file itself (its model, the checks and the estimate of turns), the folders (scratch folder, fresh work folders with retired ones, an agent's own record closed to it), the renewal of a full context with a handover note (see [Context](#context)), which already works in the five fixed group types, and the phase runner for phases with the topologies `solo`, `parallel`, `chat` and `moderated` (actions, assignments of a lead, `over`, `repeat`, isolated phases, gates with routes, inputs, channels per phase, the private channel to you, agents on standby, `folder: fresh` and `context: compact`), and `decider: user` for a phase or an agent (see [The supervising agent](#the-supervising-agent)). Votes in channels and the moderator tools are gone for all runs; gates read submissions. The phase runner has been tested with a test backend only, not yet with real models. The GUI shows runs and skills with phases: the phase plan as a table (skills page, run detail, run-start card), a progress bar over loops with the result of each pass, usage and the estimate per phase, the fill level of each agent's context, submissions under „Ergebnisse“, gate `user` and escalations with a hint field, and the private channel of each agent as „privat · <agent>“. Claude Code gets the same plan from `describe_skill` and `estimate_run` and the JSON Schema of a group from `group_schema`. Sealed submissions and the private note `note_next` are hidden in „Ergebnisse“ and in `read_results`, but an agent's transcript keeps every `submit` call in full, also for Claude Code (`read_transcript`); this limit is open. The GUI does not list the assignments of a lead yet; their turns and the log show them.
 
 ## The idea
 
@@ -140,6 +140,29 @@ After the run, slimming deletes the work folders, retired folders, the agents' t
 
 An agent works on one action at a time. If it has several in one phase, for example three entries of a list or five actions from a lead, it does them one after the other, in the order of the list or in the order the lead handed them out.
 
+### Assignments in a `moderated` phase
+
+One agent, the lead, has the action; the others are on standby (`standby`) and receive assignments from it. `max_assignments` (required) limits the assignments per pass.
+
+```yaml
+- name: split
+  topology: moderated
+  max_assignments: 4
+  actions:
+    coordinator: { task: tasks/split.md, submission: { format: text } }
+  standby: [helper-*]
+```
+
+The lead calls `assign(agent, task, format)` with an agent on standby, the text of the assignment and the format of its submission (`text`, `artifact`, `review`, `list` or an own format of the group). One agent works its assignments one after the other; different agents work at the same time. Each recipient gets up to three turns and one follow-up question, like any action, and hands in with `submit`. Its submission comes back to the lead: the lead gets a turn with the summary and the path in the results folder, and these return turns do not count against the lead's `turns`. The lead names a recipient as its context lists it (an alias, if the agent has one in an anonymous channel).
+
+The phase ends with the lead's submission. If the lead asked you something and its turns run out, the phase waits for your answer, until five minutes after the question; after your answer the lead gets a turn and can still hand out assignments. If assignments still run or wait when the lead hands in, `arr` names every one of them once and does not accept the submission; the next `submit`, with no new assignment in between, is accepted, cancels them and ends the phase. Only the lead's submission counts for the gate and for later phases; the submissions of the assignments are in the results folder.
+
+Known limit: aliases are unique only per channel. Two agents on standby that are each the first member of an anonymous channel of their own both appear as „Mitglied A“ to a lead outside those channels, and the lead cannot give either of them an assignment (`assign` refuses the name and says so). Put such agents into one anonymous channel instead of one each, or put the lead into one anonymous channel with them. An ordinary channel shared with the lead does not help, and neither does an extra anonymous channel listed after their own ones.
+
+Not in this version: a recipient giving assignments itself, showing a submission in a channel, the assignments in the GUI.
+
+The estimate counts for a `moderated` pass the lead's `turns` plus one, and per assignment its turns, one follow-up and one return turn. It does not count the note turn of auto-compact, turns after an answer of yours, or wake-ups through an agent's private channel; `turns_per_agent` stays the hard limit.
+
 ### Who takes part
 
 In each phase an agent is one of three things:
@@ -166,8 +189,9 @@ How questions to you work today:
 
 - An agent that hands in is done. An open question to you is closed with its submission, and a later answer changes nothing.
 - If an agent uses up its turns without handing in while a question to you is open, the phase waits up to five minutes for your answer, and your answer gives the agent one more turn.
-- An agent that needs your answer is meant to wait for it for up to five minutes; your message ends the wait at once. The tool for this exists, but the text agents get in the private channel still describes it wrongly. This is being corrected.
-- Two more gaps: a question from you in the private channel wakes an agent on standby only with `@name` (a note wakes it without), and a note that is not a reply does not count as the answer to an open question.
+- An agent that needs your answer is told to wait for it with `wait_until` for up to five minutes; an answer, a note or a question of yours in its private channel ends the wait at once. If it hands in instead, the question counts as settled.
+- A question from you in the private channel wakes an agent on standby, also without `@name`.
+- A note that neither replies to the question nor names the agent (`@name`) does not count as the answer to an open question.
 
 ### Context
 
@@ -224,80 +248,75 @@ If the visits are used up after a `judge` gate with a pass score and the run goe
 
 There is one exception to the limit. When you yourself choose "one more attempt", at a `user` gate or after `escalate`, the phase gets exactly one more visit, also beyond `max_visits`. The limits and the budget of the run still apply.
 
-## The five built-in groups
+## The start skills
 
-The five group types become templates built from these parts. In the diagrams a box is a phase (name, topology, who), a diamond is a gate, and an arrow is a route.
+`arr` ships four group start skills: `proof-review`, `proof`, `exploration` and `roundtable`. Each is a group with `topology: phases`, with its phases, a task file per action under `tasks/` and static roles. A comparison with fake agents checks every old group type against the start skill that replaces it: the same turns, inputs, channels, submissions, routes, results and end of the run, except named, intended differences. For example, in `exploration` a silent explorer is asked again after each repetition; in `roundtable` the summarizer no longer takes part in the discussion and every discussant hands in a conclusion; a single judge in `proof-review` gets one discussion turn alone; `reject` ends a `proof-review` run; raters see only the submission they rate. A proof from the project (`artifact`) and given ideas (`ideas`) reach every phase that needs them.
 
-### solo
+Parameters were renamed where the old value was an expression: `proof` uses `max_attempts` (1 + reworks) and `on_fail: next | stop | escalate`, `proof-review` uses `judge_memory: reset | keep` (`reset` also gives the judges a fresh work folder), and the summary of `exploration` and `roundtable` is switched off with `summarizer: none`. `solo` has no start skill.
 
-One agent works on the research question.
+In the diagrams a box is a phase (its name in the file, topology, who), a diamond is a gate, and an arrow is a route.
+
+### proof-review
+
+Independent judges review a proof, discuss and reach a verdict. The author revises until the judges accept or the revisions are used up. Without a proof from the project (`artifact`) the author writes it first. With `discussion_rounds: 0` the judges decide without a discussion, in the phase `pruefung-allein`.
 
 ```mermaid
 flowchart LR
-  S(["Start"]) --> W["work<br/>solo · agent"]
-  W -->|done| E(["End"])
+  S(["Start"]) --> F["fassung<br/>solo · author<br/>only without artifact"]
+  F --> P["pruefung<br/>parallel, isolated · judges"]
+  P --> D["diskussion<br/>chat · judges"]
+  D --> G{"signal gate<br/>verdict · majority or unanimous"}
+  G -->|"accept / reject"| E(["End"])
+  G -->|"minor / major"| X["revision<br/>solo · author<br/>at most max_revisions"]
+  X -->|done| P
+  X -.->|"revisions used up"| E
 ```
 
-### roundtable
+### proof
 
-All agents discuss in one channel, then one of them writes the summary.
-
-```mermaid
-flowchart LR
-  S(["Start"]) --> D["discussion<br/>chat · all members"]
-  D -->|done| Z["summary<br/>solo · summarizer"]
-  Z -->|done| E(["End"])
-```
-
-### waterfall
-
-Stages in order. Raters score each stage, and below the pass score its author reworks it. Retries are limited; after that the group continues, stops or asks you.
+Strategy, sketch and proof in order. Raters score each stage, and below the pass score its author reworks it. After `max_attempts` the group goes on with the best attempt, stops or asks you (`on_fail`).
 
 ```mermaid
 flowchart LR
-  S(["Start"]) --> A["strategy<br/>solo · strategist"]
-  A --> GA{"judge gate<br/>raters · mean of 7 or more"}
+  S(["Start"]) --> A["strategie<br/>solo · strategist"]
+  A --> GA{"judge gate<br/>raters · mean of pass_score or more"}
   GA -->|"fail: retry"| A
-  GA -->|pass| B["sketch<br/>solo · prover"]
+  GA -->|pass| B["skizze<br/>solo · prover"]
   B --> GB{"judge gate"}
   GB -->|"fail: retry"| B
-  GB -->|pass| C["proof<br/>solo · prover"]
+  GB -->|pass| C["beweis<br/>solo · prover"]
   C --> GC{"judge gate"}
   GC -->|"fail: retry"| C
-  GC -->|pass| Z["summary<br/>solo · summarizer"]
-  Z --> E(["End"])
-```
-
-### review
-
-Independent judges review a draft, discuss and reach a verdict. The author revises until the judges accept or the revisions are used up.
-
-```mermaid
-flowchart LR
-  S(["Start"]) --> V["draft<br/>solo · author"]
-  V --> R["review<br/>parallel, isolated · judges<br/>context: reset"]
-  R --> D["discussion<br/>chat · judges"]
-  D --> G{"signal gate<br/>verdict · majority"}
-  G -->|accept| Z["summary<br/>solo · summarizer"]
-  G -->|"minor / major"| X["revision<br/>solo · author"]
-  G -->|reject| E(["End"])
-  G -.->|"revisions used up"| Z
-  X -->|"done, at most 2 visits"| R
-  Z --> E
+  GC -->|pass| E(["End"])
 ```
 
 ### exploration
 
-An ideator proposes ideas, explorers work them out separately, rankers order the results.
+An ideator proposes ideas, or you give them with `ideas`. Explorers work them out, rankers order the results, and a summarizer sums up. `exchange` sets what the explorers see of each other: nothing (`none`), excerpts of the others (`digest`), or a channel to talk in (`channel`).
 
 ```mermaid
 flowchart LR
-  S(["Start"]) --> I["ideas<br/>solo · ideator<br/>format: list"]
-  I --> X["exploration<br/>parallel over ideas · explorers<br/>isolated"]
+  S(["Start"]) --> I["ideen<br/>solo · ideator<br/>format: list"]
+  I --> X["exploration<br/>parallel over ideen · explorers<br/>isolated"]
   X --> G{"judge gate<br/>rankers · rank"}
-  G -->|ranked| Z["summary<br/>solo · summarizer"]
+  G -->|ranked| Z["zusammenfassung<br/>solo · summarizer"]
   Z --> E(["End"])
 ```
+
+### roundtable
+
+The discussants talk in one channel, and each hands in a conclusion. Then the summarizer writes the summary.
+
+```mermaid
+flowchart LR
+  S(["Start"]) --> D["diskussion<br/>chat · discussants"]
+  D -->|done| Z["zusammenfassung<br/>solo · summarizer"]
+  Z --> E(["End"])
+```
+
+### Updating start skills
+
+`arr skills update` brings every start skill in `skills/` that you never changed to the version of your `arr`: it compares the folder byte for byte with every version `arr` shipped since the start skills exist. A skill you changed, also one with your own files beside the shipped ones, is left as it is and named in the output; a missing one is not created again (use „Start-Skills anlegen“ for that). Runs keep the copy of the skills they started with.
 
 ## A custom group
 
@@ -326,7 +345,7 @@ flowchart TD
 
 ## What a group file looks like
 
-The `review` template in this notation:
+A review group in this notation (simpler than the start skill `proof-review`):
 
 ```yaml
 kind: research-group

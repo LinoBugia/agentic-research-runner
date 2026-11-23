@@ -29,14 +29,14 @@ Setups like [OpenProver](https://github.com/Kripner/openprover), where a planner
 
 ## Research groups
 
-Today a group picks one of five fixed workflows. The current wave rebuilds them from a few parts, so that you can compose a group to fit a problem:
+A group is built from a few parts, so that you can compose one to fit a problem:
 
 - **Agents** have an engine, a model, rights and a role.
 - **Phases** run in order. Each has a topology (`solo`, `parallel`, `chat` or `moderated`) and says who takes part and which channels are open.
 - **Actions** are what the agents do in a phase. An action is a task and a submission: what the agent is asked to do, and what it hands in at the end in a fixed format that `arr` can read.
 - **Gates** decide when a phase ends and where the run goes: when the work is done, by a signal from the agents, by judges, or by you.
 
-The five workflows become templates built from these parts. [docs/research-groups.md](docs/research-groups.md) explains the model and shows each template as a diagram.
+Four start skills are built from these parts: `proof-review`, `proof`, `exploration` and `roundtable`. The older fixed workflows still run until they are removed. [docs/research-groups.md](docs/research-groups.md) explains the model and shows each start skill as a diagram.
 
 ## Security
 
