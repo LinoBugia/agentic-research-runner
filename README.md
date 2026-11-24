@@ -40,9 +40,9 @@ Every run is built from these parts; the older fixed workflows are gone. Four st
 
 ## Security
 
-Agents in `arr` work on hard, sometimes unsolvable problems for hours, without confirming every command. Released models rarely try to get around their limits, but models in development have done so under similar conditions. So `arr` doesn't rely on how a model behaves. The operating system and fixed rules enforce every limit, tests prove each one, and runs are monitored.
+Agents in `arr` work on hard, sometimes unsolvable problems for hours, without confirming every command. That is the setting in which agents have been seen to work around their limits. So `arr` puts its weight on observability: transcripts, logged decisions, usage per login and a kill switch, on top of the OS sandbox and fixed rules.
 
-[SECURITY.md](SECURITY.md) describes the threat model, the principles and layers, how they are implemented on macOS, and which ways out are known, closed or still open. Until agents run under a separate macOS user, real runs should stay supervised.
+[SECURITY.md](SECURITY.md) gives the short version: why, the architecture and the safety layers. [docs/security.md](docs/security.md) has the details: threat model, principles, the macOS implementation, and which ways out are known, closed or still open. `arr` is a research prototype. Until agents run under a separate macOS user, real runs should stay supervised.
 
 ## Status
 
