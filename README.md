@@ -53,7 +53,8 @@ Agents in `arr` work on hard, sometimes unsolvable problems for hours, without c
 | 2 | Real agents: mixed runs from the CLI | ✅ done |
 | 3 | Service and UI with real data | ✅ done |
 | 4 | MCP server for Claude Code, ready-made group skills | ✅ built |
-| 4b | Composable research groups (phases, actions, gates), context compaction per agent | in progress |
+| 4b | Composable research groups (phases, actions, gates), context compaction per agent | ✅ done |
+| 4c | Refinement of names, screens and file formats, simpler gates, fixes from the first live runs, acceptance of the Claude Code workflow | planned |
 | 5 | Hardening (separate macOS user for agents), onboarding, polish | planned |
 
 The [plan diagram](umsetzung/Codeplan_Ablauf.md) (in German) shows how the work packages fit together. Documentation for users lives in [docs/](docs/). The user interface and CLI messages are in German for now.
