@@ -1,6 +1,6 @@
 # Security
 
-> Status: 2026-11-24 · Research prototype · Implemented and tested on macOS only · Details: [docs/security.md](docs/security.md)
+> Status: 2026-11-27 · Research prototype · Implemented and tested on macOS only · Details: [docs/security.md](docs/security.md)
 
 `arr` is a research prototype, not a hardened product. It runs AI agents on your own machine, with your own model subscriptions, and lets them execute code they write. Use it the way you would use any tool that runs model-generated code: on a machine and an account where a mistake is acceptable, with real runs supervised, and not as your only line of defence.
 
@@ -45,7 +45,7 @@ A limit in layers 1, 2 and 5 counts only when a test proves it with a counter-te
 - Only macOS is implemented. Other platforms are a design template, nothing more.
 - Without layer 7, agents run under your own account, inside the sandbox. On macOS a process can read the start environment of other processes of the same user. `arr` keeps its own secrets out of every environment, but it cannot protect secrets that other applications put there.
 - Background processes an agent starts can outlive its run.
-- Four known ways out are still open and three are accepted. The full list, with what is closed and how it was tested, is in [docs/security.md §5.2](docs/security.md#52-known-ways-out).
+- Five known ways out are still open and three are accepted. One of them lies outside the sandbox: nothing in `arr` stops your own agent (Claude Code) from running a script that a research agent handed in. The full list, with what is closed and how it was tested, is in [docs/security.md §5.2](docs/security.md#52-known-ways-out).
 - Closing the ways we know of proves nothing about the ones we do not. Every review so far has found new ones.
 
 **Therefore:** real runs stay supervised. Hard problems run unsupervised only once layer 7 exists.

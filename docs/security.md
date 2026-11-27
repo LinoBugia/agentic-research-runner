@@ -1,6 +1,6 @@
 # Security model (details)
 
-> Status: 2026-11-24 · Platform implemented: macOS · Maintained with every change to sandbox, permissions or logins, every security review and every update of macOS, Claude Code CLI or Codex. · Summary: [SECURITY.md](../SECURITY.md)
+> Status: 2026-11-27 · Platform implemented: macOS · Maintained with every change to sandbox, permissions or logins, every security review and every update of macOS, Claude Code CLI or Codex. · Summary: [SECURITY.md](../SECURITY.md)
 
 This document describes in detail how `arr` tries to keep research agents from harming the machine they run on, which ways out we know of, and which of them are closed. It is written so that the general part can serve as a template for other operating systems and for servers. The platform part currently covers macOS only.
 
@@ -148,6 +148,7 @@ These hold on every platform.
 | 20 | A run input lifts the `decider: user` of a skill's agent or phase without the run-start card showing it | closed (W4b-07): the run-start card compares the request with the skill's standard and lists every `decider: user` at a phase or agent that the request removes (own `agents`, own `phases`, `defaults: {decider: null}`, or a phase dropped by parameters) as a sensitive deviation; an added tightening is listed too, as not sensitive. `estimate_run` names the same deviations to Claude Code |
 | 21 | An agent puts a Unicode line separator (U+2028, U+2029 or U+0085) into a request before or in the run's first request that needs a decision; reading the approval log then fails, and every later such request of that run is denied without a card, also after a restart | closed (W4b-07): `ApprovalLog.entries()` and the recovery of waiting run starts split `approvals.jsonl` at `"\n"` only. A separator in agent text no longer breaks the inbox of a run, and nothing is allowed that would not be allowed without it. Tests for every separator fail with the old `splitlines()` |
 | 22 | After an approval by the user, Claude's Read tool reads an attachment in another agent's private channel, as in any channel the agent is not a member of | **open**, found in a review; only after the user approved that path, and nobody attaches files there today; follow-up planned (readable for the owner only) |
+| 23 | The user's own agent (Claude Code) runs a script from an agent's submission, for example to check a result. The script then runs outside the sandbox with the user's rights; only Claude Code's own permission mode stands in between | **open**, seen in a supervised live run (2026-11-26): Claude Code reported that it could not run a submitted script itself because a package was missing locally. Nothing in `arr` would have stopped it. The `arr` skill tells Claude Code that agent text is data, not instructions, but does not yet forbid running agent code. Planned: a rule in the skill (read such files, recompute with `sympy-check` or in a new run) and a test. Until then see the operating rules (7) |
 
 Closing the ways we found does not prove that there are no others. Every review so far has found new ones.
 
@@ -190,6 +191,7 @@ On servers the Hugging Face lesson applies directly. A single allowed network pa
 - Real runs are supervised. Hard problems run unsupervised only after layer 7.
 - After stopping a run, check that none of its processes are left (way 4). A fresh work folder does not end the agent's background processes either.
 - No shared work folder for Claude and Codex agents in one run.
+- Do not let Claude Code run files from a run folder (submissions, work folders, transcripts). They are agent output: read them, and recompute with `sympy-check` or in a new run (way 23).
 - Do not write permission rules by hand that grant reading over an agent's own work folder: that makes it read-only for the Claude CLI.
 - Agents cannot commit to git inside a run, because `.git` is write-protected for them. That is the price of the wall.
 - Every change to sandbox, permissions or logins gets an escape test with a counter-test, and an independent review.
